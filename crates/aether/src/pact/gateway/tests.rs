@@ -126,7 +126,7 @@ fn fixture() -> Fixture {
     let agent = TestAgent::new("k1");
     let key = Arc::new(ProviderKey::load_or_create(directory.path()).expect("key"));
     let node = Arc::new(FakeNode::default());
-    let link = Arc::new(ConsentLink::new());
+    let link = Arc::new(ConsentLink::default());
     link.set("https://127.0.0.1:3000".to_owned());
     let path = directory.path().join(aether_store::pact::PACT_DATABASE);
     let mut gateway = Gateway::new(

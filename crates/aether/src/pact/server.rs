@@ -58,7 +58,7 @@ pub fn start(
         UrlPolicy { allow_insecure_local: config.allow_insecure_local_issuers };
     let source = HttpJwksSource::new(policy).map_err(|_| StartError::Client)?;
     let verifier = PaVerifier::new(config.audience.clone(), policy, Arc::new(source));
-    let link = Arc::new(ConsentLink::new());
+    let link = Arc::new(ConsentLink::default());
     let gateway = Arc::new(Gateway::new(
         config.clone(),
         verifier,

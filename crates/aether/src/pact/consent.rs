@@ -32,11 +32,6 @@ use crate::admin::SharedAdministration;
 pub struct ConsentLink(OnceLock<String>);
 
 impl ConsentLink {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Sets the origin, such as `https://127.0.0.1:3000`. Only the first
     /// call has an effect.
     pub fn set(&self, origin: String) {
