@@ -6,6 +6,7 @@ mr-boxington = "1.21"
 erlang = "29.1.2"
 elixir = "1.20.5-otp-29"
 java = "temurin-21.0.13+9.0.LTS"
+"cargo:mdbook" = "0.5.4"
 
 [tasks.fmt]
 description = "Check Rust formatting"
@@ -30,6 +31,14 @@ cargo build --release --locked -p aether
 mkdir -p "$HOME/.local/bin"
 install -m 755 target/release/aether "$HOME/.local/bin/aether"
 '''
+
+[tasks.docs]
+description = "Build the documentation site into target/docs-site"
+run = "sh scripts/docs-build.sh"
+
+[tasks.docs-serve]
+description = "Serve the documentation site with live reload"
+run = "mdbook serve docs --open"
 
 [tasks.server-test]
 description = "Run the hub server tests"
