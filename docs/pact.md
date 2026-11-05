@@ -7,8 +7,7 @@ code for delegation. The node is a PACT Provider. Each Brand is one
 capability that the owner offers. A personal agent gets nothing until the
 node owner approves it on the consent page of the local admin UI. The
 approval is an ordinary signed grant, so the sharing page shows it and can
-revoke it. [plans/pact-provider/PLAN.md](../plans/pact-provider/PLAN.md) records
-the design and the decisions.
+revoke it.
 
 Add a `pact` section to `policy.json`. Do not declare a `pact` scope; the
 node adds it.

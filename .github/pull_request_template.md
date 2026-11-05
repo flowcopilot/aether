@@ -5,7 +5,7 @@ Delete any section that does not apply.
 
 ## Why
 
-<!-- One or two sentences. Name the PLAN.md phase or TODO.md item if there is one. -->
+<!-- One or two sentences. Name the related issue if there is one. -->
 
 ## What changes
 

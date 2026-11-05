@@ -269,7 +269,7 @@ changed that would affect them); only the local checks were re-measured:
 `mise run check` still passes — format, lints, build, and 223 tests, one
 live Codex test still ignored. The growth from 191 covers work done after
 14 September: approved-workspace-ID resolution and a durable policy
-revision (phase 36), and, at the CLI-process level specifically, `replay`
+revision, and, at the CLI-process level specifically, `replay`
 (an idempotent retry reusing a request's own key), `cancelled` (an
 administration cancellation reaching a request in flight), `expired-result`
 (a real 24-hour retention window fast-forwarded by calling the same
@@ -278,20 +278,10 @@ cutoff instead of waiting), `unknown-result` (a real lease recovered the
 same way, immediately, instead of waiting on `LEASE_TTL` and
 `MAINTENANCE_INTERVAL`), and `overload` (a genuine three-request race made
 deterministic once the scheduler's single execution slot was confirmed in
-code, not assumed) — all five from phase 38's acceptance matrix.
+code, not assumed).
 
-This checklist covers repair phases 33 through 36 (except admission using
-the policy revision, deferred by explicit user decision), and phase 38 in
-full except `timeout`, from `PLAN.md`. It does not cover phase 37
-(Invitation: traced to two candidate flows, neither of which fits a live
-"change" without a security-relevant product decision — see `TODO.md`),
-phase 38's remaining `timeout` CLI scenario (diagnosed to a precise
-mechanism — sustained connection churn from one identity racing the
-server's post-response connection-close wait — but not yet fixed, since
-the fix needs its own verification against iroh's connection-lifecycle
-guarantees — see `TODO.md`), or a concurrent command-suite run against the
-current test count. See `TODO.md` for the exact boundary of what each
-phase covers.
+These results record checks from September 2026. They do not establish
+the test coverage or behavior of the current version.
 
 Limits in the code: 1 MiB per frame, 4 MiB per exchange, 64 frames per
 exchange, 32 concurrent Iroh connections, 8 requests per second for each

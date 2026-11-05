@@ -84,7 +84,7 @@ struct NodePolicyFile {
     /// only the `CODEX_HOME` and `HOME` that aether always sets.
     #[serde(default)]
     environment_allowlist: Vec<String>,
-    /// The PACT gateway (`plans/pact-provider/PLAN.md`). Absent: the node
+    /// The PACT gateway (see `docs/pact.md`). Absent: the node
     /// has no PACT scope and `--pact-port` is refused.
     #[serde(default)]
     pact: Option<crate::pact::config::PactFile>,

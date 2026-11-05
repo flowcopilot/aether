@@ -1117,7 +1117,7 @@ const OUTSIDE: [string, number, number][] = [
   ["MCP servers", 60, 650],
   ["memories", 70, 790],
 ];
-const FILES = ["README.md", "Cargo.toml", "crates/aether", "src/env.rs", "PLAN.md", "scripts/"];
+const FILES = ["README.md", "Cargo.toml", "crates/aether", "src/env.rs", "docs/", "scripts/"];
 const RESULTS: [string, "ink" | "spec"][] = [
   ["▸ install steps assume mise; add a fallback", "ink"],
   ["▸ 'node request' example omits --scope", "ink"],
