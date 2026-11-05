@@ -1,23 +1,13 @@
-//! The connected-agent adapter: an agent that runs on its own (the Hermes
-//! gateway, for example) connects to the node's agent socket and answers
-//! the tasks that the node sends it.
+//! The connected-agent adapter: an agent that runs on its own answers the
+//! tasks that the node sends to its agent socket.
 //!
-//! The protocol is one JSON object on each line:
-//!
-//! - agent to node, first: `{"type":"ready","protocol":1}`;
-//! - node to agent: `{"type":"task","id":…,"instructions":…,"text":…}` and
-//!   `{"type":"cancel","id":…}`;
-//! - agent to node: `{"type":"progress","id":…}`,
-//!   `{"type":"result","id":…,"text":…}`, `{"type":"failed","id":…}` and
-//!   `{"type":"cancelled","id":…}`.
-//!
-//! The node sends only the task text and the instructions: no keys, grants,
-//! endpoint IDs or caller names. The socket file is owner-only, as the admin
-//! socket is, so only the node owner's own processes can attach.
+//! The Hermes and `OpenClaw` plugins are such agents. The rules, the constants
+//! and the transcript that the tests replay are in `protocol/agent-socket/`.
 
 use std::{
     collections::BTreeMap,
     io::{self, BufRead, BufReader, Read, Write},
+    net::Shutdown,
     os::unix::{
         fs::{FileTypeExt, PermissionsExt},
         net::{UnixListener, UnixStream},
@@ -31,19 +21,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde::Deserialize;
-use serde_json::json;
+use serde::{Deserialize, Serialize};
 
 use crate::execution::{Agent, ExecutionError, ExecutionEvent, agent_instructions};
 
-/// The protocol version of the agent socket.
-pub const PROTOCOL: u64 = 1;
+const PROTOCOL: u64 = 1;
 
-/// The file name of the agent socket in the node data directory.
-pub const SOCKET_FILE: &str = "agent.sock";
+const SOCKET_FILE: &str = "agent.sock";
 
-/// The longest line the node reads from an agent: a final answer is bounded
-/// again by the executor's context limit.
+/// The longest line the node reads from an agent, its newline included: a
+/// final answer is bounded again by the executor's context limit.
 const MAX_LINE: u64 = 4 * 1024 * 1024;
 
 /// The path of the agent socket of a node data directory.
@@ -71,6 +58,8 @@ type Pending = Arc<Mutex<BTreeMap<String, mpsc::Sender<Reply>>>>;
 
 struct Connection {
     generation: u64,
+    /// Closes the connection when a newer agent replaces it.
+    stream: UnixStream,
     writer: Writer,
     pending: Pending,
 }
@@ -83,9 +72,16 @@ enum Reply {
     Cancelled,
 }
 
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum NodeMessage<'a> {
+    Task { id: &'a str, instructions: String, text: &'a str },
+    Cancel { id: &'a str },
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum Message {
+enum AgentMessage {
     Ready { protocol: u64 },
     Progress { id: String },
     Result { id: String, text: String },
@@ -131,12 +127,6 @@ impl ConnectedAgent {
         Ok(agent)
     }
 
-    /// Whether an agent is attached now.
-    #[must_use]
-    pub fn is_connected(&self) -> bool {
-        self.shared.connection.lock().is_ok_and(|connection| connection.is_some())
-    }
-
     fn connection(&self) -> Result<(Writer, Pending), ExecutionError> {
         self.shared
             .connection
@@ -148,41 +138,60 @@ impl ConnectedAgent {
             })
             .ok_or(ExecutionError::Unavailable)
     }
+
+    /// The generation of the attached connection, if one is attached.
+    #[cfg(test)]
+    fn generation(&self) -> Option<u64> {
+        self.shared
+            .connection
+            .lock()
+            .ok()?
+            .as_ref()
+            .map(|connection| connection.generation)
+    }
 }
 
 impl Shared {
     /// Runs one agent connection until it closes. The newest agent that
-    /// says `ready` replaces an older one; the older one's tasks fail.
+    /// says `ready` replaces an older one: the older connection closes, and
+    /// its turns fail.
     fn serve(&self, stream: UnixStream) {
-        let Ok(writer) = stream.try_clone() else { return };
+        let (Ok(writer), Ok(control)) = (stream.try_clone(), stream.try_clone()) else {
+            return;
+        };
         let mut reader = BufReader::new(stream);
         match read_message(&mut reader) {
-            Some(Message::Ready { protocol: PROTOCOL }) => {}
+            Some(AgentMessage::Ready { protocol: PROTOCOL }) => {}
             _ => return,
         }
         let generation =
             self.generation.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
         let pending = Arc::new(Mutex::new(BTreeMap::new()));
-        if let Ok(mut connection) = self.connection.lock() {
-            *connection = Some(Connection {
-                generation,
-                writer: Arc::new(Mutex::new(writer)),
-                pending: Arc::clone(&pending),
-            });
-        } else {
-            return;
+        let Ok(mut connection) = self.connection.lock() else { return };
+        let replaced = connection.replace(Connection {
+            generation,
+            stream: control,
+            writer: Arc::new(Mutex::new(writer)),
+            pending: Arc::clone(&pending),
+        });
+        drop(connection);
+        if let Some(replaced) = replaced {
+            // Its own serve thread then reads the end of the stream and
+            // fails its turns.
+            let _ = replaced.stream.shutdown(Shutdown::Both);
         }
         while let Some(message) = read_message(&mut reader) {
             let (id, reply) = match message {
-                Message::Ready { .. } => continue,
-                Message::Progress { id } => (id, Reply::Progress),
-                Message::Result { id, text } => (id, Reply::Result(text)),
-                Message::Failed { id } => (id, Reply::Failed),
-                Message::Cancelled { id } => (id, Reply::Cancelled),
+                AgentMessage::Ready { .. } => continue,
+                AgentMessage::Progress { id } => (id, Reply::Progress),
+                AgentMessage::Result { id, text } => (id, Reply::Result(text)),
+                AgentMessage::Failed { id } => (id, Reply::Failed),
+                AgentMessage::Cancelled { id } => (id, Reply::Cancelled),
             };
             if let Ok(pending) = pending.lock()
                 && let Some(sender) = pending.get(&id)
             {
+                // The turn has ended when its receiver is gone.
                 let _ = sender.send(reply);
             }
         }
@@ -200,25 +209,24 @@ impl Shared {
     }
 }
 
-/// Reads one message. `None` at the end of the stream, on a read error, on
-/// a line that is too long or on a line that is not a known message.
-fn read_message(reader: &mut BufReader<UnixStream>) -> Option<Message> {
+/// Reads the next message and skips lines that are not one. `None` at the
+/// end of the stream, on a read error and on a line that is too long.
+fn read_message(reader: &mut impl BufRead) -> Option<AgentMessage> {
     loop {
         let mut line = Vec::new();
         let read = reader.by_ref().take(MAX_LINE).read_until(b'\n', &mut line).ok()?;
         if read == 0 || line.last() != Some(&b'\n') {
             return None;
         }
-        if line.iter().all(u8::is_ascii_whitespace) {
-            continue;
+        if let Ok(message) = serde_json::from_slice(&line) {
+            return Some(message);
         }
-        return serde_json::from_slice(&line).ok();
     }
 }
 
 fn write_line(
     writer: &Mutex<UnixStream>,
-    message: &serde_json::Value,
+    message: &NodeMessage<'_>,
 ) -> Result<(), ExecutionError> {
     let mut writer = writer.lock().map_err(|_| ExecutionError::Unavailable)?;
     let mut line = serde_json::to_vec(message).map_err(|_| ExecutionError::Protocol)?;
@@ -257,12 +265,11 @@ impl Agent for ConnectedAgent {
         let result = (|| {
             write_line(
                 &writer,
-                &json!({
-                    "type": "task",
-                    "id": task_id,
-                    "instructions": agent_instructions(skill),
-                    "text": remote_text,
-                }),
+                &NodeMessage::Task {
+                    id: task_id,
+                    instructions: agent_instructions(skill),
+                    text: remote_text,
+                },
             )?;
             let started_at = Instant::now();
             loop {
@@ -292,7 +299,9 @@ impl Agent for ConnectedAgent {
             pending.remove(task_id);
         }
         if result == Err(ExecutionError::Timeout) {
-            let _ = write_line(&writer, &json!({"type": "cancel", "id": task_id}));
+            // A failed write means the connection is gone, and the agent
+            // forgets its turns then.
+            let _ = write_line(&writer, &NodeMessage::Cancel { id: task_id });
         }
         result
     }
@@ -301,89 +310,255 @@ impl Agent for ConnectedAgent {
         let Ok((writer, pending)) = self.connection() else { return };
         let active = pending.lock().is_ok_and(|pending| pending.contains_key(task_id));
         if active {
-            let _ = write_line(&writer, &json!({"type": "cancel", "id": task_id}));
+            let _ = write_line(&writer, &NodeMessage::Cancel { id: task_id });
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ConnectedAgent, socket_path};
-    use crate::execution::{Agent, ExecutionError, ExecutionEvent, GENERAL_SKILL};
+    use super::{
+        AgentMessage, ConnectedAgent, MAX_LINE, NodeMessage, PROTOCOL, SOCKET_FILE,
+        socket_path,
+    };
+    use crate::execution::{Agent, ExecutionError, GENERAL_SKILL, agent_instructions};
     use serde_json::{Value, json};
     use std::{
-        io::{BufRead, BufReader, Write},
+        collections::BTreeMap,
+        io::{BufRead, BufReader, Read, Write},
         os::unix::{fs::PermissionsExt, net::UnixStream},
         path::Path,
+        thread::JoinHandle,
         time::{Duration, Instant},
     };
 
-    /// A test agent: connects, says `ready`, and then answers each node
-    /// message with `answer`.
-    fn attach(
-        agent: &ConnectedAgent,
-        path: &Path,
-        answer: impl Fn(&Value) -> Vec<Value> + Send + 'static,
-    ) {
-        let mut stream = UnixStream::connect(path).expect("agent must connect");
-        stream
-            .write_all(b"{\"type\":\"ready\",\"protocol\":1}\n")
-            .expect("ready must send");
-        let reader = BufReader::new(stream.try_clone().expect("stream must clone"));
-        std::thread::spawn(move || {
-            for line in reader.lines() {
-                let Ok(line) = line else { return };
-                let message: Value =
-                    serde_json::from_str(&line).expect("node sends JSON");
-                for reply in answer(&message) {
-                    let mut reply = serde_json::to_vec(&reply).expect("reply encodes");
-                    reply.push(b'\n');
-                    if stream.write_all(&reply).is_err() {
-                        return;
-                    }
-                }
+    const CONTRACT: &str =
+        include_str!("../../../../protocol/agent-socket/contract.json");
+    const TRANSCRIPT: &str =
+        include_str!("../../../../protocol/agent-socket/transcript.json");
+
+    fn json_file(text: &str) -> Value {
+        serde_json::from_str(text).expect("the protocol file is JSON")
+    }
+
+    /// The test's end of one agent connection.
+    struct Peer {
+        stream: UnixStream,
+        lines: BufReader<UnixStream>,
+    }
+
+    impl Peer {
+        /// Connects, writes `ready`, and waits until the node has attached
+        /// this connection.
+        fn attach(agent: &ConnectedAgent, path: &Path, ready: &Value) -> Self {
+            let before = agent.generation();
+            let mut peer = Self::connect(path);
+            peer.write(ready);
+            let deadline = Instant::now()
+                .checked_add(Duration::from_secs(5))
+                .expect("deadline must fit");
+            while agent.generation().is_none() || agent.generation() == before {
+                assert!(Instant::now() < deadline, "the agent must attach");
+                std::thread::sleep(Duration::from_millis(1));
             }
-        });
-        let deadline = Instant::now()
-            .checked_add(Duration::from_secs(5))
-            .expect("deadline must fit");
-        while !agent.is_connected() {
-            assert!(Instant::now() < deadline, "agent must attach");
-            std::thread::sleep(Duration::from_millis(5));
+            peer
+        }
+
+        fn connect(path: &Path) -> Self {
+            let stream = UnixStream::connect(path).expect("the agent must connect");
+            let lines = BufReader::new(stream.try_clone().expect("stream must clone"));
+            Self { stream, lines }
+        }
+
+        fn write(&mut self, message: &Value) {
+            self.write_line(&serde_json::to_string(message).expect("message encodes"));
+        }
+
+        fn write_line(&mut self, line: &str) {
+            self.stream
+                .write_all(format!("{line}\n").as_bytes())
+                .expect("the line must send");
+        }
+
+        fn read(&mut self) -> Value {
+            let mut line = String::new();
+            self.lines.read_line(&mut line).expect("the node must send a line");
+            serde_json::from_str(&line).expect("the node sends JSON")
+        }
+
+        /// Whether the node has closed the connection.
+        fn closed(&mut self) -> bool {
+            let mut rest = Vec::new();
+            match self.lines.read_to_end(&mut rest) {
+                Ok(_) => rest.is_empty(),
+                Err(_) => true,
+            }
+        }
+    }
+
+    /// A line of exactly `bytes` bytes, the newline included, of a type
+    /// that no side knows.
+    fn noise(bytes: u64) -> Vec<u8> {
+        let mut line = br#"{"type":"noise","pad":""#.to_vec();
+        let filler = usize::try_from(bytes)
+            .expect("size fits")
+            .saturating_sub(line.len())
+            .saturating_sub(3);
+        line.resize(line.len().saturating_add(filler), b'x');
+        line.extend_from_slice(b"\"}\n");
+        line
+    }
+
+    fn text_of<'a>(message: &'a Value, field: &str) -> &'a str {
+        message[field].as_str().expect("the field is a string")
+    }
+
+    /// Replays one transcript case with the node under test.
+    fn replay(case: &Value) {
+        let name = case["name"].as_str().unwrap_or_default();
+        let directory = tempfile::tempdir().expect("directory must create");
+        let path = socket_path(directory.path());
+        let agent =
+            ConnectedAgent::listen(&path, Duration::from_secs(5)).expect("listen");
+        let mut peer: Option<Peer> = None;
+        let mut turns = BTreeMap::<String, JoinHandle<_>>::new();
+        let mut answers = BTreeMap::<String, String>::new();
+        for step in case["steps"].as_array().expect("steps") {
+            let ignored = step["ignored"] == true;
+            if let Some(message) = step.get("agent") {
+                if message["type"] == "ready" {
+                    peer = Some(Peer::attach(&agent, &path, message));
+                    continue;
+                }
+                if message["type"] == "result" && !ignored {
+                    answers.insert(
+                        text_of(message, "id").to_owned(),
+                        text_of(message, "text").to_owned(),
+                    );
+                }
+                peer.as_mut().expect("a connection").write(message);
+            } else if let Some(message) = step.get("node") {
+                let id = text_of(message, "id").to_owned();
+                let mut expected = message.clone();
+                if message["type"] == "task" {
+                    let text = text_of(message, "text").to_owned();
+                    if ignored {
+                        assert_eq!(
+                            agent.clone().start_turn(&id, GENERAL_SKILL, &text),
+                            Err(ExecutionError::Protocol),
+                            "{name}"
+                        );
+                        continue;
+                    }
+                    expected["instructions"] = json!(agent_instructions(GENERAL_SKILL));
+                    let mut runner = agent.clone();
+                    let turn_id = id.clone();
+                    turns.insert(
+                        id,
+                        std::thread::spawn(move || {
+                            runner.start_turn(&turn_id, GENERAL_SKILL, &text)
+                        }),
+                    );
+                } else {
+                    agent.cancel(&id);
+                }
+                assert_eq!(
+                    peer.as_mut().expect("a connection").read(),
+                    expected,
+                    "{name}"
+                );
+            } else if let Some(line) = step.get("agent_line") {
+                peer.as_mut()
+                    .expect("a connection")
+                    .write_line(line.as_str().expect("a line"));
+            } else if let Some(bytes) = step.get("agent_line_bytes") {
+                let line = noise(bytes.as_u64().expect("a size"));
+                // The node may close before the whole line is read.
+                let _ = peer.as_mut().expect("a connection").stream.write_all(&line);
+            } else if step["closes"] == "node" {
+                assert!(peer.take().expect("a connection").closed(), "{name}");
+            } else if step["closes"] == "agent" {
+                peer = None;
+            }
+        }
+        for (id, outcome) in case["outcomes"].as_object().expect("outcomes") {
+            let expected = match outcome.as_str() {
+                Some("answered") => Ok(answers.get(id).cloned().expect("an answer")),
+                Some("cancelled") => Err(ExecutionError::Cancelled),
+                Some("failed" | "lost") => Err(ExecutionError::Unavailable),
+                other => panic!("unknown outcome {other:?}"),
+            };
+            let turn = turns.remove(id).expect("a turn");
+            assert_eq!(turn.join().expect("turn joins"), expected, "{name}: {id}");
         }
     }
 
     #[test]
-    fn a_task_reaches_the_agent_and_its_result_comes_back() {
+    fn the_node_replays_the_protocol_transcript() {
+        for case in json_file(TRANSCRIPT)["cases"].as_array().expect("cases") {
+            replay(case);
+        }
+    }
+
+    #[test]
+    fn the_constants_and_messages_match_the_contract() {
+        let contract = json_file(CONTRACT);
+        assert_eq!(contract["protocol"], PROTOCOL);
+        assert_eq!(contract["socket_file"], SOCKET_FILE);
+        assert_eq!(contract["max_line_bytes"], MAX_LINE);
+
+        let fields = |message: Value| -> Vec<String> {
+            let mut keys: Vec<String> = message
+                .as_object()
+                .expect("an object")
+                .keys()
+                .filter(|key| *key != "type")
+                .cloned()
+                .collect();
+            keys.sort();
+            keys
+        };
+        let sorted = |names: &Value| -> Vec<String> {
+            let mut names: Vec<String> = names
+                .as_array()
+                .expect("field names")
+                .iter()
+                .map(|name| name.as_str().expect("a name").to_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        let task = NodeMessage::Task { id: "t", instructions: String::new(), text: "" };
+        let cancel = NodeMessage::Cancel { id: "t" };
+        let node = &contract["messages"]["node_to_agent"];
+        assert_eq!(fields(json!(task)), sorted(&node["task"]));
+        assert_eq!(fields(json!(cancel)), sorted(&node["cancel"]));
+
+        for (kind, names) in
+            contract["messages"]["agent_to_node"].as_object().expect("messages")
+        {
+            let mut message = json!({ "type": kind });
+            for name in names.as_array().expect("field names") {
+                let name = name.as_str().expect("a name");
+                message[name] =
+                    if name == "protocol" { json!(PROTOCOL) } else { json!("x") };
+            }
+            assert!(
+                serde_json::from_value::<AgentMessage>(message).is_ok(),
+                "the node reads {kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_socket_is_owner_only() {
         let directory = tempfile::tempdir().expect("directory must create");
         let path = socket_path(directory.path());
-        let mut agent =
+        let _agent =
             ConnectedAgent::listen(&path, Duration::from_secs(5)).expect("listen");
         let mode =
             std::fs::metadata(&path).expect("socket exists").permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
-        attach(&agent, &path, |message| {
-            if message["type"] != "task" {
-                return Vec::new();
-            }
-            let id = message["id"].clone();
-            let instructions = message["instructions"].as_str().unwrap_or_default();
-            assert!(instructions.contains("untrusted remote task text"));
-            assert_eq!(message.as_object().map(serde_json::Map::len), Some(4));
-            vec![
-                json!({"type": "progress", "id": id}),
-                json!({"type": "result", "id": id, "text": format!("echo: {}", message["text"].as_str().unwrap_or_default())}),
-            ]
-        });
-        let mut events = Vec::new();
-        let answer = agent.start_turn_with_events(
-            "task-1",
-            GENERAL_SKILL,
-            "hello",
-            &mut |event| events.push(event),
-        );
-        assert_eq!(answer, Ok("echo: hello".to_owned()));
-        assert_eq!(events, [ExecutionEvent::Progress, ExecutionEvent::Completed]);
     }
 
     #[test]
@@ -401,101 +576,46 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_or_cancelled_answer_carries_no_text() {
-        let directory = tempfile::tempdir().expect("directory must create");
-        let path = socket_path(directory.path());
-        let mut agent =
-            ConnectedAgent::listen(&path, Duration::from_secs(5)).expect("listen");
-        attach(&agent, &path, |message| {
-            let id = message["id"].clone();
-            match message["text"].as_str() {
-                Some("fail") => vec![json!({"type": "failed", "id": id})],
-                Some(_) => vec![json!({"type": "cancelled", "id": id})],
-                None => Vec::new(),
-            }
-        });
-        assert_eq!(
-            agent.start_turn("task-1", GENERAL_SKILL, "fail"),
-            Err(ExecutionError::Unavailable)
-        );
-        assert_eq!(
-            agent.start_turn("task-2", GENERAL_SKILL, "stop"),
-            Err(ExecutionError::Cancelled)
-        );
-    }
-
-    #[test]
-    fn cancel_reaches_the_agent_while_the_turn_runs() {
-        let directory = tempfile::tempdir().expect("directory must create");
-        let path = socket_path(directory.path());
-        let agent =
-            ConnectedAgent::listen(&path, Duration::from_secs(5)).expect("listen");
-        attach(&agent, &path, |message| {
-            if message["type"] == "cancel" {
-                vec![json!({"type": "cancelled", "id": message["id"]})]
-            } else {
-                Vec::new()
-            }
-        });
-        let canceller = agent.clone();
-        let mut runner = agent;
-        let turn = std::thread::spawn(move || {
-            runner.start_turn("task-1", GENERAL_SKILL, "wait")
-        });
-        std::thread::sleep(Duration::from_millis(50));
-        canceller.cancel("task-1");
-        assert_eq!(turn.join().expect("turn joins"), Err(ExecutionError::Cancelled));
-    }
-
-    #[test]
     fn a_turn_past_its_time_limit_times_out_and_is_cancelled() {
         let directory = tempfile::tempdir().expect("directory must create");
         let path = socket_path(directory.path());
         let mut agent =
             ConnectedAgent::listen(&path, Duration::from_millis(50)).expect("listen");
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let sender = std::sync::Mutex::new(sender);
-        attach(&agent, &path, move |message| {
-            if message["type"] == "cancel" {
-                let _ = sender.lock().map(|sender| sender.send(message["id"].clone()));
-            }
-            Vec::new()
-        });
+        let mut peer =
+            Peer::attach(&agent, &path, &json!({"type": "ready", "protocol": 1}));
         assert_eq!(
             agent.start_turn("task-1", GENERAL_SKILL, "wait"),
             Err(ExecutionError::Timeout)
         );
-        assert_eq!(receiver.recv_timeout(Duration::from_secs(5)), Ok(json!("task-1")));
+        assert_eq!(peer.read()["type"], "task");
+        assert_eq!(peer.read(), json!({"type": "cancel", "id": "task-1"}));
     }
 
     #[test]
-    fn a_disconnected_agent_ends_its_turns() {
+    fn a_replaced_agent_is_closed_and_its_turns_fail() {
         let directory = tempfile::tempdir().expect("directory must create");
         let path = socket_path(directory.path());
-        let mut agent =
+        let agent =
             ConnectedAgent::listen(&path, Duration::from_secs(5)).expect("listen");
-        let mut stream = UnixStream::connect(&path).expect("agent must connect");
-        stream
-            .write_all(b"{\"type\":\"ready\",\"protocol\":1}\n")
-            .expect("ready must send");
-        let deadline = Instant::now()
-            .checked_add(Duration::from_secs(5))
-            .expect("deadline must fit");
-        while !agent.is_connected() {
-            assert!(Instant::now() < deadline, "agent must attach");
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        let reader = BufReader::new(stream.try_clone().expect("stream must clone"));
-        std::thread::spawn(move || {
-            // Read the task, then hang up without an answer.
-            let _ = reader.lines().next();
-            drop(stream);
+        let ready = json!({"type": "ready", "protocol": 1});
+        let mut first = Peer::attach(&agent, &path, &ready);
+        let mut runner = agent.clone();
+        let turn = std::thread::spawn(move || {
+            runner.start_turn("task-1", GENERAL_SKILL, "hello")
         });
-        assert_eq!(
-            agent.start_turn("task-1", GENERAL_SKILL, "hello"),
-            Err(ExecutionError::Unavailable)
-        );
-        assert!(!agent.is_connected());
+        assert_eq!(first.read()["id"], "task-1");
+
+        let mut second = Peer::attach(&agent, &path, &ready);
+        assert!(first.closed());
+        assert_eq!(turn.join().expect("turn joins"), Err(ExecutionError::Unavailable));
+
+        let mut runner = agent;
+        let turn = std::thread::spawn(move || {
+            runner.start_turn("task-2", GENERAL_SKILL, "hello")
+        });
+        assert_eq!(second.read()["id"], "task-2");
+        second.write(&json!({"type": "result", "id": "task-2", "text": "answer"}));
+        assert_eq!(turn.join().expect("turn joins"), Ok("answer".to_owned()));
     }
 
     #[test]

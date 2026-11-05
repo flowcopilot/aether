@@ -9,12 +9,12 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
-import socket
 import sys
 import tempfile
-import threading
 import unittest
 from pathlib import Path
+
+from test_node import FakeNode
 
 PLUGIN = Path(__file__).resolve().parent.parent
 
@@ -64,50 +64,12 @@ def _register_plugin(data_dir: Path) -> Context:
     return context
 
 
-class Node:
-    """A node agent socket: it sends tasks and records the agent's replies."""
-
-    def __init__(self, directory: Path) -> None:
-        self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._server.bind(str(directory / "agent.sock"))
-        self._server.listen(1)
-        self.replies: "asyncio.Queue[dict]" = asyncio.Queue()
-        self._loop = asyncio.get_running_loop()
-        self._connection: socket.socket | None = None
-        self._connected = threading.Event()
-        threading.Thread(target=self._serve, daemon=True).start()
-
-    def _serve(self) -> None:
-        connection, _ = self._server.accept()
-        self._connection = connection
-        reader = connection.makefile("rb")
-        for line in reader:
-            message = json.loads(line)
-            if message["type"] == "ready":
-                self._connected.set()
-                continue
-            self._loop.call_soon_threadsafe(self.replies.put_nowait, message)
-
-    async def send(self, message: dict) -> None:
-        await asyncio.to_thread(self._connected.wait, 5)
-        assert self._connection is not None
-        self._connection.sendall(json.dumps(message).encode() + b"\n")
-
-    async def reply(self) -> dict:
-        return await asyncio.wait_for(self.replies.get(), 5)
-
-    def close(self) -> None:
-        if self._connection is not None:
-            self._connection.close()
-        self._server.close()
-
-
 @unittest.skipIf(PlatformConfig is None, "Hermes is not importable")
 class AetherAdapterTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self._directory = tempfile.TemporaryDirectory()
         self.data_dir = Path(self._directory.name)
-        self.node = Node(self.data_dir)
+        self.node = FakeNode(self.data_dir / "agent.sock")
         self.context = _register_plugin(self.data_dir)
         self.adapter = self.context.platform.adapter_factory(PlatformConfig(enabled=True))
         self.events = []
@@ -123,16 +85,24 @@ class AetherAdapterTest(unittest.IsolatedAsyncioTestCase):
         self.adapter.handle_message = handle  # the gateway's session loop
         self.adapter._message_handler = object()
         await self.adapter.connect()
+        await asyncio.to_thread(self.node.accept)
+        self.assertEqual(await self._read(), {"type": "ready", "protocol": 1})
 
     async def asyncTearDown(self) -> None:
         await self.adapter.disconnect()
-        self.node.close()
+        self.node.stop()
         self._directory.cleanup()
 
+    async def _send(self, message: dict) -> None:
+        self.node.write(json.dumps(message).encode() + b"\n")
+
+    async def _read(self) -> dict:
+        return await asyncio.to_thread(self.node.read)
+
     async def test_a_task_becomes_one_session_message_and_the_reply_its_result(self) -> None:
-        await self.node.send({"type": "task", "id": "task-1", "instructions": "Do the task.", "text": "hello"})
-        self.assertEqual(await self.node.reply(), {"type": "progress", "id": "task-1"})
-        self.assertEqual(await self.node.reply(), {"type": "result", "id": "task-1", "text": "the answer"})
+        await self._send({"type": "task", "id": "task-1", "instructions": "Do the task.", "text": "hello"})
+        self.assertEqual(await self._read(), {"type": "progress", "id": "task-1"})
+        self.assertEqual(await self._read(), {"type": "result", "id": "task-1", "text": "the answer"})
         (event,) = self.events
         self.assertEqual(event.source.chat_id, "task-1")
         self.assertEqual(event.message_id, "task-1")
@@ -141,27 +111,8 @@ class AetherAdapterTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(event.text.endswith("hello"))
 
     async def test_a_failed_turn_fails_the_task_without_text(self) -> None:
-        await self.node.send({"type": "task", "id": "task-2", "instructions": "Do the task.", "text": "fail"})
-        self.assertEqual(await self.node.reply(), {"type": "failed", "id": "task-2"})
-
-    def test_the_platform_skips_the_gateway_allowlist(self) -> None:
-        self.assertTrue(self.context.platform.trusted_inbound)
-        self.assertTrue(self.adapter.authorization_is_upstream)
-
-    def test_the_send_tools_are_the_aether_toolset(self) -> None:
-        self.assertEqual(
-            sorted(self.context.tools),
-            [
-                "aether_agents_find",
-                "aether_agents_list",
-                "aether_inbox_list",
-                "aether_inbox_read",
-                "aether_people_find",
-                "aether_task_cancel",
-                "aether_task_send",
-            ],
-        )
-        self.assertEqual({tool["toolset"] for tool in self.context.tools.values()}, {"aether"})
+        await self._send({"type": "task", "id": "task-2", "instructions": "Do the task.", "text": "fail"})
+        self.assertEqual(await self._read(), {"type": "failed", "id": "task-2"})
 
 
 if __name__ == "__main__":

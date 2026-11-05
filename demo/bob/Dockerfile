@@ -17,7 +17,7 @@ RUN npm install -g --no-audit --no-fund openclaw@2026.10.10
 COPY --from=aether /usr/local/bin/aether /usr/local/bin/aether
 COPY package.json openclaw.plugin.json README.md /opt/aether-plugin/
 COPY --from=plugin /plugin/dist /opt/aether-plugin/dist
-COPY --from=demo openclaw.json run.sh /opt/demo/
+COPY --from=demo bob/openclaw.json bob/run.sh node.sh /opt/demo/
 # Install the plugin first: the config names the aether channel, which is
 # unknown until the plugin is installed.
 RUN openclaw plugins install --link /opt/aether-plugin --force --accept-capabilities \

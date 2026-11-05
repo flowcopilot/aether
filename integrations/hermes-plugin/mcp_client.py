@@ -1,13 +1,12 @@
-"""Calls the caller tools of ``aether mcp serve`` (stdlib only).
+"""A stdio client of ``aether mcp serve`` (stdlib only).
 
 The send tools use the same MCP server as every other agent that sends Aether
 tasks, so contacts, hub names, the outbox and offline delivery work the same
 way.
 
-One ``aether mcp serve`` process serves all the calls for one command and
-data directory. Hermes calls the tools from more than one thread, so a lock
-lets one call at a time use the process. When the process stops, the next
-call starts a new one.
+One process serves all the requests for one command. Hermes calls the tools
+from more than one thread, so a lock lets one request at a time use the
+process. When the process stops, the next request starts a new one.
 """
 
 from __future__ import annotations
@@ -22,6 +21,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 _PROTOCOL_VERSION = "2025-06-18"
+_PLUGIN = Path(__file__).resolve().parent
 
 
 class McpError(Exception):
@@ -42,17 +42,17 @@ class _Server:
         self._lines: "queue.Queue[Optional[bytes]]" = queue.Queue()
         self._next_id = 0
 
-    def call(self, tool: str, arguments: dict[str, Any], deadline: float) -> dict:
-        """Sends one ``tools/call`` and returns its reply. The caller holds
+    def request(self, method: str, params: dict[str, Any], deadline: float) -> dict:
+        """Sends one request and returns its reply. The caller holds
         ``lock``."""
         if self._process is not None:
             try:
-                return self._call(tool, arguments, deadline)
+                return self._call(method, params, deadline)
             except _Stale:
                 self.close()
         self._start(deadline)
         try:
-            return self._call(tool, arguments, deadline)
+            return self._call(method, params, deadline)
         except _Stale as error:
             self.close()
             raise McpError("the Aether MCP server stopped") from error
@@ -85,7 +85,7 @@ class _Server:
             request_id = self._request("initialize", {
                 "protocolVersion": _PROTOCOL_VERSION,
                 "capabilities": {},
-                "clientInfo": {"name": "hermes-aether", "version": "2.0.0"},
+                "clientInfo": {"name": "hermes-aether", "version": _plugin_version()},
             })
             if "error" in self._response(request_id, deadline):
                 raise McpError("the Aether MCP server refused the session")
@@ -97,12 +97,12 @@ class _Server:
             self.close()
             raise
 
-    def _call(self, tool: str, arguments: dict[str, Any], deadline: float) -> dict:
+    def _call(self, method: str, params: dict[str, Any], deadline: float) -> dict:
         assert self._process is not None
         if self._process.poll() is not None:
             raise _Stale()
         try:
-            request_id = self._request("tools/call", {"name": tool, "arguments": arguments})
+            request_id = self._request(method, params)
         except OSError as error:
             # Nothing reached the server, so the call can go to a new process.
             raise _Stale() from error
@@ -195,22 +195,41 @@ def close_all() -> None:
                 server.lock.release()
 
 
+def caller_command(aether_bin: str, data_dir: Path) -> list[str]:
+    """The command of the MCP server that lists and accepts only the caller
+    tools."""
+    return [aether_bin, "mcp", "serve", "--caller-only", "--data-dir", str(data_dir)]
+
+
+def _request(command: list[str], method: str, params: dict[str, Any], timeout: float) -> dict:
+    deadline = time.monotonic() + timeout
+    server = _server(command)
+    if not server.lock.acquire(timeout=max(timeout, 0)):
+        raise McpError("the Aether MCP server did not answer in time")
+    try:
+        return server.request(method, params, deadline)
+    finally:
+        server.lock.release()
+
+
+def list_tools(command: list[str], timeout: float = 30.0) -> list[dict]:
+    """The tools that the server lists, with their names, descriptions and
+    input schemas."""
+    reply = _request(command, "tools/list", {}, timeout)
+    if "error" in reply:
+        raise McpError("the Aether MCP server did not list its tools")
+    tools = (reply.get("result") or {}).get("tools") or []
+    return [tool for tool in tools if isinstance(tool, dict) and isinstance(tool.get("name"), str)]
+
+
 def call_tool(
-    aether_bin: str,
-    data_dir: Path,
+    command: list[str],
     tool: str,
     arguments: dict[str, Any],
     timeout: float = 60.0,
 ) -> tuple[bool, str]:
     """Runs ``tool`` and returns ``(is_error, text)``."""
-    deadline = time.monotonic() + timeout
-    server = _server([aether_bin, "mcp", "serve", "--data-dir", str(data_dir)])
-    if not server.lock.acquire(timeout=max(timeout, 0)):
-        raise McpError("the Aether MCP server did not answer in time")
-    try:
-        reply = server.call(tool, arguments, deadline)
-    finally:
-        server.lock.release()
+    reply = _request(command, "tools/call", {"name": tool, "arguments": arguments}, timeout)
     if "error" in reply:
         message = (reply.get("error") or {}).get("message") or "unknown error"
         return True, str(message)
@@ -221,3 +240,10 @@ def call_tool(
         if isinstance(part, dict) and part.get("type") == "text"
     )
     return bool(result.get("isError")), text
+
+
+def _plugin_version() -> str:
+    for line in (_PLUGIN / "plugin.yaml").read_text(encoding="utf-8").splitlines():
+        if line.startswith("version:"):
+            return line.partition(":")[2].strip()
+    return "unknown"

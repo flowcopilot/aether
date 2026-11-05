@@ -8,7 +8,7 @@ import { PlatformMessageNotDispatchedError } from "openclaw/plugin-sdk/error-run
 import { channelReadyPatch, channelStoppedPatch } from "openclaw/plugin-sdk/gateway-runtime";
 import { resolveAgentRoute } from "openclaw/plugin-sdk/routing";
 import type { PluginRuntime } from "openclaw/plugin-sdk/runtime-store";
-import { CHANNEL_ID, createDispatch } from "./inbound.ts";
+import { CHANNEL_ID, DESCRIPTION, createDispatch } from "./inbound.ts";
 import { NodeSocket } from "./node-socket.ts";
 import { defaultDataDir, socketPath } from "./protocol.ts";
 import { TaskRunner } from "./task-runner.ts";
@@ -32,7 +32,6 @@ export function channelSection(cfg: OpenClawConfig): Record<string, unknown> | u
   return channels[CHANNEL_ID];
 }
 
-// The tool names that an Aether task may call. Used by index.ts too.
 export function allowedToolsFrom(cfg: OpenClawConfig): string[] {
   const value = channelSection(cfg)?.allowedTools;
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
@@ -98,7 +97,7 @@ export const aetherChannelPlugin = createChatChannelPlugin<AetherAccount>({
       // plugin README before publishing.
       docsPath: "/channels/aether",
       docsLabel: "aether",
-      blurb: "Send and receive Aether agent tasks through the local Aether node.",
+      blurb: DESCRIPTION,
       order: 80,
     },
     capabilities: { chatTypes: ["direct"] },
@@ -132,6 +131,9 @@ export const aetherChannelPlugin = createChatChannelPlugin<AetherAccount>({
           path: socketPath(account.dataDir),
           onMessage: (message) => runner.handle(message),
           onStatus: (connected) => {
+            if (!connected) {
+              runner.close();
+            }
             ctx.setStatus({
               accountId: account.accountId,
               running: true,

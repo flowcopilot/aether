@@ -6,18 +6,20 @@
 set -eu
 
 here="$(cd "$(dirname "$0")" && pwd)"
+. "$here/../scripts/lib.sh"
 compose="docker compose -f $here/compose.yml"
 call="python3 $here/mcp-call.py"
 
+# node_id <service> <node log>: sets id to the endpoint ID that the node
+# printed, and fails while it has printed none.
+node_id() {
+  id="$($compose exec -T "$1" cat "$2" 2>/dev/null | endpoint_id)"
+  [ -n "$id" ]
+}
+
 # The endpoint ID that a node prints when it listens.
 endpoint() {
-  attempt=0
-  until id="$($compose exec -T "$1" sh -c "cat $2" 2>/dev/null \
-    | sed -n 's/.*"endpoint_id":"\([^"]*\)".*/\1/p' | tail -n 1)" && [ -n "$id" ]; do
-    attempt=$((attempt + 1))
-    [ "$attempt" -lt 60 ] || { echo "connect: $1's node did not start" >&2; exit 1; }
-    sleep 1
-  done
+  retry 60 1 node_id "$1" "$2" || { echo "connect: $1's node did not start" >&2; exit 1; }
   printf '%s\n' "$id"
 }
 
