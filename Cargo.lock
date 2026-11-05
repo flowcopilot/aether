@@ -59,7 +59,7 @@ dependencies = [
 
 [[package]]
 name = "aether"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
  "a2a-lf",
  "aether-core",
@@ -108,11 +108,11 @@ dependencies = [
 
 [[package]]
 name = "aether-core"
-version = "0.2.9"
+version = "0.3.0"
 
 [[package]]
 name = "aether-store"
-version = "0.2.9"
+version = "0.3.0"
 dependencies = [
  "aether-core",
  "rusqlite",
