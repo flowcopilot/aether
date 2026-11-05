@@ -1,685 +1,96 @@
+//! Builds a node's `NodeService` from its policy: the executor and its
+//! agent, the trust, the queue, and the live admin changes replayed on top.
+
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
 use aether_core::{
-    AccessMode, AgentId, ApprovalRule, CapabilityId, Grant, GrantId, PolicyEngine,
-    Scope, ScopeId, ScopeKind, TrustProvider, WorkspaceId,
+    AgentId, Grant, PolicyEngine, Scope, ScopeId, ScopeKind, TrustProvider,
 };
-use aether_store::{NodeStore, QueueLimits, StoreError};
-use hex::FromHex;
-use serde::Deserialize;
+use aether_store::QueueLimits;
 
 use crate::{
     agent::{
         NodeAgent,
         codex::{
-            CodexAppServer, CodexLimits, MAX_ENVIRONMENT, TASK_FOLDER,
-            valid_environment_key, valid_environment_value,
+            CodexAppServer, CodexLimits, MAX_ENVIRONMENT, valid_environment_key,
+            valid_environment_value,
         },
-        connected::{self, ConnectedAgent},
+        connected::ConnectedAgent,
     },
+    data_dir::{DataDir, codex_login},
     execution::{Executor, Limits},
-    identity::{RosterClaims, SignedClaims},
+    identity::{NODE_ISSUER, RosterClaims, SignedClaims, decode_grant},
     node_service::NodeService,
+    policy::{
+        AgentAdapter, PolicyError, PolicyFile, PolicySandbox, decode_key,
+        default_sandbox, keep, load_or_create, parse_scopes, stored_limit,
+    },
     proof::ProofNode,
 };
 
-#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
-pub enum NodeConfigError {
-    #[error("node policy cannot be read")]
-    Read,
-    #[error("node policy is invalid")]
-    Invalid,
-    #[error("node policy is invalid at {0}")]
-    InvalidField(String),
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct NodePolicyFile {
-    scope: Option<ScopeFile>,
-    scopes: Option<Vec<ScopeFile>>,
-    /// Issuers besides the node's own key (`NODE_ISSUER`), which is always
-    /// trusted.
-    #[serde(default)]
-    trusted_issuers: BTreeMap<String, String>,
-    /// Grants besides the ones added from the admin UI or MCP.
-    #[serde(default)]
-    grants: Vec<GrantFile>,
-    workspace: PathBuf,
-    /// The adapter of the agent that answers this node's tasks. Absent:
-    /// Codex.
-    #[serde(default)]
-    adapter: AgentAdapter,
-    /// Codex only. The default gives each task a new empty folder. The
-    /// explicit legacy value lets an operator run tasks in the configured
-    /// workspace.
-    sandbox: Option<PolicySandbox>,
-    max_context_tokens: u32,
-    max_seconds: u64,
-    queue_global: usize,
-    queue_per_peer: usize,
-    /// Names workspace paths a live `Change::Workspace` may switch to by
-    /// id. Absent or empty (the default for an existing policy file, since
-    /// `deny_unknown_fields` still requires this to parse) keeps today's
-    /// behavior: any path is accepted. Naming even one here switches that
-    /// node to "approved IDs only" — see `load_service`'s own comment for
-    /// how a change is checked against it.
-    #[serde(default)]
-    approved_workspaces: BTreeMap<String, PathBuf>,
-    /// Codex only. Lets the spawned Codex process reach the network. Absent or false
-    /// keeps today's behavior: no network access at all, since a workspace
-    /// can be a real repository handed to an executor that otherwise has no
-    /// reason to make outbound requests.
-    #[serde(default)]
-    allow_network: bool,
-    /// Codex only. Names of environment variables to copy from `aether node serve`'s
-    /// own environment into the spawned Codex process — an allowlist, not
-    /// literal values, so a credential (e.g. an API key) never has to be
-    /// written into this file. Absent or empty: the spawned process gets
-    /// only the `CODEX_HOME` and `HOME` that aether always sets.
-    #[serde(default)]
-    environment_allowlist: Vec<String>,
-    /// The PACT gateway (see `docs/pact.md`). Absent: the node
-    /// has no PACT scope and `--pact-port` is refused.
-    #[serde(default)]
-    pact: Option<crate::pact::config::PactFile>,
-}
-
-/// The adapter of a node's agent. Each data directory has one agent.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "kebab-case")]
-pub enum AgentAdapter {
-    /// The node starts `codex app-server` for each task.
-    #[default]
-    Codex,
-    /// An agent that runs on its own (the Hermes plugin, for example)
-    /// attaches to `<data-dir>/agent.sock`. It runs with its owner's own
-    /// setup, so the Codex sandbox fields do not apply to it.
-    Connected,
-}
-
-impl AgentAdapter {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Codex => "codex",
-            Self::Connected => "connected",
-        }
-    }
-}
-
-impl std::str::FromStr for AgentAdapter {
-    type Err = NodeConfigError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "codex" => Ok(Self::Codex),
-            "connected" => Ok(Self::Connected),
-            _ => Err(NodeConfigError::InvalidField("adapter".to_owned())),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-enum PolicySandbox {
-    TaskFolder,
-    WorkspaceWrite,
-}
-
-const fn default_sandbox() -> PolicySandbox {
-    PolicySandbox::TaskFolder
-}
-
-impl PolicySandbox {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::TaskFolder => TASK_FOLDER,
-            Self::WorkspaceWrite => "workspace-write",
-        }
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ScopeFile {
-    id: String,
-    kind: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct GrantFile {
-    id: String,
-    issuer_agent_id: String,
-    subject_agent_id: String,
-    subject_endpoint_id: String,
-    scope_id: String,
-    capabilities: Vec<String>,
-    workspaces: Vec<String>,
-    access_mode: String,
-    approval_rule: String,
-    issued_at: u64,
-    expires_at: u64,
-    #[serde(with = "hex::serde")]
-    signing_key: [u8; 32],
-    #[serde(with = "hex::serde")]
-    nonce: [u8; 32],
-    #[serde(with = "hex::serde")]
-    signature: Vec<u8>,
-}
-
-/// The issuer name of the node's own signing key, which the node always
-/// trusts. The admin UI signs a friend's access with it.
-pub const NODE_ISSUER: &str = "node";
-
-/// The node's own issuer key, `<data-dir>/issuer.key`, created owner-only
-/// on first use.
-pub fn node_issuer_key(
-    data_dir: &Path,
-) -> Result<ed25519_dalek::SigningKey, NodeConfigError> {
-    crate::discovery::load_or_create_signing_key(data_dir.join("issuer.key"))
-        .map_err(|_| NodeConfigError::InvalidField("issuer.key".to_owned()))
-}
-
-const POLICY_KEY: &str = "node.policy";
-
-/// The policy `source` with `adapter`, and whether that changed it. The
-/// Codex settings do not apply to a connected agent, so a switch to one
-/// removes them; a switch back to Codex starts from the Codex defaults.
-fn with_adapter(
-    source: &[u8],
-    adapter: AgentAdapter,
-) -> Result<(Vec<u8>, bool), NodeConfigError> {
-    let mut policy: serde_json::Value =
-        serde_json::from_slice(source).map_err(|_| NodeConfigError::Invalid)?;
-    let object = policy.as_object_mut().ok_or(NodeConfigError::Invalid)?;
-    let current = match object.get("adapter") {
-        None => AgentAdapter::Codex,
-        Some(value) => serde_json::from_value(value.clone())
-            .map_err(|_| NodeConfigError::InvalidField("adapter".to_owned()))?,
-    };
-    if current == adapter {
-        return Ok((source.to_vec(), false));
-    }
-    object.insert("adapter".to_owned(), serde_json::json!(adapter.as_str()));
-    if adapter == AgentAdapter::Connected {
-        for field in ["sandbox", "allowNetwork", "environmentAllowlist"] {
-            object.remove(field);
-        }
-    }
-    let source = serde_json::to_vec(&policy).map_err(|_| NodeConfigError::Invalid)?;
-    Ok((source, true))
-}
-
-/// Settings the owner can change on the Advanced page. They take effect at
-/// the next node start, when the executor and queue are built.
-#[derive(Clone)]
-pub struct PolicySettings {
-    pub workspace: PathBuf,
-    pub max_context_tokens: u32,
-    pub max_seconds: u64,
-    pub queue_global: usize,
-    pub queue_per_peer: usize,
-}
-
-pub fn policy_settings(
-    data_dir: &Path,
-) -> Result<Option<PolicySettings>, NodeConfigError> {
-    let store = NodeStore::in_dir(data_dir).map_err(|_| NodeConfigError::Read)?;
-    let source = match store.configuration(POLICY_KEY) {
-        Ok(source) => source,
-        Err(StoreError::NotFound) => return Ok(None),
-        Err(_) => return Err(NodeConfigError::Read),
-    };
-    let policy: NodePolicyFile =
-        serde_json::from_str(&source).map_err(|_| NodeConfigError::Invalid)?;
-    Ok(Some(PolicySettings {
-        workspace: policy.workspace,
-        max_context_tokens: policy.max_context_tokens,
-        max_seconds: policy.max_seconds,
-        queue_global: policy.queue_global,
-        queue_per_peer: policy.queue_per_peer,
-    }))
-}
-
-/// Save the common policy settings without removing advanced fields from an
-/// imported policy. The running node keeps its current settings until restart.
-pub fn save_policy_settings(
-    data_dir: &Path,
-    settings: &PolicySettings,
-) -> Result<(), NodeConfigError> {
-    validate_policy_settings(settings)?;
-    let store = NodeStore::in_dir(data_dir).map_err(|_| NodeConfigError::Read)?;
-    let source = store.configuration(POLICY_KEY).map_err(|_| NodeConfigError::Read)?;
-    let mut policy: serde_json::Value =
-        serde_json::from_str(&source).map_err(|_| NodeConfigError::Invalid)?;
-    let object = policy.as_object_mut().ok_or(NodeConfigError::Invalid)?;
-    object.insert("workspace".to_owned(), serde_json::json!(settings.workspace));
-    object.insert(
-        "maxContextTokens".to_owned(),
-        serde_json::json!(settings.max_context_tokens),
-    );
-    object.insert("maxSeconds".to_owned(), serde_json::json!(settings.max_seconds));
-    object.insert("queueGlobal".to_owned(), serde_json::json!(settings.queue_global));
-    object
-        .insert("queuePerPeer".to_owned(), serde_json::json!(settings.queue_per_peer));
-    let source =
-        serde_json::to_string(&policy).map_err(|_| NodeConfigError::Invalid)?;
-    store.put_configuration(POLICY_KEY, &source).map_err(|_| NodeConfigError::Read)?;
-    // Older live admin changes must not override the new saved limits.
-    for id in ["queue_global", "queue_per_peer"] {
-        store
-            .remove_applied_change(aether_store::ChangeKind::Limit, id)
-            .map_err(|_| NodeConfigError::Read)?;
-    }
-    Ok(())
-}
-
-pub fn validate_policy_settings(
-    settings: &PolicySettings,
-) -> Result<(), NodeConfigError> {
-    if !settings.workspace.is_absolute() || !settings.workspace.is_dir() {
-        return Err(NodeConfigError::InvalidField("workspace".to_owned()));
-    }
-    if settings.max_context_tokens == 0
-        || settings.max_seconds == 0
-        || settings.queue_global == 0
-        || settings.queue_per_peer == 0
-    {
-        return Err(NodeConfigError::InvalidField("limits".to_owned()));
-    }
-    Ok(())
-}
-
-/// Open the one node database. On the first start, import an old policy file
-/// if present; otherwise create a direct policy and its task-folder root.
+/// Opens the one node database and builds the node from its policy.
+///
+/// [`crate::policy`] says where the policy comes from on the first start.
+/// When `adapter` is given, it becomes the agent adapter of this data
+/// directory; later starts keep it.
+///
+/// # Errors
+///
+/// A [`PolicyError`] when the policy is invalid or cannot be read, or the
+/// node cannot be built from it.
 pub fn load_or_create_service(
     import_path: &Path,
     data_dir: &Path,
     codex_binary: PathBuf,
-) -> Result<NodeService<RosterClaims, NodeAgent>, NodeConfigError> {
-    load_or_create_service_with_adapter(import_path, data_dir, codex_binary, None)
-}
-
-/// `load_or_create_service`, and when `adapter` is given, save it as the
-/// agent adapter of this data directory first. Later starts keep it.
-pub fn load_or_create_service_with_adapter(
-    import_path: &Path,
-    data_dir: &Path,
-    codex_binary: PathBuf,
     adapter: Option<AgentAdapter>,
-) -> Result<NodeService<RosterClaims, NodeAgent>, NodeConfigError> {
-    fs::create_dir_all(data_dir).map_err(|_| NodeConfigError::Read)?;
-    let store = NodeStore::in_dir(data_dir).map_err(|_| NodeConfigError::Read)?;
-    let (source, first_start) = match store.configuration(POLICY_KEY) {
-        Ok(source) => (source.into_bytes(), false),
-        Err(StoreError::NotFound) if import_path.is_file() => {
-            (fs::read(import_path).map_err(|_| NodeConfigError::Read)?, true)
-        }
-        Err(StoreError::NotFound) => {
-            let workspace = data_dir.parent().unwrap_or(data_dir).join("tasks");
-            fs::create_dir_all(&workspace).map_err(|_| NodeConfigError::Read)?;
-            let workspace =
-                workspace.canonicalize().map_err(|_| NodeConfigError::Read)?;
-            (
-                serde_json::to_vec(&serde_json::json!({
-                    "scope": {"id": "direct", "kind": "direct"},
-                    "workspace": workspace,
-                    "maxContextTokens": 20000,
-                    "maxSeconds": 120,
-                    "queueGlobal": 1,
-                    "queuePerPeer": 1
-                }))
-                .map_err(|_| NodeConfigError::Invalid)?,
-                true,
-            )
-        }
-        Err(_) => return Err(NodeConfigError::Read),
-    };
-    let (source, changed) = match adapter {
-        Some(adapter) => with_adapter(&source, adapter)?,
-        None => (source, false),
-    };
-    let service = load_service_source(&source, data_dir, codex_binary)?;
-    if first_start || changed {
-        let source = String::from_utf8(source).map_err(|_| NodeConfigError::Invalid)?;
-        store
-            .put_configuration(POLICY_KEY, &source)
-            .map_err(|_| NodeConfigError::Read)?;
+) -> Result<NodeService<RosterClaims, NodeAgent>, PolicyError> {
+    let layout = DataDir::new(data_dir);
+    let store = layout.store().map_err(|_| PolicyError::Read)?;
+    let (policy, new_source) = load_or_create(&store, import_path, &layout, adapter)?;
+    let service = build(policy, data_dir, codex_binary)?;
+    if let Some(source) = new_source {
+        keep(&store, &source)?;
     }
     Ok(service)
 }
 
-/// A node setting in the configuration table, with the type of its value.
-pub trait Setting {
-    /// The configuration key.
-    const KEY: &'static str;
-    type Value;
-
-    /// The value when the key is not stored.
-    ///
-    /// # Errors
-    ///
-    /// [`StoreError::NotFound`] when the setting has no default.
-    fn absent() -> Result<Self::Value, StoreError> {
-        Err(StoreError::NotFound)
-    }
-
-    /// The value of the stored text.
-    ///
-    /// # Errors
-    ///
-    /// A [`StoreError`] when the text is not a value.
-    fn decode(stored: String) -> Result<Self::Value, StoreError>;
-
-    /// The text to store for `value`; `None` removes the key.
-    ///
-    /// # Errors
-    ///
-    /// A [`StoreError`] when the value has no text form.
-    fn encode(value: &Self::Value) -> Result<Option<String>, StoreError>;
-}
-
-/// The stored value of the setting `S`.
-///
-/// # Errors
-///
-/// A [`StoreError`] when the store fails, or as [`Setting::absent`] and
-/// [`Setting::decode`] return.
-pub fn setting<S: Setting>(data_dir: &Path) -> Result<S::Value, StoreError> {
-    match NodeStore::in_dir(data_dir)?.configuration(S::KEY) {
-        Ok(stored) => S::decode(stored),
-        Err(StoreError::NotFound) => S::absent(),
-        Err(error) => Err(error),
-    }
-}
-
-/// Keeps `value` for the setting `S`.
-///
-/// # Errors
-///
-/// A [`StoreError`] when the store fails or the value has no text form.
-pub fn store_setting<S: Setting>(
-    data_dir: &Path,
-    value: &S::Value,
-) -> Result<(), StoreError> {
-    let store = NodeStore::in_dir(data_dir)?;
-    match S::encode(value)? {
-        Some(text) => store.put_configuration(S::KEY, &text),
-        None => store.delete_configuration(S::KEY),
-    }
-}
-
-/// Whether `url` is a relay URL an owner may choose: an `http` or `https`
-/// URL with a host, in the form iroh reads.
-#[must_use]
-pub fn valid_relay_url(url: &str) -> bool {
-    reqwest::Url::parse(url).is_ok_and(|parsed| {
-        matches!(parsed.scheme(), "https" | "http") && parsed.has_host()
-    }) && url.parse::<iroh::RelayUrl>().is_ok()
-}
-
-/// Waits for `switch`, which moves a running node to `relay`, and then
-/// keeps `relay` as the saved and the active relay.
-///
-/// # Errors
-///
-/// The error of `switch`, or [`TransportError::Io`] when the store fails.
-///
-/// [`TransportError::Io`]: crate::transport::TransportError::Io
-pub async fn apply_relay(
-    data_dir: &Path,
-    relay: &Option<String>,
-    switch: impl Future<Output = Result<(), crate::transport::TransportError>>,
-) -> Result<(), crate::transport::TransportError> {
-    switch.await?;
-    store_setting::<settings::Relay>(data_dir, relay)
-        .and_then(|()| store_setting::<settings::ActiveRelay>(data_dir, relay))
-        .map_err(|_| crate::transport::TransportError::Io)
-}
-
-/// The node settings.
-pub mod settings {
-    use aether_store::StoreError;
-
-    use super::Setting;
-
-    const DEFAULT_RELAY_URL: &str = "https://aether-relay.tudorandrei.xyz";
-    const RELAY_OFF: &str = "off";
-
-    fn relay(stored: String) -> Option<String> {
-        (stored != RELAY_OFF).then_some(stored)
-    }
-
-    fn relay_text(relay: Option<&String>) -> String {
-        relay.map_or_else(|| RELAY_OFF.to_owned(), Clone::clone)
-    }
-
-    /// The owner's relay choice, kept for the next start. `None` keeps the
-    /// node on the local network. A new node has the deployed relay.
-    pub struct Relay;
-
-    impl Setting for Relay {
-        const KEY: &'static str = "node.relay_url";
-        type Value = Option<String>;
-
-        fn absent() -> Result<Self::Value, StoreError> {
-            Ok(Some(DEFAULT_RELAY_URL.to_owned()))
-        }
-
-        fn decode(stored: String) -> Result<Self::Value, StoreError> {
-            Ok(relay(stored))
-        }
-
-        fn encode(value: &Self::Value) -> Result<Option<String>, StoreError> {
-            Ok(Some(relay_text(value.as_ref())))
-        }
-    }
-
-    /// The relay this running node uses for connect-code invites. The
-    /// saved [`Relay`] can differ when a command-line override or an MCP
-    /// edit is present.
-    pub struct ActiveRelay;
-
-    impl Setting for ActiveRelay {
-        const KEY: &'static str = "node.runtime.relay_url";
-        type Value = Option<String>;
-
-        fn decode(stored: String) -> Result<Self::Value, StoreError> {
-            Ok(relay(stored))
-        }
-
-        fn encode(value: &Self::Value) -> Result<Option<String>, StoreError> {
-            Ok(Some(relay_text(value.as_ref())))
-        }
-    }
-
-    /// The name of connect codes while the node has no name on the hub.
-    pub struct HostName;
-
-    impl Setting for HostName {
-        const KEY: &'static str = "node.runtime.host_name";
-        type Value = String;
-
-        fn decode(stored: String) -> Result<Self::Value, StoreError> {
-            Ok(stored)
-        }
-
-        fn encode(value: &Self::Value) -> Result<Option<String>, StoreError> {
-            Ok(Some(value.clone()))
-        }
-    }
-
-    /// The hub last set from the admin page: a URL, or `off`. `None`
-    /// returns to the default hub.
-    pub struct Hub;
-
-    impl Setting for Hub {
-        const KEY: &'static str = "node.hub_url";
-        type Value = Option<String>;
-
-        fn absent() -> Result<Self::Value, StoreError> {
-            Ok(None)
-        }
-
-        fn decode(stored: String) -> Result<Self::Value, StoreError> {
-            Ok(Some(stored))
-        }
-
-        fn encode(value: &Self::Value) -> Result<Option<String>, StoreError> {
-            Ok(value.clone())
-        }
-    }
-
-    /// This node's name on its hub, as the hub last gave it, if it passes
-    /// [`crate::direct::valid_name`]. `None` forgets it, for example when
-    /// the node moves to another hub.
-    pub struct HubName;
-
-    impl Setting for HubName {
-        const KEY: &'static str = "node.hub_name";
-        type Value = Option<String>;
-
-        fn absent() -> Result<Self::Value, StoreError> {
-            Ok(None)
-        }
-
-        fn decode(stored: String) -> Result<Self::Value, StoreError> {
-            Ok(Some(stored).filter(|name| crate::direct::valid_name(name)))
-        }
-
-        fn encode(value: &Self::Value) -> Result<Option<String>, StoreError> {
-            Ok(value.clone())
-        }
-    }
-
-    /// The type of this node's agent, once it has one. Keep it with
-    /// [`super::store_agent_kind`], which does not change it.
-    pub struct AgentKind;
-
-    impl Setting for AgentKind {
-        const KEY: &'static str = "node.agent_kind";
-        type Value = Option<crate::hub_client::AgentKind>;
-
-        fn absent() -> Result<Self::Value, StoreError> {
-            Ok(None)
-        }
-
-        fn decode(stored: String) -> Result<Self::Value, StoreError> {
-            Ok(crate::hub_client::AgentKind::parse(&stored))
-        }
-
-        fn encode(value: &Self::Value) -> Result<Option<String>, StoreError> {
-            Ok(value.map(|kind| kind.as_str().to_owned()))
-        }
-    }
-
-    /// The listing that this node last sent to its hub as its public
-    /// listing, if any. `None` forgets it.
-    pub struct ListingState;
-
-    impl Setting for ListingState {
-        const KEY: &'static str = "node.listing_state";
-        type Value = Option<crate::listing::ListingState>;
-
-        fn absent() -> Result<Self::Value, StoreError> {
-            Ok(None)
-        }
-
-        fn decode(stored: String) -> Result<Self::Value, StoreError> {
-            Ok(serde_json::from_str(&stored).ok())
-        }
-
-        fn encode(value: &Self::Value) -> Result<Option<String>, StoreError> {
-            value
-                .as_ref()
-                .map(|state| {
-                    serde_json::to_string(state).map_err(|_| StoreError::InvalidState)
-                })
-                .transpose()
-        }
-    }
-}
-
-/// Keeps the type of this node's agent. The type does not change: another
-/// type than the stored one is [`StoreError::InvalidState`].
-pub fn store_agent_kind(
-    data_dir: &Path,
-    kind: crate::hub_client::AgentKind,
-) -> Result<(), StoreError> {
-    match setting::<settings::AgentKind>(data_dir).ok().flatten() {
-        Some(stored) if stored == kind => Ok(()),
-        Some(_) => Err(StoreError::InvalidState),
-        None => store_setting::<settings::AgentKind>(data_dir, &Some(kind)),
-    }
-}
-
-/// The task queue limits in force at the next node start: the stored
-/// policy with the `admin.limit.*` overrides of `aether.change`, as
-/// [`load_service`] reads them. `None` when no policy is stored.
-pub fn queue_limits(data_dir: &Path) -> Result<Option<QueueLimits>, NodeConfigError> {
-    let Some(policy) = policy_settings(data_dir)? else {
-        return Ok(None);
-    };
-    let store = NodeStore::in_dir(data_dir).map_err(|_| NodeConfigError::Read)?;
-    Ok(Some(QueueLimits {
-        global: stored_limit(&store, "queue_global", policy.queue_global)?,
-        per_peer: stored_limit(&store, "queue_per_peer", policy.queue_per_peer)?,
-    }))
-}
-
-pub fn load_service(
-    path: &Path,
+fn build(
+    policy: PolicyFile,
     data_dir: &Path,
     codex_binary: PathBuf,
-) -> Result<NodeService<RosterClaims, NodeAgent>, NodeConfigError> {
-    let source = fs::read(path).map_err(|_| NodeConfigError::Read)?;
-    load_service_source(&source, data_dir, codex_binary)
-}
-
-fn load_service_source(
-    source: &[u8],
-    data_dir: &Path,
-    codex_binary: PathBuf,
-) -> Result<NodeService<RosterClaims, NodeAgent>, NodeConfigError> {
-    let mut decoder = serde_json::Deserializer::from_slice(source);
-    let policy: NodePolicyFile = serde_path_to_error::deserialize(&mut decoder)
-        .map_err(|error| NodeConfigError::InvalidField(error.path().to_string()))?;
+) -> Result<NodeService<RosterClaims, NodeAgent>, PolicyError> {
     let mut scopes = parse_scopes(policy.scope, policy.scopes)?;
     if scopes.iter().any(|scope| scope.kind == ScopeKind::Pact) {
         // The gateway owns the one `pact` scope; it is not declared by hand.
-        return Err(NodeConfigError::InvalidField("scopes".to_owned()));
+        return Err(PolicyError::InvalidField("scopes".to_owned()));
     }
     let pact = policy
         .pact
         .map(|pact| pact.parse(policy.max_context_tokens, policy.max_seconds))
         .transpose()
-        .map_err(|error| NodeConfigError::InvalidField(error.to_string()))?;
+        .map_err(|error| PolicyError::InvalidField(error.to_string()))?;
     if pact.is_some() {
         let id = ScopeId::new(crate::pact::config::SCOPE_ID);
         if scopes.iter().any(|scope| scope.id == id) {
-            return Err(NodeConfigError::InvalidField("scopes".to_owned()));
+            return Err(PolicyError::InvalidField("scopes".to_owned()));
         }
         scopes.push(Scope { id, kind: ScopeKind::Pact });
     }
     if policy.trusted_issuers.contains_key(NODE_ISSUER) {
-        return Err(NodeConfigError::InvalidField(format!(
-            "trustedIssuers.{NODE_ISSUER}"
-        )));
+        return Err(PolicyError::InvalidField(format!("trustedIssuers.{NODE_ISSUER}")));
     }
     let mut trusted_issuers = policy
         .trusted_issuers
         .into_iter()
         .map(|(issuer, key)| Ok((AgentId::new(issuer), decode_key(&key)?)))
-        .collect::<Result<BTreeMap<_, _>, NodeConfigError>>()?;
+        .collect::<Result<BTreeMap<_, _>, PolicyError>>()?;
     if policy.max_context_tokens == 0 || policy.max_seconds == 0 {
-        return Err(NodeConfigError::Invalid);
+        return Err(PolicyError::Invalid);
     }
     let sandbox = match policy.adapter {
         AgentAdapter::Codex => Some(policy.sandbox.unwrap_or_else(default_sandbox)),
@@ -687,13 +98,13 @@ fn load_service_source(
         // a policy that sets them is refused, not silently ignored.
         AgentAdapter::Connected => {
             if policy.sandbox.is_some() {
-                return Err(NodeConfigError::InvalidField("sandbox".to_owned()));
+                return Err(PolicyError::InvalidField("sandbox".to_owned()));
             }
             if policy.allow_network {
-                return Err(NodeConfigError::InvalidField("allowNetwork".to_owned()));
+                return Err(PolicyError::InvalidField("allowNetwork".to_owned()));
             }
             if !policy.environment_allowlist.is_empty() {
-                return Err(NodeConfigError::InvalidField(
+                return Err(PolicyError::InvalidField(
                     "environmentAllowlist".to_owned(),
                 ));
             }
@@ -701,23 +112,21 @@ fn load_service_source(
         }
     };
     if matches!(sandbox, Some(PolicySandbox::TaskFolder)) && policy.allow_network {
-        return Err(NodeConfigError::InvalidField("allowNetwork".to_owned()));
+        return Err(PolicyError::InvalidField("allowNetwork".to_owned()));
     }
-    fs::create_dir_all(data_dir).map_err(|_| NodeConfigError::Invalid)?;
-    let node_issuer = node_issuer_key(data_dir)?;
+    let layout = DataDir::new(data_dir);
+    let node_issuer = layout
+        .issuer_key()
+        .map_err(|_| PolicyError::InvalidField("issuer.key".to_owned()))?;
     trusted_issuers
         .insert(AgentId::new(NODE_ISSUER), node_issuer.verifying_key().to_bytes());
-    let mut store =
-        NodeStore::in_dir(data_dir).map_err(|_| NodeConfigError::Invalid)?;
+    let mut store = layout.store().map_err(|_| PolicyError::Invalid)?;
     // A grant revoked from the admin UI stays revoked, even when the policy
     // file still lists it.
     let mut grants = Vec::new();
     for grant in policy.grants {
-        let grant = parse_grant(grant)?;
-        if !store
-            .grant_revoked(grant.id.as_str())
-            .map_err(|_| NodeConfigError::Invalid)?
-        {
+        let grant = Grant::try_from(grant).map_err(|_| PolicyError::Invalid)?;
+        if !store.grant_revoked(grant.id.as_str()).map_err(|_| PolicyError::Invalid)? {
             grants.push(grant);
         }
     }
@@ -726,20 +135,18 @@ fn load_service_source(
         let scope = scopes
             .iter()
             .find(|scope| scope.id == grant.scope_id)
-            .ok_or(NodeConfigError::Invalid)?;
-        signed_claims
-            .verify_grant(grant, scope)
-            .map_err(|_| NodeConfigError::Invalid)?;
+            .ok_or(PolicyError::Invalid)?;
+        signed_claims.verify_grant(grant, scope).map_err(|_| PolicyError::Invalid)?;
     }
     let queue_limits = QueueLimits {
         global: stored_limit(&store, "queue_global", policy.queue_global)?,
         per_peer: stored_limit(&store, "queue_per_peer", policy.queue_per_peer)?,
     };
     let stored_workspace =
-        store.current_workspace().map_err(|_| NodeConfigError::Invalid)?;
+        store.current_workspace().map_err(|_| PolicyError::Invalid)?;
     let stored_grants = store
         .applied_changes(aether_store::ChangeKind::Grant)
-        .map_err(|_| NodeConfigError::Invalid)?;
+        .map_err(|_| PolicyError::Invalid)?;
     let mut initial_members = grants
         .iter()
         .filter(|grant| {
@@ -755,7 +162,7 @@ fn load_service_source(
         })
         .collect::<Vec<_>>();
     for value in &stored_grants {
-        if let Ok(grant) = parse_grant_json(value)
+        if let Ok(grant) = decode_grant(value)
             && scopes.iter().any(|scope| {
                 scope.id == grant.scope_id && scope.kind == ScopeKind::Direct
             })
@@ -768,14 +175,13 @@ fn load_service_source(
     }
     store
         .initialize_access_groups(&initial_members)
-        .map_err(|_| NodeConfigError::Invalid)?;
-    let trust =
-        RosterClaims::new(signed_claims, data_dir.join(aether_store::NODE_DATABASE));
+        .map_err(|_| PolicyError::Invalid)?;
+    let trust = RosterClaims::new(signed_claims, layout.clone());
     // The folder must exist; say which field names it.
     let workspace = policy
         .workspace
         .canonicalize()
-        .map_err(|_| NodeConfigError::InvalidField("workspace".to_owned()))?;
+        .map_err(|_| PolicyError::InvalidField("workspace".to_owned()))?;
     let agent = match sandbox {
         Some(sandbox) => NodeAgent::Codex(codex_agent(
             data_dir,
@@ -796,10 +202,10 @@ fn load_service_source(
         )?),
         None => NodeAgent::Connected(
             ConnectedAgent::listen(
-                &connected::socket_path(data_dir),
+                &layout.agent_socket(),
                 Duration::from_secs(policy.max_seconds),
             )
-            .map_err(|_| NodeConfigError::InvalidField("adapter".to_owned()))?,
+            .map_err(|_| PolicyError::InvalidField("adapter".to_owned()))?,
         ),
     };
     let adapter = agent.kind();
@@ -818,7 +224,7 @@ fn load_service_source(
         queue_limits,
         scopes,
     )
-    .map_err(|_| NodeConfigError::Invalid)?;
+    .map_err(|_| PolicyError::Invalid)?;
     let mut service = NodeService::new(node);
     service.set_task_folder_mode(matches!(sandbox, Some(PolicySandbox::TaskFolder)));
     service.set_agent_adapter(adapter);
@@ -831,9 +237,9 @@ fn load_service_source(
         .approved_workspaces
         .into_iter()
         .map(|(id, path)| {
-            path.canonicalize().map(|path| (id, path)).map_err(|_| {
-                NodeConfigError::InvalidField("approvedWorkspaces".to_owned())
-            })
+            path.canonicalize()
+                .map(|path| (id, path))
+                .map_err(|_| PolicyError::InvalidField("approvedWorkspaces".to_owned()))
         })
         .collect::<Result<BTreeMap<_, _>, _>>()?;
     service.set_approved_workspaces(approved_workspaces);
@@ -848,7 +254,7 @@ fn load_service_source(
     // eventual lifecycle, not a sign of corruption.
     if let Some(path) = stored_workspace.filter(|_| !service.task_folder_mode()) {
         service.apply_workspace(Path::new(&path)).map_err(|_| {
-            NodeConfigError::InvalidField("admin.current.workspace".to_owned())
+            PolicyError::InvalidField("admin.current.workspace".to_owned())
         })?;
     }
     for grant in stored_grants {
@@ -868,7 +274,7 @@ fn codex_agent(
     codex_binary: PathBuf,
     limits: CodexLimits,
     environment_allowlist: &[String],
-) -> Result<CodexAppServer, NodeConfigError> {
+) -> Result<CodexAppServer, PolicyError> {
     let owner_codex_home = std::env::var_os("CODEX_HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
@@ -897,12 +303,6 @@ const RESERVED_ENVIRONMENT: &[&str] = &[
     "CODEX_MANAGED_PACKAGE_ROOT",
 ];
 
-/// The Codex home aether owns for this node.
-#[must_use]
-pub fn codex_home(data_dir: &Path) -> PathBuf {
-    data_dir.join("codex-home")
-}
-
 /// Creates the node's Codex home. It shares only the owner's login file, when
 /// one exists. Codex writes refreshed credentials through the link, so both
 /// processes use the same token file. The owner's `~/.codex` settings stay
@@ -912,28 +312,27 @@ pub fn codex_home(data_dir: &Path) -> PathBuf {
 fn prepare_codex_home(
     data_dir: &Path,
     owner_codex_home: Option<&Path>,
-) -> Result<PathBuf, NodeConfigError> {
+) -> Result<PathBuf, PolicyError> {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
-    let codex_home = codex_home(data_dir);
-    fs::create_dir_all(codex_home.join("home"))
-        .map_err(|_| NodeConfigError::Invalid)?;
+    let codex_home = DataDir::new(data_dir).codex_home();
+    fs::create_dir_all(codex_home.join("home")).map_err(|_| PolicyError::Invalid)?;
     fs::set_permissions(&codex_home, fs::Permissions::from_mode(0o700))
-        .map_err(|_| NodeConfigError::Invalid)?;
-    let auth = codex_home.join("auth.json");
+        .map_err(|_| PolicyError::Invalid)?;
+    let auth = codex_login(&codex_home);
     if let Err(error) = fs::symlink_metadata(&auth) {
         if error.kind() != std::io::ErrorKind::NotFound {
-            return Err(NodeConfigError::Invalid);
+            return Err(PolicyError::Invalid);
         }
-        if let Some(owner_auth) = owner_codex_home.map(|home| home.join("auth.json")) {
-            let owner_auth = std::path::absolute(owner_auth)
-                .map_err(|_| NodeConfigError::Invalid)?;
+        if let Some(owner_auth) = owner_codex_home.map(codex_login) {
+            let owner_auth =
+                std::path::absolute(owner_auth).map_err(|_| PolicyError::Invalid)?;
             if owner_auth != auth && owner_auth.is_file() {
-                symlink(owner_auth, auth).map_err(|_| NodeConfigError::Invalid)?;
+                symlink(owner_auth, auth).map_err(|_| PolicyError::Invalid)?;
             }
         }
     }
-    codex_home.canonicalize().map_err(|_| NodeConfigError::Invalid)
+    codex_home.canonicalize().map_err(|_| PolicyError::Invalid)
 }
 
 /// The spawned Codex environment: the allowlisted variables plus the node's
@@ -942,11 +341,11 @@ fn codex_environment(
     codex_home: &Path,
     names: &[String],
     lookup: impl Fn(&str) -> Option<String>,
-) -> Result<BTreeMap<String, String>, NodeConfigError> {
+) -> Result<BTreeMap<String, String>, PolicyError> {
     let mut environment = allowed_environment(names, lookup)?;
     let home = codex_home.join("home");
     for (name, path) in [("CODEX_HOME", codex_home), ("HOME", home.as_path())] {
-        let path = path.to_str().ok_or(NodeConfigError::Invalid)?;
+        let path = path.to_str().ok_or(PolicyError::Invalid)?;
         environment.insert(name.to_owned(), path.to_owned());
     }
     Ok(environment)
@@ -959,10 +358,10 @@ fn codex_environment(
 fn allowed_environment(
     names: &[String],
     lookup: impl Fn(&str) -> Option<String>,
-) -> Result<BTreeMap<String, String>, NodeConfigError> {
+) -> Result<BTreeMap<String, String>, PolicyError> {
     // Two slots stay free for the `CODEX_HOME` and `HOME` aether adds.
     if names.len() > MAX_ENVIRONMENT - 2 {
-        return Err(NodeConfigError::InvalidField("environmentAllowlist".to_owned()));
+        return Err(PolicyError::InvalidField("environmentAllowlist".to_owned()));
     }
     names
         .iter()
@@ -976,135 +375,10 @@ fn allowed_environment(
                 })
                 .map(|value| (name.clone(), value))
                 .ok_or_else(|| {
-                    NodeConfigError::InvalidField(format!(
-                        "environmentAllowlist[{index}]"
-                    ))
+                    PolicyError::InvalidField(format!("environmentAllowlist[{index}]"))
                 })
         })
         .collect()
-}
-
-fn stored_limit(
-    store: &NodeStore,
-    id: &str,
-    fallback: usize,
-) -> Result<usize, NodeConfigError> {
-    match store.applied_change(aether_store::ChangeKind::Limit, id) {
-        Ok(Some(value)) => {
-            value.parse::<usize>().ok().filter(|value| *value > 0).ok_or_else(|| {
-                NodeConfigError::InvalidField(format!("admin.limit.{id}"))
-            })
-        }
-        Ok(None) => Ok(fallback),
-        Err(_) => Err(NodeConfigError::Invalid),
-    }
-}
-
-fn parse_scopes(
-    scope: Option<ScopeFile>,
-    scopes: Option<Vec<ScopeFile>>,
-) -> Result<Vec<Scope>, NodeConfigError> {
-    let scopes = match (scope, scopes) {
-        (Some(scope), None) => vec![scope],
-        (None, Some(scopes)) if !scopes.is_empty() => scopes,
-        _ => return Err(NodeConfigError::Invalid),
-    };
-    let scopes = scopes.into_iter().map(parse_scope).collect::<Result<Vec<_>, _>>()?;
-    let mut ids = BTreeSet::new();
-    if scopes.iter().any(|scope| !ids.insert(scope.id.clone())) {
-        return Err(NodeConfigError::Invalid);
-    }
-    Ok(scopes)
-}
-
-fn parse_scope(file: ScopeFile) -> Result<Scope, NodeConfigError> {
-    let kind = ScopeKind::parse(&file.kind).ok_or(NodeConfigError::Invalid)?;
-    if file.id.is_empty() {
-        return Err(NodeConfigError::Invalid);
-    }
-    Ok(Scope { id: ScopeId::new(file.id), kind })
-}
-
-pub fn parse_grant_json(value: &str) -> Result<Grant, NodeConfigError> {
-    let mut decoder = serde_json::Deserializer::from_slice(value.as_bytes());
-    let file: GrantFile = serde_path_to_error::deserialize(&mut decoder)
-        .map_err(|error| NodeConfigError::InvalidField(error.path().to_string()))?;
-    parse_grant(file)
-}
-
-/// The policy-file form of `grant`, which `parse_grant_json` reads back.
-#[must_use]
-pub fn grant_json(grant: &Grant) -> serde_json::Value {
-    let seconds = |time| aether_core::time::unix_seconds(time).unwrap_or(0);
-    serde_json::json!({
-        "id": grant.id.as_str(),
-        "issuerAgentId": grant.issuer_agent_id.as_str(),
-        "subjectAgentId": grant.subject_agent_id.as_str(),
-        "subjectEndpointId": grant.subject_endpoint_id.as_str(),
-        "scopeId": grant.scope_id.as_str(),
-        "capabilities": grant.capabilities.iter().map(CapabilityId::as_str).collect::<Vec<_>>(),
-        "workspaces": grant.workspaces.iter().map(WorkspaceId::as_str).collect::<Vec<_>>(),
-        "accessMode": grant.access_mode.as_str(),
-        "approvalRule": grant.approval_rule.as_str(),
-        "issuedAt": seconds(grant.issued_at),
-        "expiresAt": seconds(grant.expires_at),
-        "signingKey": hex::encode(grant.signing_key),
-        "nonce": hex::encode(grant.nonce),
-        "signature": hex::encode(&grant.signature),
-    })
-}
-
-fn parse_grant(file: GrantFile) -> Result<Grant, NodeConfigError> {
-    let capabilities = file
-        .capabilities
-        .into_iter()
-        .filter(|value| !value.is_empty())
-        .map(CapabilityId::new)
-        .collect::<BTreeSet<_>>();
-    let workspaces = file
-        .workspaces
-        .into_iter()
-        .filter(|value| !value.is_empty())
-        .map(WorkspaceId::new)
-        .collect::<BTreeSet<_>>();
-    let access_mode =
-        AccessMode::parse(&file.access_mode).ok_or(NodeConfigError::Invalid)?;
-    let approval_rule =
-        ApprovalRule::parse(&file.approval_rule).ok_or(NodeConfigError::Invalid)?;
-    if file.id.is_empty()
-        || file.issuer_agent_id.is_empty()
-        || file.subject_agent_id.is_empty()
-        || file.subject_endpoint_id.is_empty()
-        || file.scope_id.is_empty()
-        || capabilities.is_empty()
-        || workspaces.is_empty()
-    {
-        return Err(NodeConfigError::Invalid);
-    }
-    Ok(Grant {
-        id: GrantId::new(file.id),
-        issuer_agent_id: AgentId::new(file.issuer_agent_id),
-        subject_agent_id: AgentId::new(file.subject_agent_id),
-        subject_endpoint_id: aether_core::EndpointId::new(file.subject_endpoint_id),
-        scope_id: ScopeId::new(file.scope_id),
-        capabilities,
-        workspaces,
-        access_mode,
-        approval_rule,
-        issued_at: time(file.issued_at)?,
-        expires_at: time(file.expires_at)?,
-        signing_key: file.signing_key,
-        nonce: file.nonce,
-        signature: file.signature,
-    })
-}
-
-fn time(seconds: u64) -> Result<SystemTime, NodeConfigError> {
-    aether_core::time::from_unix_seconds(seconds).ok_or(NodeConfigError::Invalid)
-}
-
-fn decode_key(value: &str) -> Result<[u8; 32], NodeConfigError> {
-    <[u8; 32]>::from_hex(value).map_err(|_| NodeConfigError::Invalid)
 }
 
 #[cfg(test)]
@@ -1129,83 +403,16 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AgentAdapter, MAX_ENVIRONMENT, NODE_ISSUER, NodeConfigError, NodePolicyFile,
-        allowed_environment, codex_environment, grant_json, load_or_create_service,
-        load_or_create_service_with_adapter, load_service, node_issuer_key,
-        parse_grant_json, prepare_codex_home, setting, settings, store_agent_kind,
-        store_setting, with_adapter,
+        MAX_ENVIRONMENT, allowed_environment, build, codex_environment,
+        load_or_create_service, prepare_codex_home,
+    };
+    use crate::identity::{
+        AccessInput, GrantInput, GrantRecord, encode_grant, sign_access, signed_grant,
     };
     use crate::{
-        hub_client::AgentKind,
-        identity::{AccessInput, GrantInput, sign_access, signed_grant},
+        identity::NODE_ISSUER,
+        policy::{AgentAdapter, PolicyError, PolicyFile},
     };
-
-    #[test]
-    fn the_agent_kind_does_not_change_once_stored() {
-        let directory = tempfile::tempdir().expect("directory must create");
-        assert_eq!(
-            setting::<settings::AgentKind>(directory.path()).ok().flatten(),
-            None
-        );
-        store_agent_kind(directory.path(), AgentKind::Personal)
-            .expect("kind must store");
-        store_agent_kind(directory.path(), AgentKind::Personal)
-            .expect("the same kind is kept");
-        assert!(store_agent_kind(directory.path(), AgentKind::Service).is_err());
-        assert_eq!(
-            setting::<settings::AgentKind>(directory.path()).ok().flatten(),
-            Some(AgentKind::Personal)
-        );
-    }
-
-    #[test]
-    fn relay_uses_the_deployed_default_until_the_owner_changes_it() {
-        let directory = tempfile::tempdir().expect("directory must create");
-        assert_eq!(
-            setting::<settings::Relay>(directory.path()).ok().flatten().as_deref(),
-            Some("https://aether-relay.tudorandrei.xyz")
-        );
-
-        store_setting::<settings::Relay>(
-            directory.path(),
-            &Some("https://other.example.com".to_owned()),
-        )
-        .expect("relay choice must save");
-        assert_eq!(
-            setting::<settings::Relay>(directory.path()).ok().flatten().as_deref(),
-            Some("https://other.example.com")
-        );
-
-        store_setting::<settings::Relay>(directory.path(), &None)
-            .expect("local choice must save");
-        assert_eq!(setting::<settings::Relay>(directory.path()).ok().flatten(), None);
-    }
-
-    #[test]
-    fn a_signed_access_grant_survives_the_policy_form() {
-        let key = SigningKey::from_bytes(&[5; 32]);
-        let (authorization, grant) = sign_access(
-            &key,
-            &AccessInput {
-                issuer_agent_id: "node".to_owned(),
-                subject_agent_id: "friend".to_owned(),
-                subject_endpoint_id: "friend-endpoint".to_owned(),
-                scope_id: "direct".to_owned(),
-                capabilities: vec!["review".to_owned()],
-                workspaces: vec!["workspace".to_owned()],
-                access_mode: AccessMode::ReadOnly,
-                approval_rule: ApprovalRule::Automatic,
-                lifetime: Duration::from_secs(60),
-            },
-        )
-        .expect("access must sign");
-        let parsed = parse_grant_json(&grant_json(&grant).to_string())
-            .expect("grant must parse back");
-        // `SystemTime` keeps sub-second precision; the policy form does not.
-        assert_eq!(grant_json(&parsed), grant_json(&grant));
-        assert_eq!(authorization.claim.subject_endpoint_id, "friend-endpoint");
-        assert_eq!(authorization.claim.signing_key, hex::encode(grant.signing_key));
-    }
 
     #[test]
     fn signed_policy_loads_and_changed_grant_fails() {
@@ -1278,7 +485,23 @@ mod tests {
         let Err(error) = load_service(&path, &path, "codex".into()) else {
             panic!("policy with a string limit must fail");
         };
-        assert_eq!(error, NodeConfigError::InvalidField("maxContextTokens".to_owned()));
+        assert_eq!(error, PolicyError::InvalidField("maxContextTokens".to_owned()));
+    }
+
+    /// The node of the policy file at `path`, read again on each call.
+    fn load_service(
+        path: &std::path::Path,
+        data_dir: &std::path::Path,
+        codex_binary: PathBuf,
+    ) -> Result<
+        crate::node_service::NodeService<
+            crate::identity::RosterClaims,
+            crate::agent::NodeAgent,
+        >,
+        PolicyError,
+    > {
+        let source = fs::read(path).map_err(|_| PolicyError::Read)?;
+        build(PolicyFile::parse(&source)?, data_dir, codex_binary)
     }
 
     fn minimal_policy(root: &std::path::Path) -> PathBuf {
@@ -1326,11 +549,11 @@ mod tests {
         let service = load_service(&path, directory.path(), "codex".into())
             .expect("policy must load");
         assert!(!service.task_folder_mode());
-        let socket = crate::agent::connected::socket_path(directory.path());
+        let socket = crate::data_dir::DataDir::new(directory.path()).agent_socket();
         let mode =
             fs::metadata(&socket).expect("socket must exist").permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
-        assert!(!crate::node_config::codex_home(directory.path()).exists());
+        assert!(!crate::data_dir::DataDir::new(directory.path()).codex_home().exists());
     }
 
     #[test]
@@ -1338,7 +561,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("directory must create");
         let data_dir = directory.path().join("host");
         let import = directory.path().join("missing-policy.json");
-        let service = load_or_create_service_with_adapter(
+        let service = load_or_create_service(
             &import,
             &data_dir,
             "codex".into(),
@@ -1347,11 +570,11 @@ mod tests {
         .expect("node must start");
         assert_eq!(service.agent_adapter(), "connected");
         drop(service);
-        let service = load_or_create_service(&import, &data_dir, "codex".into())
+        let service = load_or_create_service(&import, &data_dir, "codex".into(), None)
             .expect("node must start again");
         assert_eq!(service.agent_adapter(), "connected");
         drop(service);
-        let service = load_or_create_service_with_adapter(
+        let service = load_or_create_service(
             &import,
             &data_dir,
             "codex".into(),
@@ -1360,22 +583,6 @@ mod tests {
         .expect("node must start with Codex");
         assert_eq!(service.agent_adapter(), "codex");
         assert!(service.task_folder_mode());
-    }
-
-    #[test]
-    fn a_switch_to_a_connected_adapter_removes_the_codex_settings() {
-        let source = json!({"workspace": "/w", "sandbox": "workspace-write", "allowNetwork": true})
-            .to_string();
-        let (source, changed) =
-            with_adapter(source.as_bytes(), AgentAdapter::Connected)
-                .expect("adapter must set");
-        assert!(changed);
-        let policy: serde_json::Value =
-            serde_json::from_slice(&source).expect("policy must decode");
-        assert_eq!(policy, json!({"workspace": "/w", "adapter": "connected"}));
-        let (_, changed) =
-            with_adapter(&source, AgentAdapter::Connected).expect("adapter must set");
-        assert!(!changed);
     }
 
     #[test]
@@ -1396,7 +603,7 @@ mod tests {
             fs::write(&path, policy.to_string()).expect("policy must write");
             assert_eq!(
                 load_service(&path, directory.path(), "codex".into()).err(),
-                Some(NodeConfigError::InvalidField(field.to_owned()))
+                Some(PolicyError::InvalidField(field.to_owned()))
             );
         }
     }
@@ -1421,22 +628,31 @@ mod tests {
         let root = directory.path();
         let service = load_service(&minimal_policy(root), root, "codex".into())
             .expect("a policy without grants must load");
-        let key = node_issuer_key(root).expect("issuer key must load");
+        let key = crate::data_dir::DataDir::new(root)
+            .issuer_key()
+            .expect("issuer key must load");
         assert_eq!(
-            node_issuer_key(root).expect("issuer key must load again").to_bytes(),
+            crate::data_dir::DataDir::new(root)
+                .issuer_key()
+                .expect("issuer key must load again")
+                .to_bytes(),
             key.to_bytes(),
             "the key file must be reused, not replaced"
         );
         let (_, grant) =
             sign_access(&key, &friend_access(NODE_ISSUER)).expect("access must sign");
         service
-            .apply_stored_grant(&grant_json(&grant).to_string())
+            .apply_stored_grant(&encode_grant(&grant).expect("grant must encode"))
             .expect("a grant signed by the node key must apply");
         assert!(service.has_grant(&grant.id).expect("grants must read"));
         let stranger = SigningKey::from_bytes(&[8; 32]);
         let (_, forged) = sign_access(&stranger, &friend_access(NODE_ISSUER))
             .expect("access must sign");
-        assert!(service.apply_stored_grant(&grant_json(&forged).to_string()).is_err());
+        assert!(
+            service
+                .apply_stored_grant(&encode_grant(&forged).expect("grant must encode"))
+                .is_err()
+        );
     }
 
     #[test]
@@ -1452,13 +668,15 @@ mod tests {
                 .expect("policy must decode");
         policy["trustedIssuers"] =
             json!({ "issuer": hex::encode(outside.verifying_key().to_bytes()) });
-        policy["grants"] = json!([grant_json(&file_grant)]);
+        policy["grants"] = json!([GrantRecord::from(&file_grant)]);
         fs::write(&path, policy.to_string()).expect("policy must write");
 
         let service = std::sync::Arc::new(
             load_service(&path, root, "codex".into()).expect("policy must load"),
         );
-        let issuer = node_issuer_key(root).expect("issuer key must load");
+        let issuer = crate::data_dir::DataDir::new(root)
+            .issuer_key()
+            .expect("issuer key must load");
         let (_, ui_grant) = sign_access(&issuer, &friend_access(NODE_ISSUER))
             .expect("access must sign");
         let mut administration = crate::admin::Administration::with_store(
@@ -1472,7 +690,7 @@ mod tests {
         ));
         let change = crate::admin::ChangeRequest::Grant {
             id: ui_grant.id.as_str().to_owned(),
-            grant: grant_json(&ui_grant).to_string(),
+            grant: encode_grant(&ui_grant).expect("grant must encode"),
         }
         .into_change()
         .expect("change must parse");
@@ -1506,10 +724,7 @@ mod tests {
         let Err(error) = load_service(&path, root, "codex".into()) else {
             panic!("the node issuer must not be redefined");
         };
-        assert_eq!(
-            error,
-            NodeConfigError::InvalidField("trustedIssuers.node".to_owned())
-        );
+        assert_eq!(error, PolicyError::InvalidField("trustedIssuers.node".to_owned()));
     }
 
     #[test]
@@ -1561,8 +776,10 @@ mod tests {
             {"id": "direct", "kind": "direct"},
             {"id": "directory", "kind": "directory"},
         ]);
-        policy["grants"] =
-            json!([grant_json(&direct_grant), grant_json(&directory_grant),]);
+        policy["grants"] = json!([
+            GrantRecord::from(&direct_grant),
+            GrantRecord::from(&directory_grant),
+        ]);
         let path = root.join("policy.json");
         fs::write(&path, serde_json::to_vec(&policy).expect("policy must encode"))
             .expect("policy must write");
@@ -1646,7 +863,7 @@ mod tests {
             .apply_change(
                 aether_store::ChangeKind::Grant,
                 "restored",
-                &grant_json(&restored_grant).to_string(),
+                &encode_grant(&restored_grant).expect("grant must encode"),
             )
             .expect("grant must store");
         drop(store);
@@ -1705,7 +922,7 @@ mod tests {
         };
         assert_eq!(
             error,
-            NodeConfigError::InvalidField("admin.current.workspace".to_owned())
+            PolicyError::InvalidField("admin.current.workspace".to_owned())
         );
     }
 
@@ -1742,10 +959,7 @@ mod tests {
         let Err(error) = load_service(&path, &root, "codex".into()) else {
             panic!("an approved workspace naming a missing path must fail");
         };
-        assert_eq!(
-            error,
-            NodeConfigError::InvalidField("approvedWorkspaces".to_owned())
-        );
+        assert_eq!(error, PolicyError::InvalidField("approvedWorkspaces".to_owned()));
     }
 
     #[test]
@@ -1792,18 +1006,6 @@ mod tests {
     }
 
     #[test]
-    fn a_policy_without_network_or_environment_fields_keeps_both_off() {
-        let file: NodePolicyFile = serde_json::from_value(policy(
-            std::path::Path::new("/workspace"),
-            &test_grant(&SigningKey::from_bytes(&[17; 32]), [11; 32]),
-            [0; 32],
-        ))
-        .expect("policy must decode");
-        assert!(!file.allow_network);
-        assert!(file.environment_allowlist.is_empty());
-    }
-
-    #[test]
     fn a_policy_with_network_and_an_allowlist_loads() {
         let directory = tempfile::tempdir().expect("directory must create");
         let root = directory.path().to_path_buf();
@@ -1824,7 +1026,7 @@ mod tests {
             .expect("policy must write");
         assert_eq!(
             load_service(&path, &root, "codex".into()).err(),
-            Some(NodeConfigError::InvalidField("environmentAllowlist[1]".to_owned()))
+            Some(PolicyError::InvalidField("environmentAllowlist[1]".to_owned()))
         );
     }
 
@@ -1853,13 +1055,13 @@ mod tests {
             let names = names.into_iter().map(str::to_owned).collect::<Vec<_>>();
             assert_eq!(
                 allowed_environment(&names, lookup),
-                Err(NodeConfigError::InvalidField(field.to_owned()))
+                Err(PolicyError::InvalidField(field.to_owned()))
             );
         }
         let too_many = vec!["OTHER".to_owned(); MAX_ENVIRONMENT - 1];
         assert_eq!(
             allowed_environment(&too_many, lookup),
-            Err(NodeConfigError::InvalidField("environmentAllowlist".to_owned()))
+            Err(PolicyError::InvalidField("environmentAllowlist".to_owned()))
         );
     }
 
@@ -1945,7 +1147,7 @@ mod tests {
         json!({
             "scope": {"id": "direct", "kind": "direct"},
             "trustedIssuers": {"issuer": hex::encode(trusted_key)},
-            "grants": [grant_json(grant)],
+            "grants": [GrantRecord::from(grant)],
             "workspace": workspace,
             "maxContextTokens": 32,
             "maxSeconds": 1,

@@ -27,7 +27,7 @@ pub enum HostStep {
 }
 
 /// The step for `invite` with the local `approval` of its id. `own_name` is
-/// this node's name on the hub (`node_config::stored_hub_name`), never a
+/// this node's name on the hub (the `HubName` setting), never a
 /// flag: without it the host makes no step. `blocked` is whether the owner
 /// blocked the endpoint that the row names: the host never signs for it.
 #[must_use]
@@ -275,21 +275,24 @@ mod tests {
     /// A delivered row for the caller, with a line that `host` signed as
     /// `agent` for the caller key `caller`.
     fn delivered(host: &std::path::Path, agent: &str, caller: &str) -> Invite {
-        let (authorization, _) = crate::identity::sign_access(
+        let access = crate::identity::AccessInput {
+            issuer_agent_id: "node".to_owned(),
+            subject_agent_id: "ana".to_owned(),
+            subject_endpoint_id: caller.to_owned(),
+            scope_id: crate::direct::SCOPE.to_owned(),
+            capabilities: vec![crate::execution::GENERAL_SKILL.to_owned()],
+            workspaces: vec!["workspace".to_owned()],
+            access_mode: aether_core::AccessMode::ReadOnly,
+            approval_rule: aether_core::ApprovalRule::Automatic,
+            lifetime: std::time::Duration::from_secs(60),
+        };
+        let (claim, _) = crate::identity::sign_access(
             &ed25519_dalek::SigningKey::from_bytes(&[9; 32]),
-            &crate::identity::AccessInput {
-                issuer_agent_id: "node".to_owned(),
-                subject_agent_id: "ana".to_owned(),
-                subject_endpoint_id: caller.to_owned(),
-                scope_id: crate::direct::SCOPE.to_owned(),
-                capabilities: vec![crate::execution::GENERAL_SKILL.to_owned()],
-                workspaces: vec!["workspace".to_owned()],
-                access_mode: aether_core::AccessMode::ReadOnly,
-                approval_rule: aether_core::ApprovalRule::Automatic,
-                lifetime: std::time::Duration::from_secs(60),
-            },
+            &access,
         )
         .expect("access must sign");
+        let authorization =
+            crate::transport::A2aAuthorization::for_access(&access, &claim);
         let line = crate::direct::InvitationBundle {
             format: crate::direct::BUNDLE_FORMAT_V1.to_owned(),
 
@@ -472,7 +475,8 @@ mod tests {
             &crate::agent_card::CardSettings::default(),
             "law#0042",
         );
-        let key = crate::transport::load_or_create_key(signer.join("endpoint.key"))
+        let key = crate::data_dir::DataDir::new(signer)
+            .endpoint_key()
             .expect("key must load");
         let expires = u64::try_from(listing_expires_at).expect("expiry");
         let approval = HubApproval {

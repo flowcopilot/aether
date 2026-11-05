@@ -75,7 +75,7 @@ impl State {
         self.port = socket.local_addr().expect("port must resolve").port();
         drop(socket);
         let root = tempfile::tempdir().expect("temporary directory must create");
-        let server = bind_node(&root.path().join("server"), self.port)
+        let server = bind_node(&root.path().join("server"), self.port, None)
             .await
             .expect("server must bind");
         let endpoint_id = server.id().to_string();
@@ -107,7 +107,7 @@ fn answer(request: &[Frame]) -> Result<Vec<Frame>, TransportError> {
         payload,
     };
     Ok(vec![
-        frame(FrameKind::Event, event_payload(task_id, A2aTaskStatus::Submitted)),
+        frame(FrameKind::Event, event_payload(task_id, A2aTaskStatus::Submitted, None)),
         frame(
             FrameKind::Result,
             text_result_payload(task_id, A2aTaskStatus::Completed, "ok"),

@@ -5,7 +5,7 @@ use std::{
         fs::{FileTypeExt, PermissionsExt},
         net::{UnixListener, UnixStream},
     },
-    path::{Path, PathBuf},
+    path::Path,
     thread,
     time::Duration,
 };
@@ -13,7 +13,6 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::admin::{AdminError, AuditEntry, ChangeRequest, SharedAdministration};
-use crate::node_config::settings;
 
 const MAX_SOCKET_BYTES: u64 = 65_536;
 /// A busy node can delay its accept loop. One second was too short under load,
@@ -109,11 +108,6 @@ pub fn start(path: &Path, administration: SharedAdministration) -> io::Result<()
     Ok(())
 }
 
-#[must_use]
-pub fn path(data_dir: &Path) -> PathBuf {
-    data_dir.join("admin.sock")
-}
-
 pub fn send(path: &Path, request: &Request) -> io::Result<Response> {
     let mut stream = UnixStream::connect(path)?;
     stream.set_read_timeout(Some(SOCKET_TIMEOUT))?;
@@ -201,19 +195,19 @@ fn handle(
         },
         Request::CreateInvite { friend_name, endpoint_id, days } => {
             // The hub name comes first, as on the host page.
-            let Some(agent_name) =
-                crate::node_config::setting::<settings::HubName>(data_dir)
-                    .ok()
-                    .flatten()
-                    .or_else(|| {
-                        crate::node_config::setting::<settings::HostName>(data_dir).ok()
-                    })
-            else {
+            let Some(agent_name) = crate::settings::setting::<
+                crate::hub_client::settings::HubName,
+            >(data_dir)
+            .ok()
+            .flatten()
+            .or_else(|| {
+                crate::settings::setting::<crate::direct::HostName>(data_dir).ok()
+            }) else {
                 return Response::Error { code: "unavailable".to_owned() };
             };
-            let Ok(relay_url) =
-                crate::node_config::setting::<settings::ActiveRelay>(data_dir)
-            else {
+            let Ok(relay_url) = crate::settings::setting::<
+                crate::transport::relay::ActiveRelay,
+            >(data_dir) else {
                 return Response::Error { code: "unavailable".to_owned() };
             };
             // The card comes first: when it fails, the node applies no grant.
@@ -229,9 +223,12 @@ fn handle(
             ) else {
                 return Response::Error { code: "invalid".to_owned() };
             };
+            let Ok(grant_text) = crate::identity::encode_grant(&grant) else {
+                return Response::Error { code: "invalid".to_owned() };
+            };
             let change = match (crate::admin::ChangeRequest::Grant {
                 id: grant.id.as_str().to_owned(),
-                grant: crate::node_config::grant_json(&grant).to_string(),
+                grant: grant_text,
             })
             .into_change()
             {
@@ -335,13 +332,13 @@ mod tests {
         os::unix::net::UnixListener,
     };
 
-    use super::{Request, Response, path, send, start};
+    use super::{Request, Response, send, start};
     use crate::admin::{AuditEntry, test_support::shared_in};
 
     #[test]
     fn socket_shares_pending_changes_without_mcp_confirmation() {
         let directory = tempfile::tempdir().expect("directory must create");
-        let socket = path(directory.path());
+        let socket = crate::data_dir::DataDir::new(directory.path()).admin_socket();
         let administration = shared_in(directory.path());
         start(&socket, administration.clone()).expect("socket must start");
         assert!(matches!(
@@ -384,7 +381,7 @@ mod tests {
     #[test]
     fn outbox_wake_reaches_the_node_and_is_unsupported_without_one() {
         let directory = tempfile::tempdir().expect("directory must create");
-        let socket = path(directory.path());
+        let socket = crate::data_dir::DataDir::new(directory.path()).admin_socket();
         let administration = shared_in(directory.path());
         start(&socket, administration.clone()).expect("socket must start");
         assert!(matches!(
@@ -418,7 +415,7 @@ mod tests {
     #[test]
     fn socket_rejects_oversized_messages_and_recovers_stale_sockets() {
         let directory = tempfile::tempdir().expect("directory must create");
-        let socket = path(directory.path());
+        let socket = crate::data_dir::DataDir::new(directory.path()).admin_socket();
         drop(UnixListener::bind(&socket).expect("stale socket must create"));
         let administration = shared_in(directory.path());
         start(&socket, administration).expect("stale socket must recover");
@@ -451,7 +448,7 @@ mod tests {
     #[test]
     fn socket_does_not_replace_an_active_owner() {
         let directory = tempfile::tempdir().expect("directory must create");
-        let socket = path(directory.path());
+        let socket = crate::data_dir::DataDir::new(directory.path()).admin_socket();
         let listener = UnixListener::bind(&socket).expect("socket must bind");
 
         let error = start(&socket, shared_in(directory.path()))

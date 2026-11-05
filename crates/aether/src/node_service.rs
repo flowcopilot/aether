@@ -14,7 +14,7 @@ use crate::{
     proof::{Identity, ProofError, ProofNode, SubmissionInput},
     transport::{
         A2aCancel, A2aPartContent, A2aRequest, A2aTaskStatus, Frame, FrameKind,
-        MAX_EXCHANGE_BYTES, MAX_FRAMES, TransportError, event_payload_with_sequence,
+        MAX_EXCHANGE_BYTES, MAX_FRAMES, TransportError, event_payload,
         text_result_payload, text_result_payload_with_progress,
     },
 };
@@ -207,7 +207,7 @@ where
     }
 
     pub fn apply_stored_grant(&self, grant_json: &str) -> Result<(), ProofError> {
-        let grant = crate::node_config::parse_grant_json(grant_json)
+        let grant = crate::identity::decode_grant(grant_json)
             .map_err(|_| ProofError::Denied(aether_core::Denial::GrantDenied))?;
         self.node.apply_stored_grant(grant)
     }
@@ -328,7 +328,7 @@ where
                 exchange_id: frame.exchange_id.clone(),
                 scope_id: frame.scope_id.clone(),
                 task_id: Some(task_id.clone()),
-                payload: event_payload_with_sequence(
+                payload: event_payload(
                     &task_id,
                     event_status(event.event_type, state),
                     Some(event.sequence),
@@ -424,7 +424,7 @@ where
                 exchange_id: frame.exchange_id.clone(),
                 scope_id: frame.scope_id.clone(),
                 task_id: frame.task_id.clone(),
-                payload: event_payload_with_sequence(
+                payload: event_payload(
                     task_id,
                     event_status(event.event_type, aether_store::TaskState::Cancelled),
                     Some(event.sequence),
@@ -597,12 +597,15 @@ where
     }
 
     fn renew_directory(&self, url: &str) -> Result<(), AdminError> {
-        if self.directory.get().is_some_and(|publication| publication.directory != url)
+        if self
+            .directory
+            .get()
+            .is_some_and(|publication| publication.directory() != url)
         {
             return Err(AdminError::InvalidField("url"));
         }
         self.publish("directory", |publication, endpoint_id| async move {
-            publication.renew(&endpoint_id).await
+            publication.renew(&endpoint_id).await.map(|_| ())
         })?
         .map_err(|_| AdminError::InvalidField("url"))
     }
@@ -618,12 +621,13 @@ where
     fn set_relay(&self, relay: Option<String>) -> Result<(), AdminError> {
         let (endpoint, runtime) =
             self.endpoint.get().ok_or(AdminError::Unsupported("relay"))?;
-        let previous = crate::node_config::setting::<
-            crate::node_config::settings::ActiveRelay,
-        >(&self.data_dir)
-        .map_err(|_| AdminError::Store)?;
+        let previous =
+            crate::settings::setting::<crate::transport::relay::ActiveRelay>(
+                &self.data_dir,
+            )
+            .map_err(|_| AdminError::Store)?;
         runtime
-            .block_on(crate::node_config::apply_relay(
+            .block_on(crate::transport::relay::apply_relay(
                 &self.data_dir,
                 &relay,
                 crate::transport::switch_relay(
@@ -843,8 +847,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("port must bind");
         let port = listener.local_addr().expect("port must resolve").port();
         drop(listener);
-        let server = bind_node(&server_data, port).await.expect("server must bind");
-        let client = bind_node(&client_data, 0).await.expect("client must bind");
+        let server =
+            bind_node(&server_data, port, None).await.expect("server must bind");
+        let client = bind_node(&client_data, 0, None).await.expect("client must bind");
         let endpoint = aether_core::EndpointId::new(client.id().to_string());
         client.close().await;
         let key = SigningKey::from_bytes(&[8; 32]);
@@ -1033,8 +1038,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("port must bind");
         let port = listener.local_addr().expect("port must resolve").port();
         drop(listener);
-        let server = bind_node(&server_data, port).await.expect("server must bind");
-        let client = bind_node(&client_data, 0).await.expect("client must bind");
+        let server =
+            bind_node(&server_data, port, None).await.expect("server must bind");
+        let client = bind_node(&client_data, 0, None).await.expect("client must bind");
         let endpoint = aether_core::EndpointId::new(client.id().to_string());
         client.close().await;
         let key = SigningKey::from_bytes(&[9; 32]);
@@ -1294,7 +1300,8 @@ mod tests {
             WIRE_TASK_ID
         );
         assert_eq!(
-            response[0].payload["statusUpdate"]["metadata"]["aetherEventSequence"],
+            response[0].payload["statusUpdate"]["metadata"]
+                [crate::transport::EVENT_SEQUENCE],
             2
         );
         assert_eq!(
@@ -1920,7 +1927,8 @@ mod tests {
             .iter()
             .filter(|frame| frame.kind == FrameKind::Event)
             .map(|frame| {
-                frame.payload["statusUpdate"]["metadata"]["aetherEventSequence"]
+                frame.payload["statusUpdate"]["metadata"]
+                    [crate::transport::EVENT_SEQUENCE]
                     .as_i64()
                     .expect("event sequence must exist")
             })

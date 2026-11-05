@@ -18,6 +18,7 @@ pub mod agent_card;
 #[allow(dead_code, clippy::pedantic, clippy::nursery)]
 mod components;
 pub mod control_service;
+pub mod data_dir;
 pub mod direct;
 pub mod directory_client;
 pub mod directory_publication;
@@ -33,12 +34,15 @@ mod key_file;
 pub mod listing;
 pub mod managed_client;
 pub mod mcp;
-pub mod node_config;
+pub mod node_builder;
 pub mod node_service;
 pub mod outbox;
 pub mod pact;
 mod pinned_https;
+pub mod policy;
 pub mod proof;
+pub mod settings;
+mod signed;
 pub mod transport;
 pub mod untrusted;
 

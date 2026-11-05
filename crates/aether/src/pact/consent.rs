@@ -150,7 +150,8 @@ impl PactConsent {
         let grant_id = grant.id.as_str().to_owned();
         let change = crate::admin::ChangeRequest::Grant {
             id: grant_id.clone(),
-            grant: crate::node_config::grant_json(&grant).to_string(),
+            grant: crate::identity::encode_grant(&grant)
+                .map_err(|_| ConsentError::Sign)?,
         }
         .into_change()
         .map_err(|_| ConsentError::Refused)?;
@@ -190,7 +191,8 @@ impl PactConsent {
         brand: &Brand,
         caller: &PaIdentity,
     ) -> Result<aether_core::Grant, ConsentError> {
-        let issuer = crate::node_config::node_issuer_key(&self.data_dir)
+        let issuer = crate::data_dir::DataDir::new(&self.data_dir)
+            .issuer_key()
             .map_err(|_| ConsentError::Sign)?;
         let now = SystemTime::now();
         let lifetime = Duration::from_secs(GRANT_SECONDS.unsigned_abs());
@@ -200,7 +202,7 @@ impl PactConsent {
             &issuer,
             crate::identity::GrantInput {
                 id: GrantId::new(format!("pact_{}", uuid::Uuid::new_v4().simple())),
-                issuer_agent_id: AgentId::new(crate::node_config::NODE_ISSUER),
+                issuer_agent_id: AgentId::new(crate::identity::NODE_ISSUER),
                 subject_agent_id: AgentId::new(caller_agent_id(&caller.issuer)),
                 subject_endpoint_id: EndpointId::new(caller_endpoint_id(caller)),
                 scope_id: ScopeId::new(SCOPE_ID),

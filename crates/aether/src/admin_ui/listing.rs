@@ -19,7 +19,6 @@ use topcoat::{
 };
 
 use super::{Host, HostContext, host::host_screen, require_admin_session};
-use crate::node_config::settings;
 use crate::{
     components::button::{ButtonSize, ButtonVariant, button},
     hub_client::{AgentKind, HubClient, HubError},
@@ -44,20 +43,22 @@ async fn publish(
     hub: &HubClient,
     now: u64,
 ) -> Result<ListingState, PublishError> {
-    let name = crate::node_config::setting::<settings::HubName>(data_dir)
-        .ok()
-        .flatten()
-        .ok_or(PublishError::NoName)?;
+    let name =
+        crate::settings::setting::<crate::hub_client::settings::HubName>(data_dir)
+            .ok()
+            .flatten()
+            .ok_or(PublishError::NoName)?;
     let settings = crate::agent_card::settings(data_dir);
     let bytes = crate::listing::listing_bytes(&settings, &name);
-    let key = crate::transport::load_or_create_key(data_dir.join("endpoint.key"))
+    let key = crate::data_dir::DataDir::new(data_dir)
+        .endpoint_key()
         .map_err(|_| PublishError::Key)?;
     let expires_at = now.saturating_add(LISTING_LIFETIME.as_secs());
     let signature = crate::listing::sign(&key, &bytes, expires_at);
     let text = URL_SAFE_NO_PAD.encode(&bytes);
     hub.put_listing(&text, &signature, expires_at).await.map_err(PublishError::Hub)?;
     let state = ListingState { listed: true, expires_at, listing: text };
-    crate::node_config::store_setting::<settings::ListingState>(
+    crate::settings::store_setting::<crate::listing::settings::ListingState>(
         data_dir,
         &Some(state.clone()),
     )
@@ -68,8 +69,10 @@ async fn publish(
 /// Stops the listing on `hub`.
 async fn stop(data_dir: &Path, hub: &HubClient) -> Result<(), PublishError> {
     hub.delete_listing().await.map_err(PublishError::Hub)?;
-    crate::node_config::store_setting::<settings::ListingState>(data_dir, &None)
-        .map_err(|_| PublishError::Store)
+    crate::settings::store_setting::<crate::listing::settings::ListingState>(
+        data_dir, &None,
+    )
+    .map_err(|_| PublishError::Store)
 }
 
 const fn publish_message(error: PublishError) -> &'static str {
@@ -96,7 +99,7 @@ const fn publish_message(error: PublishError) -> &'static str {
 
 /// The text about the shared task queue.
 pub(super) fn queue_text(data_dir: &Path) -> String {
-    match crate::node_config::queue_limits(data_dir) {
+    match crate::policy::queue_limits(data_dir) {
         Ok(Some(limits)) => {
             let tasks = if limits.global == 1 {
                 "1 waiting task".to_owned()
@@ -122,13 +125,16 @@ pub(super) async fn listing_section(
 ) -> TopcoatResult<impl View> {
     let settings = crate::agent_card::settings(&data_dir);
     let name =
-        crate::node_config::setting::<settings::HubName>(&data_dir).ok().flatten();
+        crate::settings::setting::<crate::hub_client::settings::HubName>(&data_dir)
+            .ok()
+            .flatten();
     let now = now_seconds();
-    let days_left = crate::node_config::setting::<settings::ListingState>(&data_dir)
-        .ok()
-        .flatten()
-        .filter(|state| state.listed && state.expires_at > now)
-        .map(|state| state.expires_at.saturating_sub(now).div_ceil(24 * 60 * 60));
+    let days_left =
+        crate::settings::setting::<crate::listing::settings::ListingState>(&data_dir)
+            .ok()
+            .flatten()
+            .filter(|state| state.listed && state.expires_at > now)
+            .map(|state| state.expires_at.saturating_sub(now).div_ceil(24 * 60 * 60));
     let queue = queue_text(&data_dir);
     let status = match days_left {
         Some(1) => {
@@ -217,7 +223,11 @@ pub(super) async fn publish_listing(
     let Host(Some(host)) = app_context::<Host>(cx) else {
         return Err(bad_request("this node has no listing").into());
     };
-    if crate::node_config::setting::<settings::AgentKind>(&host.data_dir).ok().flatten()
+    if crate::settings::setting::<crate::hub_client::settings::AgentKind>(
+        &host.data_dir,
+    )
+    .ok()
+    .flatten()
         != Some(AgentKind::Service)
     {
         return Err(bad_request("only a service agent has a public listing").into());
@@ -245,16 +255,19 @@ pub(super) async fn listing_worker(host: Arc<HostContext>) {
 
 async fn renew(host: &HostContext) {
     let now = now_seconds();
-    let due = crate::node_config::setting::<settings::ListingState>(&host.data_dir)
-        .ok()
-        .flatten()
-        .is_some_and(|state| {
-            state.listed
-                && state.expires_at.saturating_sub(now) < RENEW_BEFORE.as_secs()
-        });
-    let service = crate::node_config::setting::<settings::AgentKind>(&host.data_dir)
-        .ok()
-        .flatten()
+    let due = crate::settings::setting::<crate::listing::settings::ListingState>(
+        &host.data_dir,
+    )
+    .ok()
+    .flatten()
+    .is_some_and(|state| {
+        state.listed && state.expires_at.saturating_sub(now) < RENEW_BEFORE.as_secs()
+    });
+    let service = crate::settings::setting::<crate::hub_client::settings::AgentKind>(
+        &host.data_dir,
+    )
+    .ok()
+    .flatten()
         == Some(AgentKind::Service);
     let (true, true, Some(hub)) = (due, service, host.hub.get()) else {
         return;

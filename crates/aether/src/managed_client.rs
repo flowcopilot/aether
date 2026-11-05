@@ -1,9 +1,13 @@
 use hex::FromHex;
 use reqwest::{Client, StatusCode, Url};
 
+use aether_store::ManagedEventType;
+
 use crate::{
-    control_service::{WireManagedEvent, WireManagedRedeem, WireRecord},
-    discovery::validate_record,
+    discovery::{
+        validate_record,
+        wire::{self, WireManagedEvent, WireManagedRedeem, WireRecord},
+    },
     pinned_https::{self, PinnedError},
 };
 
@@ -131,8 +135,8 @@ impl ManagedClient {
             {
                 return Err(ManagedClientError::InvalidRecord);
             }
-            match event.event.as_str() {
-                "joined" => {
+            match event.event {
+                ManagedEventType::Joined => {
                     let member = event
                         .member
                         .as_ref()
@@ -144,8 +148,10 @@ impl ManagedClient {
                     }
                     Self::validate_member(member)?;
                 }
-                "revoked" if event.member.is_none() => {}
-                _ => return Err(ManagedClientError::InvalidRecord),
+                ManagedEventType::Revoked if event.member.is_none() => {}
+                ManagedEventType::Revoked => {
+                    return Err(ManagedClientError::InvalidRecord);
+                }
             }
             previous = event.cursor;
         }
@@ -153,15 +159,15 @@ impl ManagedClient {
     }
 
     fn redeem_url(&self) -> Result<Url, ManagedClientError> {
-        self.url(&["v1", "managed", "redeem"])
+        self.url(&wire::MANAGED_REDEEM)
     }
 
     fn members_url(&self, scope_id: &str) -> Result<Url, ManagedClientError> {
-        self.scope_url(scope_id, "members")
+        self.scope_url(scope_id, wire::MEMBERS)
     }
 
     fn events_url(&self, scope_id: &str) -> Result<Url, ManagedClientError> {
-        self.scope_url(scope_id, "events")
+        self.scope_url(scope_id, wire::MANAGED_EVENTS)
     }
 
     fn scope_url(
@@ -172,7 +178,7 @@ impl ManagedClient {
         if !pinned_https::valid_segment(scope_id) {
             return Err(ManagedClientError::InvalidRecord);
         }
-        self.url(&["v1", "managed", scope_id, operation])
+        self.url(&[wire::MANAGED[0], wire::MANAGED[1], scope_id, operation])
     }
 
     fn url(&self, segments: &[&str]) -> Result<Url, ManagedClientError> {
@@ -207,8 +213,8 @@ mod tests {
 
     use super::{ManagedClient, ManagedClientError};
     use crate::{
-        control_service::{ControlService, WireRecord, serve},
-        discovery::signed_record,
+        control_service::{ControlService, serve},
+        discovery::{signed_record, wire::WireRecord},
     };
 
     #[test]
@@ -255,10 +261,13 @@ mod tests {
             .await
             .expect("server must listen")
             .expect("server address must exist");
-        let certificate = fs::read(data_dir.join("control-cert.der"))
-            .expect("certificate must exist");
-        let service = ControlService::open(data_dir.join("control.sqlite"))
-            .expect("control must open");
+        let certificate =
+            fs::read(crate::data_dir::DataDir::new(&data_dir).control_certificate())
+                .expect("certificate must exist");
+        let service = ControlService::open(
+            crate::data_dir::DataDir::new(&data_dir).control_store(),
+        )
+        .expect("control must open");
         let token = service
             .create_managed_invitation("managed", Duration::from_secs(60))
             .expect("invitation must create");
@@ -293,7 +302,7 @@ mod tests {
                 .await
                 .expect("events must resume")[0]
                 .event,
-            "revoked"
+            aether_store::ManagedEventType::Revoked
         );
 
         handle.graceful_shutdown(Some(Duration::from_secs(1)));

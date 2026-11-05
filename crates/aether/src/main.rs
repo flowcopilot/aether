@@ -4,7 +4,6 @@ use std::{
     sync::Arc,
 };
 
-use aether::node_config::settings;
 use hex::FromHex;
 
 use usage_rs::{Args, Cli, Subcommands};
@@ -402,7 +401,7 @@ async fn run_control(control: Control) -> ExitCode {
         match command {
             ControlCommand::TestRecord => {
                 match serde_json::to_string_pretty(
-                    &aether::control_service::WireRecord::test_record(),
+                    &aether::discovery::wire::WireRecord::test_record(),
                 ) {
                     Ok(record) => {
                         println!("{record}");
@@ -475,13 +474,14 @@ fn run_control_invite(
             return ExitCode::from(2);
         }
     };
-    if std::fs::create_dir_all(&config.data_dir).is_err() {
+    let data_dir = aether::data_dir::DataDir::new(config.data_dir);
+    if data_dir.create().is_err() {
         eprintln!("aether: control data directory cannot be created");
         return ExitCode::from(1);
     }
-    let Ok(service) = aether::control_service::ControlService::open(
-        config.data_dir.join("control.sqlite"),
-    ) else {
+    let Ok(service) =
+        aether::control_service::ControlService::open(data_dir.control_store())
+    else {
         eprintln!("aether: control store cannot be opened");
         return ExitCode::from(1);
     };
@@ -517,7 +517,7 @@ fn run_control_member_revocation(
         }
     };
     let Ok(service) = aether::control_service::ControlService::open(
-        config.data_dir.join("control.sqlite"),
+        aether::data_dir::DataDir::new(config.data_dir).control_store(),
     ) else {
         eprintln!("aether: control store cannot be opened");
         return ExitCode::from(1);
@@ -554,8 +554,9 @@ async fn run_mcp(mcp: Mcp) -> ExitCode {
     match mcp.command {
         Some(McpCommand::Serve(McpServe { socket, data_dir, caller_only })) => {
             let data_dir = data_dir_or_default(data_dir);
-            let socket =
-                socket.unwrap_or_else(|| aether::admin_socket::path(&data_dir));
+            let socket = socket.unwrap_or_else(|| {
+                aether::data_dir::DataDir::new(&data_dir).admin_socket()
+            });
             let hub_flag = std::env::var("AETHER_HUB_URL").ok();
             match aether::mcp::serve_stdio_for(socket, data_dir, hub_flag, caller_only)
                 .await
@@ -579,7 +580,9 @@ fn hub_client(
 ) -> Result<Option<aether::hub_client::HubClient>, ExitCode> {
     aether::hub_client::resolve_url(
         hub_url,
-        aether::node_config::setting::<settings::Hub>(data_dir).ok().flatten(),
+        aether::settings::setting::<aether::hub_client::settings::Hub>(data_dir)
+            .ok()
+            .flatten(),
     )
     .map(|url| aether::hub_client::HubClient::for_data_dir(&url, data_dir))
     .transpose()
@@ -607,7 +610,7 @@ async fn run_admin(arguments: NodeAdmin) -> ExitCode {
         Ok(hub) => hub,
         Err(code) => return code,
     };
-    let socket = aether::admin_socket::path(&data_dir);
+    let socket = aether::data_dir::DataDir::new(&data_dir).admin_socket();
     if let Err(error) = aether::admin_socket::start(&socket, administration.clone()) {
         eprintln!("aether: admin failed: {error}");
         return ExitCode::from(1);
@@ -647,7 +650,7 @@ async fn run_node(node: Node) -> ExitCode {
         Some(NodeCommand::Record(arguments)) => run_record(arguments),
         Some(NodeCommand::Endpoint(arguments)) => {
             let endpoint =
-                match aether::transport::bind_node(arguments.data_dir, 0).await {
+                match aether::transport::bind_node(arguments.data_dir, 0, None).await {
                     Ok(endpoint) => endpoint,
                     Err(error) => return transport_error(&error),
                 };
@@ -694,7 +697,7 @@ async fn run_node(node: Node) -> ExitCode {
                 eprintln!("aether: --adapter must be codex or connected");
                 return ExitCode::from(2);
             };
-            let service = match aether::node_config::load_or_create_service_with_adapter(
+            let service = match aether::node_builder::load_or_create_service(
                 &arguments.policy,
                 &arguments.data_dir,
                 arguments.codex_bin.clone(),
@@ -709,8 +712,9 @@ async fn run_node(node: Node) -> ExitCode {
             match service.agent_adapter() {
                 "codex" => {
                     let codex_home =
-                        aether::node_config::codex_home(&arguments.data_dir);
-                    if !codex_home.join("auth.json").exists() {
+                        aether::data_dir::DataDir::new(&arguments.data_dir)
+                            .codex_home();
+                    if !aether::data_dir::codex_login(&codex_home).exists() {
                         eprintln!(
                             "aether: Codex is not logged in for this node, so tasks will fail. Run: CODEX_HOME={} codex login --device-auth",
                             codex_home.display()
@@ -719,7 +723,8 @@ async fn run_node(node: Node) -> ExitCode {
                 }
                 _ => eprintln!(
                     "aether: tasks go to the agent that connects to {}",
-                    aether::agent::connected::socket_path(&arguments.data_dir)
+                    aether::data_dir::DataDir::new(&arguments.data_dir)
+                        .agent_socket()
                         .display()
                 ),
             }
@@ -814,7 +819,8 @@ async fn run_node(node: Node) -> ExitCode {
                         return ExitCode::from(1);
                     }
                 };
-            let socket = aether::admin_socket::path(&arguments.data_dir);
+            let socket =
+                aether::data_dir::DataDir::new(&arguments.data_dir).admin_socket();
             let live = Arc::new(aether::node_service::RunningNode::new(
                 Arc::clone(&service),
                 arguments.data_dir.clone(),
@@ -837,12 +843,14 @@ async fn run_node(node: Node) -> ExitCode {
                 .relay_url
                 .clone()
                 .or_else(|| {
-                    aether::node_config::setting::<settings::Relay>(&arguments.data_dir)
-                        .ok()
-                        .flatten()
+                    aether::settings::setting::<aether::transport::relay::Relay>(
+                        &arguments.data_dir,
+                    )
+                    .ok()
+                    .flatten()
                 })
                 .filter(|relay| relay != "off");
-            let endpoint = match aether::transport::bind_node_with_relay(
+            let endpoint = match aether::transport::bind_node(
                 &arguments.data_dir,
                 arguments.port,
                 relay_url.as_deref(),
@@ -852,14 +860,14 @@ async fn run_node(node: Node) -> ExitCode {
                 Ok(endpoint) => endpoint,
                 Err(error) => return transport_error(&error),
             };
-            if aether::node_config::store_setting::<settings::ActiveRelay>(
+            if aether::settings::store_setting::<aether::transport::relay::ActiveRelay>(
                 &arguments.data_dir,
                 &relay_url,
             )
             .and_then(|()| {
                 // The name of connect codes from the admin socket while the
                 // node has no name on the hub, as on the host page.
-                aether::node_config::store_setting::<settings::HostName>(
+                aether::settings::store_setting::<aether::direct::HostName>(
                     &arguments.data_dir,
                     &arguments.invite_name.clone().unwrap_or_else(|| {
                         aether::direct::default_agent_name(
@@ -937,7 +945,7 @@ async fn run_node(node: Node) -> ExitCode {
                 tokio::spawn(async move {
                     loop {
                         tokio::time::sleep(std::time::Duration::from_secs(
-                            publication.ttl / 2,
+                            publication.ttl() / 2,
                         ))
                         .await;
                         let _ = publication.renew(&endpoint_id).await;
@@ -1106,7 +1114,11 @@ async fn run_node(node: Node) -> ExitCode {
                         && arguments.directory.is_none()
                         && arguments.managed_control.is_none() =>
                 {
-                    aether::direct::contact_bundle(&data_dir, agent_id).ok()
+                    aether::direct::open_store(&data_dir)
+                        .and_then(|store| {
+                            aether::direct::contact_bundle(&store, agent_id)
+                        })
+                        .ok()
                 }
                 _ => None,
             };
@@ -1194,7 +1206,9 @@ async fn run_node(node: Node) -> ExitCode {
                         if address.is_some() || relay_url.is_some() =>
                     {
                         let contact = if arguments.scope == aether::direct::SCOPE {
-                            aether::direct::contact(&data_dir, agent_id)
+                            aether::direct::open_store(&data_dir).and_then(|store| {
+                                aether::direct::contact(&store, agent_id)
+                            })
                         } else {
                             Err(aether::direct::DirectError::UnknownContact)
                         };
@@ -1238,7 +1252,11 @@ async fn run_node(node: Node) -> ExitCode {
                             eprintln!("aether: directory connection is invalid");
                             return ExitCode::from(2);
                         };
-                        let record = match directory.resolve_record(agent_id).await {
+                        let record = match directory.resolve(agent_id).await.and_then(|wire| {
+                            wire.to_record().map_err(|_| {
+                                aether::directory_client::DirectoryClientError::InvalidRecord
+                            })
+                        }) {
                             Ok(record) if record.scope_id == arguments.scope => {
                                 if cache_directory_record(&data_dir, &record).is_err() {
                                     eprintln!(
@@ -1394,7 +1412,7 @@ async fn start_directory_publication(
 ) -> Result<
     Option<(
         aether::directory_publication::DirectoryPublication,
-        aether::control_service::WireRecord,
+        aether::discovery::wire::WireRecord,
     )>,
     (),
 > {
@@ -1441,29 +1459,20 @@ async fn start_directory_publication(
         address.set_port(bound_port);
     }
     let certificate = std::fs::read(certificate).map_err(|_| ())?;
-    let publication = aether::directory_publication::DirectoryPublication {
-        directory: directory.clone(),
-        certificate,
-        signing_key: [0; 32],
-        data_dir: arguments.data_dir.clone(),
-        agent_id: agent_id.clone(),
-        address: address.to_string(),
-        scope: scope.clone(),
-        capability: std::sync::Mutex::new(capability.clone()),
-        ttl,
-    };
-    let record = publication.record(endpoint_id).map_err(|_| ())?;
-    let publication = aether::directory_publication::DirectoryPublication {
-        signing_key: record.signing_key,
-        ..publication
-    };
-    let client = aether::directory_client::DirectoryClient::with_pinned_certificate(
-        &publication.directory,
-        &publication.certificate,
-        publication.signing_key,
+    let publication = aether::directory_publication::DirectoryPublication::new(
+        directory.clone(),
+        &certificate,
+        &arguments.data_dir,
+        aether::directory_publication::PublicationRecord {
+            agent_id: agent_id.clone(),
+            address: address.to_string(),
+            scope: scope.clone(),
+            capability: capability.clone(),
+            ttl,
+        },
     )
     .map_err(|_| ())?;
-    client.publish(&record).await.map_err(|_| ())?;
+    let record = publication.renew(&endpoint_id).await.map_err(|_| ())?;
     Ok(Some((publication, record)))
 }
 
@@ -1536,7 +1545,9 @@ fn run_direct(arguments: NodeDirect) -> ExitCode {
             }
         }
         NodeDirectCommand::Resolve { agent_id } => {
-            match aether::direct::contact(&data_dir, &agent_id) {
+            match aether::direct::open_store(&data_dir)
+                .and_then(|store| aether::direct::contact(&store, &agent_id))
+            {
                 Ok(wire) => {
                     if let Ok(wire) = serde_json::to_string(&wire) {
                         println!("{wire}");
@@ -1591,24 +1602,22 @@ fn run_record(arguments: NodeRecord) -> ExitCode {
         eprintln!("aether: node record is invalid");
         return ExitCode::from(2);
     }
-    if std::fs::create_dir_all(&arguments.data_dir).is_err() {
-        eprintln!("aether: node record is unavailable");
-        return ExitCode::from(1);
-    }
     let Ok(endpoint) =
-        aether::transport::load_or_create_key(arguments.data_dir.join("endpoint.key"))
+        aether::data_dir::DataDir::new(&arguments.data_dir).endpoint_key()
     else {
         eprintln!("aether: node record is unavailable");
         return ExitCode::from(1);
     };
     let Ok(wire) = aether::directory_publication::signed_node_record(
         &arguments.data_dir,
-        arguments.agent_id,
-        endpoint.public().to_string(),
-        arguments.address,
-        arguments.scope,
-        arguments.capability,
-        arguments.expires_in,
+        &aether::directory_publication::PublicationRecord {
+            agent_id: arguments.agent_id,
+            address: arguments.address,
+            scope: arguments.scope,
+            capability: arguments.capability,
+            ttl: arguments.expires_in,
+        },
+        &endpoint.public().to_string(),
     ) else {
         eprintln!("aether: node record is unavailable");
         return ExitCode::from(1);
@@ -1727,14 +1736,14 @@ async fn sync_managed(
             if event.cursor <= cursor {
                 return Err(());
             }
-            match event.event.as_str() {
-                "joined" => {
+            match event.event {
+                aether_store::ManagedEventType::Joined => {
                     let member = event.member.ok_or(())?;
                     store
                         .apply_managed_member(control, event.cursor, &member)
                         .map_err(|_| ())?;
                 }
-                "revoked" if event.member.is_none() => {
+                aether_store::ManagedEventType::Revoked if event.member.is_none() => {
                     store
                         .revoke_managed_member(
                             control,
@@ -1744,7 +1753,7 @@ async fn sync_managed(
                         )
                         .map_err(|_| ())?;
                 }
-                _ => return Err(()),
+                aether_store::ManagedEventType::Revoked => return Err(()),
             }
             cursor = event.cursor;
             changes = changes.checked_add(1).ok_or(())?;
@@ -1770,17 +1779,10 @@ async fn run_directory(arguments: NodeDirectory) -> ExitCode {
         return ExitCode::from(2);
     };
     let result = match arguments.command {
-        NodeDirectoryCommand::Publish { record } => {
+        NodeDirectoryCommand::Publish { record }
+        | NodeDirectoryCommand::Renew { record } => {
             if let Ok(record) = read_directory_record(&record) {
                 client.publish(&record).await.map(Some)
-            } else {
-                eprintln!("aether: directory record is invalid");
-                return ExitCode::from(2);
-            }
-        }
-        NodeDirectoryCommand::Renew { record } => {
-            if let Ok(record) = read_directory_record(&record) {
-                client.renew(&record).await.map(Some)
             } else {
                 eprintln!("aether: directory record is invalid");
                 return ExitCode::from(2);
@@ -1876,18 +1878,18 @@ async fn sync_directory(
             if change.cursor <= cursor {
                 return Err(());
             }
-            match change.event.as_str() {
-                "published" | "renewed" => {
+            match change.event {
+                aether_store::DirectoryEventType::Published
+                | aether_store::DirectoryEventType::Renewed => {
                     let record = change.record.ok_or(())?;
                     cache_wire_directory_record(&store, &record)?;
                     records = records.checked_add(1).ok_or(())?;
                 }
-                "revoked" => {
+                aether_store::DirectoryEventType::Revoked => {
                     store
                         .mark_directory_record_stale(&change.scope_id, &change.agent_id)
                         .map_err(|_| ())?;
                 }
-                _ => return Err(()),
             }
             cursor = change.cursor;
             store
@@ -1911,7 +1913,7 @@ fn read_verifying_key(path: &std::path::Path) -> Result<[u8; 32], ()> {
 
 fn read_directory_record(
     path: &std::path::Path,
-) -> Result<aether::control_service::WireRecord, ()> {
+) -> Result<aether::discovery::wire::WireRecord, ()> {
     serde_json::from_slice(&std::fs::read(path).map_err(|_| ())?).map_err(|_| ())
 }
 
@@ -1922,13 +1924,13 @@ fn cache_directory_record(
     let store = aether_store::NodeStore::in_dir(data_dir).map_err(|_| ())?;
     cache_wire_directory_record(
         &store,
-        &aether::control_service::WireRecord::from_record(record),
+        &aether::discovery::wire::WireRecord::from_record(record),
     )
 }
 
 fn cache_wire_directory_record(
     store: &aether_store::NodeStore,
-    record: &aether::control_service::WireRecord,
+    record: &aether::discovery::wire::WireRecord,
 ) -> Result<(), ()> {
     store
         .cache_directory_record(&aether_store::SignedRecord {
@@ -1954,7 +1956,7 @@ fn cached_directory_record(
     if stored.expires_at <= aether_core::time::now() {
         return Err(());
     }
-    let wire: aether::control_service::WireRecord =
+    let wire: aether::discovery::wire::WireRecord =
         serde_json::from_slice(&stored.record).map_err(|_| ())?;
     let record = wire.to_record().map_err(|_| ())?;
     if record.signing_key != trusted_key {
@@ -2023,7 +2025,7 @@ mod tests {
     fn stale_cached_directory_record_cannot_be_used() {
         let directory = tempfile::tempdir().expect("directory must create");
         let data_dir = directory.path().to_path_buf();
-        let wire = aether::control_service::WireRecord::test_record();
+        let wire = aether::discovery::wire::WireRecord::test_record();
         let record = wire.to_record().expect("record must decode");
         cache_directory_record(&data_dir, &record).expect("record must cache");
         let store =
@@ -2060,8 +2062,10 @@ mod tests {
             .await
             .expect("control must listen")
             .expect("control address must exist");
-        let certificate = fs::read(control_data.join("control-cert.der"))
-            .expect("certificate must exist");
+        let certificate = fs::read(
+            aether::data_dir::DataDir::new(&control_data).control_certificate(),
+        )
+        .expect("certificate must exist");
         let control = format!("https://127.0.0.1:{}", address.port());
         let client = aether::managed_client::ManagedClient::with_pinned_certificate(
             &control,
@@ -2069,13 +2073,13 @@ mod tests {
         )
         .expect("managed client must open");
         let service = aether::control_service::ControlService::open(
-            control_data.join("control.sqlite"),
+            aether::data_dir::DataDir::new(&control_data).control_store(),
         )
         .expect("control store must open");
         let token = service
             .create_managed_invitation("managed", Duration::from_secs(60))
             .expect("invitation must create");
-        let record = aether::control_service::WireRecord::from_record(
+        let record = aether::discovery::wire::WireRecord::from_record(
             &aether::discovery::signed_record(
                 &SigningKey::from_bytes(&[10; 32]),
                 "managed-agent".to_owned(),

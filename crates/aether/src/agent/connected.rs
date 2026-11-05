@@ -12,7 +12,7 @@ use std::{
         fs::{FileTypeExt, PermissionsExt},
         net::{UnixListener, UnixStream},
     },
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -27,17 +27,9 @@ use crate::execution::{Agent, ExecutionError, ExecutionEvent, agent_instructions
 
 const PROTOCOL: u64 = 1;
 
-const SOCKET_FILE: &str = "agent.sock";
-
 /// The longest line the node reads from an agent, its newline included: a
 /// final answer is bounded again by the executor's context limit.
 const MAX_LINE: u64 = 4 * 1024 * 1024;
-
-/// The path of the agent socket of a node data directory.
-#[must_use]
-pub fn socket_path(data_dir: &Path) -> PathBuf {
-    data_dir.join(SOCKET_FILE)
-}
 
 #[derive(Clone)]
 pub struct ConnectedAgent {
@@ -317,10 +309,7 @@ impl Agent for ConnectedAgent {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AgentMessage, ConnectedAgent, MAX_LINE, NodeMessage, PROTOCOL, SOCKET_FILE,
-        socket_path,
-    };
+    use super::{AgentMessage, ConnectedAgent, MAX_LINE, NodeMessage, PROTOCOL};
     use crate::execution::{Agent, ExecutionError, GENERAL_SKILL, agent_instructions};
     use serde_json::{Value, json};
     use std::{
@@ -417,7 +406,7 @@ mod tests {
     fn replay(case: &Value) {
         let name = case["name"].as_str().unwrap_or_default();
         let directory = tempfile::tempdir().expect("directory must create");
-        let path = socket_path(directory.path());
+        let path = crate::data_dir::DataDir::new(directory.path()).agent_socket();
         let agent =
             ConnectedAgent::listen(&path, Duration::from_secs(5)).expect("listen");
         let mut peer: Option<Peer> = None;
@@ -504,7 +493,7 @@ mod tests {
     fn the_constants_and_messages_match_the_contract() {
         let contract = json_file(CONTRACT);
         assert_eq!(contract["protocol"], PROTOCOL);
-        assert_eq!(contract["socket_file"], SOCKET_FILE);
+        assert_eq!(contract["socket_file"], crate::data_dir::AGENT_SOCKET);
         assert_eq!(contract["max_line_bytes"], MAX_LINE);
 
         let fields = |message: Value| -> Vec<String> {
@@ -553,7 +542,7 @@ mod tests {
     #[test]
     fn the_socket_is_owner_only() {
         let directory = tempfile::tempdir().expect("directory must create");
-        let path = socket_path(directory.path());
+        let path = crate::data_dir::DataDir::new(directory.path()).agent_socket();
         let _agent =
             ConnectedAgent::listen(&path, Duration::from_secs(5)).expect("listen");
         let mode =
@@ -565,7 +554,7 @@ mod tests {
     fn no_attached_agent_is_unavailable() {
         let directory = tempfile::tempdir().expect("directory must create");
         let mut agent = ConnectedAgent::listen(
-            &socket_path(directory.path()),
+            &crate::data_dir::DataDir::new(directory.path()).agent_socket(),
             Duration::from_secs(5),
         )
         .expect("listen");
@@ -578,7 +567,7 @@ mod tests {
     #[test]
     fn a_turn_past_its_time_limit_times_out_and_is_cancelled() {
         let directory = tempfile::tempdir().expect("directory must create");
-        let path = socket_path(directory.path());
+        let path = crate::data_dir::DataDir::new(directory.path()).agent_socket();
         let mut agent =
             ConnectedAgent::listen(&path, Duration::from_millis(50)).expect("listen");
         let mut peer =
@@ -594,7 +583,7 @@ mod tests {
     #[test]
     fn a_replaced_agent_is_closed_and_its_turns_fail() {
         let directory = tempfile::tempdir().expect("directory must create");
-        let path = socket_path(directory.path());
+        let path = crate::data_dir::DataDir::new(directory.path()).agent_socket();
         let agent =
             ConnectedAgent::listen(&path, Duration::from_secs(5)).expect("listen");
         let ready = json!({"type": "ready", "protocol": 1});
@@ -621,7 +610,7 @@ mod tests {
     #[test]
     fn a_file_that_is_not_a_socket_is_kept() {
         let directory = tempfile::tempdir().expect("directory must create");
-        let path = socket_path(directory.path());
+        let path = crate::data_dir::DataDir::new(directory.path()).agent_socket();
         std::fs::write(&path, "owner data").expect("file must write");
         assert!(ConnectedAgent::listen(&path, Duration::from_secs(5)).is_err());
         assert_eq!(std::fs::read_to_string(&path).ok().as_deref(), Some("owner data"));

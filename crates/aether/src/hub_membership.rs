@@ -8,7 +8,6 @@ use std::time::Duration;
 use aether_store::{ApprovalKind, ApprovalSide, HubApproval, NodeStore, StoreError};
 
 use crate::hub_client::{HubClient, HubError, Invite, Role, Status};
-use crate::node_config::settings;
 
 /// How long the node keeps the approval of an invite: as long as the hub
 /// keeps the invite.
@@ -38,13 +37,13 @@ pub const fn hub_message(error: HubError) -> &'static str {
 /// in invites. A name that cannot be an agent name is not kept.
 pub fn keep_hub_name(data_dir: &std::path::Path, handle: &str) {
     if crate::direct::valid_name(handle)
-        && crate::node_config::setting::<settings::HubName>(data_dir)
+        && crate::settings::setting::<crate::hub_client::settings::HubName>(data_dir)
             .ok()
             .flatten()
             .as_deref()
             != Some(handle)
     {
-        let _ = crate::node_config::store_setting::<settings::HubName>(
+        let _ = crate::settings::store_setting::<crate::hub_client::settings::HubName>(
             data_dir,
             &Some(handle.to_owned()),
         );

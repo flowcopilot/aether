@@ -11,8 +11,6 @@ use reqwest::{Client, Method, StatusCode, Url, redirect::Policy};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::node_config::settings;
-
 /// The public hub that a node uses when nothing else is set.
 pub const DEFAULT_HUB_URL: &str = "https://aether-hub.tudorandrei.xyz";
 
@@ -58,9 +56,12 @@ pub fn set_hub_url(
     data_dir: &std::path::Path,
     stored: &Option<String>,
 ) -> Result<(), aether_store::StoreError> {
-    crate::node_config::store_setting::<settings::Hub>(data_dir, stored).and_then(
-        |()| crate::node_config::store_setting::<settings::HubName>(data_dir, &None),
-    )
+    crate::settings::store_setting::<crate::hub_client::settings::Hub>(data_dir, stored)
+        .and_then(|()| {
+            crate::settings::store_setting::<crate::hub_client::settings::HubName>(
+                data_dir, &None,
+            )
+        })
 }
 
 /// The longest long poll the hub accepts, in seconds.
@@ -411,7 +412,9 @@ impl HubCache {
     ) -> Option<HubClient> {
         let url = resolve_url(
             flag,
-            crate::node_config::setting::<settings::Hub>(data_dir).ok().flatten(),
+            crate::settings::setting::<crate::hub_client::settings::Hub>(data_dir)
+                .ok()
+                .flatten(),
         )?;
         self.client(&url, data_dir).ok()
     }
@@ -447,8 +450,8 @@ impl HubClient {
         origin: &str,
         data_dir: &std::path::Path,
     ) -> Result<Self, HubError> {
-        std::fs::create_dir_all(data_dir).map_err(|_| HubError::Unexpected)?;
-        let key = crate::transport::load_or_create_key(data_dir.join("endpoint.key"))
+        let key = crate::data_dir::DataDir::new(data_dir)
+            .endpoint_key()
             .map_err(|_| HubError::Unexpected)?;
         Self::new(origin, key)
     }
@@ -460,7 +463,9 @@ impl HubClient {
     pub fn configured(flag: Option<&str>, data_dir: &std::path::Path) -> Option<Self> {
         let url = resolve_url(
             flag,
-            crate::node_config::setting::<settings::Hub>(data_dir).ok().flatten(),
+            crate::settings::setting::<crate::hub_client::settings::Hub>(data_dir)
+                .ok()
+                .flatten(),
         )?;
         Self::for_data_dir(&url, data_dir).ok()
     }
@@ -941,6 +946,8 @@ pub fn valid_full_name(full_name: &str) -> bool {
 
 #[cfg(test)]
 pub(crate) mod test_hub;
+
+pub mod settings;
 
 #[cfg(test)]
 mod tests {

@@ -24,7 +24,6 @@ use super::{
 };
 use crate::access_groups::{self, Action};
 use crate::hub_client::{HubClient, Role};
-use crate::node_config::settings;
 use crate::{
     admin::SharedAdministration,
     admin_components::{
@@ -179,9 +178,11 @@ pub(super) async fn host_screen(
     let command = format!("aether node direct import '{}'", invitation.line);
     let hub = host.hub.get();
     let service = hub.is_some()
-        && crate::node_config::setting::<settings::AgentKind>(&host.data_dir)
-            .ok()
-            .flatten()
+        && crate::settings::setting::<crate::hub_client::settings::AgentKind>(
+            &host.data_dir,
+        )
+        .ok()
+        .flatten()
             == Some(crate::hub_client::AgentKind::Service);
     // The code form is the second way when a hub is set; it opens when it
     // is in use.
@@ -541,7 +542,7 @@ pub(super) async fn relay(
     };
     let relay = form.relay_url.trim();
     let relay = (!relay.is_empty()).then(|| relay.to_owned());
-    let valid = relay.as_deref().is_none_or(crate::node_config::valid_relay_url);
+    let valid = relay.as_deref().is_none_or(crate::transport::relay::valid_relay_url);
     let relay_error = if valid {
         match host.set_relay_url(relay).await {
             Ok(()) => String::new(),
@@ -1004,7 +1005,8 @@ pub(super) fn sign_invite(
     .map_err(|error| internal(&error))?;
     let change = crate::admin::ChangeRequest::Grant {
         id: grant.id.as_str().to_owned(),
-        grant: crate::node_config::grant_json(&grant).to_string(),
+        grant: crate::identity::encode_grant(&grant)
+            .map_err(|error| internal(&error))?,
     }
     .into_change()
     .map_err(|error| internal(&error))?;

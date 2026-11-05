@@ -31,11 +31,10 @@ use super::{
     Caller, CallerContext, Host, HostContext,
     caller::caller_screen,
     host::{Notice, host_screen, sign_invite},
-    require_admin_session,
+    page_data_dir, require_admin_session,
 };
 use aether_store::{ApprovalKind, ApprovalSide, HubApproval, NodeStore};
 
-use crate::node_config::settings;
 use crate::{
     admin::SharedAdministration,
     admin_components::{ALERT, copy_button, field},
@@ -121,12 +120,13 @@ pub(super) async fn hub_section(
         (&state, page_data_dir(cx))
     {
         keep_hub_name(&data_dir, &account.handle);
-        if crate::node_config::setting::<settings::AgentKind>(&data_dir)
+        if crate::settings::setting::<crate::hub_client::settings::AgentKind>(&data_dir)
             .ok()
             .flatten()
             .is_none()
         {
-            let _ = crate::node_config::store_agent_kind(&data_dir, account.kind);
+            let _ =
+                crate::hub_client::settings::store_agent_kind(&data_dir, account.kind);
         }
     }
     let (unreachable, account, invites, blocks, owner_links) = match state {
@@ -685,15 +685,6 @@ async fn invite_row(invite: Invite, approved: bool) -> TopcoatResult<impl View> 
     })
 }
 
-/// The data directory of this page's side: the host's, else the caller's.
-fn page_data_dir(cx: &Cx) -> Option<std::path::PathBuf> {
-    let Host(host) = app_context::<Host>(cx);
-    let Caller(caller) = app_context::<Caller>(cx);
-    host.as_ref()
-        .map(|host| host.data_dir.clone())
-        .or_else(|| caller.as_ref().map(|caller| caller.data_dir.clone()))
-}
-
 /// The hub of this page's side, and the page to show after a hub form.
 fn page_hub(cx: &Cx) -> TopcoatResult<HubClient> {
     current_hub(cx).ok_or_else(|| bad_request("this page has no hub").into())
@@ -750,7 +741,9 @@ pub(super) async fn claim_name(
         (true, Some(kind)) => AgentKind::parse(kind),
     };
     let stored = data_dir.as_deref().and_then(|dir| {
-        crate::node_config::setting::<settings::AgentKind>(dir).ok().flatten()
+        crate::settings::setting::<crate::hub_client::settings::AgentKind>(dir)
+            .ok()
+            .flatten()
     });
     let error = match chosen {
         _ if !valid_name_part(name) => {
@@ -767,7 +760,7 @@ pub(super) async fn claim_name(
                 Ok(account) => {
                     if let Some(data_dir) = &data_dir {
                         keep_hub_name(data_dir, &account.handle);
-                        let _ = crate::node_config::store_agent_kind(
+                        let _ = crate::hub_client::settings::store_agent_kind(
                             data_dir,
                             account.kind,
                         );
@@ -1006,9 +999,9 @@ async fn page_agent(
     };
     let data_dir =
         page_data_dir(cx).ok_or_else(|| bad_request("this page has no node"))?;
-    let key = crate::transport::load_or_create_key(data_dir.join("endpoint.key"))
-        .map_err(|error| {
-            internal_server_error(std::io::Error::other(error.to_string()))
+    let key =
+        crate::data_dir::DataDir::new(&data_dir).endpoint_key().map_err(|_| {
+            internal_server_error(std::io::Error::other("the endpoint key cannot load"))
         })?;
     Ok((kind, key))
 }
@@ -1318,10 +1311,11 @@ pub(super) async fn host_worker(
             let _ = store.clear_expired_hub_approvals(now());
             // The host's own name on the hub is the agent ID the friend
             // sends tasks to. Without it, the host signs nothing.
-            let own_name =
-                crate::node_config::setting::<settings::HubName>(&host.data_dir)
-                    .ok()
-                    .flatten();
+            let own_name = crate::settings::setting::<
+                crate::hub_client::settings::HubName,
+            >(&host.data_dir)
+            .ok()
+            .flatten();
             for invite in invites {
                 let line = match host_action(
                     &administration,

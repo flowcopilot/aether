@@ -174,6 +174,28 @@ macro_rules! sql_named {
 }
 pub(crate) use sql_named;
 
+/// Sends an enum that [`aether_core::named!`] names as its name on the
+/// wire, so the column and the wire share one table of names.
+macro_rules! serde_named {
+    ($($name:ty),+ $(,)?) => {$(
+        impl serde::Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_str(self.as_str())
+            }
+        }
+
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let text = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
+                Self::parse(&text).ok_or_else(|| {
+                    serde::de::Error::custom(format!("unknown {} {text:?}", stringify!($name)))
+                })
+            }
+        }
+    )+};
+}
+pub(crate) use serde_named;
+
 /// The column `index` of `row`, which holds a count that is never
 /// negative.
 pub(crate) fn column_u64(

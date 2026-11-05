@@ -8,11 +8,12 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use aether_store::NodeStore;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 
 use crate::{
-    control_service::WireInvitation,
-    discovery::Invitation,
+    data_dir::DataDir,
+    discovery::{Invitation, wire::WireInvitation},
     transport::{A2aAuthorization, A2aRequest, Frame, FrameKind, TransportError},
 };
 
@@ -44,6 +45,22 @@ pub struct InvitationBundle {
     /// base64url (`v2` only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_card_signature: Option<String>,
+}
+
+/// The name of connect codes while the node has no name on the hub.
+pub struct HostName;
+
+impl crate::settings::Setting for HostName {
+    const KEY: &'static str = "node.runtime.host_name";
+    type Value = String;
+
+    fn decode(stored: String) -> Result<Self::Value, aether_store::StoreError> {
+        Ok(stored)
+    }
+
+    fn encode(value: &Self::Value) -> Result<Option<String>, aether_store::StoreError> {
+        Ok(Some(value.clone()))
+    }
 }
 
 /// The prefix of an [`InvitationBundle`]'s one-line form.
@@ -148,23 +165,22 @@ pub fn sign_invite_access(
     {
         return Err(DirectError::Invalid);
     }
-    let issuer = crate::node_config::node_issuer_key(data_dir)
-        .map_err(|_| DirectError::Unavailable)?;
-    crate::identity::sign_access(
-        &issuer,
-        &crate::identity::AccessInput {
-            issuer_agent_id: crate::node_config::NODE_ISSUER.to_owned(),
-            subject_agent_id: friend_name.to_owned(),
-            subject_endpoint_id: endpoint_id.to_owned(),
-            scope_id: SCOPE.to_owned(),
-            capabilities: vec![crate::execution::GENERAL_SKILL.to_owned()],
-            workspaces: vec!["workspace".to_owned()],
-            access_mode: aether_core::AccessMode::ReadOnly,
-            approval_rule: aether_core::ApprovalRule::Automatic,
-            lifetime: Duration::from_secs(days.saturating_mul(24 * 60 * 60)),
-        },
-    )
-    .map_err(|_| DirectError::Invalid)
+    let issuer =
+        DataDir::new(data_dir).issuer_key().map_err(|_| DirectError::Unavailable)?;
+    let access = crate::identity::AccessInput {
+        issuer_agent_id: crate::identity::NODE_ISSUER.to_owned(),
+        subject_agent_id: friend_name.to_owned(),
+        subject_endpoint_id: endpoint_id.to_owned(),
+        scope_id: SCOPE.to_owned(),
+        capabilities: vec![crate::execution::GENERAL_SKILL.to_owned()],
+        workspaces: vec!["workspace".to_owned()],
+        access_mode: aether_core::AccessMode::ReadOnly,
+        approval_rule: aether_core::ApprovalRule::Automatic,
+        lifetime: Duration::from_secs(days.saturating_mul(24 * 60 * 60)),
+    };
+    let (claim, grant) = crate::identity::sign_access(&issuer, &access)
+        .map_err(|_| DirectError::Invalid)?;
+    Ok((A2aAuthorization::for_access(&access, &claim), grant))
 }
 
 /// Finish a connect code after the running node accepts the grant.
@@ -217,12 +233,9 @@ pub fn create_invitation(
     if agent_id.is_empty() || expires_in.is_zero() {
         return Err(DirectError::Invalid);
     }
-    std::fs::create_dir_all(data_dir).map_err(|_| DirectError::Unavailable)?;
-    let endpoint = crate::transport::load_or_create_key(data_dir.join("endpoint.key"))
-        .map_err(|_| DirectError::Unavailable)?;
-    let signing_key =
-        crate::discovery::load_or_create_signing_key(data_dir.join("discovery.key"))
-            .map_err(|_| DirectError::Unavailable)?;
+    let layout = DataDir::new(data_dir);
+    let endpoint = layout.endpoint_key().map_err(|_| DirectError::Unavailable)?;
+    let signing_key = layout.discovery_key().map_err(|_| DirectError::Unavailable)?;
     let expires_at =
         SystemTime::now().checked_add(expires_in).ok_or(DirectError::Invalid)?;
     let invitation = crate::discovery::signed_invitation(
@@ -236,8 +249,7 @@ pub fn create_invitation(
 }
 
 /// The Agent Card of this node for the agent name `agent_id`, and its
-/// signature with the invitation key (`discovery.key`), in unpadded
-/// base64url.
+/// signature with the invitation key, in unpadded base64url.
 pub fn create_card(
     data_dir: &Path,
     agent_id: &str,
@@ -252,8 +264,7 @@ pub fn create_card(
         &endpoint,
     );
     let key =
-        crate::discovery::load_or_create_signing_key(data_dir.join("discovery.key"))
-            .map_err(|_| DirectError::Unavailable)?;
+        DataDir::new(data_dir).discovery_key().map_err(|_| DirectError::Unavailable)?;
     let signature = crate::discovery::sign_agent_card(&key, &endpoint, agent_id, &card);
     let card = String::from_utf8(card).map_err(|_| DirectError::Invalid)?;
     Ok((card, URL_SAFE_NO_PAD.encode(signature)))
@@ -264,6 +275,13 @@ pub fn import_invitation(
     data_dir: &Path,
     wire: &WireInvitation,
 ) -> Result<Invitation, DirectError> {
+    import_invitation_in(&open_store(data_dir)?, wire)
+}
+
+fn import_invitation_in(
+    store: &NodeStore,
+    wire: &WireInvitation,
+) -> Result<Invitation, DirectError> {
     let invitation = match wire.to_invitation() {
         Ok(invitation) if invitation.scope_id == SCOPE => invitation,
         _ => return Err(DirectError::Invalid),
@@ -272,15 +290,12 @@ pub fn import_invitation(
         i64::try_from(wire.expires_at).map_err(|_| DirectError::Invalid)?;
     // A name stays with its endpoint: an invite from another key does not
     // take over a contact that is still valid.
-    if contact(data_dir, &invitation.agent_id)
+    if contact(store, &invitation.agent_id)
         .is_ok_and(|current| current.endpoint_id != invitation.endpoint_id)
     {
         return Err(DirectError::NameInUse);
     }
     let record = serde_json::to_vec(wire).map_err(|_| DirectError::Invalid)?;
-    std::fs::create_dir_all(data_dir).map_err(|_| DirectError::Unavailable)?;
-    let store = aether_store::NodeStore::in_dir(data_dir)
-        .map_err(|_| DirectError::Unavailable)?;
     store
         .put_contact_record(&aether_store::SignedRecord {
             scope_id: SCOPE.to_owned(),
@@ -293,18 +308,8 @@ pub fn import_invitation(
 }
 
 /// The stored, still valid invitation of the contact named `agent_id`.
-pub fn contact(data_dir: &Path, agent_id: &str) -> Result<WireInvitation, DirectError> {
-    if agent_id.is_empty() {
-        return Err(DirectError::UnknownContact);
-    }
-    let store = aether_store::NodeStore::in_dir(data_dir)
-        .map_err(|_| DirectError::UnknownContact)?;
-    contact_in(&store, agent_id)
-}
-
-/// [`contact`] in an open store.
-fn contact_in(
-    store: &aether_store::NodeStore,
+pub fn contact(
+    store: &NodeStore,
     agent_id: &str,
 ) -> Result<WireInvitation, DirectError> {
     if agent_id.is_empty() {
@@ -328,9 +333,11 @@ fn contact_in(
     Ok(wire)
 }
 
-/// The configuration key of an imported contact's bundle.
+/// The prefix of the configuration key of an imported contact's bundle.
+const BUNDLE_PREFIX: &str = "caller.contact.";
+
 fn bundle_key(agent_id: &str) -> String {
-    format!("caller.contact.{agent_id}")
+    format!("{BUNDLE_PREFIX}{agent_id}")
 }
 
 /// The configuration key of the exact Agent Card of the contact at
@@ -366,10 +373,9 @@ fn checked_card(bundle: &InvitationBundle) -> Result<Option<&str>, DirectError> 
     Ok(Some(card))
 }
 
-/// The node store of `data_dir`, for the `*_in` lookups.
-pub fn open_store(data_dir: &Path) -> Result<aether_store::NodeStore, DirectError> {
-    std::fs::create_dir_all(data_dir).map_err(|_| DirectError::Unavailable)?;
-    aether_store::NodeStore::in_dir(data_dir).map_err(|_| DirectError::Unavailable)
+/// The node store of `data_dir`, which the contact lookups read.
+pub fn open_store(data_dir: &Path) -> Result<NodeStore, DirectError> {
+    DataDir::new(data_dir).store().map_err(|_| DirectError::Unavailable)
 }
 
 /// The agent name of a node without a hub name or `--invite-name`.
@@ -383,8 +389,8 @@ pub fn default_agent_name(endpoint_id: &str) -> String {
 
 /// This data directory's endpoint id: what a host needs to invite it.
 pub fn endpoint_id(data_dir: &Path) -> Result<String, DirectError> {
-    std::fs::create_dir_all(data_dir).map_err(|_| DirectError::Unavailable)?;
-    crate::transport::load_or_create_key(data_dir.join("endpoint.key"))
+    DataDir::new(data_dir)
+        .endpoint_key()
         .map(|key| key.public().to_string())
         .map_err(|_| DirectError::Unavailable)
 }
@@ -404,7 +410,8 @@ pub fn import_bundle(
     }
     // The card is checked before anything is stored.
     let card = checked_card(bundle)?;
-    let invitation = import_invitation(data_dir, &bundle.invitation)?;
+    let store = open_store(data_dir)?;
+    let invitation = import_invitation_in(&store, &bundle.invitation)?;
     // The contact keeps the v1 shape; the card text is kept on its own.
     let kept = InvitationBundle::v1(
         bundle.invitation.clone(),
@@ -412,7 +419,6 @@ pub fn import_bundle(
         bundle.relay_url.clone(),
     );
     let value = serde_json::to_string(&kept).map_err(|_| DirectError::Invalid)?;
-    let store = open_store(data_dir)?;
     store
         .put_configuration(&bundle_key(&invitation.agent_id), &value)
         .map_err(|_| DirectError::Unavailable)?;
@@ -422,11 +428,11 @@ pub fn import_bundle(
     }
     .map_err(|_| DirectError::Unavailable)?;
     // The same key under a new name is a rename: the old name goes.
-    for old in contact_bundles(data_dir)? {
+    for old in contact_bundles(&store)? {
         if old.invitation.endpoint_id == invitation.endpoint_id
             && old.invitation.agent_id != invitation.agent_id
         {
-            remove_contact(data_dir, &old.invitation.agent_id)?;
+            remove_contact_in(&store, &old.invitation.agent_id)?;
         }
     }
     Ok(invitation)
@@ -435,24 +441,21 @@ pub fn import_bundle(
 /// The kept bundle of the contact at `endpoint_id`, when its invitation is
 /// still valid.
 pub fn contact_by_endpoint(
-    data_dir: &Path,
+    store: &NodeStore,
     endpoint_id: &str,
 ) -> Result<InvitationBundle, DirectError> {
-    contacts_by_endpoint(&open_store(data_dir)?)?
-        .remove(endpoint_id)
-        .ok_or(DirectError::UnknownContact)
+    contacts_by_endpoint(store)?.remove(endpoint_id).ok_or(DirectError::UnknownContact)
 }
 
-/// The bundle of each endpoint that [`contact_by_endpoint`] finds, read from
-/// one open store.
+/// The bundle of each endpoint that [`contact_by_endpoint`] finds.
 pub fn contacts_by_endpoint(
-    store: &aether_store::NodeStore,
+    store: &NodeStore,
 ) -> Result<BTreeMap<String, InvitationBundle>, DirectError> {
     let mut contacts = BTreeMap::new();
-    for bundle in contact_bundles_in(store)? {
+    for bundle in contact_bundles(store)? {
         let endpoint_id = &bundle.invitation.endpoint_id;
         if !contacts.contains_key(endpoint_id)
-            && contact_in(store, &bundle.invitation.agent_id)
+            && contact(store, &bundle.invitation.agent_id)
                 .is_ok_and(|wire| wire.endpoint_id == *endpoint_id)
         {
             contacts.insert(endpoint_id.clone(), bundle);
@@ -463,14 +466,7 @@ pub fn contacts_by_endpoint(
 
 /// The kept bundle of the contact named `agent_id`.
 pub fn contact_bundle(
-    data_dir: &Path,
-    agent_id: &str,
-) -> Result<InvitationBundle, DirectError> {
-    contact_bundle_in(&open_store(data_dir)?, agent_id)
-}
-
-fn contact_bundle_in(
-    store: &aether_store::NodeStore,
+    store: &NodeStore,
     agent_id: &str,
 ) -> Result<InvitationBundle, DirectError> {
     let value = store
@@ -482,11 +478,14 @@ fn contact_bundle_in(
 /// Forgets the contact named `agent_id`: its signed invitation and its
 /// bundle. [`DirectError::UnknownContact`] when there is no such contact.
 pub fn remove_contact(data_dir: &Path, agent_id: &str) -> Result<(), DirectError> {
+    remove_contact_in(&open_store(data_dir)?, agent_id)
+}
+
+fn remove_contact_in(store: &NodeStore, agent_id: &str) -> Result<(), DirectError> {
     if !valid_name(agent_id) {
         return Err(DirectError::UnknownContact);
     }
-    let store = open_store(data_dir)?;
-    if let Ok(bundle) = contact_bundle(data_dir, agent_id) {
+    if let Ok(bundle) = contact_bundle(store, agent_id) {
         store
             .delete_configuration(&card_key(&bundle.invitation.endpoint_id))
             .map_err(|_| DirectError::Unavailable)?;
@@ -507,16 +506,7 @@ pub fn remove_contact(data_dir: &Path, agent_id: &str) -> Result<(), DirectError
 /// The checked Agent Card of the contact of `bundle`, when its host sent one.
 #[must_use]
 pub fn contact_card(
-    data_dir: &Path,
-    bundle: &InvitationBundle,
-) -> Option<crate::agent_card::CardView> {
-    contact_card_in(&open_store(data_dir).ok()?, bundle)
-}
-
-/// [`contact_card`] in an open store.
-#[must_use]
-pub fn contact_card_in(
-    store: &aether_store::NodeStore,
+    store: &NodeStore,
     bundle: &InvitationBundle,
 ) -> Option<crate::agent_card::CardView> {
     let card = store.configuration(&card_key(&bundle.invitation.endpoint_id)).ok()?;
@@ -529,16 +519,11 @@ pub fn contact_card_in(
 }
 
 /// Every kept bundle, in name order.
-pub fn contact_bundles(data_dir: &Path) -> Result<Vec<InvitationBundle>, DirectError> {
-    contact_bundles_in(&open_store(data_dir)?)
-}
-
-/// [`contact_bundles`] in an open store.
-pub fn contact_bundles_in(
-    store: &aether_store::NodeStore,
+pub fn contact_bundles(
+    store: &NodeStore,
 ) -> Result<Vec<InvitationBundle>, DirectError> {
     let values = store
-        .configuration_values("caller.contact.")
+        .configuration_values(BUNDLE_PREFIX)
         .map_err(|_| DirectError::Unavailable)?;
     Ok(values.iter().filter_map(|value| serde_json::from_str(value).ok()).collect())
 }
@@ -611,20 +596,11 @@ pub fn resend_frame(
 /// The kept bundle of the contact named `agent_id`, when its invitation is
 /// still valid.
 pub fn contact_by_name(
-    data_dir: &Path,
+    store: &NodeStore,
     agent_id: &str,
 ) -> Result<InvitationBundle, DirectError> {
-    contact(data_dir, agent_id)?;
-    contact_bundle(data_dir, agent_id)
-}
-
-/// [`contact_by_name`] in an open store.
-pub fn contact_by_name_in(
-    store: &aether_store::NodeStore,
-    agent_id: &str,
-) -> Result<InvitationBundle, DirectError> {
-    contact_in(store, agent_id)?;
-    contact_bundle_in(store, agent_id)
+    contact(store, agent_id)?;
+    contact_bundle(store, agent_id)
 }
 
 /// When the access of `bundle` ends: the earlier of the invitation expiry
@@ -795,21 +771,23 @@ pub(crate) fn test_bundle_named(
     agent: &str,
     with_card: bool,
 ) -> InvitationBundle {
-    let (authorization, _) = crate::identity::sign_access(
+    let access = crate::identity::AccessInput {
+        issuer_agent_id: "node".to_owned(),
+        subject_agent_id: "ana".to_owned(),
+        subject_endpoint_id: caller_endpoint.to_owned(),
+        scope_id: SCOPE.to_owned(),
+        capabilities: vec![crate::execution::GENERAL_SKILL.to_owned()],
+        workspaces: vec!["workspace".to_owned()],
+        access_mode: aether_core::AccessMode::ReadOnly,
+        approval_rule: aether_core::ApprovalRule::Automatic,
+        lifetime: Duration::from_secs(60),
+    };
+    let (claim, _) = crate::identity::sign_access(
         &ed25519_dalek::SigningKey::from_bytes(&[9; 32]),
-        &crate::identity::AccessInput {
-            issuer_agent_id: "node".to_owned(),
-            subject_agent_id: "ana".to_owned(),
-            subject_endpoint_id: caller_endpoint.to_owned(),
-            scope_id: SCOPE.to_owned(),
-            capabilities: vec![crate::execution::GENERAL_SKILL.to_owned()],
-            workspaces: vec!["workspace".to_owned()],
-            access_mode: aether_core::AccessMode::ReadOnly,
-            approval_rule: aether_core::ApprovalRule::Automatic,
-            lifetime: Duration::from_secs(60),
-        },
+        &access,
     )
     .expect("access must sign");
+    let authorization = crate::transport::A2aAuthorization::for_access(&access, &claim);
     let invitation = create_invitation(host_dir, agent, Duration::from_secs(60))
         .expect("invitation");
     let relay_url = Some("https://relay.test".to_owned());
@@ -821,9 +799,7 @@ pub(crate) fn test_bundle_named(
         &invitation.agent_id,
         &invitation.endpoint_id,
     );
-    let key =
-        crate::discovery::load_or_create_signing_key(host_dir.join("discovery.key"))
-            .expect("discovery key must load");
+    let key = DataDir::new(host_dir).discovery_key().expect("discovery key must load");
     let signature = crate::discovery::sign_agent_card(
         &key,
         &invitation.endpoint_id,
@@ -855,21 +831,24 @@ mod tests {
         caller_endpoint: &str,
         agent: &str,
     ) -> super::InvitationBundle {
-        let (authorization, _) = crate::identity::sign_access(
+        let access = crate::identity::AccessInput {
+            issuer_agent_id: "node".to_owned(),
+            subject_agent_id: "ana".to_owned(),
+            subject_endpoint_id: caller_endpoint.to_owned(),
+            scope_id: super::SCOPE.to_owned(),
+            capabilities: vec![crate::execution::GENERAL_SKILL.to_owned()],
+            workspaces: vec!["workspace".to_owned()],
+            access_mode: aether_core::AccessMode::ReadOnly,
+            approval_rule: aether_core::ApprovalRule::Automatic,
+            lifetime: std::time::Duration::from_secs(60),
+        };
+        let (claim, _) = crate::identity::sign_access(
             &ed25519_dalek::SigningKey::from_bytes(&[9; 32]),
-            &crate::identity::AccessInput {
-                issuer_agent_id: "node".to_owned(),
-                subject_agent_id: "ana".to_owned(),
-                subject_endpoint_id: caller_endpoint.to_owned(),
-                scope_id: super::SCOPE.to_owned(),
-                capabilities: vec![crate::execution::GENERAL_SKILL.to_owned()],
-                workspaces: vec!["workspace".to_owned()],
-                access_mode: aether_core::AccessMode::ReadOnly,
-                approval_rule: aether_core::ApprovalRule::Automatic,
-                lifetime: std::time::Duration::from_secs(60),
-            },
+            &access,
         )
         .expect("access must sign");
+        let authorization =
+            crate::transport::A2aAuthorization::for_access(&access, &claim);
         super::InvitationBundle {
             format: super::BUNDLE_FORMAT_V1.to_owned(),
 
@@ -885,6 +864,10 @@ mod tests {
             authorization,
             relay_url: Some("https://relay.test".to_owned()),
         }
+    }
+
+    fn store(data_dir: &std::path::Path) -> aether_store::NodeStore {
+        super::open_store(data_dir).expect("store must open")
     }
 
     fn kept_card(caller: &std::path::Path, host: &std::path::Path) -> Option<String> {
@@ -944,8 +927,8 @@ mod tests {
             &super::test_bundle(host.path(), &endpoint, false),
         )
         .expect("the bundle must import");
-        assert!(super::contact_by_name(caller.path(), "tudor").is_ok());
-        assert!(super::contact_by_name(caller.path(), "nobody").is_err());
+        assert!(super::contact_by_name(&store(caller.path()), "tudor").is_ok());
+        assert!(super::contact_by_name(&store(caller.path()), "nobody").is_err());
     }
 
     #[test]
@@ -959,9 +942,10 @@ mod tests {
             super::InvitationBundle::decode(&line).expect("the line must decode");
         super::import_bundle(caller.path(), &decoded).expect("the bundle must import");
         assert_eq!(kept_card(caller.path(), host.path()), bundle.agent_card);
-        let kept = super::contact_bundle(caller.path(), "tudor").expect("contact");
-        let card =
-            super::contact_card(caller.path(), &kept).expect("the card must show");
+        let kept =
+            super::contact_bundle(&store(caller.path()), "tudor").expect("contact");
+        let card = super::contact_card(&store(caller.path()), &kept)
+            .expect("the card must show");
         assert_eq!(card.name, "tudor");
         assert_eq!(card.skill_name, "General tasks");
     }
@@ -976,7 +960,8 @@ mod tests {
             &super::test_bundle(host.path(), &endpoint, true),
         )
         .expect("the bundle must import");
-        let kept = super::contact_bundle(caller.path(), "tudor").expect("contact");
+        let kept =
+            super::contact_bundle(&store(caller.path()), "tudor").expect("contact");
         assert_eq!(kept.format, super::BUNDLE_FORMAT_V1);
         assert_eq!((kept.agent_card, kept.agent_card_signature), (None, None));
     }
@@ -994,7 +979,7 @@ mod tests {
             super::import_bundle(caller.path(), &changed).err(),
             Some(super::DirectError::Invalid)
         );
-        assert!(super::contact(caller.path(), "tudor").is_err());
+        assert!(super::contact(&store(caller.path()), "tudor").is_err());
         assert_eq!(kept_card(caller.path(), host.path()), None);
 
         let mut unsigned = super::test_bundle(host.path(), &endpoint, true);
@@ -1064,12 +1049,12 @@ mod tests {
         )
         .expect("the bundle must import");
         assert_eq!(
-            super::contact(caller.path(), "tudor#0042")
+            super::contact(&store(caller.path()), "tudor#0042")
                 .expect("contact must resolve")
                 .agent_id,
             "tudor#0042"
         );
-        assert!(super::contact_bundle(caller.path(), "tudor#0042").is_ok());
+        assert!(super::contact_bundle(&store(caller.path()), "tudor#0042").is_ok());
     }
 
     #[test]
@@ -1087,17 +1072,17 @@ mod tests {
             &bundle_named(host.path(), &endpoint, "tudor-k"),
         )
         .expect("the new name must import");
-        let names: Vec<String> = super::contact_bundles(caller.path())
+        let names: Vec<String> = super::contact_bundles(&store(caller.path()))
             .expect("contacts must list")
             .into_iter()
             .map(|bundle| bundle.invitation.agent_id)
             .collect();
         assert_eq!(names, ["tudor-k"]);
-        assert!(super::contact(caller.path(), "tudor").is_err());
+        assert!(super::contact(&store(caller.path()), "tudor").is_err());
         let host_endpoint =
             super::endpoint_id(host.path()).expect("endpoint must load");
         assert_eq!(
-            super::contact_by_endpoint(caller.path(), &host_endpoint)
+            super::contact_by_endpoint(&store(caller.path()), &host_endpoint)
                 .expect("the contact must resolve")
                 .invitation
                 .agent_id,
@@ -1121,7 +1106,7 @@ mod tests {
         let first_endpoint =
             super::endpoint_id(first.path()).expect("endpoint must load");
         assert_eq!(
-            super::contact(caller.path(), "tudor")
+            super::contact(&store(caller.path()), "tudor")
                 .expect("the contact must stay")
                 .endpoint_id,
             first_endpoint
@@ -1150,12 +1135,14 @@ mod tests {
         let invitation = super::import_bundle(caller.path(), &decoded)
             .expect("the bundle must import");
         assert_eq!(invitation.agent_id, "tudor");
-        let kept = super::contact_bundle(caller.path(), "tudor")
+        let kept = super::contact_bundle(&store(caller.path()), "tudor")
             .expect("contact must be kept");
         assert_eq!(kept.relay_url.as_deref(), Some("https://relay.test"));
         assert_eq!(kept.authorization.caller_endpoint_id, endpoint);
         assert_eq!(
-            super::contact_bundles(caller.path()).expect("contacts must list").len(),
+            super::contact_bundles(&store(caller.path()))
+                .expect("contacts must list")
+                .len(),
             1
         );
     }
@@ -1168,13 +1155,13 @@ mod tests {
         super::import_bundle(caller.path(), &bundle_for(host.path(), &endpoint))
             .expect("the bundle must import");
         super::remove_contact(caller.path(), "tudor").expect("the contact must remove");
-        assert!(super::contact_bundle(caller.path(), "tudor").is_err());
+        assert!(super::contact_bundle(&store(caller.path()), "tudor").is_err());
         assert_eq!(
-            super::contact(caller.path(), "tudor").err(),
+            super::contact(&store(caller.path()), "tudor").err(),
             Some(super::DirectError::UnknownContact)
         );
         assert!(
-            super::contact_bundles(caller.path())
+            super::contact_bundles(&store(caller.path()))
                 .expect("contacts must list")
                 .is_empty()
         );
@@ -1195,7 +1182,7 @@ mod tests {
             Some(super::DirectError::OtherEndpoint)
         );
         assert!(
-            super::contact_bundles(caller.path())
+            super::contact_bundles(&store(caller.path()))
                 .expect("contacts must list")
                 .is_empty()
         );
@@ -1223,13 +1210,13 @@ mod tests {
             iroh::SecretKey::generate().public().to_string(),
             std::time::SystemTime::now() - std::time::Duration::from_secs(1),
         );
-        let wire = crate::control_service::WireInvitation::from_invitation(&expired);
+        let wire = crate::discovery::wire::WireInvitation::from_invitation(&expired);
         assert_eq!(
             super::import_invitation(directory.path(), &wire).err(),
             Some(super::DirectError::Invalid)
         );
         assert_eq!(
-            super::contact(directory.path(), "tudor").err(),
+            super::contact(&store(directory.path()), "tudor").err(),
             Some(super::DirectError::UnknownContact)
         );
     }

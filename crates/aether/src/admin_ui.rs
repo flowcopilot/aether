@@ -43,7 +43,6 @@ mod pact;
 
 use crate::admin::SharedAdministration;
 use crate::admin_components::status_dot;
-use crate::node_config::settings;
 use advanced::dashboard;
 use caller::caller_screen;
 use host::host_screen;
@@ -304,6 +303,15 @@ pub(super) enum Tab {
     Advanced,
 }
 
+/// The data directory of this page's side: the host's, else the caller's.
+pub(super) fn page_data_dir(cx: &Cx) -> Option<std::path::PathBuf> {
+    let Host(host) = app_context::<Host>(cx);
+    let Caller(caller) = app_context::<Caller>(cx);
+    host.as_ref()
+        .map(|host| host.data_dir.clone())
+        .or_else(|| caller.as_ref().map(|caller| caller.data_dir.clone()))
+}
+
 /// The bar on top of every page: the product, one tab for each screen that
 /// this mode has, with the count of what waits on it, and on the right how
 /// the node is reached and its name on Aether.
@@ -311,10 +319,7 @@ pub(super) enum Tab {
 pub(super) async fn node_header(cx: &Cx, current: Tab) -> TopcoatResult<impl View> {
     let Host(host) = app_context::<Host>(cx);
     let Caller(caller) = app_context::<Caller>(cx);
-    let data_dir = host
-        .as_ref()
-        .map(|host| host.data_dir.clone())
-        .or_else(|| caller.as_ref().map(|caller| caller.data_dir.clone()));
+    let data_dir = page_data_dir(cx);
     let drafts = caller.as_ref().map_or(0, |caller| {
         let now = aether_core::time::now_seconds();
         caller::request_drafts_of(&caller.data_dir, now).len()
@@ -333,7 +338,9 @@ pub(super) async fn node_header(cx: &Cx, current: Tab) -> TopcoatResult<impl Vie
         })
     });
     let name = data_dir.as_deref().and_then(|dir| {
-        crate::node_config::setting::<settings::HubName>(dir).ok().flatten()
+        crate::settings::setting::<crate::hub_client::settings::HubName>(dir)
+            .ok()
+            .flatten()
     });
     let tabs = host.is_some() || caller.is_some();
     let agents_href = if host.is_some() { "/agents" } else { "/" };
@@ -661,7 +668,7 @@ impl HostContext {
     /// endpoint ID. The hub name comes first, so invites carry the name that
     /// people find this node by.
     pub(super) fn agent_name(&self) -> String {
-        crate::node_config::setting::<settings::HubName>(&self.data_dir)
+        crate::settings::setting::<crate::hub_client::settings::HubName>(&self.data_dir)
             .ok()
             .flatten()
             .or_else(|| self.name.clone())
@@ -687,7 +694,7 @@ impl HostContext {
 
     /// The relay the node listens through now.
     fn relay_url(&self) -> Option<String> {
-        crate::node_config::setting::<settings::ActiveRelay>(&self.data_dir)
+        crate::settings::setting::<crate::transport::relay::ActiveRelay>(&self.data_dir)
             .unwrap_or_else(|_| {
                 self.relay_url.lock().unwrap_or_else(PoisonError::into_inner).clone()
             })
@@ -698,7 +705,7 @@ impl HostContext {
         &self,
         relay: Option<String>,
     ) -> Result<(), crate::transport::TransportError> {
-        crate::node_config::apply_relay(
+        crate::transport::relay::apply_relay(
             &self.data_dir,
             &relay,
             (self.switch_relay)(self.relay_url(), relay.clone()),
@@ -725,13 +732,18 @@ struct HubState {
 impl HubSlot {
     fn new(data_dir: PathBuf) -> Self {
         let stored_url =
-            crate::node_config::setting::<settings::Hub>(&data_dir).ok().flatten();
+            crate::settings::setting::<crate::hub_client::settings::Hub>(&data_dir)
+                .ok()
+                .flatten();
         Self { data_dir, state: Mutex::new(HubState { client: None, stored_url }) }
     }
 
     fn get(&self) -> Option<crate::hub_client::HubClient> {
-        let stored_url =
-            crate::node_config::setting::<settings::Hub>(&self.data_dir).ok().flatten();
+        let stored_url = crate::settings::setting::<crate::hub_client::settings::Hub>(
+            &self.data_dir,
+        )
+        .ok()
+        .flatten();
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if state.stored_url != stored_url {
             state.client = crate::hub_client::resolve_url(None, stored_url.clone())
@@ -745,8 +757,11 @@ impl HubSlot {
     }
 
     fn set(&self, hub: Option<crate::hub_client::HubClient>) {
-        let stored_url =
-            crate::node_config::setting::<settings::Hub>(&self.data_dir).ok().flatten();
+        let stored_url = crate::settings::setting::<crate::hub_client::settings::Hub>(
+            &self.data_dir,
+        )
+        .ok()
+        .flatten();
         *self.state.lock().unwrap_or_else(PoisonError::into_inner) =
             HubState { client: hub, stored_url };
     }
@@ -944,12 +959,7 @@ fn router(state: UiState) -> AxumRouter {
 }
 
 fn tls_config(data_dir: &Path) -> io::Result<Arc<ServerConfig>> {
-    let (certificate, key) = crate::key_file::self_signed_cert(
-        data_dir,
-        "admin-cert.der",
-        "admin-key.der",
-        &["localhost", "127.0.0.1"],
-    )?;
+    let (certificate, key) = crate::data_dir::DataDir::new(data_dir).admin_tls()?;
     let config = ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -987,7 +997,6 @@ mod tests {
         ChangeRequest, SharedAdministration, shared_with_store,
         test_support::{FakeNode, shared_in},
     };
-    use crate::node_config::settings;
     use aether_store::{
         AuditActor, AuditResult, ManagedMember, NodeStore, QueueLimits, TaskInput,
     };
@@ -1006,7 +1015,7 @@ mod tests {
             .expect("hub client must create"),
         ));
         assert!(slot.get().is_some());
-        crate::node_config::store_setting::<settings::Hub>(
+        crate::settings::store_setting::<crate::hub_client::settings::Hub>(
             directory.path(),
             &Some("off".to_owned()),
         )
@@ -1103,7 +1112,7 @@ mod tests {
         assert!(host(None).agent_name().starts_with("agent-"));
         assert_eq!(host(None).agent_name().len(), "agent-".len() + 8);
         assert_eq!(host(Some("server")).agent_name(), "server");
-        crate::node_config::store_setting::<settings::HubName>(
+        crate::settings::store_setting::<crate::hub_client::settings::HubName>(
             directory.path(),
             &Some("tudor".to_owned()),
         )
@@ -1163,7 +1172,7 @@ mod tests {
         let host =
             test_host(directory.path(), Arc::new(std::sync::Mutex::new(Vec::new())))
                 .with_hub(Some(hub.client(directory.path())));
-        crate::node_config::store_setting::<settings::HubName>(
+        crate::settings::store_setting::<crate::hub_client::settings::HubName>(
             directory.path(),
             &Some("tudor".to_owned()),
         )
@@ -1189,8 +1198,8 @@ mod tests {
 
         let applied = node.granted();
         assert_eq!(applied.len(), 1);
-        let grant = crate::node_config::parse_grant_json(&applied[0])
-            .expect("grant must parse");
+        let grant =
+            crate::identity::decode_grant(&applied[0]).expect("grant must parse");
         assert_eq!(grant.subject_endpoint_id.as_str(), ana);
         let state = hub.state();
         let unsent = state.invites.iter().find(|invite| invite.id == unsent);
@@ -1200,21 +1209,24 @@ mod tests {
 
     /// A line that the host in `host_dir` signed as `agent` for `caller`.
     fn signed_line(host_dir: &std::path::Path, agent: &str, caller: &str) -> String {
-        let (authorization, _) = crate::identity::sign_access(
+        let access = crate::identity::AccessInput {
+            issuer_agent_id: "node".to_owned(),
+            subject_agent_id: "ana".to_owned(),
+            subject_endpoint_id: caller.to_owned(),
+            scope_id: crate::direct::SCOPE.to_owned(),
+            capabilities: vec![crate::execution::GENERAL_SKILL.to_owned()],
+            workspaces: vec!["workspace".to_owned()],
+            access_mode: aether_core::AccessMode::ReadOnly,
+            approval_rule: aether_core::ApprovalRule::Automatic,
+            lifetime: std::time::Duration::from_secs(60),
+        };
+        let (claim, _) = crate::identity::sign_access(
             &ed25519_dalek::SigningKey::from_bytes(&[9; 32]),
-            &crate::identity::AccessInput {
-                issuer_agent_id: "node".to_owned(),
-                subject_agent_id: "ana".to_owned(),
-                subject_endpoint_id: caller.to_owned(),
-                scope_id: crate::direct::SCOPE.to_owned(),
-                capabilities: vec![crate::execution::GENERAL_SKILL.to_owned()],
-                workspaces: vec!["workspace".to_owned()],
-                access_mode: aether_core::AccessMode::ReadOnly,
-                approval_rule: aether_core::ApprovalRule::Automatic,
-                lifetime: std::time::Duration::from_secs(60),
-            },
+            &access,
         )
         .expect("access must sign");
+        let authorization =
+            crate::transport::A2aAuthorization::for_access(&access, &claim);
         crate::direct::InvitationBundle {
             format: crate::direct::BUNDLE_FORMAT_V1.to_owned(),
 
@@ -1287,8 +1299,10 @@ mod tests {
         .expect("the worker must handle both rows");
         worker.abort();
 
-        let contacts =
-            crate::direct::contact_bundles(caller_dir.path()).expect("contacts");
+        let contacts = crate::direct::contact_bundles(
+            &crate::direct::open_store(caller_dir.path()).expect("store must open"),
+        )
+        .expect("contacts");
         assert_eq!(contacts.len(), 1);
         assert_eq!(contacts[0].invitation.agent_id, "tudor");
         assert_eq!(contacts[0].invitation.endpoint_id, host);
@@ -1322,10 +1336,12 @@ mod tests {
         assert!(claimed.body.contains("tudor#0001"), "{}", claimed.body);
         assert!(claimed.body.contains("bob#0042"));
         assert_eq!(
-            crate::node_config::setting::<settings::HubName>(directory.path())
-                .ok()
-                .flatten()
-                .as_deref(),
+            crate::settings::setting::<crate::hub_client::settings::HubName>(
+                directory.path()
+            )
+            .ok()
+            .flatten()
+            .as_deref(),
             Some("tudor#0001")
         );
     }
@@ -1360,9 +1376,11 @@ mod tests {
         assert!(claimed.body.contains("This is a service agent."), "{}", claimed.body);
         assert!(!claimed.body.contains("Their name on Aether"));
         assert_eq!(
-            crate::node_config::setting::<settings::AgentKind>(directory.path())
-                .ok()
-                .flatten(),
+            crate::settings::setting::<crate::hub_client::settings::AgentKind>(
+                directory.path()
+            )
+            .ok()
+            .flatten(),
             Some(crate::hub_client::AgentKind::Service)
         );
         let endpoint = crate::direct::endpoint_id(directory.path()).expect("endpoint");
@@ -1428,10 +1446,11 @@ mod tests {
         hub: &crate::hub_client::test_hub::TestHub,
     ) -> (axum::Router, String, std::path::PathBuf) {
         let data_dir = directory.join("node");
-        crate::node_config::load_or_create_service(
+        crate::node_builder::load_or_create_service(
             &directory.join("missing-policy.json"),
             &data_dir,
             "codex".into(),
+            None,
         )
         .expect("first node policy must create");
         let page = hub_host_ui(&data_dir, hub);
@@ -1476,10 +1495,12 @@ mod tests {
             listing.description,
             crate::agent_card::settings(&data_dir).description
         );
-        let state = crate::node_config::setting::<settings::ListingState>(&data_dir)
-            .ok()
-            .flatten()
-            .expect("state");
+        let state = crate::settings::setting::<crate::listing::settings::ListingState>(
+            &data_dir,
+        )
+        .ok()
+        .flatten()
+        .expect("state");
         assert_eq!(state.listing, text);
 
         let stopped =
@@ -1487,9 +1508,11 @@ mod tests {
         assert!(stopped.body.contains("Not listed."), "{}", stopped.body);
         assert!(!hub.state().listings.contains_key(&endpoint));
         assert_eq!(
-            crate::node_config::setting::<settings::ListingState>(&data_dir)
-                .ok()
-                .flatten(),
+            crate::settings::setting::<crate::listing::settings::ListingState>(
+                &data_dir
+            )
+            .ok()
+            .flatten(),
             None
         );
     }
@@ -2029,7 +2052,7 @@ mod tests {
             Arc::new(|_, _| Box::pin(async { Ok(()) })),
         )
         .with_hub(Some(hub.client(directory.path())));
-        crate::node_config::store_setting::<settings::HubName>(
+        crate::settings::store_setting::<crate::hub_client::settings::HubName>(
             directory.path(),
             &Some("tudor".to_owned()),
         )
@@ -2120,10 +2143,12 @@ mod tests {
         assert_eq!(response.status, StatusCode::OK, "{}", response.body);
         assert!(response.body.contains("Reachable through relay.example.com"));
         assert_eq!(
-            crate::node_config::setting::<settings::Relay>(directory.path())
-                .ok()
-                .flatten()
-                .as_deref(),
+            crate::settings::setting::<crate::transport::relay::Relay>(
+                directory.path()
+            )
+            .ok()
+            .flatten()
+            .as_deref(),
             Some("https://relay.example.com/")
         );
 
@@ -2142,9 +2167,11 @@ mod tests {
         assert_eq!(response.status, StatusCode::OK);
         assert!(response.body.contains("No relay yet"));
         assert_eq!(
-            crate::node_config::setting::<settings::Relay>(directory.path())
-                .ok()
-                .flatten(),
+            crate::settings::setting::<crate::transport::relay::Relay>(
+                directory.path()
+            )
+            .ok()
+            .flatten(),
             None
         );
 
@@ -2225,11 +2252,12 @@ mod tests {
         assert_eq!(bundle.authorization.caller_agent_id, "ana");
         assert_eq!(bundle.authorization.capability_id, crate::execution::GENERAL_SKILL);
         assert_eq!(bundle.authorization.claim.subject_endpoint_id, friend);
-        let issuer = crate::node_config::node_issuer_key(directory.path())
+        let issuer = crate::data_dir::DataDir::new(directory.path())
+            .issuer_key()
             .expect("issuer key must load");
         {
             let applied = node.granted();
-            let grant = crate::node_config::parse_grant_json(
+            let grant = crate::identity::decode_grant(
                 applied.first().expect("the grant must reach the node"),
             )
             .expect("grant must parse");
@@ -2309,7 +2337,7 @@ mod tests {
             "ana must be listed"
         );
         assert!(invited.body.contains("No tasks yet"));
-        let grant_id = crate::node_config::parse_grant_json(
+        let grant_id = crate::identity::decode_grant(
             node.granted().first().expect("grant must exist"),
         )
         .expect("grant must parse")
@@ -2582,11 +2610,11 @@ mod tests {
             home.set_cookie.as_deref().expect("home must set a cookie"),
         )
         .to_owned();
-        let caller_id =
-            crate::transport::load_or_create_key(directory.path().join("endpoint.key"))
-                .expect("caller key must load")
-                .public()
-                .to_string();
+        let caller_id = crate::data_dir::DataDir::new(directory.path())
+            .endpoint_key()
+            .expect("caller key must load")
+            .public()
+            .to_string();
         assert!(home.body.contains("Connect to a friend's agent"));
         // Shown in groups of four; the copy button holds it whole.
         assert!(home.body.contains(&crate::admin_components::grouped(
@@ -2608,12 +2636,18 @@ mod tests {
             input_value(&response.body, "request-0"),
             "aether node request --scope direct --agent-id tudor --text 'Give me three ideas for a project name'"
         );
-        let kept = crate::direct::contact_bundle(directory.path(), "tudor")
-            .expect("the bundle must be kept");
+        let kept = crate::direct::contact_bundle(
+            &crate::direct::open_store(directory.path()).expect("store must open"),
+            "tudor",
+        )
+        .expect("the bundle must be kept");
         assert_eq!(kept.relay_url.as_deref(), Some("https://relay.test"));
         // The line was v2: its card is kept apart from the contact.
-        let card = crate::direct::contact_card(directory.path(), &kept)
-            .expect("the card must be kept");
+        let card = crate::direct::contact_card(
+            &crate::direct::open_store(directory.path()).expect("store must open"),
+            &kept,
+        )
+        .expect("the card must be kept");
         assert_eq!(card.name, "tudor");
         assert!(
             response
@@ -2636,7 +2670,7 @@ mod tests {
             )),
             ..UiOptions::default()
         };
-        crate::node_config::store_setting::<settings::HubName>(
+        crate::settings::store_setting::<crate::hub_client::settings::HubName>(
             directory.path(),
             &Some("tudor#0042".to_owned()),
         )
@@ -2764,7 +2798,13 @@ mod tests {
                 .await;
         assert_eq!(removed.status, StatusCode::OK, "{}", removed.body);
         assert!(!removed.body.contains("Agents you can use"));
-        assert!(crate::direct::contact_bundle(directory.path(), "tudor").is_err());
+        assert!(
+            crate::direct::contact_bundle(
+                &crate::direct::open_store(directory.path()).expect("store must open"),
+                "tudor"
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -2794,9 +2834,11 @@ mod tests {
         assert_eq!(response.status, StatusCode::BAD_REQUEST);
         assert!(response.body.contains("This is not an Aether invite."));
         assert!(
-            crate::direct::contact_bundles(directory.path())
-                .expect("contacts must list")
-                .is_empty()
+            crate::direct::contact_bundles(
+                &crate::direct::open_store(directory.path()).expect("store must open")
+            )
+            .expect("contacts must list")
+            .is_empty()
         );
     }
 
@@ -3031,10 +3073,11 @@ mod tests {
     async fn advanced_page_saves_task_policy_in_the_node_database() {
         let directory = tempfile::tempdir().expect("directory must create");
         let data_dir = directory.path().join("node");
-        crate::node_config::load_or_create_service(
+        crate::node_builder::load_or_create_service(
             &directory.path().join("missing-policy.json"),
             &data_dir,
             "codex".into(),
+            None,
         )
         .expect("first node policy must create");
         let (admin_ui, _) = host_ui(&data_dir);
@@ -3068,7 +3111,7 @@ mod tests {
         .await;
         assert_eq!(response.status, StatusCode::OK, "{}", response.body);
         assert!(response.body.contains("Policy saved"));
-        let settings = crate::node_config::policy_settings(&data_dir)
+        let settings = crate::policy::policy_settings(&data_dir)
             .expect("policy must read")
             .expect("policy must exist");
         assert_eq!(settings.max_context_tokens, 12_000);

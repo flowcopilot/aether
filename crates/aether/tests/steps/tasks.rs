@@ -21,14 +21,12 @@ use std::{
 use aether::{
     admin::ChangeRequest,
     admin_socket::{
-        Request as AdminRequest, Response as AdminResponse, path as admin_socket_path,
-        send as send_admin,
+        Request as AdminRequest, Response as AdminResponse, send as send_admin,
     },
-    control_service::WireRecord,
     direct::InvitationBundle,
+    discovery::wire::WireRecord,
     fixture::FAKE_CODEX_SCRIPT,
-    identity::{ClaimInput, GrantInput, signed_claim, signed_grant},
-    node_config::grant_json,
+    identity::{ClaimInput, GrantInput, GrantRecord, signed_claim, signed_grant},
     transport::{
         A2aAccessMode, A2aAuthorization, A2aRequest, Frame, FrameKind, bind_node,
         request_once, text_request_payload,
@@ -324,7 +322,7 @@ fn policy_json(
 ) -> Value {
     json!({
         "trustedIssuers": {"issuer": hex::encode(trusted_key)},
-        "grants": grants.iter().map(grant_json).collect::<Vec<_>>(),
+        "grants": grants.iter().map(GrantRecord::from).collect::<Vec<_>>(),
         "workspace": workspace,
         "maxContextTokens": 32,
         // The whole fake Codex session (spawn, handshake, turn) must fit in
@@ -438,7 +436,7 @@ impl State {
     async fn add_caller(&mut self) -> usize {
         let index = self.callers.len();
         let data = self.root().join(format!("client-{index}"));
-        let client = bind_node(&data, 0).await.expect("client must bind");
+        let client = bind_node(&data, 0, None).await.expect("client must bind");
         let endpoint = EndpointId::new(client.id().to_string());
         client.close().await;
         self.callers.push(Caller {
@@ -766,7 +764,7 @@ impl State {
     }
 
     async fn change_directory(&mut self, url: String) {
-        let socket = admin_socket_path(&self.server_data());
+        let socket = aether::data_dir::DataDir::new(self.server_data()).admin_socket();
         let response = blocking(move || {
             send_admin(
                 &socket,
@@ -814,7 +812,7 @@ const fn connected_agent(world: &mut World) {
 /// The agent's MCP servers live in the node's own Codex home.
 #[given(expr = "the agent of the node has the MCP server {string}")]
 fn node_mcp_server(world: &mut World, name: String) {
-    let home = world.tasks.server_data().join("codex-home");
+    let home = aether::data_dir::DataDir::new(world.tasks.server_data()).codex_home();
     fs::create_dir_all(&home).expect("node Codex home must create");
     fs::write(
         home.join("config.toml"),
@@ -1079,7 +1077,8 @@ async fn other_endpoint_request(world: &mut World, text: String) {
 
 #[given("the connected agent is ready")]
 async fn connected_agent_ready(world: &mut World) {
-    let socket = world.tasks.server_data().join("agent.sock");
+    let socket =
+        aether::data_dir::DataDir::new(world.tasks.server_data()).agent_socket();
     let agent = blocking(move || {
         let mut agent =
             UnixStream::connect(socket).expect("the agent must connect to the node");
@@ -1197,7 +1196,7 @@ fn courier(
 async fn outbox_attempts(world: &mut World, count: usize) {
     let state = &mut world.tasks;
     let data = state.callers[0].data.clone();
-    let endpoint = bind_node(&data, 0).await.expect("client must bind");
+    let endpoint = bind_node(&data, 0, None).await.expect("client must bind");
     let courier = courier(state, &endpoint);
     let tasks = state.outbox().tasks.clone();
     assert_eq!(tasks.len(), count);
@@ -1320,7 +1319,8 @@ async fn caller_task_running(world: &mut World) {
 
 #[when("the owner cancels the caller's task")]
 async fn owner_cancels(world: &mut World) {
-    let socket = admin_socket_path(&world.tasks.server_data());
+    let socket =
+        aether::data_dir::DataDir::new(world.tasks.server_data()).admin_socket();
     let task_id = world
         .tasks
         .request
@@ -1451,7 +1451,8 @@ async fn directory_running(world: &mut World) {
     state.directory = Some(Directory {
         process: Some((process, output)),
         url,
-        certificate: control_data.join("control-cert.der"),
+        certificate: aether::data_dir::DataDir::new(&control_data)
+            .control_certificate(),
     });
 }
 

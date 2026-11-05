@@ -49,6 +49,7 @@ pub enum ManagedEventType {
 aether_core::named!(ManagedEventType { Joined => "joined", Revoked => "revoked" });
 
 sql_named!(DirectoryEventType, ManagedEventType);
+crate::serde_named!(DirectoryEventType, ManagedEventType);
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct DirectoryEvent {

@@ -1,8 +1,12 @@
 use reqwest::{Client, StatusCode, Url};
 
+use aether_store::DirectoryEventType;
+
 use crate::{
-    control_service::{WireDirectoryEvent, WireRecord},
-    discovery::validate_record,
+    discovery::{
+        validate_record,
+        wire::{self, WireDirectoryEvent, WireRecord},
+    },
     pinned_https::{self, PinnedError},
 };
 
@@ -83,23 +87,6 @@ impl DirectoryClient {
         Ok(record)
     }
 
-    pub async fn resolve_record(
-        &self,
-        agent_id: &str,
-    ) -> Result<crate::discovery::Record, DirectoryClientError> {
-        self.resolve(agent_id)
-            .await?
-            .to_record()
-            .map_err(|_| DirectoryClientError::InvalidRecord)
-    }
-
-    pub async fn renew(
-        &self,
-        record: &WireRecord,
-    ) -> Result<WireRecord, DirectoryClientError> {
-        self.publish(record).await
-    }
-
     pub async fn search(
         &self,
         capability: &str,
@@ -173,18 +160,18 @@ impl DirectoryClient {
     }
 
     fn records_url(&self) -> Result<Url, DirectoryClientError> {
-        self.url(&["v1", "records"])
+        self.url(&wire::RECORDS)
     }
 
     fn record_url(&self, agent_id: &str) -> Result<Url, DirectoryClientError> {
         if !pinned_https::valid_segment(agent_id) {
             return Err(DirectoryClientError::InvalidRecord);
         }
-        self.url(&["v1", "records", agent_id])
+        self.url(&[wire::RECORDS[0], wire::RECORDS[1], agent_id])
     }
 
     fn events_url(&self) -> Result<Url, DirectoryClientError> {
-        self.url(&["v1", "events"])
+        self.url(&wire::EVENTS)
     }
 
     fn url(&self, segments: &[&str]) -> Result<Url, DirectoryClientError> {
@@ -209,8 +196,8 @@ impl DirectoryClient {
             return Err(DirectoryClientError::InvalidRecord);
         }
         self.record_url(&event.agent_id)?;
-        match event.event.as_str() {
-            "published" | "renewed" => {
+        match event.event {
+            DirectoryEventType::Published | DirectoryEventType::Renewed => {
                 let record =
                     event.record.as_ref().ok_or(DirectoryClientError::InvalidRecord)?;
                 if record.agent_id != event.agent_id
@@ -220,8 +207,8 @@ impl DirectoryClient {
                 }
                 self.validate(record)
             }
-            "revoked" if event.record.is_none() => Ok(()),
-            _ => Err(DirectoryClientError::InvalidRecord),
+            DirectoryEventType::Revoked if event.record.is_none() => Ok(()),
+            DirectoryEventType::Revoked => Err(DirectoryClientError::InvalidRecord),
         }
     }
 }
@@ -233,7 +220,7 @@ mod tests {
     use axum_server::Handle;
 
     use super::{DirectoryClient, DirectoryClientError};
-    use crate::control_service::{WireRecord, serve};
+    use crate::{control_service::serve, discovery::wire::WireRecord};
     use ed25519_dalek::SigningKey;
 
     fn trusted_signing_key() -> [u8; 32] {
@@ -333,8 +320,9 @@ mod tests {
             .await
             .expect("server must listen")
             .expect("server address must exist");
-        let certificate = fs::read(data_dir.join("control-cert.der"))
-            .expect("certificate must exist");
+        let certificate =
+            fs::read(crate::data_dir::DataDir::new(&data_dir).control_certificate())
+                .expect("certificate must exist");
         let client = DirectoryClient::with_pinned_certificate(
             &format!("https://127.0.0.1:{}", address.port()),
             &certificate,
@@ -347,15 +335,7 @@ mod tests {
             client.resolve(&record.agent_id).await.expect("record must resolve"),
             record
         );
-        assert_eq!(
-            client
-                .resolve_record(&record.agent_id)
-                .await
-                .expect("record must resolve")
-                .endpoint_id,
-            record.endpoint_id
-        );
-        assert_eq!(client.renew(&record).await.expect("record must renew"), record);
+        assert_eq!(client.publish(&record).await.expect("record must renew"), record);
         assert_eq!(
             client.search("test").await.expect("record must search"),
             vec![record.clone()]
@@ -363,8 +343,12 @@ mod tests {
         client.revoke(&record).await.expect("record must revoke");
         let events = client.events_after(0).await.expect("events must load");
         assert_eq!(
-            events.iter().map(|event| event.event.as_str()).collect::<Vec<_>>(),
-            ["published", "renewed", "revoked"]
+            events.iter().map(|event| event.event).collect::<Vec<_>>(),
+            [
+                aether_store::DirectoryEventType::Published,
+                aether_store::DirectoryEventType::Renewed,
+                aether_store::DirectoryEventType::Revoked
+            ]
         );
         assert!(
             client

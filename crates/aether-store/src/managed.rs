@@ -236,4 +236,37 @@ mod tests {
         assert_eq!(store.managed_cursor("control", "managed"), Ok(2));
         fs::remove_file(database).expect("database must remove");
     }
+
+    #[test]
+    fn a_managed_member_keeps_its_wire_form() {
+        let member = ManagedMember {
+            scope_id: "scope".to_owned(),
+            agent_id: "agent".to_owned(),
+            endpoint_id: "endpoint".to_owned(),
+            role: "member".to_owned(),
+            expires_at: 1_900_000_000,
+            revoked_at: None,
+        };
+        let wire = serde_json::json!({
+            "scopeId": "scope",
+            "agentId": "agent",
+            "endpointId": "endpoint",
+            "role": "member",
+            "expiresAt": 1_900_000_000,
+            "revokedAt": null,
+        });
+        assert_eq!(serde_json::to_value(&member).expect("member must encode"), wire);
+        let revoked = ManagedMember { revoked_at: Some(1_800_000_000), ..member };
+        let mut revoked_wire = wire;
+        revoked_wire["revokedAt"] = serde_json::json!(1_800_000_000);
+        assert_eq!(
+            serde_json::from_value::<ManagedMember>(revoked_wire.clone())
+                .expect("member must decode"),
+            revoked
+        );
+        assert_eq!(
+            serde_json::to_value(&revoked).expect("member must encode"),
+            revoked_wire
+        );
+    }
 }

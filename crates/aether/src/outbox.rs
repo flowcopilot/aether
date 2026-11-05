@@ -74,8 +74,7 @@ impl RelayCourier {
     /// A courier on a new endpoint with the key of `data_dir`, for a process
     /// without a running node. Close it after the attempt.
     pub async fn bind(data_dir: &Path, relay: &str) -> Result<Self, TransportError> {
-        let endpoint =
-            crate::transport::bind_node_with_relay(data_dir, 0, Some(relay)).await?;
+        let endpoint = crate::transport::bind_node(data_dir, 0, Some(relay)).await?;
         Ok(Self { endpoint })
     }
 
@@ -129,9 +128,11 @@ pub fn enqueue(
     text: &str,
     now: i64,
 ) -> Result<SentTask, OutboxError> {
-    let bundle = match crate::direct::contact_by_name(data_dir, agent) {
+    let store =
+        crate::direct::open_store(data_dir).map_err(|_| OutboxError::Unavailable)?;
+    let bundle = match crate::direct::contact_by_name(&store, agent) {
         Ok(bundle) => bundle,
-        Err(_) if crate::direct::contact_bundle(data_dir, agent).is_ok() => {
+        Err(_) if crate::direct::contact_bundle(&store, agent).is_ok() => {
             return Err(OutboxError::Expired);
         }
         Err(_) => return Err(OutboxError::UnknownContact),
@@ -314,7 +315,7 @@ pub async fn attempt(
     let (store, bundle) = off_runtime(move || {
         let store =
             NodeStore::in_dir(&data_dir).map_err(|_| OutboxError::Unavailable)?;
-        let bundle = crate::direct::contact_by_endpoint(&data_dir, &endpoint_id).ok();
+        let bundle = crate::direct::contact_by_endpoint(&store, &endpoint_id).ok();
         Ok((store, bundle))
     })
     .await?;

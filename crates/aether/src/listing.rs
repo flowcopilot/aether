@@ -78,8 +78,8 @@ pub struct ListingSkill {
     pub tags: Vec<String>,
 }
 
-/// What this node last sent to the hub, kept under
-/// `node_config::settings::ListingState`.
+/// What this node last sent to the hub, kept under the setting
+/// [`settings::ListingState`].
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ListingState {
@@ -265,6 +265,38 @@ fn valid_word(word: &str, max: usize) -> bool {
         && word.bytes().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
         })
+}
+
+pub mod settings {
+    use aether_store::StoreError;
+
+    use crate::settings::Setting;
+
+    /// The listing that this node last sent to its hub as its public
+    /// listing, if any. `None` forgets it.
+    pub struct ListingState;
+
+    impl Setting for ListingState {
+        const KEY: &'static str = "node.listing_state";
+        type Value = Option<super::ListingState>;
+
+        fn absent() -> Result<Self::Value, StoreError> {
+            Ok(None)
+        }
+
+        fn decode(stored: String) -> Result<Self::Value, StoreError> {
+            Ok(serde_json::from_str(&stored).ok())
+        }
+
+        fn encode(value: &Self::Value) -> Result<Option<String>, StoreError> {
+            value
+                .as_ref()
+                .map(|state| {
+                    serde_json::to_string(state).map_err(|_| StoreError::InvalidState)
+                })
+                .transpose()
+        }
+    }
 }
 
 #[cfg(test)]
