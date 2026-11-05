@@ -6,7 +6,7 @@ use std::{path::Path, sync::Mutex};
 use ed25519_dalek::SigningKey;
 
 use crate::{
-    control_service::WireRecord, data_dir::DataDir, directory_client::DirectoryClient,
+    data_dir::DataDir, directory_client::DirectoryClient, discovery::wire::WireRecord,
 };
 
 /// The directory refused the record, or the record cannot be made.

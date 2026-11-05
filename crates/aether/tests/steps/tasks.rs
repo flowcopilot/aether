@@ -23,8 +23,8 @@ use aether::{
     admin_socket::{
         Request as AdminRequest, Response as AdminResponse, send as send_admin,
     },
-    control_service::WireRecord,
     direct::InvitationBundle,
+    discovery::wire::WireRecord,
     fixture::FAKE_CODEX_SCRIPT,
     identity::{ClaimInput, GrantInput, signed_claim, signed_grant},
     node_config::grant_json,

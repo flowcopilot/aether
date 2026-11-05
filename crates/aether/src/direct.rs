@@ -12,9 +12,8 @@ use aether_store::NodeStore;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 
 use crate::{
-    control_service::WireInvitation,
     data_dir::DataDir,
-    discovery::Invitation,
+    discovery::{Invitation, wire::WireInvitation},
     transport::{A2aAuthorization, A2aRequest, Frame, FrameKind, TransportError},
 };
 
@@ -1191,7 +1190,7 @@ mod tests {
             iroh::SecretKey::generate().public().to_string(),
             std::time::SystemTime::now() - std::time::Duration::from_secs(1),
         );
-        let wire = crate::control_service::WireInvitation::from_invitation(&expired);
+        let wire = crate::discovery::wire::WireInvitation::from_invitation(&expired);
         assert_eq!(
             super::import_invitation(directory.path(), &wire).err(),
             Some(super::DirectError::Invalid)

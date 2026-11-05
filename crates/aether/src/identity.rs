@@ -7,11 +7,12 @@ use aether_core::{
     AccessMode, AgentId, ApprovalRule, CapabilityId, Claim, ClaimId, EndpointId, Grant,
     GrantId, ProviderError, Scope, ScopeId, ScopeKind, TrustProvider, WorkspaceId,
 };
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::SigningKey;
+
+use crate::signed::{SignedBytes, sign, verify};
 
 pub struct SignedClaims {
     trusted_keys: BTreeMap<AgentId, [u8; 32]>,
-    revoked_keys: BTreeSet<[u8; 32]>,
     clock_skew: Duration,
 }
 
@@ -52,12 +53,32 @@ impl SignedClaims {
         trusted_keys: BTreeMap<AgentId, [u8; 32]>,
         clock_skew: Duration,
     ) -> Self {
-        Self { trusted_keys, revoked_keys: BTreeSet::new(), clock_skew }
+        Self { trusted_keys, clock_skew }
     }
 
-    pub fn revoke(&mut self, key: [u8; 32]) {
-        self.revoked_keys.insert(key);
+    /// Whether a claim or grant of `scope` with these fields is in force
+    /// now and comes from the trusted key of its issuer.
+    fn trusts(&self, signed: &Signed<'_>, scope: &Scope) -> bool {
+        let now = SystemTime::now();
+        // A skew too large for the clock accepts any issue time.
+        let latest_issue = now.checked_add(self.clock_skew);
+        *signed.scope_id == scope.id
+            && latest_issue.is_none_or(|latest| signed.issued_at <= latest)
+            && signed.expires_at > now
+            && signed.issued_at < signed.expires_at
+            && *signed.nonce != [0; 32]
+            && self.trusted_keys.get(signed.issuer) == Some(signed.signing_key)
     }
+}
+
+/// The fields a claim and a grant share, which [`SignedClaims`] checks.
+struct Signed<'a> {
+    scope_id: &'a ScopeId,
+    issuer: &'a AgentId,
+    issued_at: SystemTime,
+    expires_at: SystemTime,
+    nonce: &'a [u8; 32],
+    signing_key: &'a [u8; 32],
 }
 
 impl RosterClaims {
@@ -77,53 +98,39 @@ impl TrustProvider for SignedClaims {
         authenticated_endpoint: &EndpointId,
         scope: &Scope,
     ) -> Result<(), ProviderError> {
-        let now = SystemTime::now();
-        // A skew too large for the clock accepts any issue time.
-        let latest_issue = now.checked_add(self.clock_skew);
+        let signed = Signed {
+            scope_id: &claim.scope_id,
+            issuer: &claim.issuer_agent_id,
+            issued_at: claim.issued_at,
+            expires_at: claim.expires_at,
+            nonce: &claim.nonce,
+            signing_key: &claim.signing_key,
+        };
         if claim.subject_endpoint_id != *authenticated_endpoint
-            || claim.scope_id != scope.id
-            || latest_issue.is_some_and(|latest| claim.issued_at > latest)
-            || claim.expires_at <= now
-            || claim.issued_at >= claim.expires_at
-            || claim.nonce == [0; 32]
-            || self.revoked_keys.contains(&claim.signing_key)
-            || self.trusted_keys.get(&claim.issuer_agent_id) != Some(&claim.signing_key)
+            || !self.trusts(&signed, scope)
         {
             return Err(ProviderError::Invalid("claim is not trusted".to_owned()));
         }
-        let key = VerifyingKey::from_bytes(&claim.signing_key)
-            .map_err(|_| ProviderError::Invalid("claim key is invalid".to_owned()))?;
-        let signature =
-            Signature::try_from(claim.signature.as_slice()).map_err(|_| {
-                ProviderError::Invalid("claim signature is invalid".to_owned())
-            })?;
-        key.verify_strict(&claim_bytes(claim), &signature).map_err(|_| {
-            ProviderError::Invalid("claim signature is invalid".to_owned())
-        })
+        verify(&claim.signing_key, &claim_bytes(claim), &claim.signature).map_err(
+            |_| ProviderError::Invalid("claim signature is invalid".to_owned()),
+        )
     }
 
     fn verify_grant(&self, grant: &Grant, scope: &Scope) -> Result<(), ProviderError> {
-        let now = SystemTime::now();
-        let latest_issue = now.checked_add(self.clock_skew);
-        if grant.scope_id != scope.id
-            || latest_issue.is_some_and(|latest| grant.issued_at > latest)
-            || grant.expires_at <= now
-            || grant.issued_at >= grant.expires_at
-            || grant.nonce == [0; 32]
-            || self.revoked_keys.contains(&grant.signing_key)
-            || self.trusted_keys.get(&grant.issuer_agent_id) != Some(&grant.signing_key)
-        {
+        let signed = Signed {
+            scope_id: &grant.scope_id,
+            issuer: &grant.issuer_agent_id,
+            issued_at: grant.issued_at,
+            expires_at: grant.expires_at,
+            nonce: &grant.nonce,
+            signing_key: &grant.signing_key,
+        };
+        if !self.trusts(&signed, scope) {
             return Err(ProviderError::Invalid("grant is not trusted".to_owned()));
         }
-        let key = VerifyingKey::from_bytes(&grant.signing_key)
-            .map_err(|_| ProviderError::Invalid("grant key is invalid".to_owned()))?;
-        let signature =
-            Signature::try_from(grant.signature.as_slice()).map_err(|_| {
-                ProviderError::Invalid("grant signature is invalid".to_owned())
-            })?;
-        key.verify_strict(&grant_bytes(grant), &signature).map_err(|_| {
-            ProviderError::Invalid("grant signature is invalid".to_owned())
-        })
+        verify(&grant.signing_key, &grant_bytes(grant), &grant.signature).map_err(
+            |_| ProviderError::Invalid("grant signature is invalid".to_owned()),
+        )
     }
 }
 
@@ -177,7 +184,7 @@ pub fn signed_claim(signing_key: &SigningKey, input: ClaimInput) -> Claim {
         nonce: input.nonce,
         signature: Vec::new(),
     };
-    claim.signature = signing_key.sign(&claim_bytes(&claim)).to_bytes().to_vec();
+    claim.signature = sign(signing_key, &claim_bytes(&claim));
     claim
 }
 
@@ -199,7 +206,7 @@ pub fn signed_grant(signing_key: &SigningKey, input: GrantInput) -> Grant {
         nonce: input.nonce,
         signature: Vec::new(),
     };
-    grant.signature = signing_key.sign(&grant_bytes(&grant)).to_bytes().to_vec();
+    grant.signature = sign(signing_key, &grant_bytes(&grant));
     grant
 }
 
@@ -306,65 +313,41 @@ fn random_nonce() -> Result<[u8; 32], SignError> {
 }
 
 fn claim_bytes(claim: &Claim) -> Vec<u8> {
-    let mut bytes = b"aether/claim/v1".to_vec();
-    append_string(&mut bytes, claim.id.as_str());
-    append_string(&mut bytes, claim.issuer_agent_id.as_str());
-    append_string(&mut bytes, claim.subject_agent_id.as_str());
-    append_string(&mut bytes, claim.subject_endpoint_id.as_str());
-    append_string(&mut bytes, claim.scope_id.as_str());
-    append_time(&mut bytes, claim.issued_at);
-    append_time(&mut bytes, claim.expires_at);
-    bytes.extend_from_slice(&claim.signing_key);
-    bytes.extend_from_slice(&claim.nonce);
-    bytes
+    SignedBytes::new(b"aether/claim/v1")
+        .string(claim.id.as_str())
+        .string(claim.issuer_agent_id.as_str())
+        .string(claim.subject_agent_id.as_str())
+        .string(claim.subject_endpoint_id.as_str())
+        .string(claim.scope_id.as_str())
+        .time(claim.issued_at)
+        .time(claim.expires_at)
+        .raw(&claim.signing_key)
+        .raw(&claim.nonce)
+        .finish()
 }
 
 fn grant_bytes(grant: &Grant) -> Vec<u8> {
-    let mut bytes = b"aether/grant/v1".to_vec();
-    append_string(&mut bytes, grant.id.as_str());
-    append_string(&mut bytes, grant.issuer_agent_id.as_str());
-    append_string(&mut bytes, grant.subject_agent_id.as_str());
-    append_string(&mut bytes, grant.subject_endpoint_id.as_str());
-    append_string(&mut bytes, grant.scope_id.as_str());
-    append_strings(&mut bytes, grant.capabilities.iter().map(CapabilityId::as_str));
-    append_strings(&mut bytes, grant.workspaces.iter().map(WorkspaceId::as_str));
-    bytes.push(match grant.access_mode {
-        AccessMode::ReadOnly => 0,
-        AccessMode::ReadWrite => 1,
-    });
-    bytes.push(match grant.approval_rule {
-        ApprovalRule::Automatic => 0,
-        ApprovalRule::LocalUi => 1,
-    });
-    append_time(&mut bytes, grant.issued_at);
-    append_time(&mut bytes, grant.expires_at);
-    bytes.extend_from_slice(&grant.signing_key);
-    bytes.extend_from_slice(&grant.nonce);
-    bytes
-}
-
-fn append_string(bytes: &mut Vec<u8>, value: &str) {
-    append_length(bytes, value.len());
-    bytes.extend_from_slice(value.as_bytes());
-}
-
-/// A length as a big-endian `u64`, which holds every `usize` on the
-/// platforms Rust supports; the saturation only keeps the conversion total.
-fn append_length(bytes: &mut Vec<u8>, length: usize) {
-    bytes.extend_from_slice(&u64::try_from(length).unwrap_or(u64::MAX).to_be_bytes());
-}
-
-fn append_strings<'a>(bytes: &mut Vec<u8>, values: impl Iterator<Item = &'a str>) {
-    let values = values.collect::<Vec<_>>();
-    append_length(bytes, values.len());
-    for value in values {
-        append_string(bytes, value);
-    }
-}
-
-fn append_time(bytes: &mut Vec<u8>, value: SystemTime) {
-    let seconds = aether_core::time::unix_seconds(value).unwrap_or(0);
-    bytes.extend_from_slice(&seconds.to_be_bytes());
+    SignedBytes::new(b"aether/grant/v1")
+        .string(grant.id.as_str())
+        .string(grant.issuer_agent_id.as_str())
+        .string(grant.subject_agent_id.as_str())
+        .string(grant.subject_endpoint_id.as_str())
+        .string(grant.scope_id.as_str())
+        .strings(grant.capabilities.iter().map(CapabilityId::as_str))
+        .strings(grant.workspaces.iter().map(WorkspaceId::as_str))
+        .byte(match grant.access_mode {
+            AccessMode::ReadOnly => 0,
+            AccessMode::ReadWrite => 1,
+        })
+        .byte(match grant.approval_rule {
+            ApprovalRule::Automatic => 0,
+            ApprovalRule::LocalUi => 1,
+        })
+        .time(grant.issued_at)
+        .time(grant.expires_at)
+        .raw(&grant.signing_key)
+        .raw(&grant.nonce)
+        .finish()
 }
 
 #[cfg(test)]
@@ -452,8 +435,8 @@ mod tests {
     }
 
     #[test]
-    fn signed_claims_reject_forged_changed_wrong_expired_future_revoked_and_cross_scope_claims()
-     {
+    fn signed_claims_reject_forged_changed_wrong_expired_future_and_cross_scope_claims()
+    {
         let key = SigningKey::from_bytes(&[3; 32]);
         let valid = claim(&key);
         assert!(verify(&provider(&key), &valid));
@@ -512,13 +495,10 @@ mod tests {
                 )
                 .is_err()
         );
-        let mut revoked = provider(&key);
-        revoked.revoke(key.verifying_key().to_bytes());
-        assert!(!verify(&revoked, &valid));
     }
 
     #[test]
-    fn signed_grants_reject_changed_unknown_and_revoked_grants() {
+    fn signed_grants_reject_changed_and_unknown_grants() {
         let key = SigningKey::from_bytes(&[5; 32]);
         let valid = grant(&key);
         assert!(verify_grant(&provider(&key), &valid));
@@ -529,9 +509,6 @@ mod tests {
             &SignedClaims::new(BTreeMap::new(), Duration::ZERO),
             &valid
         ));
-        let mut revoked = provider(&key);
-        revoked.revoke(key.verifying_key().to_bytes());
-        assert!(!verify_grant(&revoked, &valid));
     }
 
     #[test]

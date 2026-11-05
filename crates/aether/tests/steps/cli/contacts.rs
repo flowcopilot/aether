@@ -3,7 +3,7 @@
 
 use std::{fs, path::PathBuf};
 
-use aether::control_service::{WireInvitation, WireRecord};
+use aether::discovery::wire::{WireInvitation, WireRecord};
 use cucumber::{given, then, when};
 
 use super::{assert_success, run, utf8};

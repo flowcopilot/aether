@@ -40,6 +40,7 @@ pub mod outbox;
 pub mod pact;
 mod pinned_https;
 pub mod proof;
+mod signed;
 pub mod transport;
 pub mod untrusted;
 

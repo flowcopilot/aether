@@ -402,7 +402,7 @@ async fn run_control(control: Control) -> ExitCode {
         match command {
             ControlCommand::TestRecord => {
                 match serde_json::to_string_pretty(
-                    &aether::control_service::WireRecord::test_record(),
+                    &aether::discovery::wire::WireRecord::test_record(),
                 ) {
                     Ok(record) => {
                         println!("{record}");
@@ -1249,7 +1249,11 @@ async fn run_node(node: Node) -> ExitCode {
                             eprintln!("aether: directory connection is invalid");
                             return ExitCode::from(2);
                         };
-                        let record = match directory.resolve_record(agent_id).await {
+                        let record = match directory.resolve(agent_id).await.and_then(|wire| {
+                            wire.to_record().map_err(|_| {
+                                aether::directory_client::DirectoryClientError::InvalidRecord
+                            })
+                        }) {
                             Ok(record) if record.scope_id == arguments.scope => {
                                 if cache_directory_record(&data_dir, &record).is_err() {
                                     eprintln!(
@@ -1405,7 +1409,7 @@ async fn start_directory_publication(
 ) -> Result<
     Option<(
         aether::directory_publication::DirectoryPublication,
-        aether::control_service::WireRecord,
+        aether::discovery::wire::WireRecord,
     )>,
     (),
 > {
@@ -1729,14 +1733,14 @@ async fn sync_managed(
             if event.cursor <= cursor {
                 return Err(());
             }
-            match event.event.as_str() {
-                "joined" => {
+            match event.event {
+                aether_store::ManagedEventType::Joined => {
                     let member = event.member.ok_or(())?;
                     store
                         .apply_managed_member(control, event.cursor, &member)
                         .map_err(|_| ())?;
                 }
-                "revoked" if event.member.is_none() => {
+                aether_store::ManagedEventType::Revoked if event.member.is_none() => {
                     store
                         .revoke_managed_member(
                             control,
@@ -1746,7 +1750,7 @@ async fn sync_managed(
                         )
                         .map_err(|_| ())?;
                 }
-                _ => return Err(()),
+                aether_store::ManagedEventType::Revoked => return Err(()),
             }
             cursor = event.cursor;
             changes = changes.checked_add(1).ok_or(())?;
@@ -1772,17 +1776,10 @@ async fn run_directory(arguments: NodeDirectory) -> ExitCode {
         return ExitCode::from(2);
     };
     let result = match arguments.command {
-        NodeDirectoryCommand::Publish { record } => {
+        NodeDirectoryCommand::Publish { record }
+        | NodeDirectoryCommand::Renew { record } => {
             if let Ok(record) = read_directory_record(&record) {
                 client.publish(&record).await.map(Some)
-            } else {
-                eprintln!("aether: directory record is invalid");
-                return ExitCode::from(2);
-            }
-        }
-        NodeDirectoryCommand::Renew { record } => {
-            if let Ok(record) = read_directory_record(&record) {
-                client.renew(&record).await.map(Some)
             } else {
                 eprintln!("aether: directory record is invalid");
                 return ExitCode::from(2);
@@ -1878,18 +1875,18 @@ async fn sync_directory(
             if change.cursor <= cursor {
                 return Err(());
             }
-            match change.event.as_str() {
-                "published" | "renewed" => {
+            match change.event {
+                aether_store::DirectoryEventType::Published
+                | aether_store::DirectoryEventType::Renewed => {
                     let record = change.record.ok_or(())?;
                     cache_wire_directory_record(&store, &record)?;
                     records = records.checked_add(1).ok_or(())?;
                 }
-                "revoked" => {
+                aether_store::DirectoryEventType::Revoked => {
                     store
                         .mark_directory_record_stale(&change.scope_id, &change.agent_id)
                         .map_err(|_| ())?;
                 }
-                _ => return Err(()),
             }
             cursor = change.cursor;
             store
@@ -1913,7 +1910,7 @@ fn read_verifying_key(path: &std::path::Path) -> Result<[u8; 32], ()> {
 
 fn read_directory_record(
     path: &std::path::Path,
-) -> Result<aether::control_service::WireRecord, ()> {
+) -> Result<aether::discovery::wire::WireRecord, ()> {
     serde_json::from_slice(&std::fs::read(path).map_err(|_| ())?).map_err(|_| ())
 }
 
@@ -1924,13 +1921,13 @@ fn cache_directory_record(
     let store = aether_store::NodeStore::in_dir(data_dir).map_err(|_| ())?;
     cache_wire_directory_record(
         &store,
-        &aether::control_service::WireRecord::from_record(record),
+        &aether::discovery::wire::WireRecord::from_record(record),
     )
 }
 
 fn cache_wire_directory_record(
     store: &aether_store::NodeStore,
-    record: &aether::control_service::WireRecord,
+    record: &aether::discovery::wire::WireRecord,
 ) -> Result<(), ()> {
     store
         .cache_directory_record(&aether_store::SignedRecord {
@@ -1956,7 +1953,7 @@ fn cached_directory_record(
     if stored.expires_at <= aether_core::time::now() {
         return Err(());
     }
-    let wire: aether::control_service::WireRecord =
+    let wire: aether::discovery::wire::WireRecord =
         serde_json::from_slice(&stored.record).map_err(|_| ())?;
     let record = wire.to_record().map_err(|_| ())?;
     if record.signing_key != trusted_key {
@@ -2025,7 +2022,7 @@ mod tests {
     fn stale_cached_directory_record_cannot_be_used() {
         let directory = tempfile::tempdir().expect("directory must create");
         let data_dir = directory.path().to_path_buf();
-        let wire = aether::control_service::WireRecord::test_record();
+        let wire = aether::discovery::wire::WireRecord::test_record();
         let record = wire.to_record().expect("record must decode");
         cache_directory_record(&data_dir, &record).expect("record must cache");
         let store =
@@ -2079,7 +2076,7 @@ mod tests {
         let token = service
             .create_managed_invitation("managed", Duration::from_secs(60))
             .expect("invitation must create");
-        let record = aether::control_service::WireRecord::from_record(
+        let record = aether::discovery::wire::WireRecord::from_record(
             &aether::discovery::signed_record(
                 &SigningKey::from_bytes(&[10; 32]),
                 "managed-agent".to_owned(),
