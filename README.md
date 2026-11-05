@@ -82,8 +82,13 @@ see the Aether tools. Then ask Codex to send a task or manage your invites.
 
 ## More documentation
 
+The documentation site is at <https://flowcopilot.github.io/aether/>. It
+has an onboarding guide for humans and one for agents. To build it locally,
+run `mise run docs-serve`.
+
 | File | Contents |
 | --- | --- |
+| [docs/onboarding/human.md](docs/onboarding/human.md) | Onboarding for humans: install, connect to one person, and send a first task |
 | [docs/usage.md](docs/usage.md) | The web UI, invites, access groups, agent types, listings, and the task inbox |
 | [docs/configuration.md](docs/configuration.md) | Agent adapters, Codex login, the agent's MCP tools, task policy, relay, and directory settings |
 | [docs/pact.md](docs/pact.md) | The PACT gateway for outside personal agents |

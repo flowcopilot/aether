@@ -46,7 +46,7 @@ each `specs/<Name>.cfg` with TLC; `mise run check` runs it too. The script
 downloads a pinned `tla2tools.jar` into `target/tla/` and checks its hash.
 Check one model with `sh scripts/tla.sh ExecutionLease`. The models do not
 read the code: when you change a function that a model names, change the
-model in the same commit. [specs/README.md](../specs/README.md) lists the
+model in the same commit. [specs/README.md](https://github.com/flowcopilot/aether/blob/main/specs/README.md) lists the
 models and what each one checks.
 
 The proof binary has three process modes:
@@ -290,7 +290,7 @@ a 30-second handler limit. The local UI accepts 32 connections, an 8 KiB form
 body, a 5-second TLS handshake, and a 10-second request. The administration
 socket accepts a 64 KiB message.
 
-The [two-VM direct-path runbook](../references/aether-vm-runbook.md) gives a
+The [two-VM direct-path runbook](https://github.com/flowcopilot/aether/blob/main/references/aether-vm-runbook.md) gives a
 separate-VM test. It does not replace a physical two-computer test.
 
 The proof includes a local HTTPS directory service. It does not include a
