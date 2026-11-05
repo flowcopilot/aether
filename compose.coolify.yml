@@ -1,0 +1,28 @@
+# The iroh relay behind Coolify's proxy. Coolify terminates TLS on the
+# domain set for this service (aether-relay.tudorandrei.xyz) and forwards to
+# port 3340, where the relay serves plain HTTP: its config has no `tls`
+# section, which the relay reads as "serve every route over HTTP". Nodes use
+# AETHER_RELAY_URL=https://aether-relay.tudorandrei.xyz.
+#
+# QUIC address discovery stays off: it needs UDP and its own TLS, which a
+# HTTP proxy cannot carry. Relaying itself runs over the WebSocket upgrade
+# on /relay, which the proxy passes through.
+services:
+  relay:
+    # Same version as the iroh client in the aether crates.
+    image: n0computer/iroh-relay:v1.1.0
+    restart: unless-stopped
+    environment:
+      # Coolify routes the service's domain to this port.
+      - SERVICE_URL_RELAY_3340
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        printf 'http_bind_addr = "[::]:3340"\nenable_metrics = false\n' > /tmp/relay.toml
+        exec /iroh-relay --config-path /tmp/relay.toml
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3340/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

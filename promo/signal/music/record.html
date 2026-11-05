@@ -1,0 +1,65 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Score recorder</title>
+<script>
+  // Tap every connection into the speakers so the mix can be captured as
+  // raw PCM. Installed before Strudel loads, so its output passes through it.
+  // Strudel creates more than one AudioContext, and a node can only connect
+  // inside its own, so each context gets its own tap. The take keeps the
+  // loudest one.
+  window.__taps = [];
+  const connect = AudioNode.prototype.connect;
+  const tapFor = (ctx) => {
+    if (ctx.__tap) return ctx.__tap;
+    const bus = ctx.createGain();
+    const proc = ctx.createScriptProcessor(4096, 2, 2);
+    const chunks = [[], []];
+    proc.onaudioprocess = (e) => {
+      if (!window.__recording) return;
+      for (let c = 0; c < 2; c++) chunks[c].push(new Float32Array(e.inputBuffer.getChannelData(c)));
+    };
+    connect.call(bus, proc);
+    connect.call(proc, ctx.destination);
+    ctx.__tap = bus;
+    window.__taps.push({ rate: ctx.sampleRate, chunks });
+    return bus;
+  };
+  AudioNode.prototype.connect = function (dest, ...rest) {
+    if (dest instanceof AudioDestinationNode) connect.call(this, tapFor(dest.context));
+    return connect.call(this, dest, ...rest);
+  };
+  window.__wav = () => {
+    const energy = (t) => t.chunks[0].reduce((s, a) => s + a.reduce((q, v) => q + v * v, 0), 0);
+    const best = window.__taps.reduce((a, b) => (energy(b) > energy(a) ? b : a));
+    const [L, R] = best.chunks;
+    const n = L.reduce((s, a) => s + a.length, 0);
+    const pcm = new Int16Array(n * 2);
+    let i = 0;
+    L.forEach((l, k) => {
+      const r = R[k];
+      for (let j = 0; j < l.length; j++) {
+        pcm[i++] = Math.max(-1, Math.min(1, l[j])) * 32767;
+        pcm[i++] = Math.max(-1, Math.min(1, r[j])) * 32767;
+      }
+    });
+    const bytes = new Uint8Array(pcm.buffer);
+    let s = "";
+    for (let k = 0; k < bytes.length; k += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(k, k + 0x8000));
+    return { rate: best.rate, taps: window.__taps.length, b64: btoa(s) };
+  };
+</script>
+<script src="https://unpkg.com/@strudel/web@1.3.0"></script>
+<script>
+  window.__start = async () => {
+    await initStrudel();
+    // initStrudel waits for a first click to load the audio worklets, and
+    // worklet synths such as supersaw stay silent until then. No one clicks
+    // a headless page, so load them now.
+    await (window.initAudio ?? window.strudel.initAudio)();
+    const file = new URLSearchParams(location.search).get("score") ?? "score.strudel.js";
+    const code = await (await fetch(file)).text();
+    window.__recording = true;
+    await evaluate(code);
+    return "playing";
+  };
+</script>

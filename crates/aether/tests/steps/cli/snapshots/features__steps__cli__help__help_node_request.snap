@@ -1,0 +1,32 @@
+---
+source: crates/aether/tests/steps/cli/help.rs
+expression: world.cli.stdout()
+---
+Usage: aether node request <FLAGS>
+
+Flags:
+      --data-dir <DATA_DIR>               Defaults to `$AETHER_DATA_DIR`, else `~/.aether/host`.
+      --endpoint-id <ENDPOINT_ID>
+      --address <ADDRESS>
+      --directory <DIRECTORY>
+      --directory-certificate <DIRECTORY_CERTIFICATE>
+      --agent-id <AGENT_ID>
+      --agent-verifying-key <AGENT_VERIFYING_KEY>
+      --managed-control <MANAGED_CONTROL>
+      --managed-control-certificate <MANAGED_CONTROL_CERTIFICATE>
+      --relay-url <RELAY_URL>             An iroh relay to reach the peer through.
+                                          [env: AETHER_RELAY_URL]
+      --scope <SCOPE>
+      --text <TEXT>
+      --authorization <AUTHORIZATION>     Optional for a direct contact imported from an invite: its
+                                          bundle holds the authorization.
+      --idempotency-key <IDEMPOTENCY_KEY>  Lets a caller retry a request idempotently by
+                                          resubmitting the same key. A fresh one is generated when
+                                          this is left unset, matching the previous, only behavior.
+      --task-id <TASK_ID>                 Lets a caller learn its own task id ahead of the response,
+                                          so it can target this request with an administration
+                                          cancellation. A fresh one is generated when this is left
+                                          unset, matching the previous, only behavior. Must be a
+                                          UUID, the same requirement the wire protocol already
+                                          places on every task id.
+  -h, --help                              Print help

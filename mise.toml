@@ -1,0 +1,84 @@
+[tools]
+node = "26.12.1"
+npm = "11.21.2"
+rust = { version = "1.98.0", components = ["rustfmt", "clippy"], mr_boxington = true }
+mr-boxington = "1.21"
+erlang = "29.1.2"
+elixir = "1.20.5-otp-29"
+java = "temurin-21.0.13+9.0.LTS"
+
+[tasks.fmt]
+description = "Check Rust formatting"
+run = "cargo fmt --all -- --check"
+
+[tasks.lint]
+description = "Run Rust lints"
+run = "cargo clippy --workspace --all-targets -- -D warnings"
+
+[tasks.test]
+description = "Run workspace tests"
+run = "cargo test --workspace"
+
+[tasks.build]
+description = "Build the workspace"
+run = "cargo build --workspace"
+
+[tasks.install-aether]
+description = "Build and install the Aether release binary"
+run = '''
+cargo build --release --locked -p aether
+mkdir -p "$HOME/.local/bin"
+install -m 755 target/release/aether "$HOME/.local/bin/aether"
+'''
+
+[tasks.server-test]
+description = "Run the hub server tests"
+dir = "server"
+run = "mix test"
+
+[tasks.hermes-plugin-test]
+description = "Run the Hermes plugin tests (the adapter tests need Hermes on PYTHONPATH)"
+run = "python3 -m unittest discover -s integrations/hermes-plugin/tests"
+
+[tasks.openclaw-plugin-test]
+description = "Run the OpenClaw plugin tests"
+run = "node --test integrations/openclaw-plugin/test/"
+
+[tasks.tla]
+description = "Model-check the TLA+ specs in specs/ with TLC"
+run = "sh scripts/tla.sh"
+
+[tasks.features]
+description = "Run the product features in features/ (node and hub)"
+run = [
+  "cargo test -p aether --test features",
+  "cd server && mix test test/features",
+]
+
+[tasks.check]
+description = "Run all local checks"
+depends = ["fmt", "lint", "test", "build", "server-test", "hermes-plugin-test", "tla"]
+
+[tasks.proof]
+description = "Run the complete local proof check"
+depends = ["check"]
+
+[tasks.container-proof]
+description = "Build images and run direct, relay, and managed relay proofs"
+run = '''
+docker build -f Dockerfile.e2e -t aether-e2e:local .
+docker build -f Dockerfile.relay -t iroh-relay:local .
+sh scripts/container-e2e.sh
+sh scripts/relay-e2e.sh
+sh scripts/managed-relay-e2e.sh
+'''
+
+[tasks.film-music]
+description = "Record the Strudel score for the promo film (real time, about 90 s)"
+dir = "promo/signal"
+run = "npm run music"
+
+[tasks.film]
+description = "Render the promo film to promo/signal/out/aether-signal.mp4"
+dir = "promo/signal"
+run = "npm run render"

@@ -1,0 +1,1 @@
+ALTER TABLE pending_changes ADD COLUMN value TEXT NOT NULL DEFAULT '';

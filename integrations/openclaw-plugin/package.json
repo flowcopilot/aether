@@ -1,0 +1,41 @@
+{
+  "name": "@aether/openclaw-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Aether channel and caller tools for OpenClaw",
+  "type": "module",
+  "openclaw": {
+    "extensions": [
+      "./dist/index.js"
+    ],
+    "channel": {
+      "id": "aether",
+      "label": "Aether",
+      "blurb": "Send and receive Aether agent tasks through the local Aether node."
+    },
+    "compat": {
+      "pluginApi": ">=2026.10.9 <2026.11.0"
+    }
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.10.9 <2026.11.0"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "openclaw": "2026.10.9",
+    "typescript": "^7.0.2"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node --test test/"
+  },
+  "overrides": {
+    "undici@8.11.2": "8.12.2",
+    "npm": "12.2.2"
+  }
+}

@@ -1,0 +1,333 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-10-22T18:00:00Z",
+  "title": "Design System: Aether",
+  "extensions": {
+    "colorMeta": {
+      "canvas": {
+        "role": "neutral",
+        "displayName": "Canvas",
+        "canonical": "oklch(0.955 0.005 165)",
+        "tonalRamp": [
+          "oklch(0.15 0.005 165)",
+          "oklch(0.27 0.005 165)",
+          "oklch(0.39 0.005 165)",
+          "oklch(0.51 0.005 165)",
+          "oklch(0.63 0.005 165)",
+          "oklch(0.75 0.005 165)",
+          "oklch(0.87 0.005 165)",
+          "oklch(0.955 0.005 165)"
+        ]
+      },
+      "background": {
+        "role": "neutral",
+        "displayName": "Paper",
+        "canonical": "oklch(0.99 0.002 165)"
+      },
+      "foreground": {
+        "role": "neutral",
+        "displayName": "Ink",
+        "canonical": "oklch(0.22 0.008 165)"
+      },
+      "muted": {
+        "role": "neutral",
+        "displayName": "Mist",
+        "canonical": "oklch(0.925 0.007 165)"
+      },
+      "muted-foreground": {
+        "role": "neutral",
+        "displayName": "Slate",
+        "canonical": "oklch(0.46 0.012 165)"
+      },
+      "border": {
+        "role": "neutral",
+        "displayName": "Hairline",
+        "canonical": "oklch(0.88 0.008 165)"
+      },
+      "primary": {
+        "role": "primary",
+        "displayName": "Deep Teal",
+        "canonical": "oklch(0.43 0.07 185)",
+        "tonalRamp": [
+          "oklch(0.15 0.07 185)",
+          "oklch(0.25 0.07 185)",
+          "oklch(0.35 0.07 185)",
+          "oklch(0.43 0.07 185)",
+          "oklch(0.55 0.07 185)",
+          "oklch(0.67 0.07 185)",
+          "oklch(0.78 0.08 185)",
+          "oklch(0.95 0.03 185)"
+        ]
+      },
+      "success": {
+        "role": "semantic",
+        "displayName": "Success",
+        "canonical": "oklch(0.46 0.09 160)"
+      },
+      "warning": {
+        "role": "semantic",
+        "displayName": "Warning",
+        "canonical": "oklch(0.47 0.09 80)"
+      },
+      "destructive": {
+        "role": "semantic",
+        "displayName": "Destructive",
+        "canonical": "oklch(0.48 0.15 30)"
+      },
+      "hub-sky": {
+        "role": "neutral",
+        "displayName": "Night Sky",
+        "canonical": "#030508"
+      },
+      "hub-ink": {
+        "role": "neutral",
+        "displayName": "Starlight",
+        "canonical": "#d6e2ee"
+      },
+      "spectrum-cyan": {
+        "role": "tertiary",
+        "displayName": "Spectrum — cyan",
+        "canonical": "#5ad1ff"
+      },
+      "spectrum-violet": {
+        "role": "tertiary",
+        "displayName": "Spectrum — violet",
+        "canonical": "#9b7bff"
+      },
+      "spectrum-pink": {
+        "role": "tertiary",
+        "displayName": "Spectrum — pink",
+        "canonical": "#ff6bd5"
+      },
+      "spectrum-amber": {
+        "role": "tertiary",
+        "displayName": "Spectrum — amber",
+        "canonical": "#ffb86b"
+      },
+      "spectrum-green": {
+        "role": "tertiary",
+        "displayName": "Spectrum — green",
+        "canonical": "#7effa8"
+      }
+    },
+    "typographyMeta": {
+      "headline": {
+        "displayName": "Headline",
+        "purpose": "One page title."
+      },
+      "title": {
+        "displayName": "Title",
+        "purpose": "Step and panel titles."
+      },
+      "lead": {
+        "displayName": "Lead",
+        "purpose": "The one-line purpose under a page title."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Rows, controls, alerts; tabular figures."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Copy-field labels, badges, hints."
+      },
+      "code": {
+        "displayName": "Code",
+        "purpose": "Invite strings, commands, paths."
+      },
+      "key": {
+        "displayName": "Key",
+        "purpose": "Endpoint keys in groups of four."
+      },
+      "section": {
+        "displayName": "Section",
+        "purpose": "A section inside a page."
+      },
+      "card-title": {
+        "displayName": "Card title",
+        "purpose": "Smaller aside cards and access groups."
+      },
+      "caption": {
+        "displayName": "Caption",
+        "purpose": "Secondary lines in cards and rows."
+      },
+      "count": {
+        "displayName": "Count",
+        "purpose": "Numbers in tab and card count pills."
+      }
+    },
+    "shadows": [
+      {
+        "name": "control",
+        "value": "0 1px 2px oklch(0.25 0.02 165 / 10%)",
+        "purpose": "Buttons with a fill or border, and inputs."
+      },
+      {
+        "name": "raised",
+        "value": "0 1px 2px oklch(0.25 0.02 165 / 7%), 0 8px 24px -6px oklch(0.25 0.02 165 / 12%)",
+        "purpose": "Cards and panels."
+      }
+    ],
+    "motion": [
+      {
+        "name": "state",
+        "value": "150ms ease (Tailwind transition-colors)",
+        "purpose": "Hover and press colour changes."
+      },
+      {
+        "name": "copied",
+        "value": "1600ms",
+        "purpose": "How long a Copy button shows 'Copied'."
+      },
+      {
+        "name": "hub-card",
+        "value": "opacity .2s, transform .2s",
+        "purpose": "The agent card on the hub map."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "sm",
+        "value": "640px"
+      },
+      {
+        "name": "hub-narrow",
+        "value": "620px"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "The one main action of a panel.",
+      "html": "<button class=\"ds-btn-primary\">Create invite</button>",
+      "css": ".ds-btn-primary{display:inline-flex;align-items:center;justify-content:center;height:36px;padding:0 16px;border:1px solid transparent;border-radius:8px;background:var(--primary,oklch(0.43 0.07 185));color:var(--primary-foreground,oklch(0.99 0.004 185));font:500 14px/20px ui-sans-serif,system-ui,sans-serif;box-shadow:0 1px 2px oklch(0.25 0.02 165 / 10%);transition:background-color .15s;cursor:pointer}.ds-btn-primary:hover{background:color-mix(in oklch,var(--primary,oklch(0.43 0.07 185)) 90%,transparent)}.ds-btn-primary:active{background:color-mix(in oklch,var(--primary,oklch(0.43 0.07 185)) 80%,transparent)}.ds-btn-primary:focus-visible{outline:none;box-shadow:0 0 0 2px var(--background,#fcfdfc),0 0 0 4px var(--ring,oklch(0.43 0.07 185))}"
+    },
+    {
+      "name": "Outline Button",
+      "kind": "button",
+      "refersTo": "button-outline",
+      "description": "Copy, Revoke at rest, secondary actions.",
+      "html": "<button class=\"ds-btn-outline\">Revoke</button>",
+      "css": ".ds-btn-outline{display:inline-flex;align-items:center;justify-content:center;height:36px;padding:0 16px;border:1px solid var(--border,oklch(0.88 0.008 165));border-radius:8px;background:var(--background,oklch(0.99 0.002 165));color:var(--foreground,oklch(0.22 0.008 165));font:500 14px/20px ui-sans-serif,system-ui,sans-serif;box-shadow:0 1px 2px oklch(0.25 0.02 165 / 10%);transition:background-color .15s;cursor:pointer}.ds-btn-outline:hover{background:color-mix(in oklch,var(--foreground,oklch(0.22 0.008 165)) 5%,var(--background,oklch(0.99 0.002 165)))}.ds-btn-outline:focus-visible{outline:none;box-shadow:0 0 0 2px var(--background,#fcfdfc),0 0 0 4px var(--ring,oklch(0.43 0.07 185))}"
+    },
+    {
+      "name": "Destructive Button",
+      "kind": "button",
+      "refersTo": "button-destructive",
+      "description": "Only the confirming click of a revoke.",
+      "html": "<button class=\"ds-btn-destructive\">Revoke</button>",
+      "css": ".ds-btn-destructive{display:inline-flex;align-items:center;justify-content:center;height:36px;padding:0 16px;border:1px solid transparent;border-radius:8px;background:var(--destructive,oklch(0.48 0.15 30));color:var(--destructive-foreground,oklch(0.99 0.012 30));font:500 14px/20px ui-sans-serif,system-ui,sans-serif;box-shadow:0 1px 2px oklch(0.25 0.02 165 / 10%);cursor:pointer}.ds-btn-destructive:hover{background:color-mix(in oklch,var(--destructive,oklch(0.48 0.15 30)) 90%,transparent)}.ds-btn-destructive:focus-visible{outline:none;box-shadow:0 0 0 2px #fcfdfc,0 0 0 4px var(--ring,oklch(0.43 0.07 185))}"
+    },
+    {
+      "name": "Text Input",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "A labelled field; flush with a 36px button.",
+      "html": "<label class=\"ds-field\"><span class=\"ds-field-label\">Their name</span><input class=\"ds-input\" placeholder=\"ana\"></label>",
+      "css": ".ds-field{display:flex;flex-direction:column;gap:6px;font-family:ui-sans-serif,system-ui,sans-serif}.ds-field-label{font:500 14px/1 ui-sans-serif,system-ui,sans-serif;color:var(--foreground,oklch(0.22 0.008 165))}.ds-input{height:36px;padding:0 12px;border:1px solid var(--border,oklch(0.88 0.008 165));border-radius:8px;background:var(--background,oklch(0.99 0.002 165));color:var(--foreground,oklch(0.22 0.008 165));font:400 14px/20px ui-sans-serif,system-ui,sans-serif;box-shadow:0 1px 2px oklch(0.25 0.02 165 / 10%);outline:none}.ds-input::placeholder{color:var(--muted-foreground,oklch(0.46 0.012 165))}.ds-input:focus-visible{box-shadow:0 0 0 2px var(--background,#fcfdfc),0 0 0 4px var(--ring,oklch(0.43 0.07 185))}"
+    },
+    {
+      "name": "Copy Field",
+      "kind": "custom",
+      "refersTo": "copy-field",
+      "description": "A value to hand to another person, with a Copy button.",
+      "html": "<div class=\"ds-copy\"><span class=\"ds-copy-label\">For their Aether page</span><div class=\"ds-copy-row\"><input class=\"ds-copy-value\" readonly value=\"aether-invite:eyJmb3JtYXQiOiJhZXRo\"><button class=\"ds-copy-btn\">Copy</button></div></div>",
+      "css": ".ds-copy{display:flex;flex-direction:column;gap:6px}.ds-copy-label{font:500 12px/16px ui-sans-serif,system-ui,sans-serif;color:var(--muted-foreground,oklch(0.46 0.012 165))}.ds-copy-row{display:flex;gap:8px}.ds-copy-value{flex:1;min-width:0;height:36px;padding:0 12px;border:0;border-radius:8px;background:var(--muted,oklch(0.925 0.007 165));color:var(--foreground,oklch(0.22 0.008 165));font:400 13px/20px ui-monospace,Menlo,monospace}.ds-copy-btn{height:36px;padding:0 16px;border:1px solid var(--border,oklch(0.88 0.008 165));border-radius:8px;background:var(--background,oklch(0.99 0.002 165));font:500 14px/20px ui-sans-serif,system-ui,sans-serif;cursor:pointer}.ds-copy-btn:hover{background:color-mix(in oklch,var(--foreground,oklch(0.22 0.008 165)) 5%,var(--background,oklch(0.99 0.002 165)))}"
+    },
+    {
+      "name": "Badge",
+      "kind": "chip",
+      "refersTo": "badge",
+      "description": "The state of the last task.",
+      "html": "<span class=\"ds-badge\">Answered</span>",
+      "css": ".ds-badge{display:inline-flex;align-items:center;padding:2px 8px;border:1px solid var(--border,oklch(0.88 0.008 165));border-radius:6px;font:500 12px/16px ui-sans-serif,system-ui,sans-serif;color:var(--foreground,oklch(0.22 0.008 165))}"
+    },
+    {
+      "name": "Card",
+      "kind": "card",
+      "refersTo": "card",
+      "description": "A raised panel, such as Invite someone.",
+      "html": "<div class=\"ds-card\"><h3 class=\"ds-card-title\">Invite someone</h3><p class=\"ds-card-desc\">Ask them for the connect code on their Aether page.</p></div>",
+      "css": ".ds-card{display:flex;flex-direction:column;gap:6px;padding:24px;border:1px solid var(--border,oklch(0.88 0.008 165));border-radius:12px;background:var(--background,oklch(0.99 0.002 165));box-shadow:0 1px 2px oklch(0.25 0.02 165 / 7%),0 8px 24px -6px oklch(0.25 0.02 165 / 12%)}.ds-card-title{margin:0;font:600 16px/1 ui-sans-serif,system-ui,sans-serif;color:var(--foreground,oklch(0.22 0.008 165))}.ds-card-desc{margin:0;font:400 14px/20px ui-sans-serif,system-ui,sans-serif;color:var(--muted-foreground,oklch(0.46 0.012 165))}"
+    },
+    {
+      "name": "Header Bar",
+      "kind": "nav",
+      "description": "Product, section, status, links.",
+      "html": "<header class=\"ds-nav\"><b>Aether</b><span class=\"ds-nav-sep\">/</span><span class=\"ds-nav-sec\">Sharing</span><span class=\"ds-nav-fill\"></span><span class=\"ds-nav-status\"><i></i>Reachable through the relay</span><a href=\"#\">Advanced</a></header>",
+      "css": ".ds-nav{display:flex;align-items:center;gap:12px;min-height:56px;padding:0 32px;border-bottom:1px solid var(--border,oklch(0.88 0.008 165));font:400 14px/20px ui-sans-serif,system-ui,sans-serif;color:var(--foreground,oklch(0.22 0.008 165))}.ds-nav b{font-size:16px;font-weight:600;letter-spacing:-0.025em}.ds-nav-sep{color:var(--border,oklch(0.88 0.008 165))}.ds-nav-sec{color:var(--muted-foreground,oklch(0.46 0.012 165))}.ds-nav-fill{flex:1}.ds-nav-status{display:inline-flex;align-items:center;gap:8px;color:var(--muted-foreground,oklch(0.46 0.012 165))}.ds-nav-status i{width:8px;height:8px;border-radius:50%;background:var(--success,oklch(0.46 0.09 160))}.ds-nav a{color:var(--primary,oklch(0.43 0.07 185));text-decoration:underline;text-underline-offset:3px}.ds-nav a:hover{text-decoration-thickness:2px}"
+    },
+    {
+      "name": "Numbered Step",
+      "kind": "custom",
+      "refersTo": "step-number",
+      "description": "A step where order matters.",
+      "html": "<div class=\"ds-step\"><span class=\"ds-step-n\">1</span><span class=\"ds-step-t\">Send your friend this connect code</span></div>",
+      "css": ".ds-step{display:flex;gap:16px;align-items:center}.ds-step-n{display:flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:50%;background:var(--primary,oklch(0.43 0.07 185));color:var(--primary-foreground,oklch(0.99 0.004 185));font:600 14px/1 ui-sans-serif,system-ui,sans-serif}.ds-step-t{font:600 18px/28px ui-sans-serif,system-ui,sans-serif;color:var(--foreground,oklch(0.22 0.008 165))}"
+    }
+  ],
+  "narrative": {
+    "northStar": "Signal in the Dark",
+    "overview": "Everything is quiet and still until a signed permission makes a link. The system reserves its colour and energy for that moment: a person who can use your agent, an invite that has just been made, an agent on the hub that is available now. Everything else stays neutral so that the link is what you see.\n\nAether has two registers. The node UI is the base system: a light, cool-neutral tool served on loopback, with system typefaces, hairline borders, small shadows, and one deep teal accent. It is plain and exact; nothing competes with the person and the action. The hub page is the public register: it shows the agents in the network as a living map, each agent drawn as a sigil from its key. The idea of the map is a commitment. Its current style (a dark night sky, an italic serif headline, a mono face) is one execution and is not mandatory.\n\nThe node UI is light today. Its dark tokens are part of the system but nothing turns them on yet.",
+    "keyCharacteristics": [
+      "Neutral surfaces; colour marks a status, the main action, or (on the hub) an available agent.",
+      "One accent (deep teal) for the main action, links, focus, and step numbers.",
+      "System typefaces only in the node UI, so it works offline.",
+      "Hairline borders and low shadows; surfaces are close in value.",
+      "Keys are shown in mono, in groups of four, so a person can read them aloud.",
+      "Agents are drawn as sigils made from their 32-byte key."
+    ],
+    "rules": [
+      {
+        "name": "The Derived States Rule",
+        "body": "Hover and press have no tokens of their own. Derive them from the fill or the foreground at reduced opacity (primary at 90% and 80%; foreground at 5%, 10%, and 15%), so that both colour schemes work without overrides.",
+        "section": "colors"
+      },
+      {
+        "name": "The One Accent Rule",
+        "body": "Teal is the only accent in the node UI. Do not add a second brand colour.",
+        "section": "colors"
+      },
+      {
+        "name": "The Status Colour Rule",
+        "body": "In the node UI, colour means a status: success for answered or reachable, warning for running or unreachable, destructive for revoke and errors. People are initials in tinted circles. The spectrum and the sigils stay on the hub's network map. (Decided 2026-10-22: variant A on the \"Colour rule — choose\" page of the Aether Paper file. Variant B, which drew people as spectrum sigils and made statuses grey, was rejected.)",
+        "section": "colors"
+      },
+      {
+        "name": "The Offline Type Rule",
+        "body": "The node UI uses only system typefaces. It is served on loopback and must work offline, so it loads no web font. (The Paper mock-ups use IBM Plex Sans and Plex Mono; they are a close stand-in, not the shipped stack.)",
+        "section": "typography"
+      },
+      {
+        "name": "The Read-Aloud Rule",
+        "body": "Show a key or a code in groups of four characters, so that two people can compare it by voice.",
+        "section": "typography"
+      },
+      {
+        "name": "The Hairline First Rule",
+        "body": "Separate with a 1px border line or a value step before you add a shadow. Use only the two shadows above.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "Do use only the tokens in crates/aether/styles.css; components refer to tokens, never to raw colours.",
+      "Do keep one filled teal button for each panel.",
+      "Do derive hover and press states from opacity, as in the Derived States Rule.",
+      "Do show keys and codes in mono, in groups of four.",
+      "Do give every value that a person must pass on a Copy button and a selectable fallback.",
+      "Do draw an agent from its key, and keep the same sigil for the same key.",
+      "Do stop all motion when prefers-reduced-motion is set."
+    ],
+    "donts": [
+      "Don't load a web font or an external asset in the node UI.",
+      "Don't add a second accent colour to the node UI.",
+      "Don't use the spectrum as decoration on surfaces, headings, or buttons.",
+      "Don't use a filled red button before the confirming step of a destructive action.",
+      "Don't add shadows other than Control and Raised.",
+      "Don't set role=\"alert\" on a notice that renders with the page."
+    ]
+  }
+}

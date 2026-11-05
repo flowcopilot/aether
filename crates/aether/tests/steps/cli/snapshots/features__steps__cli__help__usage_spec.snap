@@ -1,0 +1,323 @@
+---
+source: crates/aether/tests/steps/cli/help.rs
+expression: spec
+---
+name aether
+bin aether
+version "[version]"
+subcommand_required #true
+flag "-h --help" help="Print help" action=help builtin=#true
+flag "-V --version" help="Print version" action=version builtin=#true
+cmd node {
+    flag --config {
+        arg <CONFIG>
+    }
+    flag "-h --help" help="Print help" action=help builtin=#true
+    cmd serve {
+        flag --policy help="Old policy file to import on the first start. Later changes use SQLite." default="~/.aether/policy.json" {
+            arg <POLICY>
+        }
+        flag --data-dir default="~/.aether/host" {
+            arg <DATA_DIR>
+        }
+        flag --port default="0" {
+            arg <PORT>
+        }
+        flag --admin-port default="0" {
+            arg <ADMIN_PORT>
+        }
+        flag --pact-listen help="The address the PACT gateway listens on, such as 127.0.0.1:8080. It needs a `pact` section in the policy and `--admin-port`, which serves the consent page." requires=--admin-port {
+            arg <PACT_LISTEN>
+        }
+        flag --managed-control requires=--managed-control-certificate {
+            arg <MANAGED_CONTROL>
+        }
+        flag --managed-control-certificate requires=--managed-control {
+            arg <MANAGED_CONTROL_CERTIFICATE>
+        }
+        flag --adapter help="The agent adapter of this data directory: codex or connected. The node saves it; later starts keep it." {
+            arg <ADAPTER>
+        }
+        flag --codex-bin help="The Codex binary of the Codex adapter." env=AETHER_CODEX_BIN default=codex {
+            arg <CODEX_BIN>
+        }
+        flag --relay-url help="An iroh relay to reach the node through." env=AETHER_RELAY_URL {
+            arg <RELAY_URL>
+        }
+        flag --hub-url help="The Aether hub that lets people invite and connect by name. Defaults to the one set on the page, else the public hub; `off` turns it off." env=AETHER_HUB_URL {
+            arg <HUB_URL>
+        }
+        flag --directory {
+            arg <DIRECTORY>
+        }
+        flag --directory-certificate {
+            arg <DIRECTORY_CERTIFICATE>
+        }
+        flag --agent-id help="The agent ID in the published directory record. It does not name invites." {
+            arg <AGENT_ID>
+        }
+        flag --address {
+            arg <ADDRESS>
+        }
+        flag --scope {
+            arg <SCOPE>
+        }
+        flag --capability {
+            arg <CAPABILITY>
+        }
+        flag --directory-record-ttl {
+            arg <DIRECTORY_RECORD_TTL>
+        }
+        flag --invite-name help="The agent name in invites while this node has no name on the hub. Defaults to agent- and the first 8 characters of the endpoint ID." {
+            arg <INVITE_NAME>
+        }
+        flag "-h --help" help="Print help" action=help builtin=#true
+    }
+    cmd request {
+        flag --data-dir help="Defaults to `$AETHER_DATA_DIR`, else `~/.aether/host`." {
+            arg <DATA_DIR>
+        }
+        flag --endpoint-id {
+            arg <ENDPOINT_ID>
+        }
+        flag --address {
+            arg <ADDRESS>
+        }
+        flag --directory {
+            arg <DIRECTORY>
+        }
+        flag --directory-certificate {
+            arg <DIRECTORY_CERTIFICATE>
+        }
+        flag --agent-id {
+            arg <AGENT_ID>
+        }
+        flag --agent-verifying-key {
+            arg <AGENT_VERIFYING_KEY>
+        }
+        flag --managed-control {
+            conflicts --endpoint-id --address --directory --directory-certificate --agent-verifying-key
+            requires --managed-control-certificate --agent-id
+            arg <MANAGED_CONTROL>
+        }
+        flag --managed-control-certificate requires=--managed-control {
+            arg <MANAGED_CONTROL_CERTIFICATE>
+        }
+        flag --relay-url help="An iroh relay to reach the peer through." env=AETHER_RELAY_URL {
+            arg <RELAY_URL>
+        }
+        flag --scope required=#true {
+            arg <SCOPE>
+        }
+        flag --text required=#true {
+            arg <TEXT>
+        }
+        flag --authorization help="Optional for a direct contact imported from an invite: its bundle holds the authorization." {
+            arg <AUTHORIZATION>
+        }
+        flag --idempotency-key help="Lets a caller retry a request idempotently by resubmitting the same key. A fresh one is generated when this is left unset, matching the previous, only behavior." {
+            arg <IDEMPOTENCY_KEY>
+        }
+        flag --task-id help="Lets a caller learn its own task id ahead of the response, so it can target this request with an administration cancellation. A fresh one is generated when this is left unset, matching the previous, only behavior. Must be a UUID, the same requirement the wire protocol already places on every task id." {
+            arg <TASK_ID>
+        }
+        flag "-h --help" help="Print help" action=help builtin=#true
+    }
+    cmd direct subcommand_required=#true {
+        flag --data-dir help="Defaults to `$AETHER_DATA_DIR`, else `~/.aether/host`." {
+            arg <DATA_DIR>
+        }
+        flag "-h --help" help="Print help" action=help builtin=#true
+        cmd import help="Imports an `aether-invite:` line, or a file with an invitation or an invitation bundle." {
+            flag "-h --help" help="Print help" action=help builtin=#true
+            arg <INVITATION>
+        }
+        cmd resolve {
+            flag "-h --help" help="Print help" action=help builtin=#true
+            arg <AGENT_ID>
+        }
+        cmd remove help="Forgets a contact: its invitation and its stored access." {
+            flag "-h --help" help="Print help" action=help builtin=#true
+            arg <AGENT_ID>
+        }
+    }
+    cmd invite {
+        flag --data-dir required=#true {
+            arg <DATA_DIR>
+        }
+        flag --agent-id required=#true {
+            arg <AGENT_ID>
+        }
+        flag --expires-in required=#true {
+            arg <EXPIRES_IN>
+        }
+        flag "-h --help" help="Print help" action=help builtin=#true
+    }
+    cmd directory subcommand_required=#true {
+        flag --directory required=#true {
+            arg <DIRECTORY>
+        }
+        flag --directory-certificate required=#true {
+            arg <DIRECTORY_CERTIFICATE>
+        }
+        flag --agent-verifying-key required=#true {
+            arg <AGENT_VERIFYING_KEY>
+        }
+        flag "-h --help" help="Print help" action=help builtin=#true
+        cmd publish {
+            flag "-h --help" help="Print help" action=help builtin=#true
+            arg <RECORD>
+        }
+        cmd renew {
+            flag "-h --help" help="Print help" action=help builtin=#true
+            arg <RECORD>
+        }
+        cmd resolve {
+            flag "-h --help" help="Print help" action=help builtin=#true
+            arg <AGENT_ID>
+        }
+        cmd search {
+            flag "-h --help" help="Print help" action=help builtin=#true
+            arg <CAPABILITY>
+        }
+        cmd revoke {
+            flag "-h --help" help="Print help" action=help builtin=#true
+            arg <RECORD>
+        }
+        cmd sync {
+            flag --data-dir required=#true {
+                arg <DATA_DIR>
+            }
+            flag "-h --help" help="Print help" action=help builtin=#true
+        }
+    }
+    cmd managed subcommand_required=#true {
+        flag --control required=#true {
+            arg <CONTROL>
+        }
+        flag --control-certificate required=#true {
+            arg <CONTROL_CERTIFICATE>
+        }
+        flag "-h --help" help="Print help" action=help builtin=#true
+        cmd redeem {
+            flag --token-file required=#true {
+                arg <TOKEN_FILE>
+            }
+            flag "-h --help" help="Print help" action=help builtin=#true
+            arg <RECORD>
+        }
+        cmd members {
+            flag "-h --help" help="Print help" action=help builtin=#true
+            arg <SCOPE>
+        }
+        cmd events {
+            flag --after {
+                arg <AFTER>
+            }
+            flag "-h --help" help="Print help" action=help builtin=#true
+            arg <SCOPE>
+        }
+        cmd sync {
+            flag --data-dir required=#true {
+                arg <DATA_DIR>
+            }
+            flag "-h --help" help="Print help" action=help builtin=#true
+            arg <SCOPE>
+        }
+    }
+    cmd record {
+        flag --data-dir required=#true {
+            arg <DATA_DIR>
+        }
+        flag --agent-id required=#true {
+            arg <AGENT_ID>
+        }
+        flag --address required=#true {
+            arg <ADDRESS>
+        }
+        flag --scope required=#true {
+            arg <SCOPE>
+        }
+        flag --capability required=#true {
+            arg <CAPABILITY>
+        }
+        flag --expires-in required=#true {
+            arg <EXPIRES_IN>
+        }
+        flag "-h --help" help="Print help" action=help builtin=#true
+    }
+    cmd endpoint {
+        flag --data-dir required=#true {
+            arg <DATA_DIR>
+        }
+        flag "-h --help" help="Print help" action=help builtin=#true
+    }
+    cmd fixture {
+        flag --data-dir required=#true {
+            arg <DATA_DIR>
+        }
+        flag --scope {
+            arg <SCOPE>
+        }
+        flag "-h --help" help="Print help" action=help builtin=#true
+    }
+    cmd admin {
+        flag --data-dir {
+            arg <DATA_DIR>
+        }
+        flag --port required=#true {
+            arg <PORT>
+        }
+        flag --hub-url help="The Aether hub that lets people invite and connect by name. Defaults to the one set on the page, else the public hub; `off` turns it off." env=AETHER_HUB_URL {
+            arg <HUB_URL>
+        }
+        flag --managed-scope
+        flag "-h --help" help="Print help" action=help builtin=#true
+    }
+}
+cmd control {
+    flag --config {
+        arg <CONFIG>
+    }
+    flag --port {
+        arg <PORT>
+    }
+    flag "-h --help" help="Print help" action=help builtin=#true
+    cmd test-record {
+        flag "-h --help" help="Print help" action=help builtin=#true
+    }
+    cmd invite {
+        flag --scope required=#true {
+            arg <SCOPE>
+        }
+        flag --expires-in required=#true {
+            arg <EXPIRES_IN>
+        }
+        flag "-h --help" help="Print help" action=help builtin=#true
+    }
+    cmd revoke-member {
+        flag --scope required=#true {
+            arg <SCOPE>
+        }
+        flag --agent-id required=#true {
+            arg <AGENT_ID>
+        }
+        flag "-h --help" help="Print help" action=help builtin=#true
+    }
+}
+cmd mcp {
+    flag --config {
+        arg <CONFIG>
+    }
+    flag "-h --help" help="Print help" action=help builtin=#true
+    cmd serve {
+        flag --socket help="The node's administration socket. Defaults to the one in the data directory." {
+            arg <SOCKET>
+        }
+        flag --data-dir help="The data directory with the friends' agents you can use. Defaults to `$AETHER_DATA_DIR`, else `~/.aether/host`." {
+            arg <DATA_DIR>
+        }
+        flag --caller-only help="List only the tools that send tasks and read answers, for an agent that must not manage this node."
+        flag "-h --help" help="Print help" action=help builtin=#true
+    }
+}

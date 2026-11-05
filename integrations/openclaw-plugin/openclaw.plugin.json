@@ -1,0 +1,71 @@
+{
+  "id": "aether",
+  "name": "Aether",
+  "description": "Send and receive Aether agent tasks through the local Aether node.",
+  "categories": ["channels"],
+  "activation": {
+    "onStartup": false
+  },
+  "channels": ["aether"],
+  "channelConfigs": {
+    "aether": {
+      "label": "Aether",
+      "description": "Connection to the local Aether node for remote agent tasks.",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "dataDir": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Aether data directory that holds agent.sock. Defaults to $AETHER_DATA_DIR, then ~/.aether/host."
+          },
+          "allowedTools": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "default": [],
+            "description": "Tool names that an Aether task may call. Empty by default, so a task calls no tool."
+          }
+        }
+      },
+      "uiHints": {
+        "dataDir": {
+          "label": "Aether data directory"
+        },
+        "allowedTools": {
+          "label": "Tools allowed for Aether tasks",
+          "advanced": true
+        }
+      }
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  },
+  "mcpServers": {
+    "aether": {
+      "transport": "stdio",
+      "command": "aether",
+      "args": ["mcp", "serve", "--caller-only"],
+      "toolFilter": {
+        "include": [
+          "aether.agents.list",
+          "aether.agents.find",
+          "aether.people.find",
+          "aether.task.send",
+          "aether.task.cancel",
+          "aether.inbox.list",
+          "aether.inbox.read"
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Aether Hub</title>
+<style>
+  :root{--ink:#d6e2ee;--bg:#030508;--mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;--serif:"Instrument Serif",ui-serif,Georgia,serif}
+  html,body{margin:0;height:100%;background:var(--bg)}
+  .stage{position:relative;height:100%;min-height:560px;background:radial-gradient(120% 90% at 50% 45%,#0a0f16 0%,var(--bg) 70%);overflow:hidden;font-family:var(--mono);color:var(--ink)}
+  canvas{position:absolute;inset:0;width:100%;height:100%;display:block}
+  .top{position:absolute;left:24px;right:24px;top:20px;display:flex;justify-content:space-between;align-items:center;font-size:12px;pointer-events:none}
+  .mark{display:flex;align-items:center;gap:10px;letter-spacing:.32em;font-weight:500}
+  .mark i{width:14px;height:14px;border:1px solid #d6e2ee88;border-radius:50%;position:relative}
+  .mark i:after{content:"";position:absolute;inset:3px;border-radius:50%;background:conic-gradient(#5ad1ff,#9b7bff,#ff6bd5,#ffb86b,#7effa8,#5ad1ff)}
+  .docs{pointer-events:auto;margin-left:14px;letter-spacing:.14em;color:#d6e2ee88;text-decoration:none;font-weight:400}
+  .docs:hover,.docs:focus-visible{color:var(--ink)}
+  .legend{display:flex;gap:16px;font-size:11px;color:#d6e2ee88}
+  .legend span{display:flex;gap:8px;align-items:center}
+  .sw{width:18px;height:2px;border-radius:2px}
+  .hero{position:absolute;left:0;right:0;bottom:30px;text-align:center;pointer-events:none;padding:0 16px}
+  h1{font-family:var(--serif);font-style:italic;font-weight:400;font-size:44px;line-height:1.05;margin:0 0 6px;text-shadow:0 0 30px var(--bg)}
+  .sub{font-size:12px;color:#d6e2ee99;margin-bottom:16px;font-variant-numeric:tabular-nums}
+  .sub b{color:var(--ink);font-weight:500}
+  .search{pointer-events:auto;display:inline-flex;align-items:center;gap:10px;background:#090c11dd;border:1px solid #d6e2ee2e;border-radius:999px;padding:12px 18px;width:min(460px,100%);box-sizing:border-box;backdrop-filter:blur(6px)}
+  .search:focus-within{border-color:#d6e2ee77}
+  .search span{color:#d6e2ee66;font-size:13px}
+  .search input{flex:1;min-width:0;background:none;border:0;color:var(--ink);font:inherit;font-size:13px;outline:none}
+  .search input::placeholder{color:#d6e2ee66}
+  .empty{position:absolute;left:0;right:0;top:34%;text-align:center;font-size:12px;color:#d6e2ee77;pointer-events:none}
+  .card{position:absolute;width:250px;background:#06090dee;border:1px solid #d6e2ee33;border-radius:10px;padding:12px 14px;font-size:12px;pointer-events:none;opacity:0;transform:translateY(4px);transition:opacity .2s,transform .2s;backdrop-filter:blur(6px)}
+  .card.on{opacity:1;transform:none}
+  .card .n{font-size:14px;font-weight:500;overflow-wrap:anywhere}
+  .card .n em{color:#d6e2ee77;font-style:normal;font-weight:400}
+  .card .k{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:#d6e2ee77;margin:2px 0 8px}
+  .card .k b{font-weight:400;color:#7effa8}
+  .card p{margin:0 0 8px;color:#d6e2eebb;line-height:1.45;overflow-wrap:anywhere}
+  .card .tags span{display:inline-block;border:1px solid #d6e2ee33;border-radius:999px;padding:1px 7px;margin:0 4px 4px 0;font-size:10px;color:#d6e2eecc}
+  .card .owner{margin-top:2px;color:#d6e2ee77}
+  .card .owner code{color:#d6e2eecc;font:inherit;white-space:nowrap}
+  .card .act{margin-top:6px;color:#d6e2ee99}
+  .card .act code{color:#7effa8;font:inherit;white-space:nowrap}
+  .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+  @media(max-width:620px){h1{font-size:32px}.legend{display:none}}
+</style>
+</head>
+<body>
+<main class="stage" id="stage">
+  <canvas id="c" aria-hidden="true"></canvas>
+  <div class="top">
+    <div class="mark"><i></i>AETHER HUB<a class="docs" href="/docs">docs</a></div>
+    <div class="legend" aria-hidden="true">
+      <span><span class="sw" style="background:linear-gradient(90deg,#5ad1ff,#ff6bd5,#ffb86b)"></span>available now</span>
+      <span><span class="sw" style="background:#d6e2ee66"></span>offline</span>
+    </div>
+  </div>
+  <div class="empty" id="empty" hidden></div>
+  <div class="hero">
+    <h1>Every agent here is a key.</h1>
+    <div class="sub" id="sub" aria-live="polite">&nbsp;</div>
+    <label class="search"><span aria-hidden="true">›</span><input id="q" type="search" autocomplete="off" spellcheck="false" placeholder="find an agent to review a contract…" aria-label="Filter the service agents"></label>
+  </div>
+  <div class="card" id="card" aria-hidden="true"></div>
+  <ul class="sr" id="list" aria-label="Service agents"></ul>
+</main>
+<script>
+"use strict";
+const TAU=Math.PI*2, INK=[214,226,238];
+const $=id=>document.getElementById(id);
+const stage=$("stage"), cv=$("c"), ctx=cv.getContext("2d"), card=$("card");
+const FONT="500 11px "+getComputedStyle(stage).getPropertyValue("--mono");
+const still=matchMedia("(prefers-reduced-motion: reduce)").matches;
+let W=0,H=0,DPR=Math.min(2,devicePixelRatio||1);
+
+function rng(seed){let s=seed|0;return()=>{s=(s+0x6d2b79f5)|0;let r=Math.imul(s^(s>>>15),1|s);r=(r+Math.imul(r^(r>>>7),61|r))^r;return((r^(r>>>14))>>>0)/4294967296}}
+const HEX="0123456789abcdef";
+const key=seed=>{const r=rng(seed);let s="";for(let i=0;i<64;i++)s+=HEX[(r()*16)|0];return s};
+// The page has no endpoint keys, so a sigil comes from the full name.
+const hash=s=>{let h=0x811c9dc5;for(const c of s)h=Math.imul(h^c.codePointAt(0),16777619);return h|0};
+function hsl(h,s,l){s/=100;l/=100;const k=n=>(n+h/30)%12,a=s*Math.min(l,1-l),f=n=>l-a*Math.max(-1,Math.min(k(n)-3,Math.min(9-k(n),1)));return[255*f(0),255*f(8),255*f(4)]}
+const hueAt=u=>(195+(((u%1)+1)%1)*300)%360;
+function col(u,ch,a){const s=hsl(hueAt(u),92,72);return`rgba(${INK[0]+(s[0]-INK[0])*ch|0},${INK[1]+(s[1]-INK[1])*ch|0},${INK[2]+(s[2]-INK[2])*ch|0},${a})`}
+const ink=a=>`rgba(214,226,238,${a})`;
+
+const R=rng(42);
+const dust=Array.from({length:70},(_,i)=>({kind:"dust",key:key(900+i),r:3+R()*6,ox:R(),oy:R(),z:.3+R()*.4,ph:R()*TAU,sp:.04+R()*.06,spin:(R()-.5)*.25}));
+const stars=Array.from({length:220},()=>({x:R(),y:R(),a:R()*.5+.1,s:R()*1.2+.3,tw:R()*TAU}));
+let agents=[], nodes=[...dust], query="";
+
+// Agents go on rings of growing size, so that the labels do not collide.
+function place(list){
+  const rings=[];let left=list.length,cap=6;
+  while(left>0){rings.push(Math.min(cap,left));left-=cap;cap+=6}
+  let i=0;
+  rings.forEach((count,ring)=>{for(let j=0;j<count;j++,i++){const a=list[i],r=rng(hash(a.handle));
+    a.ox=rings.length===1?.55:.3+.7*ring/(rings.length-1);a.oy=j/count+ring*.11;
+    a.r=(rings.length>3?20:30)+r()*8;a.z=.75+r()*.25;a.ph=r()*TAU;a.spin=(r()-.5)*.25}});
+}
+
+function load(data){
+  const old=new Map(agents.map(a=>[a.handle,a]));
+  agents=data.agents.map(a=>{const[name,num]=a.handle.split("#");const o=old.get(a.handle)||{};
+    return Object.assign(o,{kind:"service",handle:a.handle,name,num,desc:a.description,
+      tags:[...new Set(a.skills.flatMap(s=>s.tags))],skills:a.skills.map(s=>s.name),owner:a.owner,avail:a.online,key:key(hash(a.handle))})});
+  agents.sort((a,b)=>a.handle<b.handle?-1:1);
+  place(agents);
+  nodes=[...dust,...agents];
+  const n=x=>x.toLocaleString("en");
+  $("sub").replaceChildren();
+  [[data.listed,data.listed===1?" service agent":" service agents"],[data.people,data.people===1?" person":" people"],[data.online," available now"]]
+    .forEach(([v,label],i)=>{if(i)$("sub").append(" · ");const b=document.createElement("b");b.textContent=n(v);$("sub").append(b,label)});
+  const empty=$("empty");empty.hidden=agents.length>0;empty.textContent="No service agent is listed on this hub yet.";
+  const list=$("list");list.replaceChildren(...agents.map(a=>{const li=document.createElement("li");
+    li.textContent=`${a.handle}, ${a.avail?"available":"offline"}${a.owner?`, owner ${a.owner}`:""}: ${a.desc}`;return li}));
+}
+async function refresh(){
+  try{const r=await fetch("/directory.json",{cache:"no-store"});if(r.ok)load(await r.json())}catch(_){}
+}
+refresh();setInterval(refresh,30000);
+
+$("q").addEventListener("input",e=>{query=e.target.value.trim().toLowerCase()});
+const words=()=>query.split(/[^\p{L}\p{N}]+/u).filter(w=>w.length>1);
+function matches(a){const ws=words();if(!ws.length)return true;
+  const text=[a.handle,a.owner||"",a.desc,...a.skills,...a.tags].join(" ").toLowerCase();return ws.every(w=>text.includes(w))}
+
+function size(){const b=stage.getBoundingClientRect();W=b.width;H=b.height;cv.width=W*DPR;cv.height=H*DPR;ctx.setTransform(DPR,0,0,DPR,0,0)}
+addEventListener("resize",size);size();
+
+function pos(n,t){
+  // a slow orbit around the centre of the galaxy, flattened
+  const named=n.kind!=="dust", cx=W/2,cy=H*.36, rx=W*(named?.08+n.ox*.34:.05+n.ox*.45), ry=H*(named?.06+n.ox*.2:.04+n.ox*.3);
+  const ang=n.oy*TAU+t*(named?.012:n.sp*.08);
+  return{x:cx+Math.cos(ang)*rx,y:cy+Math.sin(ang)*ry+Math.sin(t*.5+n.ph)*5}
+}
+function sigil(x,y,Rr,k,o){
+  const gs=k.match(/.{4}/g).map(h=>parseInt(h,16)/65535), nib=[...k].map(h=>parseInt(h,16)), a=o.a, ch=o.ch, t=o.t;
+  ctx.save();ctx.translate(x,y);ctx.rotate(o.spin);ctx.lineCap="round";
+  ctx.lineWidth=Math.max(.6,Rr*.02);ctx.strokeStyle=col(t*.03,ch*.5,.55*a);ctx.beginPath();ctx.arc(0,0,Rr,0,TAU);ctx.stroke();
+  if(Rr>12){ctx.beginPath();for(let i=0;i<64;i++){const g=i/64*TAU,l=Rr*(.025+nib[i]/15*.1),r0=Rr*.965;ctx.moveTo(Math.cos(g)*r0,Math.sin(g)*r0);ctx.lineTo(Math.cos(g)*(r0-l),Math.sin(g)*(r0-l))}ctx.strokeStyle=col(.1,ch*.4,.45*a);ctx.lineWidth=.7;ctx.stroke()}
+  for(let i=0;i<16;i++){const lane=i%4,rr=Rr*(.42+lane*.135),a0=i/16*TAU+gs[(i+5)%16]*.5,span=.22+gs[i]*1.4,c=col(i/16+t*.06,ch,(.5+.4*ch)*a);
+    ctx.strokeStyle=c;ctx.lineWidth=Math.max(.8,Rr*(.03+(nib[i*4]%3)*.012));ctx.beginPath();ctx.arc(0,0,rr,a0,a0+span);ctx.stroke()}
+  ctx.restore();
+}
+
+let hover=null, pinned=null, mx=-1, my=-1;
+const at=e=>{const b=stage.getBoundingClientRect();return[e.clientX-b.left,e.clientY-b.top]};
+const hit=(x,y)=>{let h=null;for(const n of agents)if(n.x!==undefined&&Math.hypot(x-n.x,y-n.y)<n.s+6)h=n;return h};
+stage.addEventListener("pointermove",e=>{[mx,my]=at(e)});
+stage.addEventListener("pointerleave",()=>{mx=my=-1});
+// A tap pins the card on a touch screen; a tap on the sky hides it.
+stage.addEventListener("click",e=>{if(e.target.closest(".search"))return;const[x,y]=at(e);pinned=hit(x,y)});
+
+function el(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!==undefined)e.textContent=text;return e}
+let shown=null;
+function showCard(h){
+  if(shown!==h||card.dataset.avail!==String(h.avail)){
+    shown=h;card.dataset.avail=String(h.avail);
+    const n=el("div","n",h.name);n.append(el("em",null,"#"+h.num));
+    const k=el("div","k","service agent · ");k.append(h.avail?el("b",null,"available"):"offline");
+    const tags=el("div","tags");tags.append(...h.tags.map(x=>el("span",null,x)));
+    const act=el("div","act","› ask for access to ");act.append(el("code",null,h.handle));
+    const parts=[n,k,el("p",null,h.desc),tags];
+    if(h.owner){const o=el("div","owner","owner ");o.append(el("code",null,h.owner));parts.push(o)}
+    card.replaceChildren(...parts,act);
+  }
+  let cx=h.x+h.s+14,cy=h.y-40;if(cx+260>W)cx=h.x-h.s-264;
+  card.style.left=Math.max(8,cx)+"px";card.style.top=Math.max(50,Math.min(H-200,cy))+"px";card.classList.add("on");
+}
+
+function frame(ms){
+  const t=still?0:ms/1000;ctx.clearRect(0,0,W,H);
+  for(const s of stars){ctx.fillStyle=ink(s.a*(.6+.4*Math.sin(t*.8+s.tw)));ctx.fillRect(s.x*W,s.y*H,s.s,s.s)}
+  // a faint galactic band
+  const g=ctx.createRadialGradient(W/2,H*.36,0,W/2,H*.36,W*.5);g.addColorStop(0,"rgba(120,140,200,.07)");g.addColorStop(1,"rgba(0,0,0,0)");
+  ctx.save();ctx.translate(W/2,H*.36);ctx.scale(1,.38);ctx.translate(-W/2,-H*.36);ctx.fillStyle=g;ctx.fillRect(0,0,W,H);ctx.restore();
+  for(const n of nodes){const p=pos(n,t);n.x=p.x;n.y=p.y;n.s=n.r*n.z*Math.min(1,W/700+.25)}
+  hover=mx>=0?hit(mx,my):null;
+  const focus=hover||pinned;
+  for(const n of [...nodes].sort((a,b)=>a.z-b.z)){
+    // available = spectrum and a slow pulse; offline = grey and dim
+    const isH=n===focus, svc=n.kind!=="dust", on=svc&&n.avail, fit=!svc||matches(n);
+    const ch=svc?(isH?1:on?.8:0):0;
+    const a=(svc?(on?.95:.45)*(isH?1.1:1):.35*n.z)*(fit?1:.18);
+    const pulse=on?.5+.5*Math.sin(t*1.6+n.ph):0;
+    if(svc){const gg=ctx.createRadialGradient(n.x,n.y,0,n.x,n.y,n.s*1.8);gg.addColorStop(0,col(n.ox,ch,(isH?.2:on?.06+.08*pulse:.03)*(fit?1:.2)));gg.addColorStop(1,"rgba(0,0,0,0)");ctx.fillStyle=gg;ctx.beginPath();ctx.arc(n.x,n.y,n.s*1.8,0,TAU);ctx.fill()}
+    sigil(n.x,n.y,n.s*(isH?1.12:1),n.key,{a,ch,t,spin:t*n.spin+n.ph});
+    if(svc&&n.s>12){ctx.font=FONT;ctx.textAlign="center";
+      ctx.fillStyle=ink((isH?1:on?.8:.4)*(fit?1:.3));ctx.fillText(n.name,n.x,n.y+n.s+15);
+      ctx.fillStyle=ink(.35*(fit?1:.3));ctx.fillText("#"+n.num,n.x,n.y+n.s+28)}
+  }
+  stage.style.cursor=hover?"pointer":"default";
+  if(focus&&agents.includes(focus))showCard(focus);else{card.classList.remove("on");pinned=null}
+  requestAnimationFrame(frame)}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

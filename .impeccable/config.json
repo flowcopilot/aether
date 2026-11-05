@@ -1,0 +1,30 @@
+{
+  "hook": {
+    "enabled": true,
+    "limits": {
+      "maxFindings": 5,
+      "maxChars": 8000
+    }
+  },
+  "detector": {
+    "extensions": [
+      {
+        "ext": ".rs",
+        "engine": "text"
+      }
+    ],
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "broken-image",
+        "value": "*",
+        "files": [
+          "crates/aether/src/components/avatar.rs"
+        ],
+        "createdAt": "2026-10-22T11:38:44.528Z",
+        "reason": "Agent: avatar_image takes src from the caller's attrs at run time; the static <img> in the Rust source has no src by design"
+      }
+    ]
+  }
+}

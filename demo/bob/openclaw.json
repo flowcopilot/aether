@@ -1,0 +1,38 @@
+{
+  "gateway": { "mode": "local", "bind": "loopback" },
+  "models": {
+    "mode": "replace",
+    "providers": {
+      "mock": {
+        "baseUrl": "http://127.0.0.1:4010/v1",
+        "apiKey": "mock",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "mock-model",
+            "name": "Mock model",
+            "reasoning": false,
+            "input": ["text"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 128000,
+            "maxTokens": 4096
+          }
+        ]
+      }
+    }
+  },
+  "tools": { "sessions": { "visibility": "self" }, "toolSearch": false },
+  "agents": {
+    "ownership": "explicit",
+    "defaults": { "model": { "primary": "mock/mock-model" }, "systemAgent": { "agentId": "main" } },
+    "entries": {
+      "main": { "workspace": "/root/.openclaw/workspace" },
+      "aether": {
+        "workspace": "/root/.openclaw/workspace-aether",
+        "tools": { "profile": "minimal", "deny": ["aether__*", "group:plugins"] }
+      }
+    }
+  },
+  "bindings": [{ "agentId": "aether", "match": { "channel": "aether" } }],
+  "channels": { "aether": { "enabled": true, "dataDir": "/root/.aether/host" } }
+}

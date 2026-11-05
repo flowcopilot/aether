@@ -1,0 +1,90 @@
+# Two people, two agents, one Aether network:
+#
+#   alice: an Aether node that answers with Hermes Agent
+#   bob:   an Aether node that answers with OpenClaw
+#
+# Both images use the aether binary built from this checkout.
+#
+#   docker compose -f demo/compose.yml up -d --build
+#   sh demo/connect.sh     # alice and bob invite each other
+#   sh demo/e2e.sh         # the end-to-end test (it starts and connects too)
+#
+# By default a mock model answers, so no provider key is needed. To use a
+# real model, set OPENROUTER_API_KEY and DEMO_MODEL (an OpenRouter model ID,
+# for example nvidia/nemotron-3.5-lightning:free) before `up`.
+name: aether-demo
+
+x-model-env: &model-env
+  OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+  DEMO_MODEL: ${DEMO_MODEL:-}
+
+services:
+  # The aether binary of this checkout. The agent images copy it from here.
+  # On `up` it only prints its version and stops.
+  aether:
+    build:
+      context: ..
+      dockerfile: Dockerfile.e2e
+    image: aether-e2e:local
+    command: ["--version"]
+
+  # Fake OpenAI-compatible models: each answers every request with one text.
+  model-alice:
+    image: node:26-trixie-slim
+    command: ["node", "/mock/mock-model.mjs"]
+    environment:
+      MOCK_MODEL_HOST: 0.0.0.0
+      MOCK_MODEL_ANSWER: fake Hermes result
+    volumes:
+      - ../integrations/openclaw-plugin/e2e/mock-model.mjs:/mock/mock-model.mjs:ro
+
+  model-bob:
+    image: node:26-trixie-slim
+    command: ["node", "/mock/mock-model.mjs"]
+    environment:
+      MOCK_MODEL_HOST: 0.0.0.0
+      MOCK_MODEL_ANSWER: fake OpenClaw result
+    volumes:
+      - ../integrations/openclaw-plugin/e2e/mock-model.mjs:/mock/mock-model.mjs:ro
+
+  alice:
+    build:
+      context: ../integrations/hermes-plugin
+      dockerfile: ../../demo/alice/Dockerfile
+      additional_contexts:
+        aether: service:aether
+        demo: ./alice
+    image: aether-demo-alice:local
+    hostname: alice
+    environment:
+      <<: *model-env
+      MOCK_MODEL_URL: http://model-alice:4010/v1
+    ports:
+      - "127.0.0.1:8441:8441"   # Aether node page
+      - "127.0.0.1:9119:9119"   # Hermes dashboard
+    volumes:
+      - alice:/var/lib/aether
+    depends_on: [model-alice]
+
+  bob:
+    build:
+      context: ../integrations/openclaw-plugin
+      dockerfile: ../../demo/bob/Dockerfile
+      additional_contexts:
+        aether: service:aether
+        demo: ./bob
+    image: aether-demo-bob:local
+    hostname: bob
+    environment:
+      <<: *model-env
+      MOCK_MODEL_URL: http://model-bob:4010/v1
+    ports:
+      - "127.0.0.1:8442:8442"   # Aether node page
+      - "127.0.0.1:18789:18789" # OpenClaw Control UI
+    volumes:
+      - bob:/root/.aether
+    depends_on: [model-bob]
+
+volumes:
+  alice:
+  bob:

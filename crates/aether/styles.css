@@ -1,0 +1,130 @@
+/* Aether, restyled from Neutral, the built-in Topcoat theme.
+
+   The theme is a small set of design tokens. Components refer to tokens only,
+   never to raw colors, so a project restyles itself by editing the values in
+   `:root` and `.dark` below.
+
+     --canvas                  the page ground, behind raised surfaces
+     --background              raised surfaces: cards, panels, inputs
+     --foreground              text and iconography on the background
+     --muted                   quiet fills: code, keys, chips
+     --muted-foreground        secondary text: captions, descriptions, placeholders
+     --primary                 the emphasis color: primary actions, selection, highlights
+     --primary-foreground      text on a primary-filled surface
+     --success                 a finished state: an answered task, a created invite
+     --warning                 a state that needs time or attention: a running task
+     --destructive             destructive actions and error states
+     --destructive-foreground  text on a destructive-filled surface
+     --border                  hairline borders and dividers
+     --ring                    the focus ring
+     --shadow-xs               a subtle shadow for controls: buttons, inputs
+     --shadow-sm               a shadow for raised surfaces: cards, menus
+
+   The palette is a cool, slightly green neutral with one deep teal accent.
+   The page is served on loopback and must work offline, so it uses the
+   system typefaces rather than a web font.
+
+   Interactive states (hover, press) have no tokens of their own: components
+   derive them by applying the fill or foreground color at reduced opacity,
+   which adapts to both color schemes automatically. */
+
+@import "tailwindcss";
+
+/* Scan the project's Rust sources for the Tailwind classes they use. This
+   file is installed at the project root, so `./src` is the crate's source. */
+@source "./src/**/*.rs";
+
+/* Dark mode is opted into by putting the `dark` class on an ancestor,
+   typically <html>. */
+@custom-variant dark (&:is(.dark *));
+
+/* Expose the tokens as Tailwind utilities (`bg-background`, `text-primary`,
+   `border-border`, ...). The indirection through plain variables on `:root`
+   and `.dark` is what lets the values swap when the color scheme changes. */
+@theme inline {
+  --font-sans:
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --color-canvas: var(--canvas);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-ring: var(--ring);
+  --shadow-xs: var(--shadow-xs);
+  --shadow-sm: var(--shadow-sm);
+}
+
+:root {
+  --canvas: oklch(0.955 0.005 165);
+  --background: oklch(0.99 0.002 165);
+  --foreground: oklch(0.22 0.008 165);
+  --muted: oklch(0.925 0.007 165);
+  --muted-foreground: oklch(0.46 0.012 165);
+  --primary: oklch(0.43 0.07 185);
+  --primary-foreground: oklch(0.99 0.004 185);
+  --success: oklch(0.46 0.09 160);
+  --warning: oklch(0.47 0.09 80);
+  --destructive: oklch(0.48 0.15 30);
+  --destructive-foreground: oklch(0.99 0.012 30);
+  --border: oklch(0.88 0.008 165);
+  --ring: oklch(0.43 0.07 185);
+  --shadow-xs: 0 1px 2px oklch(0.25 0.02 165 / 10%);
+  --shadow-sm:
+    0 1px 2px oklch(0.25 0.02 165 / 7%),
+    0 8px 24px -6px oklch(0.25 0.02 165 / 12%);
+}
+
+.dark {
+  --canvas: oklch(0.16 0.008 165);
+  --background: oklch(0.2 0.009 165);
+  --foreground: oklch(0.94 0.005 165);
+  --muted: oklch(0.27 0.01 165);
+  --muted-foreground: oklch(0.72 0.012 165);
+  --primary: oklch(0.78 0.08 185);
+  --primary-foreground: oklch(0.2 0.03 185);
+  --success: oklch(0.78 0.1 160);
+  --warning: oklch(0.8 0.1 80);
+  --destructive: oklch(0.68 0.17 28);
+  --destructive-foreground: oklch(0.15 0.02 28);
+  --border: oklch(0.32 0.01 165);
+  --ring: oklch(0.78 0.08 185);
+  --shadow-xs: 0 1px 2px oklch(0 0 0 / 35%);
+  --shadow-sm:
+    0 1px 2px oklch(0 0 0 / 35%),
+    0 8px 24px -6px oklch(0 0 0 / 40%);
+}
+
+@layer base {
+  body {
+    @apply bg-canvas font-sans text-foreground antialiased;
+    font-variant-numeric: tabular-nums;
+  }
+
+  ::selection {
+    background: color-mix(in oklch, var(--primary) 22%, transparent);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+
+  a {
+    color: var(--primary);
+    text-decoration: underline;
+    text-underline-offset: 3px;
+  }
+
+  code,
+  kbd {
+    font-family: var(--font-mono);
+  }
+}

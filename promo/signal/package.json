@@ -1,0 +1,42 @@
+{
+  "name": "signal",
+  "version": "1.0.0",
+  "description": "My Remotion video",
+  "repository": {},
+  "license": "UNLICENSED",
+  "private": true,
+  "dependencies": {
+    "@remotion/cli": "4.0.539",
+    "@remotion/google-fonts": "4.0.539",
+    "@remotion/media": "4.0.539",
+    "@remotion/tailwind-v4": "4.0.539",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "remotion": "4.0.539",
+    "tailwindcss": "4.3.3"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.7",
+    "@types/web": "0.0.166",
+    "oxfmt": "0.74.0",
+    "oxlint": "1.89.0",
+    "playwright-core": "^1.63.0",
+    "tsrs": "0.18.0-ts7.1.0-dev.20260929",
+    "typescript": "7.1.0-beta"
+  },
+  "scripts": {
+    "dev": "remotion studio",
+    "build": "remotion bundle",
+    "upgrade": "remotion upgrade",
+    "lint": "oxlint src && tsrs",
+    "format": "oxfmt",
+    "music": "node music/record.mjs && uv run music/trim.py",
+    "render": "remotion render src/index.ts Signal out/aether-signal.mp4 --props='{\"withMusic\":true}' --codec=h264 --crf=16"
+  },
+  "sideEffects": [
+    "*.css"
+  ],
+  "overrides": {
+    "zod": "4.6.6"
+  }
+}

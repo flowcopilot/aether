@@ -1,0 +1,44 @@
+---
+source: crates/aether/tests/steps/cli/help.rs
+expression: world.cli.stdout()
+---
+Usage: aether node serve [FLAGS]
+
+Flags:
+      --policy <POLICY>                   Old policy file to import on the first start. Later
+                                          changes use SQLite.
+                                          (default: ~/.aether/policy.json)
+      --data-dir <DATA_DIR>
+                                          (default: ~/.aether/host)
+      --port <PORT>
+                                          (default: 0)
+      --admin-port <ADMIN_PORT>
+                                          (default: 0)
+      --pact-listen <PACT_LISTEN>         The address the PACT gateway listens on, such as
+                                          127.0.0.1:8080. It needs a `pact` section in the policy
+                                          and `--admin-port`, which serves the consent page.
+      --managed-control <MANAGED_CONTROL>
+      --managed-control-certificate <MANAGED_CONTROL_CERTIFICATE>
+      --adapter <ADAPTER>                 The agent adapter of this data directory: codex or
+                                          connected. The node saves it; later starts keep it.
+      --codex-bin <CODEX_BIN>             The Codex binary of the Codex adapter.
+                                          [env: AETHER_CODEX_BIN]
+                                          (default: codex)
+      --relay-url <RELAY_URL>             An iroh relay to reach the node through.
+                                          [env: AETHER_RELAY_URL]
+      --hub-url <HUB_URL>                 The Aether hub that lets people invite and connect by
+                                          name. Defaults to the one set on the page, else the public
+                                          hub; `off` turns it off.
+                                          [env: AETHER_HUB_URL]
+      --directory <DIRECTORY>
+      --directory-certificate <DIRECTORY_CERTIFICATE>
+      --agent-id <AGENT_ID>               The agent ID in the published directory record. It does
+                                          not name invites.
+      --address <ADDRESS>
+      --scope <SCOPE>
+      --capability <CAPABILITY>
+      --directory-record-ttl <DIRECTORY_RECORD_TTL>
+      --invite-name <INVITE_NAME>         The agent name in invites while this node has no name on
+                                          the hub. Defaults to agent- and the first 8 characters of
+                                          the endpoint ID.
+  -h, --help                              Print help

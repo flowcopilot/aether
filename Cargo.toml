@@ -1,0 +1,53 @@
+[workspace]
+members = ["crates/aether-core", "crates/aether-store", "crates/aether"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.98"
+license = "MIT OR Apache-2.0"
+version = "0.2.9"
+authors = ["Aether contributors"]
+repository = "https://github.com/flowcopilot/aether"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+# Production code must not panic; `clippy.toml` allows the shortcuts in tests.
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+unreachable = "deny"
+unimplemented = "deny"
+unchecked_time_subtraction = "deny"
+todo = "deny"
+string_slice = "deny"
+panic_in_result_fn = "deny"
+panic = "deny"
+exit = "deny"
+as_conversions = "deny"
+# Allowed on purpose. An "# Errors" section on every public function of an
+# application's library adds text, not safety; the error types say it.
+missing_errors_doc = "allow"
+# The command dispatch in `main.rs` and the scheduler loop are long by nature;
+# splitting them is a refactor of its own, not a lint fix.
+too_many_lines = "allow"
+# A nursery lint that turns plain `if let … else` into `map_or_else` closures,
+# which reads worse here.
+option_if_let_else = "allow"
+
+# min-sized-rust (https://github.com/johnthagen/min-sized-rust) techniques
+# that don't change behavior. `panic = "abort"` is deliberately not set: the
+# scheduler relies on a panicking execution thread being caught by
+# `JoinHandle::join()` (see `proof.rs`) rather than killing the whole node,
+# and abort-on-panic would turn one task's panic into a full process crash.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true

@@ -1,0 +1,17 @@
+---
+source: crates/aether/tests/steps/cli/help.rs
+expression: world.cli.stdout()
+---
+Usage: aether node managed <--control <CONTROL>> <--control-certificate <CONTROL_CERTIFICATE>> <SUBCOMMAND>
+
+Commands:
+  events
+  members
+  redeem
+  sync
+  help     Print this message or the help of the given subcommand(s)
+
+Flags:
+      --control <CONTROL>
+      --control-certificate <CONTROL_CERTIFICATE>
+  -h, --help                              Print help

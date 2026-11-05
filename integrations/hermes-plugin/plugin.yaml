@@ -1,0 +1,28 @@
+name: aether
+label: Aether
+kind: platform
+version: 2.0.0
+manifest_version: 2
+license: MIT
+description: >-
+  Makes Hermes an agent on the Aether network. The aether gateway platform
+  answers the tasks that the local Aether node admits, and the aether tools
+  send tasks to other Aether agents. The node keeps the keys and grants; the
+  plugin talks only to the local node.
+provides_tools:
+  - aether_agents_list
+  - aether_agents_find
+  - aether_people_find
+  - aether_task_send
+  - aether_task_cancel
+  - aether_inbox_list
+  - aether_inbox_read
+config_schema:
+  data_dir:
+    type: str
+    default: ""
+    description: "The Aether node data directory (default: $AETHER_DATA_DIR, else ~/.aether/host)"
+  aether_bin:
+    type: str
+    default: "aether"
+    description: "The aether command that runs `aether mcp serve` for the send tools"

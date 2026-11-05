@@ -1,0 +1,14 @@
+---
+source: crates/aether/tests/steps/cli/help.rs
+expression: world.cli.stdout()
+---
+Usage: aether node admin <FLAGS>
+
+Flags:
+      --data-dir <DATA_DIR>
+      --port <PORT>
+      --hub-url <HUB_URL>    The Aether hub that lets people invite and connect by name. Defaults to
+                             the one set on the page, else the public hub; `off` turns it off.
+                             [env: AETHER_HUB_URL]
+      --managed-scope
+  -h, --help                 Print help

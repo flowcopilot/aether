@@ -1,0 +1,14 @@
+---
+source: crates/aether/tests/steps/cli/help.rs
+expression: world.cli.stdout()
+---
+Usage: aether node record <FLAGS>
+
+Flags:
+      --data-dir <DATA_DIR>
+      --agent-id <AGENT_ID>
+      --address <ADDRESS>
+      --scope <SCOPE>
+      --capability <CAPABILITY>
+      --expires-in <EXPIRES_IN>
+  -h, --help                     Print help
