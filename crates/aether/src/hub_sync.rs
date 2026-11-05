@@ -472,7 +472,8 @@ mod tests {
             &crate::agent_card::CardSettings::default(),
             "law#0042",
         );
-        let key = crate::transport::load_or_create_key(signer.join("endpoint.key"))
+        let key = crate::data_dir::DataDir::new(signer)
+            .endpoint_key()
             .expect("key must load");
         let expires = u64::try_from(listing_expires_at).expect("expiry");
         let approval = HubApproval {

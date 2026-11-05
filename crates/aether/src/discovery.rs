@@ -1,4 +1,4 @@
-use std::{path::Path, time::SystemTime};
+use std::time::SystemTime;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 
@@ -96,18 +96,6 @@ pub fn signed_record(
     };
     record.signature = signing_key.sign(&record_bytes(&record)).to_bytes().to_vec();
     record
-}
-
-pub fn load_or_create_signing_key(
-    path: impl AsRef<Path>,
-) -> Result<SigningKey, DiscoveryError> {
-    let bytes = crate::key_file::load_or_create(path.as_ref(), || {
-        let mut bytes = [0; 32];
-        getrandom::fill(&mut bytes).map_err(std::io::Error::other)?;
-        Ok(bytes)
-    })
-    .map_err(|_| DiscoveryError::Unavailable)?;
-    Ok(SigningKey::from_bytes(&bytes))
 }
 
 #[must_use]
@@ -223,9 +211,8 @@ fn append_u64(bytes: &mut Vec<u8>, value: u64) {
 )]
 mod tests {
     use super::{
-        DiscoveryError, Record, load_or_create_signing_key, sign_agent_card,
-        signed_invitation, signed_record, validate_invitation, validate_record,
-        verify_agent_card,
+        DiscoveryError, Record, sign_agent_card, signed_invitation, signed_record,
+        validate_invitation, validate_record, verify_agent_card,
     };
 
     #[test]
@@ -306,32 +293,5 @@ mod tests {
             validate_invitation(&changed_invitation),
             Err(DiscoveryError::Forged)
         );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn signing_key_persists_and_rejects_links() {
-        use std::os::unix::fs::{PermissionsExt, symlink};
-
-        let temporary = tempfile::tempdir().expect("directory must create");
-        let directory = temporary.path();
-        let key = directory.join("discovery.key");
-        let first = load_or_create_signing_key(&key).expect("key must create");
-        let second = load_or_create_signing_key(&key).expect("key must load");
-        assert_eq!(first.verifying_key(), second.verifying_key());
-        assert_eq!(
-            std::fs::metadata(&key)
-                .expect("key metadata must load")
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-        let link = directory.join("link");
-        symlink(&key, &link).expect("link must create");
-        assert!(matches!(
-            load_or_create_signing_key(&link),
-            Err(DiscoveryError::Unavailable)
-        ));
     }
 }

@@ -21,7 +21,7 @@ use topcoat::{
 };
 
 use super::{
-    AdminConfirmations, Caller, Host, Managed, Tab, ensure_admin_session, node_header,
+    AdminConfirmations, Host, Managed, Tab, ensure_admin_session, node_header,
 };
 use crate::{
     admin::SharedAdministration,
@@ -49,13 +49,9 @@ pub(super) async fn dashboard(
 ) -> TopcoatResult<impl View> {
     ensure_admin_session(cx).await?;
     let Host(host) = app_context::<Host>(cx);
-    let Caller(caller) = app_context::<Caller>(cx);
-    let data_dir = host
-        .as_ref()
-        .map(|host| &host.data_dir)
-        .or_else(|| caller.as_ref().map(|caller| &caller.data_dir));
+    let data_dir = super::page_data_dir(cx);
     let policy = data_dir
-        .map(|path| policy_settings(path))
+        .map(|path| policy_settings(&path))
         .transpose()
         .map_err(internal_server_error)?
         .flatten();
@@ -331,12 +327,7 @@ pub(super) async fn save_policy(
     Form(form): Form<PolicyForm>,
 ) -> TopcoatResult<impl View> {
     super::require_admin_session(cx).await?;
-    let Host(host) = app_context::<Host>(cx);
-    let Caller(caller) = app_context::<Caller>(cx);
-    let data_dir = host
-        .as_ref()
-        .map(|host| &host.data_dir)
-        .or_else(|| caller.as_ref().map(|caller| &caller.data_dir))
+    let data_dir = super::page_data_dir(cx)
         .ok_or_else(|| bad_request("this page has no node data"))?;
     let settings = PolicySettings {
         workspace: PathBuf::from(form.workspace),
@@ -345,7 +336,7 @@ pub(super) async fn save_policy(
         queue_global: form.queue_global,
         queue_per_peer: form.queue_per_peer,
     };
-    save_policy_settings(data_dir, &settings).map_err(|_| {
+    save_policy_settings(&data_dir, &settings).map_err(|_| {
         bad_request("use an existing absolute folder and limits above zero")
     })?;
     Ok(view! { dashboard(policy_saved: true) })

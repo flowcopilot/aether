@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    fs,
     net::{SocketAddr, ToSocketAddrs},
     path::Path,
     sync::Arc,
@@ -28,8 +27,8 @@ use aether_core::{
 };
 
 use crate::{
+    data_dir::KeyFileError,
     discovery::{Record, validate_record},
-    key_file::KeyFileError,
 };
 
 pub use a2a::{
@@ -610,18 +609,11 @@ fn valid_exchange_id(value: &str) -> bool {
 pub async fn bind_node(
     data_dir: impl AsRef<Path>,
     port: u16,
-) -> Result<iroh::Endpoint, TransportError> {
-    bind_node_with_relay(data_dir, port, None).await
-}
-
-pub async fn bind_node_with_relay(
-    data_dir: impl AsRef<Path>,
-    port: u16,
     relay_url: Option<&str>,
 ) -> Result<iroh::Endpoint, TransportError> {
-    let data_dir = data_dir.as_ref();
-    fs::create_dir_all(data_dir).map_err(|_| TransportError::Io)?;
-    let key = load_or_create_key(data_dir.join("endpoint.key"))?;
+    let key = crate::data_dir::DataDir::new(data_dir.as_ref())
+        .endpoint_key()
+        .map_err(key_error)?;
     let builder = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
         .secret_key(key)
         .alpns(vec![ALPN.to_vec()]);
@@ -1192,7 +1184,7 @@ async fn request_once_at(
     relay_url: Option<String>,
     request: Frame,
 ) -> Result<Vec<Frame>, TransportError> {
-    let endpoint = bind_node_with_relay(data_dir, 0, relay_url.as_deref()).await?;
+    let endpoint = bind_node(data_dir, 0, relay_url.as_deref()).await?;
     let result = request_with_polling_on(&endpoint, remote, request).await;
     endpoint.close().await;
     result
@@ -1359,17 +1351,12 @@ async fn exchange_stream(
     read_frames(&mut receive).await
 }
 
-pub fn load_or_create_key(
-    path: impl AsRef<Path>,
-) -> Result<iroh::SecretKey, TransportError> {
-    let bytes = crate::key_file::load_or_create(path.as_ref(), || {
-        Ok(iroh::SecretKey::generate().to_bytes())
-    })
-    .map_err(|error| match error {
+/// The transport error of an endpoint key that cannot load.
+pub(crate) const fn key_error(error: KeyFileError) -> TransportError {
+    match error {
         KeyFileError::Unreadable | KeyFileError::WrongSize => TransportError::Key,
         KeyFileError::Io => TransportError::Io,
-    })?;
-    Ok(iroh::SecretKey::from_bytes(&bytes))
+    }
 }
 
 #[cfg(test)]
@@ -1377,7 +1364,7 @@ mod tests {
     use super::{
         A2aAccessMode, A2aAuthorization, A2aClaim, A2aRequest, A2aTaskStatus, Frame,
         FrameKind, TransportError, endpoint_addr_from_record, event_payload,
-        event_payload_with_sequence, load_or_create_key, response_last_event_sequence,
+        event_payload_with_sequence, response_last_event_sequence,
         response_more_events_remain, text_request_payload, text_result_payload,
         text_result_payload_with_progress,
     };
@@ -1385,7 +1372,6 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use std::{
         collections::HashMap,
-        fs,
         sync::{
             Arc, Barrier, Mutex,
             atomic::{AtomicUsize, Ordering},
@@ -1983,34 +1969,6 @@ mod tests {
         );
         assert!(start.elapsed() >= super::STREAM_TIMEOUT);
         drop(receive);
-    }
-
-    #[test]
-    fn endpoint_keys_persist() {
-        let directory = tempfile::tempdir().expect("directory must create");
-        let path = directory.path().join("key");
-        let first = load_or_create_key(&path).expect("key must load");
-        let second = load_or_create_key(&path).expect("key must reload");
-        assert_eq!(first.public(), second.public());
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn endpoint_keys_reject_links_and_keep_owner_only_permissions() {
-        use std::os::unix::fs::{PermissionsExt, symlink};
-
-        let temporary = tempfile::tempdir().expect("directory must create");
-        let directory = temporary.path();
-        let key = directory.join("key");
-        load_or_create_key(&key).expect("key must create");
-        assert_eq!(
-            fs::metadata(&key).expect("key metadata must load").permissions().mode()
-                & 0o077,
-            0
-        );
-        let link = directory.join("link");
-        symlink(&key, &link).expect("link must create");
-        assert!(matches!(load_or_create_key(&link), Err(TransportError::Key)));
     }
 
     #[tokio::test]

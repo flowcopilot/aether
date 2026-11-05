@@ -20,6 +20,7 @@ use ed25519_dalek::SigningKey;
 use hex::FromHex;
 use serde::{Deserialize, Serialize};
 
+use crate::data_dir::DataDir;
 use crate::discovery::{
     DiscoveryError, Invitation, Record, signed_record, validate_invitation,
     validate_record,
@@ -455,24 +456,16 @@ const CONTROL_HARDENING: crate::https::Hardening = crate::https::Hardening {
     body_limit: 64 * 1_024,
 };
 
-fn tls_material(data_dir: &Path) -> io::Result<(Vec<u8>, Vec<u8>)> {
-    crate::key_file::self_signed_cert(
-        data_dir,
-        "control-cert.der",
-        "control-key.der",
-        &["localhost", "127.0.0.1", "control"],
-    )
-}
-
 pub async fn serve(
     data_dir: &Path,
     port: u16,
     handle: Handle<std::net::SocketAddr>,
 ) -> Result<(), ControlError> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    std::fs::create_dir_all(data_dir)?;
-    let service = ControlService::open(data_dir.join("control.sqlite"))?;
-    let (certificate, key) = tls_material(data_dir)?;
+    let data_dir = DataDir::new(data_dir);
+    data_dir.create()?;
+    let service = ControlService::open(data_dir.control_store())?;
+    let (certificate, key) = data_dir.control_tls()?;
     let config = RustlsConfig::from_der(vec![certificate], key)
         .await
         .map_err(|error| ControlError::Server(error.to_string()))?;
@@ -595,9 +588,7 @@ fn map_store_error(error: aether_store::StoreError) -> ControlError {
 mod tests {
     use std::time::{Duration, SystemTime};
 
-    use super::{
-        ControlError, ControlService, WireManagedRedeem, WireRecord, tls_material,
-    };
+    use super::{ControlError, ControlService, DataDir, WireManagedRedeem, WireRecord};
     use crate::discovery::signed_record;
     use ed25519_dalek::SigningKey;
 
@@ -640,8 +631,9 @@ mod tests {
         use tower::ServiceExt;
 
         let directory = tempfile::tempdir().expect("directory must create");
-        let service = ControlService::open(directory.path().join("control.sqlite"))
-            .expect("service must open");
+        let service =
+            ControlService::open(DataDir::new(directory.path()).control_store())
+                .expect("service must open");
         let mut record = serde_json::to_value(WireRecord::test_record())
             .expect("record must serialize");
         record["signature"] = serde_json::Value::String("zz".to_owned());
@@ -655,32 +647,6 @@ mod tests {
             .await
             .expect("router must answer");
         assert_eq!(response.status(), axum::http::StatusCode::UNPROCESSABLE_ENTITY);
-    }
-
-    #[test]
-    fn tls_material_replaces_a_key_left_without_its_certificate() {
-        let directory = tempfile::tempdir().expect("directory must create");
-        let key_path = directory.path().join("control-key.der");
-        std::fs::write(&key_path, b"orphaned").expect("orphaned key must write");
-        let (certificate, key) =
-            tls_material(directory.path()).expect("TLS material must generate");
-        assert_ne!(key, b"orphaned");
-        assert_eq!(std::fs::read(&key_path).expect("key must read"), key);
-        assert_eq!(
-            std::fs::read(directory.path().join("control-cert.der"))
-                .expect("certificate must read"),
-            certificate
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            let mode = std::fs::metadata(&key_path)
-                .expect("key must exist")
-                .permissions()
-                .mode();
-            assert_eq!(mode & 0o777, 0o600);
-        }
     }
 
     fn record_for(key: &SigningKey) -> WireRecord {
@@ -699,14 +665,14 @@ mod tests {
     fn records_can_be_published_found_and_revoked() {
         let directory = tempfile::tempdir().expect("directory must create");
         let directory = directory.path();
-        let service = ControlService::open(directory.join("control.sqlite"))
+        let service = ControlService::open(DataDir::new(directory).control_store())
             .expect("service must open");
         let record = WireRecord::test_record();
 
         assert!(!service.publish(&record).expect("record must publish"));
         assert!(service.publish(&record).expect("record must renew"));
         drop(service);
-        let service = ControlService::open(directory.join("control.sqlite"))
+        let service = ControlService::open(DataDir::new(directory).control_store())
             .expect("service must reopen");
         assert_eq!(service.resolve("test-agent").expect("record must resolve"), record);
         assert_eq!(
@@ -735,8 +701,9 @@ mod tests {
     #[test]
     fn forged_records_are_not_stored() {
         let directory = tempfile::tempdir().expect("directory must create");
-        let service = ControlService::open(directory.path().join("control.sqlite"))
-            .expect("service must open");
+        let service =
+            ControlService::open(DataDir::new(directory.path()).control_store())
+                .expect("service must open");
         let mut record = WireRecord::test_record();
         record.endpoint_id = "changed".to_owned();
 
@@ -747,8 +714,9 @@ mod tests {
     #[test]
     fn another_signer_cannot_replace_or_revoke_a_record() {
         let directory = tempfile::tempdir().expect("directory must create");
-        let service = ControlService::open(directory.path().join("control.sqlite"))
-            .expect("service must open");
+        let service =
+            ControlService::open(DataDir::new(directory.path()).control_store())
+                .expect("service must open");
         let record = WireRecord::test_record();
         let replacement = record_for(&SigningKey::from_bytes(&[8; 32]));
 
@@ -769,7 +737,7 @@ mod tests {
     fn invited_signed_member_is_durable_and_can_be_revoked() {
         let directory = tempfile::tempdir().expect("directory must create");
         let directory = directory.path();
-        let service = ControlService::open(directory.join("control.sqlite"))
+        let service = ControlService::open(DataDir::new(directory).control_store())
             .expect("service must open");
         let token = service
             .create_managed_invitation("managed", Duration::from_secs(60))
@@ -790,7 +758,7 @@ mod tests {
             .expect("invitation must redeem");
         assert_eq!(member.agent_id, "member-agent");
         drop(service);
-        let service = ControlService::open(directory.join("control.sqlite"))
+        let service = ControlService::open(DataDir::new(directory).control_store())
             .expect("service must reopen");
         assert_eq!(
             service.managed_members("managed").expect("members must load"),

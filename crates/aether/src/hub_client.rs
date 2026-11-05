@@ -447,8 +447,8 @@ impl HubClient {
         origin: &str,
         data_dir: &std::path::Path,
     ) -> Result<Self, HubError> {
-        std::fs::create_dir_all(data_dir).map_err(|_| HubError::Unexpected)?;
-        let key = crate::transport::load_or_create_key(data_dir.join("endpoint.key"))
+        let key = crate::data_dir::DataDir::new(data_dir)
+            .endpoint_key()
             .map_err(|_| HubError::Unexpected)?;
         Self::new(origin, key)
     }

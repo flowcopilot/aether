@@ -74,8 +74,7 @@ impl RelayCourier {
     /// A courier on a new endpoint with the key of `data_dir`, for a process
     /// without a running node. Close it after the attempt.
     pub async fn bind(data_dir: &Path, relay: &str) -> Result<Self, TransportError> {
-        let endpoint =
-            crate::transport::bind_node_with_relay(data_dir, 0, Some(relay)).await?;
+        let endpoint = crate::transport::bind_node(data_dir, 0, Some(relay)).await?;
         Ok(Self { endpoint })
     }
 

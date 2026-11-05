@@ -9,8 +9,7 @@ use std::{
 };
 
 use aether::admin_socket::{
-    Request as AdminRequest, Response as AdminResponse, path as admin_socket_path,
-    send as send_admin,
+    Request as AdminRequest, Response as AdminResponse, send as send_admin,
 };
 use cucumber::{given, then, when};
 use serde_json::json;
@@ -79,7 +78,7 @@ fn new_home(world: &mut World) {
 fn owner_logged_in(world: &mut World) {
     let codex_home = world.cli.node_files.home().join(".codex");
     fs::create_dir_all(&codex_home).expect("owner Codex home must create");
-    let auth = codex_home.join("auth.json");
+    let auth = aether::data_dir::codex_login(&codex_home);
     fs::write(&auth, "test credentials").expect("owner login must write");
     world.cli.node_files.owner_auth = Some(auth);
 }
@@ -151,7 +150,10 @@ async fn node_stops(world: &mut World) {
 
 #[when("the node is woken to send its outbox")]
 async fn wake_outbox(world: &mut World) {
-    let socket = admin_socket_path(&world.cli.node_files.home().join(".aether/host"));
+    let socket = aether::data_dir::DataDir::new(
+        world.cli.node_files.home().join(".aether/host"),
+    )
+    .admin_socket();
     blocking(move || {
         let started = Instant::now();
         while !matches!(
@@ -188,8 +190,10 @@ fn node_database_at(world: &mut World, path: String) {
 fn node_uses_owner_login(world: &mut World) {
     let home = world.cli.node_files.home();
     assert_eq!(
-        fs::read_link(home.join(".aether/host/codex-home/auth.json"))
-            .expect("node must link the owner's login"),
+        fs::read_link(aether::data_dir::codex_login(
+            &aether::data_dir::DataDir::new(home.join(".aether/host")).codex_home(),
+        ))
+        .expect("node must link the owner's login"),
         world.cli.node_files.owner_auth.clone().expect("owner must be logged in")
     );
 }

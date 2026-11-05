@@ -41,8 +41,9 @@ pub async fn create_for_scope(
     let client_data = data_dir.join("client");
     let workspace = data_dir.join("workspace");
     fs::create_dir_all(&workspace).map_err(|_| FixtureError)?;
-    let endpoint =
-        crate::transport::bind_node(&client_data, 0).await.map_err(|_| FixtureError)?;
+    let endpoint = crate::transport::bind_node(&client_data, 0, None)
+        .await
+        .map_err(|_| FixtureError)?;
     let caller_endpoint = EndpointId::new(endpoint.id().to_string());
     endpoint.close().await;
     let mut key_bytes = [0; 32];

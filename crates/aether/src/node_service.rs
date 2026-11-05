@@ -597,12 +597,15 @@ where
     }
 
     fn renew_directory(&self, url: &str) -> Result<(), AdminError> {
-        if self.directory.get().is_some_and(|publication| publication.directory != url)
+        if self
+            .directory
+            .get()
+            .is_some_and(|publication| publication.directory() != url)
         {
             return Err(AdminError::InvalidField("url"));
         }
         self.publish("directory", |publication, endpoint_id| async move {
-            publication.renew(&endpoint_id).await
+            publication.renew(&endpoint_id).await.map(|_| ())
         })?
         .map_err(|_| AdminError::InvalidField("url"))
     }
@@ -843,8 +846,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("port must bind");
         let port = listener.local_addr().expect("port must resolve").port();
         drop(listener);
-        let server = bind_node(&server_data, port).await.expect("server must bind");
-        let client = bind_node(&client_data, 0).await.expect("client must bind");
+        let server =
+            bind_node(&server_data, port, None).await.expect("server must bind");
+        let client = bind_node(&client_data, 0, None).await.expect("client must bind");
         let endpoint = aether_core::EndpointId::new(client.id().to_string());
         client.close().await;
         let key = SigningKey::from_bytes(&[8; 32]);
@@ -1033,8 +1037,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("port must bind");
         let port = listener.local_addr().expect("port must resolve").port();
         drop(listener);
-        let server = bind_node(&server_data, port).await.expect("server must bind");
-        let client = bind_node(&client_data, 0).await.expect("client must bind");
+        let server =
+            bind_node(&server_data, port, None).await.expect("server must bind");
+        let client = bind_node(&client_data, 0, None).await.expect("client must bind");
         let endpoint = aether_core::EndpointId::new(client.id().to_string());
         client.close().await;
         let key = SigningKey::from_bytes(&[9; 32]);

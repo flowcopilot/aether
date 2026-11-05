@@ -304,6 +304,15 @@ pub(super) enum Tab {
     Advanced,
 }
 
+/// The data directory of this page's side: the host's, else the caller's.
+pub(super) fn page_data_dir(cx: &Cx) -> Option<std::path::PathBuf> {
+    let Host(host) = app_context::<Host>(cx);
+    let Caller(caller) = app_context::<Caller>(cx);
+    host.as_ref()
+        .map(|host| host.data_dir.clone())
+        .or_else(|| caller.as_ref().map(|caller| caller.data_dir.clone()))
+}
+
 /// The bar on top of every page: the product, one tab for each screen that
 /// this mode has, with the count of what waits on it, and on the right how
 /// the node is reached and its name on Aether.
@@ -311,10 +320,7 @@ pub(super) enum Tab {
 pub(super) async fn node_header(cx: &Cx, current: Tab) -> TopcoatResult<impl View> {
     let Host(host) = app_context::<Host>(cx);
     let Caller(caller) = app_context::<Caller>(cx);
-    let data_dir = host
-        .as_ref()
-        .map(|host| host.data_dir.clone())
-        .or_else(|| caller.as_ref().map(|caller| caller.data_dir.clone()));
+    let data_dir = page_data_dir(cx);
     let drafts = caller.as_ref().map_or(0, |caller| {
         let now = aether_core::time::now_seconds();
         caller::request_drafts_of(&caller.data_dir, now).len()
@@ -944,12 +950,7 @@ fn router(state: UiState) -> AxumRouter {
 }
 
 fn tls_config(data_dir: &Path) -> io::Result<Arc<ServerConfig>> {
-    let (certificate, key) = crate::key_file::self_signed_cert(
-        data_dir,
-        "admin-cert.der",
-        "admin-key.der",
-        &["localhost", "127.0.0.1"],
-    )?;
+    let (certificate, key) = crate::data_dir::DataDir::new(data_dir).admin_tls()?;
     let config = ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -2225,7 +2226,8 @@ mod tests {
         assert_eq!(bundle.authorization.caller_agent_id, "ana");
         assert_eq!(bundle.authorization.capability_id, crate::execution::GENERAL_SKILL);
         assert_eq!(bundle.authorization.claim.subject_endpoint_id, friend);
-        let issuer = crate::node_config::node_issuer_key(directory.path())
+        let issuer = crate::data_dir::DataDir::new(directory.path())
+            .issuer_key()
             .expect("issuer key must load");
         {
             let applied = node.granted();
@@ -2582,11 +2584,11 @@ mod tests {
             home.set_cookie.as_deref().expect("home must set a cookie"),
         )
         .to_owned();
-        let caller_id =
-            crate::transport::load_or_create_key(directory.path().join("endpoint.key"))
-                .expect("caller key must load")
-                .public()
-                .to_string();
+        let caller_id = crate::data_dir::DataDir::new(directory.path())
+            .endpoint_key()
+            .expect("caller key must load")
+            .public()
+            .to_string();
         assert!(home.body.contains("Connect to a friend's agent"));
         // Shown in groups of four; the copy button holds it whole.
         assert!(home.body.contains(&crate::admin_components::grouped(

@@ -75,7 +75,7 @@ impl State {
         self.port = socket.local_addr().expect("port must resolve").port();
         drop(socket);
         let root = tempfile::tempdir().expect("temporary directory must create");
-        let server = bind_node(&root.path().join("server"), self.port)
+        let server = bind_node(&root.path().join("server"), self.port, None)
             .await
             .expect("server must bind");
         let endpoint_id = server.id().to_string();

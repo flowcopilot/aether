@@ -298,8 +298,7 @@ impl TestHub {
         bytes: &[u8],
     ) -> super::AgentRow {
         let endpoint = crate::direct::endpoint_id(host).expect("endpoint");
-        let key = crate::transport::load_or_create_key(signer.join("endpoint.key"))
-            .expect("key");
+        let key = crate::data_dir::DataDir::new(signer).endpoint_key().expect("key");
         let expires_at = now().saturating_add(3600);
         let row = super::AgentRow {
             handle: handle.to_owned(),

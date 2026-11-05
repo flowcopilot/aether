@@ -190,7 +190,8 @@ impl PactConsent {
         brand: &Brand,
         caller: &PaIdentity,
     ) -> Result<aether_core::Grant, ConsentError> {
-        let issuer = crate::node_config::node_issuer_key(&self.data_dir)
+        let issuer = crate::data_dir::DataDir::new(&self.data_dir)
+            .issuer_key()
             .map_err(|_| ConsentError::Sign)?;
         let now = SystemTime::now();
         let lifetime = Duration::from_secs(GRANT_SECONDS.unsigned_abs());

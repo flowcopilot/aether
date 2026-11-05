@@ -147,7 +147,7 @@ impl Control {
     }
 
     fn certificate(&self) -> PathBuf {
-        self.data.join("control-cert.der")
+        aether::data_dir::DataDir::new(&self.data).control_certificate()
     }
 }
 

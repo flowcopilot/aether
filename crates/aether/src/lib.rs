@@ -18,6 +18,7 @@ pub mod agent_card;
 #[allow(dead_code, clippy::pedantic, clippy::nursery)]
 mod components;
 pub mod control_service;
+pub mod data_dir;
 pub mod direct;
 pub mod directory_client;
 pub mod directory_publication;

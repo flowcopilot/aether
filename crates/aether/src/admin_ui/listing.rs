@@ -50,7 +50,8 @@ async fn publish(
         .ok_or(PublishError::NoName)?;
     let settings = crate::agent_card::settings(data_dir);
     let bytes = crate::listing::listing_bytes(&settings, &name);
-    let key = crate::transport::load_or_create_key(data_dir.join("endpoint.key"))
+    let key = crate::data_dir::DataDir::new(data_dir)
+        .endpoint_key()
         .map_err(|_| PublishError::Key)?;
     let expires_at = now.saturating_add(LISTING_LIFETIME.as_secs());
     let signature = crate::listing::sign(&key, &bytes, expires_at);

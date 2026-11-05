@@ -1825,7 +1825,7 @@ mod tests {
             ChangeRequest, shared_with_store,
             test_support::{FakeNode, shared_in},
         },
-        admin_socket::{path, start},
+        admin_socket::start,
     };
 
     #[tokio::test]
@@ -2134,7 +2134,7 @@ mod tests {
         directory: &std::path::Path,
         administration: crate::admin::SharedAdministration,
     ) -> McpServer {
-        let socket = path(directory);
+        let socket = crate::data_dir::DataDir::new(directory).admin_socket();
         start(&socket, administration).expect("socket must start");
         McpServer::socket(socket)
     }
@@ -2898,7 +2898,9 @@ mod tests {
         )
         .expect("first policy must create");
         // No node runs, so the relay setting is saved for the next start.
-        let server = McpServer::socket(path(&data_dir)).with_caller(data_dir.clone());
+        let server =
+            McpServer::socket(crate::data_dir::DataDir::new(&data_dir).admin_socket())
+                .with_caller(data_dir.clone());
         let request = PolicyUpdateArguments {
             workspace: None,
             max_context_tokens: None,
@@ -2993,7 +2995,7 @@ mod tests {
                 data_dir.clone(),
             ),
         ));
-        let socket = path(&data_dir);
+        let socket = crate::data_dir::DataDir::new(&data_dir).admin_socket();
         start(&socket, administration.clone()).expect("socket must start");
         let server = McpServer::socket(socket).with_caller(data_dir.clone());
         let endpoint = crate::direct::endpoint_id(caller.path())
@@ -3163,7 +3165,7 @@ mod tests {
             shared_with_store(NodeStore::in_dir(&data_dir).expect("store must open"));
         let node = Arc::new(FakeNode::default());
         administration.lock().expect("administration must lock").set_live(node.clone());
-        let socket = path(&data_dir);
+        let socket = crate::data_dir::DataDir::new(&data_dir).admin_socket();
         start(&socket, administration).expect("socket must start");
         let server = McpServer::socket(socket).with_caller(data_dir.clone());
         let result = server
@@ -3180,7 +3182,7 @@ mod tests {
     #[tokio::test]
     async fn socket_change_uses_the_ui_administration_state() {
         let directory = tempfile::tempdir().expect("directory must create");
-        let socket = path(directory.path());
+        let socket = crate::data_dir::DataDir::new(directory.path()).admin_socket();
         let administration = shared_in(directory.path());
         start(&socket, administration.clone()).expect("socket must start");
         let response = McpServer::socket(socket.clone())
@@ -3205,7 +3207,7 @@ mod tests {
     {
         let directory = tempfile::tempdir().expect("directory must create");
         let database = directory.path().join(aether_store::NODE_DATABASE);
-        let socket = path(directory.path());
+        let socket = crate::data_dir::DataDir::new(directory.path()).admin_socket();
         let store = NodeStore::open(&database).expect("store must open");
         let administration = shared_with_store(store);
         let node = Arc::new(FakeNode::default());

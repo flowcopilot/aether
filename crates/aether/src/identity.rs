@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
     time::{Duration, SystemTime},
 };
 
@@ -8,7 +7,6 @@ use aether_core::{
     AccessMode, AgentId, ApprovalRule, CapabilityId, Claim, ClaimId, EndpointId, Grant,
     GrantId, ProviderError, Scope, ScopeId, ScopeKind, TrustProvider, WorkspaceId,
 };
-use aether_store::NodeStore;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 
 pub struct SignedClaims {
@@ -19,7 +17,7 @@ pub struct SignedClaims {
 
 pub struct RosterClaims {
     signed_claims: SignedClaims,
-    database: PathBuf,
+    data_dir: crate::data_dir::DataDir,
 }
 
 pub struct ClaimInput {
@@ -64,8 +62,11 @@ impl SignedClaims {
 
 impl RosterClaims {
     #[must_use]
-    pub const fn new(signed_claims: SignedClaims, database: PathBuf) -> Self {
-        Self { signed_claims, database }
+    pub const fn new(
+        signed_claims: SignedClaims,
+        data_dir: crate::data_dir::DataDir,
+    ) -> Self {
+        Self { signed_claims, data_dir }
     }
 }
 
@@ -137,8 +138,7 @@ impl TrustProvider for RosterClaims {
         if scope.kind != ScopeKind::Managed {
             return Ok(());
         }
-        let store =
-            NodeStore::open(&self.database).map_err(|_| ProviderError::Unavailable)?;
+        let store = self.data_dir.store().map_err(|_| ProviderError::Unavailable)?;
         let now = aether_core::time::unix_timestamp(SystemTime::now())
             .ok_or(ProviderError::Unavailable)?;
         let active = store
@@ -380,7 +380,7 @@ mod tests {
         AccessMode, AgentId, ApprovalRule, CapabilityId, ClaimId, EndpointId, GrantId,
         Scope, ScopeId, ScopeKind, TrustProvider, WorkspaceId,
     };
-    use aether_store::{ManagedMember, NodeStore};
+    use aether_store::ManagedMember;
     use ed25519_dalek::SigningKey;
     use std::{
         collections::{BTreeMap, BTreeSet},
@@ -537,8 +537,8 @@ mod tests {
     #[test]
     fn managed_claims_require_an_active_durable_roster_member() {
         let directory = tempfile::tempdir().expect("directory must create");
-        let database = directory.path().join(aether_store::NODE_DATABASE);
-        let mut store = NodeStore::open(&database).expect("store must open");
+        let data_dir = crate::data_dir::DataDir::new(directory.path());
+        let mut store = data_dir.store().expect("store must open");
         store
             .apply_managed_member(
                 "https://control.test",
@@ -568,7 +568,7 @@ mod tests {
                 nonce: [6; 32],
             },
         );
-        let trust = RosterClaims::new(provider(&key), database);
+        let trust = RosterClaims::new(provider(&key), data_dir);
         let scope = Scope { id: ScopeId::new("managed"), kind: ScopeKind::Managed };
         assert!(trust.verify(&claim, &EndpointId::new("endpoint"), &scope,).is_ok());
         store

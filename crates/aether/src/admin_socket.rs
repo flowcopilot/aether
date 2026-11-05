@@ -5,7 +5,7 @@ use std::{
         fs::{FileTypeExt, PermissionsExt},
         net::{UnixListener, UnixStream},
     },
-    path::{Path, PathBuf},
+    path::Path,
     thread,
     time::Duration,
 };
@@ -107,11 +107,6 @@ pub fn start(path: &Path, administration: SharedAdministration) -> io::Result<()
         }
     });
     Ok(())
-}
-
-#[must_use]
-pub fn path(data_dir: &Path) -> PathBuf {
-    data_dir.join("admin.sock")
 }
 
 pub fn send(path: &Path, request: &Request) -> io::Result<Response> {
@@ -335,13 +330,13 @@ mod tests {
         os::unix::net::UnixListener,
     };
 
-    use super::{Request, Response, path, send, start};
+    use super::{Request, Response, send, start};
     use crate::admin::{AuditEntry, test_support::shared_in};
 
     #[test]
     fn socket_shares_pending_changes_without_mcp_confirmation() {
         let directory = tempfile::tempdir().expect("directory must create");
-        let socket = path(directory.path());
+        let socket = crate::data_dir::DataDir::new(directory.path()).admin_socket();
         let administration = shared_in(directory.path());
         start(&socket, administration.clone()).expect("socket must start");
         assert!(matches!(
@@ -384,7 +379,7 @@ mod tests {
     #[test]
     fn outbox_wake_reaches_the_node_and_is_unsupported_without_one() {
         let directory = tempfile::tempdir().expect("directory must create");
-        let socket = path(directory.path());
+        let socket = crate::data_dir::DataDir::new(directory.path()).admin_socket();
         let administration = shared_in(directory.path());
         start(&socket, administration.clone()).expect("socket must start");
         assert!(matches!(
@@ -418,7 +413,7 @@ mod tests {
     #[test]
     fn socket_rejects_oversized_messages_and_recovers_stale_sockets() {
         let directory = tempfile::tempdir().expect("directory must create");
-        let socket = path(directory.path());
+        let socket = crate::data_dir::DataDir::new(directory.path()).admin_socket();
         drop(UnixListener::bind(&socket).expect("stale socket must create"));
         let administration = shared_in(directory.path());
         start(&socket, administration).expect("stale socket must recover");
@@ -451,7 +446,7 @@ mod tests {
     #[test]
     fn socket_does_not_replace_an_active_owner() {
         let directory = tempfile::tempdir().expect("directory must create");
-        let socket = path(directory.path());
+        let socket = crate::data_dir::DataDir::new(directory.path()).admin_socket();
         let listener = UnixListener::bind(&socket).expect("socket must bind");
 
         let error = start(&socket, shared_in(directory.path()))

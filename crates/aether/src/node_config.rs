@@ -20,8 +20,9 @@ use crate::{
             CodexAppServer, CodexLimits, MAX_ENVIRONMENT, TASK_FOLDER,
             valid_environment_key, valid_environment_value,
         },
-        connected::{self, ConnectedAgent},
+        connected::ConnectedAgent,
     },
+    data_dir::{DataDir, codex_login},
     execution::{Executor, Limits},
     identity::{RosterClaims, SignedClaims},
     node_service::NodeService,
@@ -178,15 +179,6 @@ struct GrantFile {
 /// trusts. The admin UI signs a friend's access with it.
 pub const NODE_ISSUER: &str = "node";
 
-/// The node's own issuer key, `<data-dir>/issuer.key`, created owner-only
-/// on first use.
-pub fn node_issuer_key(
-    data_dir: &Path,
-) -> Result<ed25519_dalek::SigningKey, NodeConfigError> {
-    crate::discovery::load_or_create_signing_key(data_dir.join("issuer.key"))
-        .map_err(|_| NodeConfigError::InvalidField("issuer.key".to_owned()))
-}
-
 const POLICY_KEY: &str = "node.policy";
 
 /// The policy `source` with `adapter`, and whether that changed it. The
@@ -315,15 +307,14 @@ pub fn load_or_create_service_with_adapter(
     codex_binary: PathBuf,
     adapter: Option<AgentAdapter>,
 ) -> Result<NodeService<RosterClaims, NodeAgent>, NodeConfigError> {
-    fs::create_dir_all(data_dir).map_err(|_| NodeConfigError::Read)?;
-    let store = NodeStore::in_dir(data_dir).map_err(|_| NodeConfigError::Read)?;
+    let store = DataDir::new(data_dir).store().map_err(|_| NodeConfigError::Read)?;
     let (source, first_start) = match store.configuration(POLICY_KEY) {
         Ok(source) => (source.into_bytes(), false),
         Err(StoreError::NotFound) if import_path.is_file() => {
             (fs::read(import_path).map_err(|_| NodeConfigError::Read)?, true)
         }
         Err(StoreError::NotFound) => {
-            let workspace = data_dir.parent().unwrap_or(data_dir).join("tasks");
+            let workspace = DataDir::new(data_dir).default_tasks_root();
             fs::create_dir_all(&workspace).map_err(|_| NodeConfigError::Read)?;
             let workspace =
                 workspace.canonicalize().map_err(|_| NodeConfigError::Read)?;
@@ -703,12 +694,13 @@ fn load_service_source(
     if matches!(sandbox, Some(PolicySandbox::TaskFolder)) && policy.allow_network {
         return Err(NodeConfigError::InvalidField("allowNetwork".to_owned()));
     }
-    fs::create_dir_all(data_dir).map_err(|_| NodeConfigError::Invalid)?;
-    let node_issuer = node_issuer_key(data_dir)?;
+    let layout = DataDir::new(data_dir);
+    let node_issuer = layout
+        .issuer_key()
+        .map_err(|_| NodeConfigError::InvalidField("issuer.key".to_owned()))?;
     trusted_issuers
         .insert(AgentId::new(NODE_ISSUER), node_issuer.verifying_key().to_bytes());
-    let mut store =
-        NodeStore::in_dir(data_dir).map_err(|_| NodeConfigError::Invalid)?;
+    let mut store = layout.store().map_err(|_| NodeConfigError::Invalid)?;
     // A grant revoked from the admin UI stays revoked, even when the policy
     // file still lists it.
     let mut grants = Vec::new();
@@ -769,8 +761,7 @@ fn load_service_source(
     store
         .initialize_access_groups(&initial_members)
         .map_err(|_| NodeConfigError::Invalid)?;
-    let trust =
-        RosterClaims::new(signed_claims, data_dir.join(aether_store::NODE_DATABASE));
+    let trust = RosterClaims::new(signed_claims, layout.clone());
     // The folder must exist; say which field names it.
     let workspace = policy
         .workspace
@@ -796,7 +787,7 @@ fn load_service_source(
         )?),
         None => NodeAgent::Connected(
             ConnectedAgent::listen(
-                &connected::socket_path(data_dir),
+                &layout.agent_socket(),
                 Duration::from_secs(policy.max_seconds),
             )
             .map_err(|_| NodeConfigError::InvalidField("adapter".to_owned()))?,
@@ -897,12 +888,6 @@ const RESERVED_ENVIRONMENT: &[&str] = &[
     "CODEX_MANAGED_PACKAGE_ROOT",
 ];
 
-/// The Codex home aether owns for this node.
-#[must_use]
-pub fn codex_home(data_dir: &Path) -> PathBuf {
-    data_dir.join("codex-home")
-}
-
 /// Creates the node's Codex home. It shares only the owner's login file, when
 /// one exists. Codex writes refreshed credentials through the link, so both
 /// processes use the same token file. The owner's `~/.codex` settings stay
@@ -915,17 +900,17 @@ fn prepare_codex_home(
 ) -> Result<PathBuf, NodeConfigError> {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
-    let codex_home = codex_home(data_dir);
+    let codex_home = DataDir::new(data_dir).codex_home();
     fs::create_dir_all(codex_home.join("home"))
         .map_err(|_| NodeConfigError::Invalid)?;
     fs::set_permissions(&codex_home, fs::Permissions::from_mode(0o700))
         .map_err(|_| NodeConfigError::Invalid)?;
-    let auth = codex_home.join("auth.json");
+    let auth = codex_login(&codex_home);
     if let Err(error) = fs::symlink_metadata(&auth) {
         if error.kind() != std::io::ErrorKind::NotFound {
             return Err(NodeConfigError::Invalid);
         }
-        if let Some(owner_auth) = owner_codex_home.map(|home| home.join("auth.json")) {
+        if let Some(owner_auth) = owner_codex_home.map(codex_login) {
             let owner_auth = std::path::absolute(owner_auth)
                 .map_err(|_| NodeConfigError::Invalid)?;
             if owner_auth != auth && owner_auth.is_file() {
@@ -1131,9 +1116,9 @@ mod tests {
     use super::{
         AgentAdapter, MAX_ENVIRONMENT, NODE_ISSUER, NodeConfigError, NodePolicyFile,
         allowed_environment, codex_environment, grant_json, load_or_create_service,
-        load_or_create_service_with_adapter, load_service, node_issuer_key,
-        parse_grant_json, prepare_codex_home, setting, settings, store_agent_kind,
-        store_setting, with_adapter,
+        load_or_create_service_with_adapter, load_service, parse_grant_json,
+        prepare_codex_home, setting, settings, store_agent_kind, store_setting,
+        with_adapter,
     };
     use crate::{
         hub_client::AgentKind,
@@ -1326,11 +1311,11 @@ mod tests {
         let service = load_service(&path, directory.path(), "codex".into())
             .expect("policy must load");
         assert!(!service.task_folder_mode());
-        let socket = crate::agent::connected::socket_path(directory.path());
+        let socket = crate::data_dir::DataDir::new(directory.path()).agent_socket();
         let mode =
             fs::metadata(&socket).expect("socket must exist").permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
-        assert!(!crate::node_config::codex_home(directory.path()).exists());
+        assert!(!crate::data_dir::DataDir::new(directory.path()).codex_home().exists());
     }
 
     #[test]
@@ -1421,9 +1406,14 @@ mod tests {
         let root = directory.path();
         let service = load_service(&minimal_policy(root), root, "codex".into())
             .expect("a policy without grants must load");
-        let key = node_issuer_key(root).expect("issuer key must load");
+        let key = crate::data_dir::DataDir::new(root)
+            .issuer_key()
+            .expect("issuer key must load");
         assert_eq!(
-            node_issuer_key(root).expect("issuer key must load again").to_bytes(),
+            crate::data_dir::DataDir::new(root)
+                .issuer_key()
+                .expect("issuer key must load again")
+                .to_bytes(),
             key.to_bytes(),
             "the key file must be reused, not replaced"
         );
@@ -1458,7 +1448,9 @@ mod tests {
         let service = std::sync::Arc::new(
             load_service(&path, root, "codex".into()).expect("policy must load"),
         );
-        let issuer = node_issuer_key(root).expect("issuer key must load");
+        let issuer = crate::data_dir::DataDir::new(root)
+            .issuer_key()
+            .expect("issuer key must load");
         let (_, ui_grant) = sign_access(&issuer, &friend_access(NODE_ISSUER))
             .expect("access must sign");
         let mut administration = crate::admin::Administration::with_store(

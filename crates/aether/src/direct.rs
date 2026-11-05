@@ -12,6 +12,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 
 use crate::{
     control_service::WireInvitation,
+    data_dir::DataDir,
     discovery::Invitation,
     transport::{A2aAuthorization, A2aRequest, Frame, FrameKind, TransportError},
 };
@@ -148,8 +149,8 @@ pub fn sign_invite_access(
     {
         return Err(DirectError::Invalid);
     }
-    let issuer = crate::node_config::node_issuer_key(data_dir)
-        .map_err(|_| DirectError::Unavailable)?;
+    let issuer =
+        DataDir::new(data_dir).issuer_key().map_err(|_| DirectError::Unavailable)?;
     crate::identity::sign_access(
         &issuer,
         &crate::identity::AccessInput {
@@ -217,12 +218,9 @@ pub fn create_invitation(
     if agent_id.is_empty() || expires_in.is_zero() {
         return Err(DirectError::Invalid);
     }
-    std::fs::create_dir_all(data_dir).map_err(|_| DirectError::Unavailable)?;
-    let endpoint = crate::transport::load_or_create_key(data_dir.join("endpoint.key"))
-        .map_err(|_| DirectError::Unavailable)?;
-    let signing_key =
-        crate::discovery::load_or_create_signing_key(data_dir.join("discovery.key"))
-            .map_err(|_| DirectError::Unavailable)?;
+    let layout = DataDir::new(data_dir);
+    let endpoint = layout.endpoint_key().map_err(|_| DirectError::Unavailable)?;
+    let signing_key = layout.discovery_key().map_err(|_| DirectError::Unavailable)?;
     let expires_at =
         SystemTime::now().checked_add(expires_in).ok_or(DirectError::Invalid)?;
     let invitation = crate::discovery::signed_invitation(
@@ -236,8 +234,7 @@ pub fn create_invitation(
 }
 
 /// The Agent Card of this node for the agent name `agent_id`, and its
-/// signature with the invitation key (`discovery.key`), in unpadded
-/// base64url.
+/// signature with the invitation key, in unpadded base64url.
 pub fn create_card(
     data_dir: &Path,
     agent_id: &str,
@@ -252,8 +249,7 @@ pub fn create_card(
         &endpoint,
     );
     let key =
-        crate::discovery::load_or_create_signing_key(data_dir.join("discovery.key"))
-            .map_err(|_| DirectError::Unavailable)?;
+        DataDir::new(data_dir).discovery_key().map_err(|_| DirectError::Unavailable)?;
     let signature = crate::discovery::sign_agent_card(&key, &endpoint, agent_id, &card);
     let card = String::from_utf8(card).map_err(|_| DirectError::Invalid)?;
     Ok((card, URL_SAFE_NO_PAD.encode(signature)))
@@ -278,10 +274,7 @@ pub fn import_invitation(
         return Err(DirectError::NameInUse);
     }
     let record = serde_json::to_vec(wire).map_err(|_| DirectError::Invalid)?;
-    std::fs::create_dir_all(data_dir).map_err(|_| DirectError::Unavailable)?;
-    let store = aether_store::NodeStore::in_dir(data_dir)
-        .map_err(|_| DirectError::Unavailable)?;
-    store
+    open_store(data_dir)?
         .put_contact_record(&aether_store::SignedRecord {
             scope_id: SCOPE.to_owned(),
             agent_id: invitation.agent_id.clone(),
@@ -368,8 +361,7 @@ fn checked_card(bundle: &InvitationBundle) -> Result<Option<&str>, DirectError> 
 
 /// The node store of `data_dir`, for the `*_in` lookups.
 pub fn open_store(data_dir: &Path) -> Result<aether_store::NodeStore, DirectError> {
-    std::fs::create_dir_all(data_dir).map_err(|_| DirectError::Unavailable)?;
-    aether_store::NodeStore::in_dir(data_dir).map_err(|_| DirectError::Unavailable)
+    DataDir::new(data_dir).store().map_err(|_| DirectError::Unavailable)
 }
 
 /// The agent name of a node without a hub name or `--invite-name`.
@@ -383,8 +375,8 @@ pub fn default_agent_name(endpoint_id: &str) -> String {
 
 /// This data directory's endpoint id: what a host needs to invite it.
 pub fn endpoint_id(data_dir: &Path) -> Result<String, DirectError> {
-    std::fs::create_dir_all(data_dir).map_err(|_| DirectError::Unavailable)?;
-    crate::transport::load_or_create_key(data_dir.join("endpoint.key"))
+    DataDir::new(data_dir)
+        .endpoint_key()
         .map(|key| key.public().to_string())
         .map_err(|_| DirectError::Unavailable)
 }
@@ -821,9 +813,7 @@ pub(crate) fn test_bundle_named(
         &invitation.agent_id,
         &invitation.endpoint_id,
     );
-    let key =
-        crate::discovery::load_or_create_signing_key(host_dir.join("discovery.key"))
-            .expect("discovery key must load");
+    let key = DataDir::new(host_dir).discovery_key().expect("discovery key must load");
     let signature = crate::discovery::sign_agent_card(
         &key,
         &invitation.endpoint_id,

@@ -333,8 +333,9 @@ mod tests {
             .await
             .expect("server must listen")
             .expect("server address must exist");
-        let certificate = fs::read(data_dir.join("control-cert.der"))
-            .expect("certificate must exist");
+        let certificate =
+            fs::read(crate::data_dir::DataDir::new(&data_dir).control_certificate())
+                .expect("certificate must exist");
         let client = DirectoryClient::with_pinned_certificate(
             &format!("https://127.0.0.1:{}", address.port()),
             &certificate,
