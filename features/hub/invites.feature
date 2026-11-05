@@ -176,15 +176,16 @@ Feature: Invites
       And the version of bob is 1 higher
 
     Scenario: An invite expires after 7 days and the sweep removes it
-      Given alice invited bob
-      And the version of bob is noted
-      When the invite is 7 days old
+      Given the version of bob is noted
+      And it is 7 days ago
+      And alice invited bob
+      And it is now
       Then bob sees no invites
       When bob accepts the invite
       Then the hub answers 404
       When the hub sweeps expired invites
       Then the hub keeps no record of the invite
-      And the version of bob is 1 higher
+      And the version of bob is 2 higher
 
   Rule: A node can wait for the next change of its invite list
 

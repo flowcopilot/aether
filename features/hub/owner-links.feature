@@ -108,7 +108,7 @@ Feature: Owner links
   Rule: A block hides and ends the link
 
     Scenario: A claim from a blocked person is hidden from the service agent
-      Given law blocks ana
+      Given law blocked ana
       When ana claims law
       Then the hub answers 201
       And ana sees her claim
@@ -163,11 +163,12 @@ Feature: Owner links
 
     Scenario: The sweep removes expired links and old claims
       Given bob is a person
+      And it is 31 days ago
       And ana claimed law
       And law confirmed the claim
-      And the link expires
+      And it is 8 days ago
       And bob claimed law
-      And the claim of bob is 8 days old
+      And it is now
       When the hub sweeps expired links
       Then the hub keeps no links for law
 

@@ -11,34 +11,39 @@ defmodule AetherHub.Directory do
 
   import Ecto.Query
 
-  alias AetherHub.{Account, Listing, Listings, Names, OwnerLinks, Presence, Repo}
+  alias AetherHub.{Account, Clock, Listing, Listings, OwnerLinks, Presence, Repo}
 
-  @max_agents 100
+  @max_agents AetherHub.Protocol.limit(:max_directory_agents)
 
   @doc """
-  The listed service agents at Unix time `now`, online agents first, then by
-  the latest update, at most #{@max_agents}. Also the counts of listed agents,
-  of online listed agents, and of personal accounts.
+  The listed service agents, online agents first, then by the latest
+  update, at most #{@max_agents}. Also the counts of listed agents, of
+  online listed agents, and of personal accounts.
   """
-  def snapshot(now) do
+  def snapshot do
     rows =
       Repo.all(
         from l in Listing,
           join: a in Account,
           on: a.endpoint == l.endpoint,
-          where: l.expires_at > ^now,
+          where: l.expires_at > ^Clock.now(),
           order_by: [desc: l.updated_at],
-          select: {l.endpoint, l.listing, a.name, a.number}
+          select: {l.endpoint, l.listing, a}
       )
 
+    # The hub checked a listing when the node sent it, so a listing that
+    # does not read is a bad row: the page leaves it out.
     agents =
       rows
-      |> Enum.flat_map(fn {endpoint, text, name, number} ->
-        case agent(text) do
-          {:ok, agent} ->
-            handle = Names.format(name, number)
-            online = Presence.online?(endpoint, now)
-            [{endpoint, Map.merge(agent, %{"handle" => handle, "online" => online})}]
+      |> Enum.flat_map(fn {endpoint, text, account} ->
+        case Listings.card(text) do
+          {:ok, card} ->
+            online = Presence.online?(endpoint)
+
+            [
+              {endpoint,
+               Map.merge(card, %{"handle" => Account.full_name(account), "online" => online})}
+            ]
 
           :error ->
             []
@@ -52,7 +57,7 @@ defmodule AetherHub.Directory do
       # The full name of the owner only: never the owner's presence or
       # endpoint.
       |> Enum.map(fn {endpoint, agent} ->
-        Map.put(agent, "owner", OwnerLinks.active_owner(endpoint, now))
+        Map.put(agent, "owner", OwnerLinks.active_owner(endpoint))
       end)
 
     %{
@@ -61,21 +66,5 @@ defmodule AetherHub.Directory do
       "online" => Enum.count(agents, fn {_endpoint, agent} -> agent["online"] end),
       "people" => Repo.aggregate(from(a in Account, where: a.kind == "personal"), :count)
     }
-  end
-
-  # The hub checked the listing when the node sent it, so a read error means
-  # a bad row: the page leaves it out.
-  defp agent(text) do
-    with {:ok, bytes} <- Base.url_decode64(text, padding: false),
-         {:ok, %{"description" => description, "skills" => skills}} <-
-           Listings.decode_json(bytes) do
-      {:ok,
-       %{
-         "description" => description,
-         "skills" => Enum.map(skills, &Map.take(&1, ["name", "tags"]))
-       }}
-    else
-      _ -> :error
-    end
   end
 end

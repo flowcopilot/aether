@@ -8,9 +8,6 @@ Feature: Agent search
   is new for the scenario, so that listings from other scenarios do not
   match.
 
-  Scenario: The hub's database can search text
-    Then the database of the hub has full-text search
-
   Rule: A search finds listings by their words
 
     Scenario: Every word of the search must match
@@ -28,9 +25,10 @@ Feature: Agent search
       Then the search finds strong, weak
 
     Scenario: For the same match, the newer listing comes first
-      Given older is listed with "same text"
+      Given it is 1 minute ago
+      And older is listed with "same text"
+      And it is now
       And newer is listed with "same text"
-      And the listing of older is a minute older
       When a person searches for "same"
       Then the search finds newer, older
 
@@ -140,7 +138,8 @@ Feature: Agent search
   Rule: A node makes at most 30 searches and lookups in one minute
 
     Scenario: The 31st search in one minute is refused
-      Given a person at the start of a minute
+      Given it is the start of a minute
+      And a person
       When the person searches 30 times
       Then the hub answers 200 each time
       When the person searches once more

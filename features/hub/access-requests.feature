@@ -98,7 +98,7 @@ Feature: Access requests
       Then the hub answers 409 with the error "limit"
 
     Scenario: The eleventh request in one day is refused
-      Given a day that does not end in the next 10 seconds
+      Given it is the start of a day
       And alice asked law for access and deleted the request 10 times
       When alice asks law for access
       Then the hub answers 429 with the error "rate_limited"
@@ -106,7 +106,7 @@ Feature: Access requests
   Rule: A service agent does not see requests from people it blocked
 
     Scenario: A request from a blocked person is hidden from the service agent
-      Given law blocks alice
+      Given law blocked alice
       And bob is a person
       When alice asks law for access
       Then the hub answers 201
@@ -140,8 +140,9 @@ Feature: Access requests
   Rule: A request expires after 7 days like an invite
 
     Scenario: An expired request is gone and a new request is a new row
-      Given alice asked law for access
-      When the request is 7 days old
+      Given it is 7 days ago
+      And alice asked law for access
+      When it is now
       Then law sees no requests
       And alice sees no requests
       When law approves the request

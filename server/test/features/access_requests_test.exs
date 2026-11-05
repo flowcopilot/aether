@@ -1,10 +1,7 @@
 defmodule AetherHub.Features.AccessRequestsTest do
   use AetherHub.Feature, file: "access-requests.feature", async: true
 
-  import AetherHub.TestClient
-  import AetherHub.HubStepsSocial
-
-  alias AetherHub.Repo
+  alias AetherHub.Clock
 
   defp ask(requester, service, days \\ 7) do
     request(requester, "POST", "/v1/requests", %{"to" => service.handle, "days" => days})
@@ -25,9 +22,15 @@ defmodule AetherHub.Features.AccessRequestsTest do
   defp target(state, "an unknown name"), do: {state, %{handle: unique_name() <> "#0001"}}
   defp target(state, "a name without a number"), do: {state, %{handle: "no-number"}}
 
+  # A listing of one day, published two days ago.
   defp target(state, "a service agent whose listing expired") do
-    expired = listed_service()
-    Repo.query!("UPDATE listings SET expires_at = 1 WHERE endpoint = ?1", [expired.endpoint])
+    expired =
+      at(Clock.now() - 2 * 86_400, fn ->
+        service = claimed_node("service")
+        %{status: 200} = put_listing(service, listing(service), expires_at: Clock.now() + 86_400)
+        service
+      end)
+
     {state, expired}
   end
 
@@ -38,22 +41,6 @@ defmodule AetherHub.Features.AccessRequestsTest do
     answers = Map.put(state[:answers] || %{}, who, answer)
     changes = %{conn: conn, answers: answers}
     if answer, do: Map.put(changes, :last_request, answer), else: changes
-  end
-
-  defstep ~r/^(?<names>\w+(?:(?:, | and )\w+)*) (?:is an?|are) (?<kind>person|people|listed service agent|node without a name)$/,
-          %{names: names, kind: kind},
-          state do
-    {:ok, new_actors(state, names, kind)}
-  end
-
-  defstep ~r/^the hub answers (?<status>\d+)$/, %{status: status}, state do
-    assert_status(state, status)
-  end
-
-  defstep ~r/^the hub answers (?<status>\d+) with the error "(?<error>\w+)"$/,
-          %{status: status, error: error},
-          state do
-    assert_error(state, status, error)
   end
 
   # Asking
@@ -94,10 +81,6 @@ defmodule AetherHub.Features.AccessRequestsTest do
     assert Enum.uniq(statuses) == [201]
   end
 
-  defstep ~r/^a day that does not end in the next 10 seconds$/, _, _state do
-    start_early_in_window(86_400, 10)
-  end
-
   defstep ~r/^(?<who>\w+) asked (?<service>\w+) for access and deleted the request 10 times$/,
           %{who: who, service: service},
           state do
@@ -113,18 +96,13 @@ defmodule AetherHub.Features.AccessRequestsTest do
   defstep ~r/^52 people with accounts of different ages asked (?<service>\w+) for access$/,
           %{service: service},
           state do
-    requesters = for _ <- 1..52, do: claimed_node()
+    # One account a second, the oldest first.
+    start = Clock.now() - 60
+    requesters = for index <- 1..52, do: at(start + index, &claimed_node/0)
 
-    requesters
-    |> Enum.with_index(1)
-    |> Enum.each(fn {requester, index} ->
-      Repo.query!("UPDATE accounts SET created_at = ?1 WHERE endpoint = ?2", [
-        index,
-        requester.endpoint
-      ])
-
+    for requester <- requesters do
       %{status: 201} = ask(requester, actor(state, service))
-    end)
+    end
 
     {:ok, %{oldest: hd(requesters), newest: List.last(requesters)}}
   end
@@ -158,11 +136,6 @@ defmodule AetherHub.Features.AccessRequestsTest do
   end
 
   # Blocks
-
-  defstep ~r/^(?<service>\w+) blocks (?<who>\w+)$/, %{service: service, who: who}, state do
-    path = "/v1/blocks/#{actor(state, who).endpoint}"
-    assert request(actor(state, service), "PUT", path).status == 204
-  end
 
   defstep ~r/^(?<who>\w+) blocks through the request$/, %{who: who}, state do
     {:ok, %{conn: request(actor(state, who), "POST", "/v1/invites/#{id(state)}/block")}}
@@ -290,10 +263,6 @@ defmodule AetherHub.Features.AccessRequestsTest do
     assert handle == actor(state, other).handle
   end
 
-  defstep ~r/^(?<who>\w+) has no contacts$/, %{who: who}, state do
-    assert json(request(actor(state, who), "GET", "/v1/contacts"))["contacts"] == []
-  end
-
   # Versions and expiry
 
   defstep ~r/^the version of (?<who>\w+) is noted$/, %{who: who}, state do
@@ -302,10 +271,5 @@ defmodule AetherHub.Features.AccessRequestsTest do
 
   defstep ~r/^the version of (?<who>\w+) is the same$/, %{who: who}, state do
     assert list(actor(state, who))["version"] == state.version
-  end
-
-  defstep ~r/^the request is 7 days old$/, _, state do
-    old = System.system_time(:second) - 7 * 86_400
-    Repo.query!("UPDATE invites SET created_at = ?1 WHERE id = ?2", [old, id(state)])
   end
 end
