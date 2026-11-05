@@ -62,11 +62,13 @@ pub(super) async fn caller_screen(
     let endpoint_id =
         crate::direct::endpoint_id(&caller.data_dir).map_err(internal_server_error)?;
     let now = aether_core::time::now_seconds();
-    let mut contacts = crate::direct::contact_bundles(&caller.data_dir)
+    let store =
+        crate::direct::open_store(&caller.data_dir).map_err(internal_server_error)?;
+    let mut contacts = crate::direct::contact_bundles(&store)
         .map_err(internal_server_error)?
         .into_iter()
         .map(|bundle| Contact {
-            card: crate::direct::contact_card(&caller.data_dir, &bundle),
+            card: crate::direct::contact_card(&store, &bundle),
             days_left: bundle
                 .invitation
                 .expires_at

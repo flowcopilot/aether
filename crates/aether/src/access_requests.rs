@@ -55,7 +55,10 @@ pub fn draft(
     if !(1..=u64::from(aether_core::limits::MAX_HUB_ACCESS_DAYS)).contains(&days) {
         return Err(DraftError::Invalid("days must be from 1 to 30"));
     }
-    if crate::direct::contact_by_name(data_dir, target_name).is_ok() {
+    if crate::direct::open_store(data_dir)
+        .and_then(|store| crate::direct::contact_by_name(&store, target_name))
+        .is_ok()
+    {
         return Err(DraftError::Invalid("this agent is a contact already"));
     }
     let lifetime = i64::try_from(DRAFT_LIFETIME.as_secs()).unwrap_or(i64::MAX);

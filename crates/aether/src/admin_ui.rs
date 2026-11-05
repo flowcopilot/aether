@@ -1288,8 +1288,10 @@ mod tests {
         .expect("the worker must handle both rows");
         worker.abort();
 
-        let contacts =
-            crate::direct::contact_bundles(caller_dir.path()).expect("contacts");
+        let contacts = crate::direct::contact_bundles(
+            &crate::direct::open_store(caller_dir.path()).expect("store must open"),
+        )
+        .expect("contacts");
         assert_eq!(contacts.len(), 1);
         assert_eq!(contacts[0].invitation.agent_id, "tudor");
         assert_eq!(contacts[0].invitation.endpoint_id, host);
@@ -2610,12 +2612,18 @@ mod tests {
             input_value(&response.body, "request-0"),
             "aether node request --scope direct --agent-id tudor --text 'Give me three ideas for a project name'"
         );
-        let kept = crate::direct::contact_bundle(directory.path(), "tudor")
-            .expect("the bundle must be kept");
+        let kept = crate::direct::contact_bundle(
+            &crate::direct::open_store(directory.path()).expect("store must open"),
+            "tudor",
+        )
+        .expect("the bundle must be kept");
         assert_eq!(kept.relay_url.as_deref(), Some("https://relay.test"));
         // The line was v2: its card is kept apart from the contact.
-        let card = crate::direct::contact_card(directory.path(), &kept)
-            .expect("the card must be kept");
+        let card = crate::direct::contact_card(
+            &crate::direct::open_store(directory.path()).expect("store must open"),
+            &kept,
+        )
+        .expect("the card must be kept");
         assert_eq!(card.name, "tudor");
         assert!(
             response
@@ -2766,7 +2774,13 @@ mod tests {
                 .await;
         assert_eq!(removed.status, StatusCode::OK, "{}", removed.body);
         assert!(!removed.body.contains("Agents you can use"));
-        assert!(crate::direct::contact_bundle(directory.path(), "tudor").is_err());
+        assert!(
+            crate::direct::contact_bundle(
+                &crate::direct::open_store(directory.path()).expect("store must open"),
+                "tudor"
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -2796,9 +2810,11 @@ mod tests {
         assert_eq!(response.status, StatusCode::BAD_REQUEST);
         assert!(response.body.contains("This is not an Aether invite."));
         assert!(
-            crate::direct::contact_bundles(directory.path())
-                .expect("contacts must list")
-                .is_empty()
+            crate::direct::contact_bundles(
+                &crate::direct::open_store(directory.path()).expect("store must open")
+            )
+            .expect("contacts must list")
+            .is_empty()
         );
     }
 

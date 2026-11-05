@@ -248,7 +248,10 @@ impl McpServer {
             .await;
             return;
         }
-        let relay = crate::direct::contact_by_endpoint(data_dir, &claimed.endpoint_id)
+        let relay = crate::direct::open_store(data_dir)
+            .and_then(|store| {
+                crate::direct::contact_by_endpoint(&store, &claimed.endpoint_id)
+            })
             .ok()
             .and_then(|bundle| bundle.relay_url);
         let Some(relay) = relay else {
@@ -1075,7 +1078,7 @@ impl McpServer {
         let Ok(store) = crate::direct::open_store(data_dir) else {
             return tool_error("the contacts are unavailable");
         };
-        let Ok(bundles) = crate::direct::contact_bundles_in(&store) else {
+        let Ok(bundles) = crate::direct::contact_bundles(&store) else {
             return tool_error("the contacts are unavailable");
         };
         let presence = self.presence(data_dir).await;
@@ -1091,7 +1094,7 @@ impl McpServer {
                         .checked_sub(now)
                         .map_or(0, |left| left.div_ceil(24 * 60 * 60)),
                     "online": presence.get(&invitation.endpoint_id),
-                    "card": crate::direct::contact_card_in(&store, bundle).map(|card| card_json(&card)),
+                    "card": crate::direct::contact_card(&store, bundle).map(|card| card_json(&card)),
                 })
             })
             .collect::<Vec<_>>();
@@ -1163,7 +1166,7 @@ impl McpServer {
         }
         let contacts = Contacts::read(data_dir);
         let Some(Ok(bundles)) =
-            contacts.store.as_ref().map(crate::direct::contact_bundles_in)
+            contacts.store.as_ref().map(crate::direct::contact_bundles)
         else {
             return tool_error("the contacts are unavailable");
         };
@@ -1641,7 +1644,7 @@ fn join_contact(
         contacts
             .store
             .as_ref()
-            .and_then(|store| crate::direct::contact_by_name_in(store, handle).ok())
+            .and_then(|store| crate::direct::contact_by_name(store, handle).ok())
             .map(|_| {
                 if endpoint.is_some() { OTHER_KEY_WARNING } else { UNCONFIRMED_WARNING }
             });

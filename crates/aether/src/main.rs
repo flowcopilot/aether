@@ -1111,7 +1111,11 @@ async fn run_node(node: Node) -> ExitCode {
                         && arguments.directory.is_none()
                         && arguments.managed_control.is_none() =>
                 {
-                    aether::direct::contact_bundle(&data_dir, agent_id).ok()
+                    aether::direct::open_store(&data_dir)
+                        .and_then(|store| {
+                            aether::direct::contact_bundle(&store, agent_id)
+                        })
+                        .ok()
                 }
                 _ => None,
             };
@@ -1199,7 +1203,9 @@ async fn run_node(node: Node) -> ExitCode {
                         if address.is_some() || relay_url.is_some() =>
                     {
                         let contact = if arguments.scope == aether::direct::SCOPE {
-                            aether::direct::contact(&data_dir, agent_id)
+                            aether::direct::open_store(&data_dir).and_then(|store| {
+                                aether::direct::contact(&store, agent_id)
+                            })
                         } else {
                             Err(aether::direct::DirectError::UnknownContact)
                         };
@@ -1532,7 +1538,9 @@ fn run_direct(arguments: NodeDirect) -> ExitCode {
             }
         }
         NodeDirectCommand::Resolve { agent_id } => {
-            match aether::direct::contact(&data_dir, &agent_id) {
+            match aether::direct::open_store(&data_dir)
+                .and_then(|store| aether::direct::contact(&store, &agent_id))
+            {
                 Ok(wire) => {
                     if let Ok(wire) = serde_json::to_string(&wire) {
                         println!("{wire}");
