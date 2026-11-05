@@ -414,22 +414,20 @@ enum OAuthError {
     ServerError,
 }
 
-impl OAuthError {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::InvalidClient => "invalid_client",
-            Self::InvalidScope => "invalid_scope",
-            Self::InvalidGrant => "invalid_grant",
-            Self::UnsupportedGrantType => "unsupported_grant_type",
-            Self::AuthorizationPending => "authorization_pending",
-            Self::SlowDown => "slow_down",
-            Self::AccessDenied => "access_denied",
-            Self::ExpiredToken => "expired_token",
-            Self::TemporarilyUnavailable => "temporarily_unavailable",
-            Self::ServerError => "server_error",
-        }
-    }
+aether_core::named!(OAuthError {
+    InvalidClient => "invalid_client",
+    InvalidScope => "invalid_scope",
+    InvalidGrant => "invalid_grant",
+    UnsupportedGrantType => "unsupported_grant_type",
+    AuthorizationPending => "authorization_pending",
+    SlowDown => "slow_down",
+    AccessDenied => "access_denied",
+    ExpiredToken => "expired_token",
+    TemporarilyUnavailable => "temporarily_unavailable",
+    ServerError => "server_error",
+});
 
+impl OAuthError {
     const fn status(self) -> StatusCode {
         match self {
             // RFC 6749 §5.2: a client that fails to authenticate gets 401.
@@ -454,20 +452,10 @@ enum GrantType {
     RefreshToken,
 }
 
-impl GrantType {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::DeviceCode => "urn:ietf:params:oauth:grant-type:device_code",
-            Self::RefreshToken => "refresh_token",
-        }
-    }
-
-    fn parse(value: &str) -> Option<Self> {
-        [Self::DeviceCode, Self::RefreshToken]
-            .into_iter()
-            .find(|grant_type| grant_type.as_str() == value)
-    }
-}
+aether_core::named!(GrantType {
+    DeviceCode => "urn:ietf:params:oauth:grant-type:device_code",
+    RefreshToken => "refresh_token",
+});
 
 fn a2a_json(status: StatusCode, body: &Value) -> Response {
     let mut response = (status, body.to_string()).into_response();
