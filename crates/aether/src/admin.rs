@@ -4,11 +4,11 @@ use std::{
     time::SystemTime,
 };
 
+use aether_core::Grant;
 use aether_store::{
     AuditActor, AuditResult, ChangeKind, ManagedMember, NodeStore, NodeSummary,
     StoreError, TaskActivity,
 };
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
@@ -31,14 +31,105 @@ pub enum AdminError {
     Stale,
 }
 
-#[derive(Debug, Clone, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+impl schemars::JsonSchema for ChangeRequest {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "ChangeRequest".into()
+    }
+
+    fn json_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "object",
+            "description": "A typed administration change."
+        })
+    }
+}
+
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum ChangeRequest {
     Workspace { id: String, path: String },
-    Grant { id: String, grant: String },
+    Grant { id: String, grant: Grant },
     Directory { id: String, url: String },
     Capability { id: String, capability: String },
     Limit { id: String, limit: u32 },
+}
+
+impl<'de> Deserialize<'de> for ChangeRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+        enum Raw {
+            Workspace { id: String, path: String },
+            Grant { id: String, grant: String },
+            Directory { id: String, url: String },
+            Capability { id: String, capability: String },
+            Limit { id: String, limit: u32 },
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Workspace { id, path } => Ok(Self::Workspace { id, path }),
+            Raw::Grant { id, grant } => {
+                let grant = crate::identity::decode_grant(&grant)
+                    .map_err(serde::de::Error::custom)?;
+                Ok(Self::Grant { id, grant })
+            }
+            Raw::Directory { id, url } => Ok(Self::Directory { id, url }),
+            Raw::Capability { id, capability } => {
+                Ok(Self::Capability { id, capability })
+            }
+            Raw::Limit { id, limit } => Ok(Self::Limit { id, limit }),
+        }
+    }
+}
+
+impl Serialize for ChangeRequest {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum Raw<'a> {
+            Workspace { id: &'a str, path: &'a str },
+            Grant { id: &'a str, grant: String },
+            Directory { id: &'a str, url: &'a str },
+            Capability { id: &'a str, capability: &'a str },
+            Limit { id: &'a str, limit: u32 },
+        }
+        match self {
+            Self::Workspace { id, path } => {
+                Raw::Workspace { id, path }.serialize(serializer)
+            }
+            Self::Grant { id, grant } => {
+                let grant = crate::identity::encode_grant(grant)
+                    .map_err(serde::ser::Error::custom)?;
+                Raw::Grant { id, grant }.serialize(serializer)
+            }
+            Self::Directory { id, url } => {
+                Raw::Directory { id, url }.serialize(serializer)
+            }
+            Self::Capability { id, capability } => {
+                Raw::Capability { id, capability }.serialize(serializer)
+            }
+            Self::Limit { id, limit } => {
+                Raw::Limit { id, limit: *limit }.serialize(serializer)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ApplyOutcome {
+    Applied,
+    Pending,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ChangeOutcome {
+    Validated,
+    Applied,
+    Pending,
 }
 
 /// A validated change, with the time after which it cannot be confirmed.
@@ -58,7 +149,12 @@ impl ChangeRequest {
         valid(self.id(), "id")?;
         match &self {
             Self::Workspace { path, .. } => valid(path, "path")?,
-            Self::Grant { grant, .. } => valid(grant, "grant")?,
+            Self::Grant { id, grant } => {
+                valid(id, "id")?;
+                if grant.id.as_str() != id {
+                    return Err(AdminError::InvalidField("id"));
+                }
+            }
             Self::Directory { url, .. } => {
                 if !url.starts_with("https://") {
                     return Err(AdminError::InvalidField("url"));
@@ -79,7 +175,11 @@ impl ChangeRequest {
     ) -> Result<Self, AdminError> {
         match kind {
             ChangeKind::Workspace => Ok(Self::Workspace { id, path: value }),
-            ChangeKind::Grant => Ok(Self::Grant { id, grant: value }),
+            ChangeKind::Grant => {
+                let grant = crate::identity::decode_grant(&value)
+                    .map_err(|_| AdminError::InvalidField("grant"))?;
+                Ok(Self::Grant { id, grant })
+            }
             ChangeKind::Directory => Ok(Self::Directory { id, url: value }),
             ChangeKind::Capability => Ok(Self::Capability { id, capability: value }),
             ChangeKind::Limit => value
@@ -111,13 +211,14 @@ impl ChangeRequest {
         }
     }
 
-    /// The value string that the store keeps.
+    #[allow(clippy::expect_used)]
     fn value(&self) -> String {
         match self {
             Self::Workspace { path: value, .. }
-            | Self::Grant { grant: value, .. }
             | Self::Directory { url: value, .. }
             | Self::Capability { capability: value, .. } => value.clone(),
+            Self::Grant { grant, .. } => crate::identity::encode_grant(grant)
+                .expect("a validated grant must encode"),
             Self::Limit { limit, .. } => limit.to_string(),
         }
     }
@@ -424,39 +525,57 @@ impl Administration {
         self.live = Some(live);
     }
 
-    pub fn change(&mut self, change: &Change, dry_run: bool) -> Result<(), AdminError> {
+    pub fn submit(
+        &mut self,
+        change: &Change,
+        actor: AuditActor,
+        dry_run: bool,
+    ) -> Result<ChangeOutcome, AdminError> {
         if dry_run {
-            return Ok(());
+            return Ok(ChangeOutcome::Validated);
         }
-        let result = self.queue_or_apply(change);
+        let result = self.apply(change, actor).map(|outcome| match outcome {
+            ApplyOutcome::Applied => ChangeOutcome::Applied,
+            ApplyOutcome::Pending => ChangeOutcome::Pending,
+        });
         self.audited(result)
     }
 
-    fn queue_or_apply(&mut self, change: &Change) -> Result<(), AdminError> {
-        if self.change_requires_confirmation(change) {
-            let base_revision =
-                self.revision.load(std::sync::atomic::Ordering::Acquire);
-            self.store
-                .queue_change(
-                    change.kind(),
-                    change.id(),
-                    &change.value(),
-                    expires_at(change.expires_at),
-                    base_revision,
-                )
-                .map_err(|_| AdminError::Store)?;
+    pub fn apply(
+        &mut self,
+        change: &Change,
+        actor: AuditActor,
+    ) -> Result<ApplyOutcome, AdminError> {
+        let pending =
+            actor != AuditActor::Ui && self.change_requires_confirmation(change);
+        if pending {
+            self.queue_pending(change)?;
+            Ok(ApplyOutcome::Pending)
         } else {
-            self.apply_now(change, AuditActor::Mcp)?;
+            self.apply_now(change, actor)?;
+            Ok(ApplyOutcome::Applied)
         }
-        Ok(())
     }
 
-    /// Applies `change` at once, for the local operator in the admin UI. The
-    /// UI is the authority that confirms a high-risk change, so a change made
-    /// there needs no second confirmation step.
-    pub fn apply_ui(&mut self, change: &Change) -> Result<(), AdminError> {
-        let result = self.apply_now(change, AuditActor::Ui);
-        self.audited(result)
+    pub fn apply_immediate(
+        &mut self,
+        change: &Change,
+        actor: AuditActor,
+    ) -> Result<(), AdminError> {
+        self.apply_now(change, actor)
+    }
+
+    fn queue_pending(&mut self, change: &Change) -> Result<(), AdminError> {
+        let base_revision = self.revision.load(std::sync::atomic::Ordering::Acquire);
+        self.store
+            .queue_change(
+                change.kind(),
+                change.id(),
+                &change.value(),
+                expires_at(change.expires_at),
+                base_revision,
+            )
+            .map_err(|_| AdminError::Store)
     }
 
     /// Writes the durable value first, then the live value. A live failure
@@ -519,7 +638,9 @@ impl Administration {
                 self.store.set_current_workspace(path).map_err(|_| AdminError::Store)
             }
             ChangeRequest::Grant { id, grant } => {
-                live.map_or(Ok(()), |live| live.apply_grant(id, grant))
+                let text = crate::identity::encode_grant(grant)
+                    .map_err(|_| AdminError::InvalidField("grant"))?;
+                live.map_or(Ok(()), |live| live.apply_grant(id, &text))
             }
             // Renews the node's already-configured, already-pinned directory
             // record. Not "switch to a new directory": that would need a new
@@ -600,10 +721,6 @@ impl Administration {
         }
     }
 
-    pub const fn confirm_mcp(&mut self, _id: &str) -> Result<(), AdminError> {
-        Err(AdminError::ConfirmationRequired)
-    }
-
     /// The running node's workspace path; none without a running node.
     #[must_use]
     pub fn current_workspace(&self) -> Option<String> {
@@ -621,22 +738,22 @@ impl Administration {
     /// revocation mark stays so a grant from the policy file is not
     /// restored at the next start, and the running node drops the grant at
     /// once.
-    pub fn revoke_ui(&mut self, id: &str) -> Result<(), AdminError> {
-        let result = self.revoke(id);
+    pub fn revoke(&mut self, id: &str, actor: AuditActor) -> Result<(), AdminError> {
+        let result = self.revoke_inner(id, actor);
         self.audited(result)
     }
 
-    fn revoke(&mut self, id: &str) -> Result<(), AdminError> {
+    fn revoke_inner(&mut self, id: &str, actor: AuditActor) -> Result<(), AdminError> {
         valid(id, "id")?;
         let live = self.live.clone().ok_or(AdminError::Unsupported("revoke"))?;
         self.store.revoke_applied_grant(id).map_err(|_| AdminError::Store)?;
         live.revoke_grant(id)?;
         self.store
-            .record_change(AuditActor::Ui, AuditResult::Applied)
+            .record_change(actor, AuditResult::Applied)
             .map_err(|_| AdminError::Store)
     }
 
-    pub fn set_relay_ui(&self, relay: Option<String>) -> Result<(), AdminError> {
+    pub fn set_relay(&self, relay: Option<String>) -> Result<(), AdminError> {
         self.live.as_ref().ok_or(AdminError::Unsupported("relay"))?.set_relay(relay)
     }
 
@@ -773,10 +890,43 @@ fn change_from_pending(
     Ok(Change { request, expires_at: SystemTime::now() })
 }
 #[cfg(test)]
+#[allow(clippy::arithmetic_side_effects)]
+pub(crate) fn peer_grant() -> aether_core::Grant {
+    use crate::identity::{GrantInput, signed_grant};
+    use aether_core::{
+        AccessMode, AgentId, ApprovalRule, CapabilityId, EndpointId, GrantId, ScopeId,
+        WorkspaceId,
+    };
+    use std::{
+        collections::BTreeSet,
+        time::{Duration, SystemTime},
+    };
+    let key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+    let now = SystemTime::now();
+    signed_grant(
+        &key,
+        GrantInput {
+            id: GrantId::new("peer"),
+            issuer_agent_id: AgentId::new("issuer"),
+            subject_agent_id: AgentId::new("caller"),
+            subject_endpoint_id: EndpointId::new("endpoint"),
+            scope_id: ScopeId::new("direct"),
+            capabilities: BTreeSet::from([CapabilityId::new("review")]),
+            workspaces: BTreeSet::from([WorkspaceId::new("workspace")]),
+            access_mode: AccessMode::ReadOnly,
+            approval_rule: ApprovalRule::Automatic,
+            issued_at: now - Duration::from_secs(1),
+            expires_at: now + Duration::from_secs(60),
+            nonce: [8; 32],
+        },
+    )
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
-        AdminError, Administration, ChangeRequest, PendingChange, shared_with_store,
-        test_support::FakeNode,
+        AdminError, Administration, ChangeOutcome, ChangeRequest, PendingChange,
+        peer_grant, shared_with_store, test_support::FakeNode,
     };
     use aether_store::NodeStore;
     use std::sync::Arc;
@@ -787,8 +937,10 @@ mod tests {
             ChangeRequest::Workspace { id: "one".to_owned(), path: "safe".to_owned() }
                 .into_change()
                 .expect("change must parse");
-        admin.change(&change, false).expect("change");
-        assert_eq!(admin.confirm_mcp("one"), Err(AdminError::ConfirmationRequired));
+        assert_eq!(
+            admin.submit(&change, aether_store::AuditActor::Mcp, false),
+            Ok(ChangeOutcome::Pending)
+        );
         admin.confirm_ui("one").expect("ui confirmation");
         assert_eq!(admin.audit(), ["pending", "confirmed", "applied"]);
     }
@@ -797,20 +949,17 @@ mod tests {
     fn caller_cannot_lower_workspace_change_risk() {
         let (_directory, mut admin) = in_temp_dir();
         admin
-            .change(
+            .submit(
                 &ChangeRequest::Workspace {
                     id: "workspace".to_owned(),
                     path: "project".to_owned(),
                 }
                 .into_change()
                 .expect("change must parse"),
+                aether_store::AuditActor::Mcp,
                 false,
             )
             .expect("change must be accepted");
-        assert_eq!(
-            admin.confirm_mcp("workspace"),
-            Err(AdminError::ConfirmationRequired)
-        );
     }
 
     #[test]
@@ -846,7 +995,11 @@ mod tests {
         let node = Arc::new(FakeNode::default().with_queue_limit(4));
         administration.set_live(node.clone());
         administration
-            .change(&limit_change("queue_global", 2), false)
+            .submit(
+                &limit_change("queue_global", 2),
+                aether_store::AuditActor::Mcp,
+                false,
+            )
             .expect("limit decrease must apply");
         assert_eq!(node.calls(), ["limit queue_global 2"]);
         assert!(administration.pending().is_empty());
@@ -857,7 +1010,11 @@ mod tests {
         let (_directory, mut administration) = in_temp_dir();
         administration.set_live(Arc::new(FakeNode::default().with_queue_limit(1)));
         administration
-            .change(&limit_change("queue_global", 2), false)
+            .submit(
+                &limit_change("queue_global", 2),
+                aether_store::AuditActor::Mcp,
+                false,
+            )
             .expect("limit increase must queue");
         assert_eq!(
             administration.pending(),
@@ -871,7 +1028,11 @@ mod tests {
         // must queue rather than apply silently.
         let (_directory, mut administration) = in_temp_dir();
         administration
-            .change(&limit_change("queue_global", 2), false)
+            .submit(
+                &limit_change("queue_global", 2),
+                aether_store::AuditActor::Mcp,
+                false,
+            )
             .expect("limit change without a reader must queue");
         assert_eq!(
             administration.pending(),
@@ -883,7 +1044,11 @@ mod tests {
         let (_directory, mut administration) = in_temp_dir();
         administration.set_live(Arc::new(FakeNode::default()));
         administration
-            .change(&limit_change("queue_per_peer", 2), false)
+            .submit(
+                &limit_change("queue_per_peer", 2),
+                aether_store::AuditActor::Mcp,
+                false,
+            )
             .expect("limit change with a failing reader must queue");
         assert_eq!(
             administration.pending(),
@@ -900,10 +1065,11 @@ mod tests {
         let node = Arc::new(FakeNode::default().with_queue_limit(5));
         administration.set_live(node.clone());
         administration
-            .change(
+            .submit(
                 &ChangeRequest::Limit { id: "queue_global".to_owned(), limit: 2 }
                     .into_change()
                     .expect("limit change must parse"),
+                aether_store::AuditActor::Mcp,
                 false,
             )
             .expect("limit change must apply");
@@ -919,13 +1085,14 @@ mod tests {
         let mut administration = Administration::with_store(store);
         administration.set_live(node.clone());
         administration
-            .change(
+            .submit(
                 &ChangeRequest::Workspace {
                     id: "workspace".to_owned(),
                     path: "project".to_owned(),
                 }
                 .into_change()
                 .expect("change must parse"),
+                aether_store::AuditActor::Mcp,
                 false,
             )
             .expect("change must queue");
@@ -952,24 +1119,26 @@ mod tests {
             FakeNode::default().with_directory("https://directory.test"),
         ));
         administration
-            .change(
+            .submit(
                 &ChangeRequest::Workspace {
                     id: "workspace".to_owned(),
                     path: "project".to_owned(),
                 }
                 .into_change()
                 .expect("change must parse"),
+                aether_store::AuditActor::Mcp,
                 false,
             )
             .expect("high-risk change must queue");
         administration
-            .change(
+            .submit(
                 &ChangeRequest::Directory {
                     id: "directory".to_owned(),
                     url: "https://directory.test".to_owned(),
                 }
                 .into_change()
                 .expect("change must parse"),
+                aether_store::AuditActor::Mcp,
                 false,
             )
             .expect("unrelated low-risk change must apply immediately");
@@ -987,24 +1156,26 @@ mod tests {
             FakeNode::default().with_directory("https://directory.test"),
         ));
         administration
-            .change(
+            .submit(
                 &ChangeRequest::Workspace {
                     id: "workspace".to_owned(),
                     path: "project".to_owned(),
                 }
                 .into_change()
                 .expect("change must parse"),
+                aether_store::AuditActor::Mcp,
                 false,
             )
             .expect("high-risk change must queue");
         administration
-            .change(
+            .submit(
                 &ChangeRequest::Directory {
                     id: "directory".to_owned(),
                     url: "https://directory.test".to_owned(),
                 }
                 .into_change()
                 .expect("change must parse"),
+                aether_store::AuditActor::Mcp,
                 false,
             )
             .expect("unrelated low-risk change must apply immediately");
@@ -1027,14 +1198,13 @@ mod tests {
         let node = Arc::new(FakeNode::default());
         node.fail_with(AdminError::InvalidField("grant"));
         administration.set_live(node);
+        let grant = peer_grant();
         administration
-            .change(
-                &ChangeRequest::Grant {
-                    id: "peer".to_owned(),
-                    grant: "signed-grant".to_owned(),
-                }
-                .into_change()
-                .expect("change must parse"),
+            .submit(
+                &ChangeRequest::Grant { id: grant.id.as_str().to_owned(), grant }
+                    .into_change()
+                    .expect("change must parse"),
+                aether_store::AuditActor::Mcp,
                 false,
             )
             .expect("change must queue");
@@ -1062,13 +1232,14 @@ mod tests {
         let node = Arc::new(FakeNode::default());
         administration.set_live(node.clone());
         administration
-            .change(
+            .submit(
                 &ChangeRequest::Workspace {
                     id: "workspace".to_owned(),
                     path: "project".to_owned(),
                 }
                 .into_change()
                 .expect("change must parse"),
+                aether_store::AuditActor::Mcp,
                 false,
             )
             .expect("change must queue");
@@ -1125,13 +1296,14 @@ mod tests {
                     administration
                         .lock()
                         .expect("administration must lock")
-                        .change(
+                        .submit(
                             &ChangeRequest::Workspace {
                                 id: id.clone(),
                                 path: path.clone(),
                             }
                             .into_change()
                             .expect("change must parse"),
+                            aether_store::AuditActor::Mcp,
                             false,
                         )
                         .expect("change must queue");
@@ -1188,13 +1360,14 @@ mod tests {
     fn a_directory_change_reports_itself_unsupported_without_an_applier() {
         let (_directory, mut administration) = in_temp_dir();
         assert_eq!(
-            administration.change(
+            administration.submit(
                 &ChangeRequest::Directory {
                     id: "directory".to_owned(),
                     url: "https://directory.test".to_owned(),
                 }
                 .into_change()
                 .expect("change must parse"),
+                aether_store::AuditActor::Mcp,
                 false,
             ),
             Err(AdminError::Unsupported("directory"))
@@ -1208,26 +1381,28 @@ mod tests {
             Arc::new(FakeNode::default().with_directory("https://directory.test"));
         administration.set_live(node.clone());
         assert_eq!(
-            administration.change(
+            administration.submit(
                 &ChangeRequest::Directory {
                     id: "directory".to_owned(),
                     url: "https://other.test".to_owned(),
                 }
                 .into_change()
                 .expect("change must parse"),
+                aether_store::AuditActor::Mcp,
                 false,
             ),
             Err(AdminError::InvalidField("url"))
         );
         assert!(node.calls().is_empty());
         administration
-            .change(
+            .submit(
                 &ChangeRequest::Directory {
                     id: "directory".to_owned(),
                     url: "https://directory.test".to_owned(),
                 }
                 .into_change()
                 .expect("change must parse"),
+                aether_store::AuditActor::Mcp,
                 false,
             )
             .expect("matching url must apply");
@@ -1238,13 +1413,14 @@ mod tests {
     fn a_capability_change_reports_itself_unsupported_without_an_applier() {
         let (_directory, mut administration) = in_temp_dir();
         administration
-            .change(
+            .submit(
                 &ChangeRequest::Capability {
                     id: "capability".to_owned(),
                     capability: "review".to_owned(),
                 }
                 .into_change()
                 .expect("change must parse"),
+                aether_store::AuditActor::Mcp,
                 false,
             )
             .expect("high-risk change must queue");
@@ -1260,13 +1436,14 @@ mod tests {
         let node = Arc::new(FakeNode::default());
         administration.set_live(node.clone());
         administration
-            .change(
+            .submit(
                 &ChangeRequest::Capability {
                     id: "capability".to_owned(),
                     capability: "review".to_owned(),
                 }
                 .into_change()
                 .expect("change must parse"),
+                aether_store::AuditActor::Mcp,
                 false,
             )
             .expect("high-risk change must queue");
@@ -1305,11 +1482,19 @@ mod tests {
         let mut administration = Administration::with_store(store);
         administration.set_live(node.clone());
         administration
-            .change(&limit_change("queue_global", 2), false)
+            .submit(
+                &limit_change("queue_global", 2),
+                aether_store::AuditActor::Mcp,
+                false,
+            )
             .expect("first limit must apply");
         node.fail_with(AdminError::InvalidField("limit"));
         assert_eq!(
-            administration.change(&limit_change("queue_global", 5), false),
+            administration.submit(
+                &limit_change("queue_global", 5),
+                aether_store::AuditActor::Mcp,
+                false
+            ),
             Err(AdminError::InvalidField("limit"))
         );
         assert_eq!(administration.audit(), ["applied".to_owned(), "failed".to_owned()]);
@@ -1332,7 +1517,11 @@ mod tests {
         node.fail_with(AdminError::InvalidField("limit"));
         administration.set_live(node);
         assert_eq!(
-            administration.change(&limit_change("queue_per_peer", 4), false),
+            administration.submit(
+                &limit_change("queue_per_peer", 4),
+                aether_store::AuditActor::Mcp,
+                false
+            ),
             Err(AdminError::InvalidField("limit"))
         );
         drop(administration);
@@ -1364,13 +1553,14 @@ mod tests {
         let store = NodeStore::open(&database).expect("store must open");
         let mut administration = Administration::with_store(store);
         administration
-            .change(
+            .submit(
                 &ChangeRequest::Workspace {
                     id: "workspace".to_owned(),
                     path: "project".to_owned(),
                 }
                 .into_change()
                 .expect("change must parse"),
+                aether_store::AuditActor::Mcp,
                 false,
             )
             .expect("change must queue");

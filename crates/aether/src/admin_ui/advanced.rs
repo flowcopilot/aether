@@ -21,7 +21,7 @@ use topcoat::{
 };
 
 use super::{
-    AdminConfirmations, Host, Managed, Tab, ensure_admin_session, node_header,
+    AdminConfirmations, Managed, Page, Tab, ensure_admin_session, node_header,
 };
 use crate::{
     admin::SharedAdministration,
@@ -48,7 +48,7 @@ pub(super) async fn dashboard(
     #[default] policy_saved: bool,
 ) -> TopcoatResult<impl View> {
     ensure_admin_session(cx).await?;
-    let Host(host) = app_context::<Host>(cx);
+    let Page(page) = app_context::<Page>(cx);
     let data_dir = super::page_data_dir(cx);
     let policy = data_dir
         .map(|path| policy_settings(&path))
@@ -136,7 +136,7 @@ pub(super) async fn dashboard(
 
             <section id="permissions" class="flex scroll-mt-6 flex-col gap-3">
                 <h2 class="text-xl font-semibold tracking-tight">"Permissions"</h2>
-                if host.is_some() {
+                if page.as_ref().is_some_and(|page| page.host_ui) {
                     <p class="text-muted-foreground">"Invite a person to send tasks to your agent. Access groups control who can send tasks."</p>
                     <div class="flex flex-wrap gap-2">
                         <a href="/#invite" class=(class!(button_variants(ButtonVariant::Primary, ButtonSize::Md), "no-underline"))>"Invite someone"</a>

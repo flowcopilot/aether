@@ -769,10 +769,10 @@ impl State {
             send_admin(
                 &socket,
                 &AdminRequest::Change {
-                    change: ChangeRequest::Directory {
+                    change: Box::new(ChangeRequest::Directory {
                         id: "directory".to_owned(),
                         url,
-                    },
+                    }),
                     dry_run: false,
                 },
             )

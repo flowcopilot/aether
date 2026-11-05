@@ -219,13 +219,11 @@ enum NodeDirectCommand {
 /// `node request` share it, so a copied invite command reaches the same
 /// contacts that the caller's web page shows.
 fn data_dir_or_default(data_dir: Option<PathBuf>) -> PathBuf {
-    data_dir
-        .or_else(|| std::env::var_os("AETHER_DATA_DIR").map(PathBuf::from))
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(|home| PathBuf::from(home).join(".aether").join("host"))
-        })
-        .unwrap_or_else(|| PathBuf::from(".aether/host"))
+    aether::data_dir::default_node_data_dir(
+        data_dir,
+        |name| std::env::var_os(name),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
 }
 
 fn expand_home(path: PathBuf) -> PathBuf {
@@ -623,9 +621,10 @@ async fn run_admin(arguments: NodeAdmin) -> ExitCode {
             managed: arguments.managed_scope,
             // `node admin` runs without a node, so its data directory can be
             // a caller's own: its endpoint key and contacts.
-            caller: Some(
-                aether::admin_ui::CallerContext::new(data_dir.clone()).with_hub(hub),
-            ),
+            page: Some(Arc::new(
+                aether::admin_ui::PageContext::admin_caller(data_dir.clone())
+                    .with_hub(hub),
+            )),
             ..Default::default()
         },
     )
@@ -710,7 +709,7 @@ async fn run_node(node: Node) -> ExitCode {
                 }
             };
             match service.agent_adapter() {
-                "codex" => {
+                aether::policy::AgentAdapter::Codex => {
                     let codex_home =
                         aether::data_dir::DataDir::new(&arguments.data_dir)
                             .codex_home();
@@ -721,7 +720,7 @@ async fn run_node(node: Node) -> ExitCode {
                         );
                     }
                 }
-                _ => eprintln!(
+                aether::policy::AgentAdapter::Connected => eprintln!(
                     "aether: tasks go to the agent that connects to {}",
                     aether::data_dir::DataDir::new(&arguments.data_dir)
                         .agent_socket()
@@ -940,18 +939,6 @@ async fn run_node(node: Node) -> ExitCode {
                 // signed-record construction the periodic renewer below uses.
                 live.attach_directory(Arc::clone(publication));
             }
-            let directory_renewer = directory_publication.map(|(publication, _)| {
-                let endpoint_id = endpoint.id().to_string();
-                tokio::spawn(async move {
-                    loop {
-                        tokio::time::sleep(std::time::Duration::from_secs(
-                            publication.ttl() / 2,
-                        ))
-                        .await;
-                        let _ = publication.renew(&endpoint_id).await;
-                    }
-                })
-            });
             // The outbox sends the tasks of this node's own agent with the
             // node's endpoint, and keeps their answers for the inbox.
             let outbox_wake = Arc::new(tokio::sync::Notify::new());
@@ -962,16 +949,35 @@ async fn run_node(node: Node) -> ExitCode {
                 arguments.hub_url.clone(),
                 outbox_wake,
             ));
-            let managed_renewer = managed_sync.map(|(client, control, scope_id)| {
-                let data_dir = arguments.data_dir.clone();
-                tokio::spawn(async move {
-                    loop {
-                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                        let _ =
-                            sync_managed(&data_dir, &control, &scope_id, &client).await;
-                    }
-                })
+            let relay_switcher: aether::admin_ui::RelaySwitcher = Arc::new({
+                let endpoint = endpoint.clone();
+                move |previous, relay| {
+                    let endpoint = endpoint.clone();
+                    Box::pin(async move {
+                        aether::transport::switch_relay(
+                            &endpoint,
+                            previous.as_deref(),
+                            relay.as_deref(),
+                        )
+                        .await
+                    })
+                }
             });
+            let background = aether::node_runtime::start_background_workers(
+                &administration,
+                &arguments.data_dir,
+                hub.clone(),
+                arguments.invite_name.clone(),
+                relay_url.clone(),
+                Some(Arc::clone(&relay_switcher)),
+                directory_publication
+                    .as_ref()
+                    .map(|(publication, _)| Arc::clone(publication)),
+                endpoint.id().to_string(),
+                managed_sync.map(|(client, control, scope_id)| {
+                    (Arc::new(client), control, scope_id)
+                }),
+            );
             let admin_server = arguments.admin_port.map(|admin_port| {
                 let handle = axum_server::Handle::new();
                 let data_dir = arguments.data_dir.clone();
@@ -979,33 +985,17 @@ async fn run_node(node: Node) -> ExitCode {
                 let shutdown = handle.clone();
                 let options = aether::admin_ui::UiOptions {
                     managed: managed_scope,
-                    host: Some(
-                        aether::admin_ui::HostContext::new(
+                    page: Some(Arc::new(
+                        aether::admin_ui::PageContext::host(
                             data_dir.clone(),
                             arguments.invite_name.clone(),
                             relay_url.clone(),
-                            Arc::new({
-                                let endpoint = endpoint.clone();
-                                move |previous, relay| {
-                                    let endpoint = endpoint.clone();
-                                    Box::pin(async move {
-                                        aether::transport::switch_relay(
-                                            &endpoint,
-                                            previous.as_deref(),
-                                            relay.as_deref(),
-                                        )
-                                        .await
-                                    })
-                                }
-                            }),
+                            Arc::clone(&relay_switcher),
                         )
                         .with_hub(hub.clone())
+                        .with_caller(true)
                         .with_task_folder_mode(service.task_folder_mode()),
-                    ),
-                    caller: Some(
-                        aether::admin_ui::CallerContext::new(data_dir.clone())
-                            .with_hub(hub.clone()),
-                    ),
+                    )),
                     pact: pact.as_ref().map(|(_, started, _, _)| {
                         aether::admin_ui::PactUi {
                             consent: Arc::clone(&started.consent),
@@ -1083,14 +1073,7 @@ async fn run_node(node: Node) -> ExitCode {
                     _ => {}
                 }
             }
-            if let Some(renewer) = directory_renewer {
-                renewer.abort();
-                let _ = renewer.await;
-            }
-            if let Some(renewer) = managed_renewer {
-                renewer.abort();
-                let _ = renewer.await;
-            }
+            background.shutdown().await;
             outbox.abort();
             let _ = outbox.await;
             service_for_shutdown.shutdown();
@@ -1367,11 +1350,7 @@ async fn managed_request(
     };
     let member = members
         .into_iter()
-        .find(|member| {
-            member.agent_id == agent_id
-                && member.revoked_at.is_none()
-                && member.expires_at > aether_core::time::now()
-        })
+        .find(|member| aether::node_runtime::managed_member_active(member, agent_id))
         .ok_or(aether::transport::TransportError::Address)?;
     let relay_url = arguments
         .relay_url
@@ -1396,11 +1375,7 @@ fn cached_managed_member(
         .managed_members(scope_id)
         .map_err(|_| ())?
         .into_iter()
-        .find(|member| {
-            member.agent_id == agent_id
-                && member.revoked_at.is_none()
-                && member.expires_at > aether_core::time::now()
-        })
+        .find(|member| aether::node_runtime::managed_member_active(member, agent_id))
         .ok_or(())
 }
 

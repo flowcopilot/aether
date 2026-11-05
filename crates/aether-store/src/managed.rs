@@ -46,6 +46,11 @@ impl ManagedMember {
             Ok(())
         }
     }
+
+    #[must_use]
+    pub const fn is_active(&self, now: i64) -> bool {
+        self.revoked_at.is_none() && self.expires_at > now
+    }
 }
 
 /// The members of `scope_id`, by agent.

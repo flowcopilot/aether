@@ -38,7 +38,7 @@ mod advanced;
 mod caller;
 mod host;
 pub(crate) mod hub;
-mod listing;
+pub(crate) mod listing;
 mod pact;
 
 use crate::admin::SharedAdministration;
@@ -303,13 +303,9 @@ pub(super) enum Tab {
     Advanced,
 }
 
-/// The data directory of this page's side: the host's, else the caller's.
 pub(super) fn page_data_dir(cx: &Cx) -> Option<std::path::PathBuf> {
-    let Host(host) = app_context::<Host>(cx);
-    let Caller(caller) = app_context::<Caller>(cx);
-    host.as_ref()
-        .map(|host| host.data_dir.clone())
-        .or_else(|| caller.as_ref().map(|caller| caller.data_dir.clone()))
+    let Page(page) = app_context::<Page>(cx);
+    page.as_ref().map(|page| page.data_dir.clone())
 }
 
 /// The bar on top of every page: the product, one tab for each screen that
@@ -317,20 +313,19 @@ pub(super) fn page_data_dir(cx: &Cx) -> Option<std::path::PathBuf> {
 /// the node is reached and its name on Aether.
 #[component]
 pub(super) async fn node_header(cx: &Cx, current: Tab) -> TopcoatResult<impl View> {
-    let Host(host) = app_context::<Host>(cx);
-    let Caller(caller) = app_context::<Caller>(cx);
+    let Page(page) = app_context::<Page>(cx);
     let data_dir = page_data_dir(cx);
-    let drafts = caller.as_ref().map_or(0, |caller| {
+    let drafts = page.as_ref().filter(|page| page.caller).map_or(0, |page| {
         let now = aether_core::time::now_seconds();
-        caller::request_drafts_of(&caller.data_dir, now).len()
+        caller::request_drafts_of(&page.data_dir, now).len()
     });
     let pending = app_context::<SharedAdministration>(cx)
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .pending()
         .len();
-    let relay_host = host.as_ref().map(|host| {
-        host.relay_url().map(|url| {
+    let relay_host = page.as_ref().filter(|page| page.host_ui).map(|page| {
+        page.relay_url().map(|url| {
             reqwest::Url::parse(&url)
                 .ok()
                 .and_then(|url| url.host_str().map(str::to_owned))
@@ -342,18 +337,19 @@ pub(super) async fn node_header(cx: &Cx, current: Tab) -> TopcoatResult<impl Vie
             .ok()
             .flatten()
     });
-    let tabs = host.is_some() || caller.is_some();
-    let agents_href = if host.is_some() { "/agents" } else { "/" };
+    let tabs = page.is_some();
+    let agents_href =
+        if page.as_ref().is_some_and(|page| page.host_ui) { "/agents" } else { "/" };
     Ok(view! {
         <header class="border-b border-border">
             <div class="mx-auto flex min-h-14 max-w-6xl flex-wrap items-center gap-x-6 gap-y-2 px-4 sm:px-8">
                 <a href="/" class="text-base font-semibold tracking-tight text-foreground no-underline">"Aether"</a>
                 if tabs {
                     <nav aria-label="Pages" class="-mb-px flex self-stretch overflow-x-auto">
-                        if host.is_some() {
+                        if page.as_ref().is_some_and(|page| page.host_ui) {
                             node_tab(href: "/", current: current == Tab::Sharing, "Who can use your agent")
                         }
-                        if caller.is_some() {
+                        if page.as_ref().is_some_and(|page| page.caller) {
                             node_tab(
                                 href: agents_href,
                                 current: current == Tab::Agents,
@@ -423,13 +419,11 @@ async fn node_tab(
 /// set.
 #[page("/")]
 async fn home(cx: &Cx) -> TopcoatResult<impl View> {
-    let Host(host) = app_context::<Host>(cx);
-    let Caller(caller) = app_context::<Caller>(cx);
-    let (hosting, calling) = (host.is_some(), caller.is_some());
+    let Page(page) = app_context::<Page>(cx);
     Ok(view! {
-        if hosting {
+        if page.as_ref().is_some_and(|page| page.host_ui) {
             host_screen()
-        } else if calling {
+        } else if page.as_ref().is_some_and(|page| page.caller) {
             caller_screen()
         } else {
             dashboard()
@@ -439,9 +433,12 @@ async fn home(cx: &Cx) -> TopcoatResult<impl View> {
 
 #[page("/agents")]
 async fn agents(cx: &Cx) -> TopcoatResult<impl View> {
-    let Caller(Some(_)) = app_context::<Caller>(cx) else {
+    let Page(Some(page)) = app_context::<Page>(cx) else {
         return Err(forbidden().into());
     };
+    if !page.caller {
+        return Err(forbidden().into());
+    }
     Ok(view! { caller_screen() })
 }
 
@@ -621,31 +618,21 @@ pub type RelayFuture =
 pub type RelaySwitcher =
     Arc<dyn Fn(Option<String>, Option<String>) -> RelayFuture + Send + Sync>;
 
-/// What the host side of the UI needs from the running node.
-///
-/// Its data directory holds the issuer, endpoint and discovery keys, and the
-/// relay is the one it listens through. `node admin` has no running node and
-/// passes none.
-pub struct HostContext {
+pub struct PageContext {
     pub data_dir: PathBuf,
     pub task_folder_mode: bool,
-    /// The `--invite-name` value: the agent name in invites while this
-    /// node has no name on the hub. It must pass
-    /// [`crate::direct::valid_name`].
+    pub host_ui: bool,
+    pub caller: bool,
     name: Option<String>,
     relay_url: Mutex<Option<String>>,
     switch_relay: RelaySwitcher,
-    /// The hub that matches people by name, when one is set.
     hub: HubSlot,
-    /// Held while the hub worker checks, signs, and pins one row, and while
-    /// the owner blocks a requester, so that a block cannot land between
-    /// the worker's block check and its grant.
     hub_sign: Mutex<()>,
 }
 
-impl HostContext {
+impl PageContext {
     #[must_use]
-    pub fn new(
+    pub fn host(
         data_dir: PathBuf,
         name: Option<String>,
         relay_url: Option<String>,
@@ -655,6 +642,8 @@ impl HostContext {
         Self {
             data_dir,
             task_folder_mode: false,
+            host_ui: true,
+            caller: false,
             name,
             relay_url: Mutex::new(relay_url),
             switch_relay,
@@ -663,23 +652,33 @@ impl HostContext {
         }
     }
 
-    /// The name an invited person knows this node by: its name on the hub,
-    /// else the `--invite-name` value, else `agent-` and the start of the
-    /// endpoint ID. The hub name comes first, so invites carry the name that
-    /// people find this node by.
-    pub(super) fn agent_name(&self) -> String {
-        crate::settings::setting::<crate::hub_client::settings::HubName>(&self.data_dir)
-            .ok()
-            .flatten()
-            .or_else(|| self.name.clone())
-            .unwrap_or_else(|| {
-                crate::direct::default_agent_name(
-                    &crate::direct::endpoint_id(&self.data_dir).unwrap_or_default(),
-                )
-            })
+    #[must_use]
+    pub fn admin_caller(data_dir: PathBuf) -> Self {
+        let hub = HubSlot::new(data_dir.clone());
+        Self {
+            data_dir,
+            task_folder_mode: false,
+            host_ui: false,
+            caller: true,
+            name: None,
+            relay_url: Mutex::new(None),
+            switch_relay: Arc::new(|_, _| Box::pin(async { Ok(()) })),
+            hub,
+            hub_sign: Mutex::new(()),
+        }
     }
 
-    /// Lets people invite and connect by name through `hub`.
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn with_caller(mut self, enabled: bool) -> Self {
+        self.caller = enabled;
+        self
+    }
+
+    pub(super) fn agent_name(&self) -> String {
+        crate::invites::invite_agent_name(&self.data_dir, self.name.as_deref())
+    }
+
     #[must_use]
     pub fn with_hub(self, hub: Option<crate::hub_client::HubClient>) -> Self {
         self.hub.set(hub);
@@ -692,16 +691,26 @@ impl HostContext {
         self
     }
 
-    /// The relay the node listens through now.
-    fn relay_url(&self) -> Option<String> {
+    pub(super) fn current_hub(&self) -> Option<crate::hub_client::HubClient> {
+        self.hub.get()
+    }
+
+    pub(super) fn set_hub(&self, hub: Option<crate::hub_client::HubClient>) {
+        self.hub.set(hub);
+    }
+
+    pub(super) const fn hub_sign(&self) -> &Mutex<()> {
+        &self.hub_sign
+    }
+
+    pub(super) fn relay_url(&self) -> Option<String> {
         crate::settings::setting::<crate::transport::relay::ActiveRelay>(&self.data_dir)
             .unwrap_or_else(|_| {
                 self.relay_url.lock().unwrap_or_else(PoisonError::into_inner).clone()
             })
     }
 
-    /// Moves the running node to `relay` and keeps it for the next start.
-    async fn set_relay_url(
+    pub(super) async fn set_relay_url(
         &self,
         relay: Option<String>,
     ) -> Result<(), crate::transport::TransportError> {
@@ -767,41 +776,10 @@ impl HubSlot {
     }
 }
 
-/// What the caller side of the UI needs: the caller's own data directory.
-///
-/// The directory holds its endpoint key and imported contacts. The page
-/// connects a caller to a host; sending tasks is the job of agents (MCP) and
-/// the CLI.
-pub struct CallerContext {
-    pub data_dir: PathBuf,
-    /// The hub that matches people by name, when one is set.
-    hub: HubSlot,
-}
-
-impl CallerContext {
-    #[must_use]
-    pub fn new(data_dir: PathBuf) -> Self {
-        Self { hub: HubSlot::new(data_dir.clone()), data_dir }
-    }
-
-    /// Lets this person accept invites by name through `hub`.
-    #[must_use]
-    pub fn with_hub(self, hub: Option<crate::hub_client::HubClient>) -> Self {
-        self.hub.set(hub);
-        self
-    }
-}
-
-/// How to serve the admin UI.
 #[derive(Default)]
 pub struct UiOptions {
-    /// Show the managed scope's members and invitations.
     pub managed: bool,
-    /// Show the host forms: invite a friend.
-    pub host: Option<HostContext>,
-    /// Show the caller forms: import an invitation.
-    pub caller: Option<CallerContext>,
-    /// Serve the PACT consent page, and publish its origin to the gateway.
+    pub page: Option<Arc<PageContext>>,
     pub pact: Option<PactUi>,
 }
 
@@ -813,31 +791,16 @@ pub struct PactUi {
     pub link: Arc<crate::pact::consent::ConsentLink>,
 }
 
-struct Host(Option<Arc<HostContext>>);
+pub(super) struct Page(pub Option<Arc<PageContext>>);
 
 struct Pact(Option<Arc<crate::pact::consent::PactConsent>>);
-
-struct Caller(Option<Arc<CallerContext>>);
 
 fn build_admin_ui(
     administration: SharedAdministration,
     options: UiOptions,
     port: u16,
 ) -> AdminUi {
-    let UiOptions { managed, host, caller, pact } = options;
-    let caller = caller.map(Arc::new);
-    let host = host.map(Arc::new);
-    // Each side follows its invites on the hub while the page runs. The
-    // hub can be set later on the page, so the workers start without one.
-    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-        if let Some(host) = &host {
-            runtime.spawn(hub::host_worker(administration.clone(), Arc::clone(host)));
-            runtime.spawn(listing::listing_worker(Arc::clone(host)));
-        }
-        if let Some(caller) = &caller {
-            runtime.spawn(hub::caller_worker(Arc::clone(caller)));
-        }
-    }
+    let UiOptions { managed, page, pact } = options;
     if let Some(pact) = &pact {
         pact.link.set(format!("https://127.0.0.1:{port}"));
     }
@@ -895,8 +858,7 @@ fn build_admin_ui(
         .route(stylesheet)
         .app_context(administration)
         .app_context(Managed(managed))
-        .app_context(Host(host))
-        .app_context(Caller(caller))
+        .app_context(Page(page))
         .app_context(Pact(pact.map(|pact| pact.consent)))
         .app_context(AdminPort(port))
         .app_context(Arc::clone(&sessions))
@@ -990,8 +952,8 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{
-        AdminUi, CallerContext, HostContext, HubSlot, UiOptions, UiState,
-        build_admin_ui, router, tls_config, ui_service,
+        AdminUi, HubSlot, PageContext, UiOptions, UiState, build_admin_ui, router,
+        tls_config, ui_service,
     };
     use crate::admin::{
         ChangeRequest, SharedAdministration, shared_with_store,
@@ -1057,14 +1019,12 @@ mod tests {
         caller: bool,
     ) -> (AdminUi, Arc<FakeNode>) {
         let (administration, node) = test_administration(data_dir);
-        let options = UiOptions {
-            host: Some(
-                test_host(data_dir, Arc::new(std::sync::Mutex::new(Vec::new())))
-                    .with_task_folder_mode(task_folder_mode),
-            ),
-            caller: caller.then(|| CallerContext::new(data_dir.to_path_buf())),
-            ..UiOptions::default()
-        };
+        let mut page = test_host(data_dir, Arc::new(std::sync::Mutex::new(Vec::new())))
+            .with_task_folder_mode(task_folder_mode);
+        if caller {
+            page = page.with_caller(true);
+        }
+        let options = UiOptions { page: Some(Arc::new(page)), ..UiOptions::default() };
         (build_admin_ui(administration, options, PORT), node)
     }
 
@@ -1073,8 +1033,8 @@ mod tests {
 
     /// A host on relay.test whose relay switches are recorded in `switches`
     /// instead of reaching a node. `https://down.test` never answers.
-    fn test_host(data_dir: &std::path::Path, switches: Switches) -> HostContext {
-        HostContext::new(
+    fn test_host(data_dir: &std::path::Path, switches: Switches) -> PageContext {
+        PageContext::host(
             data_dir.to_path_buf(),
             Some("tudor".to_owned()),
             Some("https://relay.test".to_owned()),
@@ -1096,7 +1056,7 @@ mod tests {
     fn the_agent_name_comes_from_the_hub_name_then_the_invite_name_then_the_endpoint() {
         let directory = tempfile::tempdir().expect("directory must create");
         let host = |name: Option<&str>| {
-            HostContext::new(
+            PageContext::host(
                 directory.path().to_path_buf(),
                 name.map(str::to_owned),
                 None,
@@ -1287,7 +1247,8 @@ mod tests {
             }
         }
         let context = Arc::new(
-            CallerContext::new(caller_dir.path().to_path_buf()).with_hub(Some(client)),
+            PageContext::admin_caller(caller_dir.path().to_path_buf())
+                .with_hub(Some(client)),
         );
         let worker = tokio::spawn(super::hub::caller_worker(context));
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -1314,13 +1275,15 @@ mod tests {
         hub: &crate::hub_client::test_hub::TestHub,
     ) -> axum::Router {
         let (administration, _) = test_administration(data_dir);
-        let options = UiOptions {
-            host: Some(
-                test_host(data_dir, Arc::new(std::sync::Mutex::new(Vec::new())))
-                    .with_hub(Some(hub.client(data_dir))),
-            ),
-            ..UiOptions::default()
-        };
+        let page = Arc::new(
+            test_host(data_dir, Arc::new(std::sync::Mutex::new(Vec::new())))
+                .with_hub(Some(hub.client(data_dir))),
+        );
+        tokio::spawn(super::hub::host_worker(
+            administration.clone(),
+            Arc::clone(&page),
+        ));
+        let options = UiOptions { page: Some(page), ..UiOptions::default() };
         app(build_admin_ui(administration, options, PORT))
     }
 
@@ -1352,10 +1315,10 @@ mod tests {
         hub: &crate::hub_client::test_hub::TestHub,
     ) -> axum::Router {
         let options = UiOptions {
-            caller: Some(
-                CallerContext::new(data_dir.to_path_buf())
+            page: Some(Arc::new(
+                PageContext::admin_caller(data_dir.to_path_buf())
                     .with_hub(Some(hub.client(data_dir))),
-            ),
+            )),
             ..UiOptions::default()
         };
         app(build_admin_ui(shared_in(data_dir), options, PORT))
@@ -2045,7 +2008,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("directory must create");
         let hub = crate::hub_client::test_hub::TestHub::start().await;
         let (administration, node) = test_administration(directory.path());
-        let host = HostContext::new(
+        let host = PageContext::host(
             directory.path().to_path_buf(),
             Some("server".to_owned()),
             None,
@@ -2126,7 +2089,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("directory must create");
         let switches = Arc::new(std::sync::Mutex::new(Vec::new()));
         let options = UiOptions {
-            host: Some(test_host(directory.path(), Arc::clone(&switches))),
+            page: Some(Arc::new(test_host(directory.path(), Arc::clone(&switches)))),
             ..UiOptions::default()
         };
         let application =
@@ -2562,7 +2525,7 @@ mod tests {
     /// A caller UI over `data_dir`.
     fn caller_ui(data_dir: &std::path::Path) -> AdminUi {
         let options = UiOptions {
-            caller: Some(super::CallerContext::new(data_dir.to_path_buf())),
+            page: Some(Arc::new(PageContext::admin_caller(data_dir.to_path_buf()))),
             ..UiOptions::default()
         };
         build_admin_ui(shared_in(data_dir), options, PORT)
@@ -2662,12 +2625,12 @@ mod tests {
         let directory = tempfile::tempdir().expect("directory must create");
         let (administration, _) = test_administration(directory.path());
         let options = UiOptions {
-            host: Some(HostContext::new(
+            page: Some(Arc::new(PageContext::host(
                 directory.path().to_path_buf(),
                 Some("server".to_owned()),
                 None,
                 Arc::new(|_, _| Box::pin(async { Ok(()) })),
-            )),
+            ))),
             ..UiOptions::default()
         };
         crate::settings::store_setting::<crate::hub_client::settings::HubName>(
@@ -2876,10 +2839,11 @@ mod tests {
         administration
             .lock()
             .expect("administration must lock")
-            .change(
+            .submit(
                 &ChangeRequest::Directory { id: id.to_owned(), url: url.to_owned() }
                     .into_change()
                     .expect("change must parse"),
+                aether_store::AuditActor::Ui,
                 false,
             )
             .expect("change must apply");
@@ -3583,21 +3547,21 @@ mod tests {
         administration
             .lock()
             .expect("administration must lock")
-            .change(
-                &ChangeRequest::Grant {
-                    id: "private-key".to_owned(),
-                    grant: "credential".to_owned(),
+            .submit(
+                &{
+                    let grant = crate::admin::peer_grant();
+                    ChangeRequest::Grant { id: grant.id.as_str().to_owned(), grant }
                 }
                 .into_change()
                 .expect("change must parse"),
+                aether_store::AuditActor::Mcp,
                 false,
             )
             .expect("change must add");
         let application = app(admin_ui);
         let home = get(application.clone(), "/").await;
         assert!(home.body.contains("Confirm change"));
-        assert!(!home.body.contains("private-key"));
-        assert!(!home.body.contains("credential"));
+        assert!(!home.body.contains("08080808080808080808080808080808"));
         let token = extract_confirm_token(&home.body)
             .expect("a confirmation token must render");
         let cookie = session_cookie_pair(

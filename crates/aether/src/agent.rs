@@ -13,7 +13,10 @@ pub mod connected;
 
 use std::path::Path;
 
-use crate::execution::{Agent, ExecutionError, ExecutionEvent};
+use crate::{
+    execution::{Agent, ExecutionError, ExecutionEvent},
+    policy::AgentAdapter,
+};
 
 /// The agent of one node, chosen in the policy file.
 #[derive(Clone)]
@@ -23,12 +26,11 @@ pub enum NodeAgent {
 }
 
 impl NodeAgent {
-    /// The adapter's name, for the owner's own logs only.
     #[must_use]
-    pub const fn kind(&self) -> &'static str {
+    pub const fn kind(&self) -> AgentAdapter {
         match self {
-            Self::Codex(_) => "codex",
-            Self::Connected(_) => "connected",
+            Self::Codex(_) => AgentAdapter::Codex,
+            Self::Connected(_) => AgentAdapter::Connected,
         }
     }
 }
