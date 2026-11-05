@@ -1,0 +1,150 @@
+{
+  "protocol": 2,
+  "headers": {
+    "protocol": "x-aether-protocol",
+    "endpoint": "x-aether-endpoint",
+    "time": "x-aether-time",
+    "signature": "x-aether-signature"
+  },
+  "signing": {
+    "maxSkewSeconds": 300,
+    "endpoint": "^[0-9a-f]{64}$",
+    "messages": {
+      "request": ["aether-hub/v1", "{method}", "{pathAndQuery}", "{time}", "{bodySha256}"],
+      "listing": ["aether-listing/v1", "{endpoint}", "true", "{expiresAt}", "{listingSha256}"],
+      "ownerClaim": ["aether-owner/v1", "claim", "{personalEndpoint}", "{serviceHandle}", "{expiresAt}"],
+      "ownerConfirm": ["aether-owner/v1", "confirm", "{serviceEndpoint}", "{personalEndpoint}", "{expiresAt}"]
+    }
+  },
+  "errors": {
+    "invalid": 400,
+    "unauthorized": 401,
+    "no_account": 403,
+    "forbidden": 403,
+    "not_found": 404,
+    "taken": 409,
+    "limit": 409,
+    "too_large": 413,
+    "upgrade_required": 426,
+    "rate_limited": 429
+  },
+  "names": {
+    "name": "^[a-z0-9][a-z0-9._-]{0,31}$",
+    "numbers": {"min": 1, "max": 9999},
+    "numberDigits": 4,
+    "kinds": ["personal", "service"],
+    "defaultKind": "personal"
+  },
+  "limits": {
+    "maxBodyBytes": 16384,
+    "accessDays": {"min": 1, "max": 30},
+    "offerDays": [1, 7, 30],
+    "defaultDays": 7,
+    "maxWaitSeconds": 30,
+    "inviteSeconds": 604800,
+    "invitePrefix": "aether-invite:",
+    "maxInviteBytes": 8192,
+    "maxOpenRequests": 5,
+    "maxListedRequests": 50,
+    "maxBlocks": 1000,
+    "maxDirectoryAgents": 100,
+    "presence": {
+      "onlineSeconds": 45,
+      "lastSeenStepSeconds": 900,
+      "keepSeconds": 604800
+    },
+    "listing": {
+      "maxDays": 30,
+      "maxBytes": 8192,
+      "maxDescription": 500,
+      "maxSkills": 5,
+      "skillId": "^[a-z0-9-]{1,64}$",
+      "maxSkillName": 64,
+      "maxSkillDescription": 300,
+      "maxTags": 5,
+      "tag": "^[a-z0-9-]{1,24}$",
+      "hiddenCodepoints": [
+        [0, 31],
+        [127, 159],
+        [8203, 8207],
+        [8234, 8238],
+        [8294, 8297],
+        [65279, 65279]
+      ]
+    },
+    "search": {
+      "limit": {"min": 1, "max": 20, "default": 10},
+      "agents": {"maxQueryChars": 128, "minWordChars": 2, "maxWords": 8},
+      "people": {"query": "^[a-z0-9._-]{2,32}$"}
+    },
+    "ownerLinks": {
+      "maxDays": 365,
+      "claimSeconds": 604800,
+      "maxOpenClaims": 5,
+      "maxLinks": 20
+    }
+  },
+  "values": {
+    "inviteStatus": ["pending", "requested", "accepted", "delivered"],
+    "inviteOrigin": ["invite", "request"],
+    "inviteRole": ["sender", "receiver"],
+    "ownerLinkRole": ["personal", "service"]
+  },
+  "objects": {
+    "hub": {"keys": ["protocol"]},
+    "error": {"keys": ["error"]},
+    "account": {"keys": ["handle", "name", "number", "endpoint", "kind", "searchable"]},
+    "invite": {"keys": ["id", "from", "to", "role", "days", "status", "origin", "receiverEndpoint", "bundle", "senderEndpoint", "createdAt"]},
+    "invites": {"keys": ["version", "invites"]},
+    "contact": {"keys": ["handle", "kind", "endpoint", "online", "lastSeen"]},
+    "contacts": {"keys": ["contacts"]},
+    "block": {"keys": ["endpoint", "handle"]},
+    "blocks": {"keys": ["blocks"]},
+    "person": {"keys": ["handle", "contact"], "contactKeys": ["online", "endpoint"]},
+    "people": {"keys": ["people"]},
+    "listing": {"keys": ["listed", "listing", "signature", "expiresAt"]},
+    "listingText": {"keys": ["name", "description", "skills"]},
+    "listingSkill": {"keys": ["id", "name", "description", "tags"]},
+    "agent": {"keys": ["handle", "listing", "signature", "expiresAt", "online", "contact", "owner"], "contactKeys": ["endpoint"]},
+    "agents": {"keys": ["agents"]},
+    "ownerLink": {"keys": ["id", "role", "service", "personal", "expiresAt", "confirmed", "claimSignature", "confirmSignature", "personalEndpoint", "serviceEndpoint"]},
+    "ownerLinks": {"keys": ["links"]},
+    "directory": {"keys": ["agents", "listed", "online", "people"]},
+    "directoryAgent": {"keys": ["handle", "description", "skills", "online", "owner"]},
+    "directorySkill": {"keys": ["name", "tags"]}
+  },
+  "routes": [
+    {"method": "GET", "path": "/healthz", "auth": "none"},
+    {"method": "GET", "path": "/", "auth": "none"},
+    {"method": "GET", "path": "/docs", "auth": "none"},
+    {"method": "GET", "path": "/directory.json", "auth": "none", "reply": "directory"},
+    {"method": "GET", "path": "/v1/hub", "auth": "signed", "protocolHeader": false, "reply": "hub"},
+    {"method": "GET", "path": "/v1/account", "auth": "signed", "reply": "account"},
+    {"method": "PUT", "path": "/v1/account", "auth": "signed", "body": ["name", "kind", "searchable"], "reply": "account"},
+    {"method": "DELETE", "path": "/v1/account", "auth": "account", "status": 204},
+    {"method": "POST", "path": "/v1/invites", "auth": "account", "body": ["to", "days"], "status": 201, "reply": "invite"},
+    {"method": "GET", "path": "/v1/invites", "auth": "account", "query": ["after", "wait"], "reply": "invites"},
+    {"method": "POST", "path": "/v1/invites/{id}/accept", "auth": "account", "reply": "invite"},
+    {"method": "POST", "path": "/v1/invites/{id}/bundle", "auth": "account", "body": ["bundle"], "reply": "invite"},
+    {"method": "POST", "path": "/v1/invites/{id}/approve", "auth": "account", "optionalBody": ["days"], "reply": "invite"},
+    {"method": "POST", "path": "/v1/invites/{id}/block", "auth": "account", "status": 204},
+    {"method": "DELETE", "path": "/v1/invites/{id}", "auth": "account", "status": 204},
+    {"method": "POST", "path": "/v1/requests", "auth": "account", "body": ["to", "days"], "status": 201, "reply": "invite"},
+    {"method": "GET", "path": "/v1/contacts", "auth": "account", "reply": "contacts"},
+    {"method": "DELETE", "path": "/v1/contacts/{endpoint}", "auth": "account", "status": 204},
+    {"method": "GET", "path": "/v1/blocks", "auth": "account", "reply": "blocks"},
+    {"method": "PUT", "path": "/v1/blocks/{endpoint}", "auth": "account", "status": 204},
+    {"method": "DELETE", "path": "/v1/blocks/{endpoint}", "auth": "account", "status": 204},
+    {"method": "GET", "path": "/v1/people/{name}/{number}", "auth": "account", "reply": "person"},
+    {"method": "GET", "path": "/v1/people", "auth": "account", "query": ["q", "limit"], "reply": "people"},
+    {"method": "PUT", "path": "/v1/listing", "auth": "account", "body": ["listing", "listed", "expiresAt", "signature"], "reply": "listing"},
+    {"method": "GET", "path": "/v1/listing", "auth": "account", "reply": "listing"},
+    {"method": "DELETE", "path": "/v1/listing", "auth": "account", "status": 204},
+    {"method": "GET", "path": "/v1/agents/{name}/{number}", "auth": "account", "reply": "agent"},
+    {"method": "GET", "path": "/v1/agents", "auth": "account", "query": ["q", "limit"], "reply": "agents"},
+    {"method": "POST", "path": "/v1/owner-links", "auth": "account", "body": ["service", "expiresAt", "signature"], "status": 201, "reply": "ownerLink"},
+    {"method": "GET", "path": "/v1/owner-links", "auth": "account", "reply": "ownerLinks"},
+    {"method": "POST", "path": "/v1/owner-links/{id}/confirm", "auth": "account", "body": ["signature"], "reply": "ownerLink"},
+    {"method": "DELETE", "path": "/v1/owner-links/{id}", "auth": "account", "status": 204}
+  ]
+}
