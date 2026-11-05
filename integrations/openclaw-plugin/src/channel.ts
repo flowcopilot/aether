@@ -32,7 +32,6 @@ export function channelSection(cfg: OpenClawConfig): Record<string, unknown> | u
   return channels[CHANNEL_ID];
 }
 
-// The tool names that an Aether task may call.
 export function allowedToolsFrom(cfg: OpenClawConfig): string[] {
   const value = channelSection(cfg)?.allowedTools;
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];

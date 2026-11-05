@@ -32,9 +32,7 @@ export class NodeSocket {
       await this.#session(signal);
       try {
         await sleep(this.#retryMs, undefined, { signal });
-      } catch {
-        // Aborted during the wait. The loop ends.
-      }
+      } catch {}
     }
   }
 
