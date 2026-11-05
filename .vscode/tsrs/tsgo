@@ -1,3 +1,0 @@
-#!/bin/sh
-# The TypeScript 7 extension searches for an executable named tsgo or tsc.
-exec "$(dirname "$0")/../../promo/signal/node_modules/.bin/tsrs" "$@"
