@@ -1,13 +1,28 @@
 defmodule AetherHub.Sweeper do
-  @moduledoc """
-  Once a minute, removes expired invites and wakes both sides, and removes
-  expired listings and owner links.
-  """
+  @moduledoc "Removes what expired, once a minute."
   use GenServer
 
-  @interval 60_000
+  require Logger
+
+  @interval :timer.minutes(1)
 
   def start_link(_opts), do: GenServer.start_link(__MODULE__, nil, name: __MODULE__)
+
+  def sweep do
+    for {name, sweep} <- [
+          invites: &AetherHub.Invites.delete_expired/0,
+          listings: &AetherHub.Listings.delete_expired/0,
+          owner_links: &AetherHub.OwnerLinks.delete_expired/0,
+          presence: &AetherHub.Presence.sweep/0,
+          rate_limits: &AetherHub.RateLimit.sweep/0
+        ] do
+      with {:error, reason} <- sweep.() do
+        Logger.error("the sweep of #{name} failed: #{inspect(reason)}")
+      end
+    end
+
+    :ok
+  end
 
   @impl true
   def init(nil) do
@@ -17,9 +32,7 @@ defmodule AetherHub.Sweeper do
 
   @impl true
   def handle_info(:sweep, state) do
-    AetherHub.Hub.delete_expired()
-    AetherHub.Listings.delete_expired()
-    AetherHub.OwnerLinks.delete_expired()
+    sweep()
     schedule()
     {:noreply, state}
   end

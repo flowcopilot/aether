@@ -10,108 +10,68 @@ defmodule AetherHub.People do
 
   import Ecto.Query
 
-  alias AetherHub.{Account, Contact, Names, Presence, Repo}
+  alias AetherHub.{Account, Contacts, Params, Presence, Protocol, Repo}
 
-  @query ~r/\A[a-z0-9._-]{2,32}\z/
-  @default_limit 10
-  @max_limit 20
   # Every character of the name alphabet sorts before "{", so the names that
   # start with `q` are the range from `q` up to `q <> "{"`.
   @after_alphabet "{"
 
   @doc """
-  The personal agent `name#number`, as seen by `asker` at Unix time `now`.
-  `{:error, :not_found}` for an unknown name or a service agent.
+  The personal agent `name#number`, as seen by `asker`. `{:error,
+  :not_found}` for an unknown name or a service agent.
   """
-  def lookup(asker, name, number, now) do
-    with {:ok, _} <- fetch_account(asker) do
-      case Repo.one(
-             from a in Account,
-               where: a.name == ^name and a.number == ^number and a.kind == "personal"
-           ) do
-        nil -> {:error, :not_found}
-        account -> {:ok, row(account, contacts(asker, [account]), now)}
-      end
+  def lookup(%Account{endpoint: asker}, name, number) do
+    case Repo.one(
+           from a in Account,
+             where: a.name == ^name and a.number == ^number and a.kind == "personal"
+         ) do
+      nil -> {:error, :not_found}
+      account -> {:ok, row(account, Contacts.known(asker, [account.endpoint]))}
     end
   end
 
-  @doc """
-  The `q` and `limit` of a search request: `q` has 2 to 32 characters of the
-  name alphabet, and `limit` is 1 to 20 (default 10).
-  """
+  @doc "The `q` and `limit` of a search request."
   def parse_search(params) do
     with q when is_binary(q) <- params["q"],
-         true <- Regex.match?(@query, q),
-         {:ok, limit} <- parse_limit(params["limit"]) do
+         true <- Regex.match?(Protocol.regex(:people_query), q),
+         {:ok, limit} <- Params.limit(params["limit"]) do
       {:ok, q, limit}
     else
       _ -> {:error, :invalid}
     end
   end
 
-  defp parse_limit(nil), do: {:ok, @default_limit}
-
-  defp parse_limit(value) when is_binary(value) do
-    case Integer.parse(value) do
-      {limit, ""} when limit in 1..@max_limit -> {:ok, limit}
-      _ -> :error
-    end
-  end
-
-  defp parse_limit(_value), do: :error
-
   @doc """
   The personal agents that opted in to search and whose name starts with
-  `q`, ordered by name and number, as seen by `asker` at Unix time `now`.
+  `q`, ordered by name and number, as seen by `asker`.
   """
-  def search(asker, q, limit, now) do
-    with {:ok, _} <- fetch_account(asker) do
-      accounts =
-        from(a in Account,
-          where:
-            a.name >= ^q and a.name < ^(q <> @after_alphabet) and a.kind == "personal" and
-              a.searchable == true,
-          order_by: [asc: a.name, asc: a.number],
-          limit: ^limit
-        )
-        |> Repo.all()
+  def search(%Account{endpoint: asker}, q, limit) do
+    accounts =
+      from(a in Account,
+        where:
+          a.name >= ^q and a.name < ^(q <> @after_alphabet) and a.kind == "personal" and
+            a.searchable == true,
+        order_by: [asc: a.name, asc: a.number],
+        limit: ^limit
+      )
+      |> Repo.all()
 
-      contacts = contacts(asker, accounts)
-      {:ok, %{"people" => Enum.map(accounts, &row(&1, contacts, now))}}
-    end
+    contacts = Contacts.known(asker, Enum.map(accounts, & &1.endpoint))
+    {:ok, %{"people" => Enum.map(accounts, &row(&1, contacts))}}
   end
 
-  # The endpoints in `accounts` that are contacts of `asker`.
-  defp contacts(asker, accounts) do
-    endpoints = Enum.map(accounts, & &1.endpoint)
-
-    from(c in Contact,
-      where: c.owner_endpoint == ^asker and c.contact_endpoint in ^endpoints,
-      select: c.contact_endpoint
-    )
-    |> Repo.all()
-    |> MapSet.new()
-  end
-
-  defp row(%Account{endpoint: endpoint} = account, contacts, now) do
-    handle = Names.format(account.name, account.number)
+  defp row(%Account{endpoint: endpoint} = account, contacts) do
+    handle = Account.full_name(account)
 
     if MapSet.member?(contacts, endpoint) do
       %{
         "handle" => handle,
         "contact" => true,
-        "online" => Presence.online?(endpoint, now),
+        "online" => Presence.online?(endpoint),
         "endpoint" => endpoint
       }
     else
       %{"handle" => handle, "contact" => false}
-    end
-  end
-
-  defp fetch_account(endpoint) do
-    case Repo.get(Account, endpoint) do
-      nil -> {:error, :no_account}
-      account -> {:ok, account}
     end
   end
 end

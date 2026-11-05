@@ -1,13 +1,10 @@
 defmodule AetherHub.Features.AgentSearchTest do
   use AetherHub.Feature, file: "agent-search.feature", async: true
 
-  import AetherHub.TestClient
-  import AetherHub.HubStepsSocial
-
-  alias AetherHub.{Contact, Presence, Repo}
+  alias AetherHub.Contract
 
   # The scenario's own word. Every listing and every search in a scenario has it.
-  defp word(state), do: state[:word] || marker()
+  defp word(state), do: state[:word] || unique_name()
 
   defp search(asker, query), do: request(asker, "GET", "/v1/agents?" <> query)
 
@@ -19,9 +16,6 @@ defmodule AetherHub.Features.AgentSearchTest do
     json(conn)["agents"]
   end
 
-  defp lookup_path(node),
-    do: "/v1/agents/#{node.name}/#{String.pad_leading("#{node.number}", 4, "0")}"
-
   defp words(n), do: "q=" <> Enum.map_join(1..n, "+", &"word#{&1}")
 
   defp raw_query("a limit of 5 and no words"), do: "limit=5"
@@ -32,20 +26,6 @@ defmodule AetherHub.Features.AgentSearchTest do
   defp raw_query("a word of 129 letters"), do: "q=" <> String.duplicate("a", 129)
 
   defp raw_query(~s(the word "law" and a limit of ) <> limit), do: "q=law&limit=" <> limit
-
-  defstep ~r/^(?<names>\w+(?:(?:, | and )\w+)*) (?:is an?|are) (?<kind>person|people|listed service agent|unlisted service agent|node without a name)$/,
-          %{names: names, kind: kind},
-          state do
-    {:ok, new_actors(state, names, kind)}
-  end
-
-  defstep ~r/^the hub answers (?<status>\d+)$/, %{status: status}, state do
-    assert_status(state, status)
-  end
-
-  defstep ~r/^the database of the hub has full-text search$/, _, _state do
-    assert %{rows: [[1]]} = Repo.query!("SELECT sqlite_compileoption_used('ENABLE_FTS5')")
-  end
 
   # Listings
 
@@ -60,25 +40,11 @@ defmodule AetherHub.Features.AgentSearchTest do
     {:ok, Map.put(put_actor(state, name, listed_service(opts)), :word, word)}
   end
 
-  defstep ~r/^the listing of (?<name>\w+) is a minute older$/, %{name: name}, state do
-    Repo.query!("UPDATE listings SET updated_at = updated_at - 60 WHERE endpoint = ?1", [
-      actor(state, name).endpoint
-    ])
-  end
-
-  defstep ~r/^(?<name>\w+) was last online long ago$/, %{name: name}, state do
-    Presence.seen(actor(state, name).endpoint, 1)
-  end
-
   defstep ~r/^(?<name>\w+) is a person with (?<contact>\w+) as a contact$/,
           %{name: name, contact: contact},
           state do
     friend = claimed_node()
-
-    Repo.insert_all(Contact, [
-      %{owner_endpoint: friend.endpoint, contact_endpoint: actor(state, contact).endpoint}
-    ])
-
+    connect_by_request(friend, actor(state, contact))
     {:ok, put_actor(state, name, friend)}
   end
 
@@ -148,19 +114,19 @@ defmodule AetherHub.Features.AgentSearchTest do
   defstep ~r/^the row shows only the listing, its signature and expiry, the full name, the owner, and whether it is online and a contact$/,
           _,
           %{found: [row]} do
-    assert Enum.sort(Map.keys(row)) ==
-             ~w(contact expiresAt handle listing online owner signature)
+    assert Enum.sort(Map.keys(row)) == Contract.keys("agent")
   end
 
   # Lookups
 
   defstep ~r/^(?<who>a person|\w+) looks up (?<name>\w+)$/, %{who: who, name: name}, state do
-    {:ok, %{conn: request(searcher(state, who), "GET", lookup_path(actor(state, name)))}}
+    {:ok,
+     %{conn: request(searcher(state, who), "GET", name_path("/v1/agents", actor(state, name)))}}
   end
 
   defstep ~r/^a person looks up the name "(?<handle>[^"]+)"$/, %{handle: handle}, _state do
-    [name, number] = String.split(handle, "#")
-    {:ok, %{conn: request(claimed_node(), "GET", "/v1/agents/#{name}/#{number}")}}
+    path = name_path("/v1/agents", %{handle: handle})
+    {:ok, %{conn: request(claimed_node(), "GET", path)}}
   end
 
   defstep ~r/^the answer is the listing of (?<name>\w+)$/, %{name: name}, %{conn: conn} = state do
@@ -170,17 +136,12 @@ defmodule AetherHub.Features.AgentSearchTest do
 
   # The limit
 
-  defstep ~r/^a person at the start of a minute$/, _, _state do
-    start_early_in_window(60, 10)
+  defstep ~r/^a person$/, _, _state do
     {:ok, %{asker: claimed_node()}}
   end
 
   defstep ~r/^the person searches 30 times$/, _, %{asker: asker} do
     {:ok, %{statuses: for(_ <- 1..30, do: search(asker, "q=law").status)}}
-  end
-
-  defstep ~r/^the hub answers 200 each time$/, _, state do
-    assert Enum.uniq(state.statuses) == [200]
   end
 
   defstep ~r/^the person searches once more$/, _, %{asker: asker} do

@@ -1,12 +1,18 @@
 defmodule AetherHub.Router do
-  @moduledoc "The HTTP routes of the hub protocol, version 1."
+  @moduledoc """
+  The HTTP routes of the hub protocol (`protocol/hub/contract.json`). Every
+  rate limit is counted here: per request, per search, per directory read,
+  and for the account changes and access requests that succeed.
+  """
   use Plug.Router
 
-  alias AetherHub.{Directory, Hub, Listings, OwnerLinks, People, RateLimit}
+  alias AetherHub.{Accounts, Directory, Invites, Json, Listings, Names, OwnerLinks, People}
+  alias AetherHub.{Contacts, Presence, Protocol, RateLimit, Reply}
 
   plug :match
   plug AetherHub.ClientIp
   plug AetherHub.Verify
+  plug :admit
   plug :dispatch
 
   get "/healthz" do
@@ -49,265 +55,259 @@ defmodule AetherHub.Router do
       :ok ->
         conn
         |> put_resp_header("cache-control", "public, max-age=15")
-        |> reply({:ok, Directory.snapshot(now())})
+        |> reply({:ok, Directory.snapshot()})
 
       :rate_limited ->
         reply(conn, {:error, :rate_limited})
     end
   end
 
-  # The protocol of this hub. A node reads it to find an older hub, which
+  # A node reads the protocol of the hub to find an older hub, which
   # answers 404 here.
   get "/v1/hub" do
-    reply(conn, {:ok, %{"protocol" => 2}})
+    reply(conn, {:ok, %{"protocol" => Protocol.version()}})
   end
 
   get "/v1/account" do
-    conn |> reply(Hub.get_account(conn.assigns.endpoint))
-  end
-
-  delete "/v1/account" do
-    case Hub.delete_account(conn.assigns.endpoint) do
-      :ok -> send_resp(conn, 204, "")
-      error -> reply(conn, error)
+    case conn.assigns.account do
+      nil -> reply(conn, {:error, :not_found})
+      account -> reply(conn, {:ok, Accounts.json(account)})
     end
   end
 
   put "/v1/account" do
-    with {:ok, body} <- decode(conn) do
-      reply(conn, Hub.put_account(conn.assigns.endpoint, body, conn.assigns.client_ip))
-    else
-      error -> reply(conn, error)
-    end
+    %{endpoint: endpoint, account: account, client_ip: client_ip} = conn.assigns
+
+    result =
+      with {:ok, body} <- decode(conn) do
+        counted(Accounts.quota(account, body, client_ip), fn ->
+          Accounts.put(endpoint, account, body)
+        end)
+      end
+
+    reply(conn, result)
+  end
+
+  delete "/v1/account" do
+    reply(conn, as_account(conn, &Accounts.delete/1))
   end
 
   post "/v1/invites" do
-    with {:ok, body} <- decode(conn) do
-      reply(conn, Hub.create_invite(conn.assigns.endpoint, body), 201)
-    else
-      error -> reply(conn, error)
-    end
+    reply(conn, with_body(conn, &Invites.invite/2), 201)
   end
 
   get "/v1/invites" do
     conn = fetch_query_params(conn)
-    reply(conn, Hub.list_invites(conn.assigns.endpoint, conn.query_params))
+    reply(conn, as_account(conn, &Invites.list(&1, conn.query_params)))
   end
 
   post "/v1/requests" do
-    with {:ok, body} <- decode(conn) do
-      reply(conn, Hub.create_request(conn.assigns.endpoint, body), 201)
-    else
-      error -> reply(conn, error)
-    end
+    result =
+      with {:ok, body} <- decode(conn) do
+        counted({:access_request, conn.assigns.endpoint}, fn ->
+          as_account(conn, &Invites.request(&1, body))
+        end)
+      end
+
+    reply(conn, result, 201)
   end
 
   post "/v1/invites/:id/approve" do
     body = if conn.assigns.body == "", do: {:ok, %{}}, else: decode(conn)
 
-    with {:ok, body} <- body do
-      reply(conn, Hub.approve_request(conn.assigns.endpoint, id, body))
-    else
-      error -> reply(conn, error)
-    end
+    result =
+      with {:ok, body} <- body do
+        as_account(conn, &Invites.approve(&1, id, body))
+      end
+
+    reply(conn, result)
   end
 
   post "/v1/invites/:id/accept" do
-    reply(conn, Hub.accept_invite(conn.assigns.endpoint, id))
+    reply(conn, as_account(conn, &Invites.accept(&1, id)))
   end
 
   post "/v1/invites/:id/bundle" do
-    with {:ok, body} <- decode(conn) do
-      reply(conn, Hub.deliver_bundle(conn.assigns.endpoint, id, body))
-    else
-      error -> reply(conn, error)
-    end
+    reply(conn, with_body(conn, &Invites.deliver(&1, id, &2)))
   end
 
   post "/v1/invites/:id/block" do
-    case Hub.block_invite(conn.assigns.endpoint, id) do
-      :ok -> send_resp(conn, 204, "")
-      error -> reply(conn, error)
-    end
-  end
-
-  get "/v1/blocks" do
-    reply(conn, Hub.list_blocks(conn.assigns.endpoint))
-  end
-
-  put "/v1/blocks/:blocked" do
-    case Hub.block(conn.assigns.endpoint, blocked) do
-      :ok -> send_resp(conn, 204, "")
-      error -> reply(conn, error)
-    end
-  end
-
-  delete "/v1/blocks/:blocked" do
-    case Hub.unblock(conn.assigns.endpoint, blocked) do
-      :ok -> send_resp(conn, 204, "")
-      error -> reply(conn, error)
-    end
+    reply(conn, as_account(conn, &Accounts.block_through(&1, id)))
   end
 
   delete "/v1/invites/:id" do
-    case Hub.delete_invite(conn.assigns.endpoint, id) do
-      :ok -> send_resp(conn, 204, "")
-      error -> reply(conn, error)
-    end
+    reply(conn, as_account(conn, &Invites.delete(&1, id)))
   end
 
   get "/v1/contacts" do
-    reply(conn, Hub.list_contacts(conn.assigns.endpoint))
+    reply(conn, as_account(conn, &Contacts.list/1))
   end
 
-  delete "/v1/contacts/:contact" do
-    case Hub.delete_contact(conn.assigns.endpoint, contact) do
-      :ok -> send_resp(conn, 204, "")
-      error -> reply(conn, error)
-    end
+  delete "/v1/contacts/:endpoint" do
+    reply(conn, as_account(conn, &Contacts.delete(&1, endpoint)))
+  end
+
+  get "/v1/blocks" do
+    reply(conn, as_account(conn, &Accounts.blocks/1))
+  end
+
+  put "/v1/blocks/:endpoint" do
+    reply(conn, as_account(conn, &Accounts.block(&1, endpoint)))
+  end
+
+  delete "/v1/blocks/:endpoint" do
+    reply(conn, as_account(conn, &Accounts.unblock(&1, endpoint)))
   end
 
   get "/v1/people/:name/:number" do
-    with {:ok, {name, number}} <- parse_name(name, number),
-         :ok <- count_search(conn) do
-      reply(conn, People.lookup(conn.assigns.endpoint, name, number, now()))
-    else
-      error -> reply(conn, error)
-    end
+    result =
+      with {:ok, {name, number}} <- parse_name(name, number),
+           :ok <- count_search(conn) do
+        as_account(conn, &People.lookup(&1, name, number))
+      end
+
+    reply(conn, result)
   end
 
   get "/v1/people" do
     conn = fetch_query_params(conn)
 
-    with {:ok, q, limit} <- People.parse_search(conn.query_params),
-         :ok <- count_search(conn) do
-      reply(conn, People.search(conn.assigns.endpoint, q, limit, now()))
-    else
-      error -> reply(conn, error)
-    end
+    result =
+      with {:ok, q, limit} <- People.parse_search(conn.query_params),
+           :ok <- count_search(conn) do
+        as_account(conn, &People.search(&1, q, limit))
+      end
+
+    reply(conn, result)
   end
 
   put "/v1/listing" do
-    case Listings.decode_json(conn.assigns.body) do
-      {:ok, body} -> reply(conn, Listings.put(conn.assigns.endpoint, body, now()))
-      :error -> reply(conn, {:error, :invalid})
-    end
+    reply(conn, with_body(conn, &Listings.put/2))
   end
 
   get "/v1/listing" do
-    reply(conn, Listings.get(conn.assigns.endpoint, now()))
+    reply(conn, as_account(conn, &Listings.get/1))
   end
 
   delete "/v1/listing" do
-    case Hub.delete_listing(conn.assigns.endpoint) do
-      :ok -> send_resp(conn, 204, "")
-      error -> reply(conn, error)
-    end
+    reply(conn, as_account(conn, &Listings.delete(&1.endpoint)))
   end
 
   get "/v1/agents/:name/:number" do
-    with {:ok, {name, number}} <- parse_name(name, number),
-         :ok <- count_search(conn) do
-      reply(conn, Listings.lookup(conn.assigns.endpoint, name, number, now()))
-    else
-      error -> reply(conn, error)
-    end
+    result =
+      with {:ok, {name, number}} <- parse_name(name, number),
+           :ok <- count_search(conn) do
+        as_account(conn, &Listings.lookup(&1, name, number))
+      end
+
+    reply(conn, result)
   end
 
   get "/v1/agents" do
     conn = fetch_query_params(conn)
 
-    with {:ok, words, limit} <- Listings.parse_search(conn.query_params),
-         :ok <- count_search(conn) do
-      reply(conn, Listings.search(conn.assigns.endpoint, words, limit, now()))
-    else
-      error -> reply(conn, error)
-    end
+    result =
+      with {:ok, words, limit} <- Listings.parse_search(conn.query_params),
+           :ok <- count_search(conn) do
+        as_account(conn, &Listings.search(&1, words, limit))
+      end
+
+    reply(conn, result)
   end
 
   post "/v1/owner-links" do
-    with {:ok, body} <- decode(conn) do
-      reply(conn, OwnerLinks.claim(conn.assigns.endpoint, body, now()), 201)
-    else
-      error -> reply(conn, error)
-    end
+    reply(conn, with_body(conn, &OwnerLinks.claim/2), 201)
   end
 
   get "/v1/owner-links" do
-    reply(conn, OwnerLinks.list(conn.assigns.endpoint, now()))
+    reply(conn, as_account(conn, &OwnerLinks.list/1))
   end
 
   post "/v1/owner-links/:id/confirm" do
-    with {:ok, body} <- decode(conn) do
-      reply(conn, OwnerLinks.confirm(conn.assigns.endpoint, id, body, now()))
-    else
-      error -> reply(conn, error)
-    end
+    reply(conn, with_body(conn, &OwnerLinks.confirm(&1, id, &2)))
   end
 
   delete "/v1/owner-links/:id" do
-    case OwnerLinks.delete(conn.assigns.endpoint, id) do
-      :ok -> send_resp(conn, 204, "")
-      error -> reply(conn, error)
-    end
+    reply(conn, as_account(conn, &OwnerLinks.delete(&1, id)))
   end
 
   match _ do
-    error(conn, 404, "not_found")
+    reply(conn, {:error, :not_found})
   end
+
+  # A signed request counts against the endpoint's request limit. Only a
+  # request within the limit marks the endpoint as seen, and its account is
+  # read once for the route.
+  defp admit(%Plug.Conn{assigns: %{endpoint: endpoint}} = conn, _opts) do
+    case RateLimit.hit(:request, endpoint) do
+      :ok ->
+        Presence.seen(endpoint)
+        assign(conn, :account, Accounts.get(endpoint))
+
+      :rate_limited ->
+        conn |> Reply.error(:rate_limited) |> halt()
+    end
+  end
+
+  defp admit(conn, _opts), do: conn
+
+  defp as_account(%Plug.Conn{assigns: %{account: nil}}, _fun), do: {:error, :no_account}
+  defp as_account(%Plug.Conn{assigns: %{account: account}}, fun), do: fun.(account)
+
+  defp with_body(conn, fun) do
+    with {:ok, body} <- decode(conn), do: as_account(conn, &fun.(&1, body))
+  end
+
+  # Runs `fun` when `bucket` has room for `key`, and counts a success that
+  # makes something new. A request that fails uses up nothing.
+  defp counted(nil, fun), do: fun.()
+
+  defp counted({bucket, key}, fun) do
+    with :ok <- limited(RateLimit.check(bucket, key)) do
+      case fun.() do
+        {:ok, value, :open} ->
+          {:ok, value}
+
+        {:ok, value, :created} ->
+          RateLimit.hit(bucket, key)
+          {:ok, value}
+
+        {:ok, value} ->
+          RateLimit.hit(bucket, key)
+          {:ok, value}
+
+        error ->
+          error
+      end
+    end
+  end
+
+  defp count_search(conn) do
+    with :ok <- limited(RateLimit.hit(:search, conn.assigns.endpoint)) do
+      limited(RateLimit.hit(:search_ip, conn.assigns.client_ip))
+    end
+  end
+
+  defp limited(:ok), do: :ok
+  defp limited(:rate_limited), do: {:error, :rate_limited}
 
   # A path names an account with two segments, such as `/ana/0042`.
   defp parse_name(name, number) do
-    case AetherHub.Names.parse_handle(name <> "#" <> number) do
+    case Names.parse_handle(name <> "#" <> number) do
       {:ok, parsed} -> {:ok, parsed}
       :error -> {:error, :invalid}
     end
   end
 
-  # A search counts for the endpoint and for the client address.
-  defp count_search(conn) do
-    with :ok <- RateLimit.hit(:search, conn.assigns.endpoint),
-         :ok <- RateLimit.hit(:search_ip, conn.assigns.client_ip) do
-      :ok
-    else
-      :rate_limited -> {:error, :rate_limited}
-    end
-  end
-
-  defp now, do: System.system_time(:second)
-
-  @statuses %{
-    invalid: 400,
-    no_account: 403,
-    forbidden: 403,
-    not_found: 404,
-    taken: 409,
-    limit: 409,
-    upgrade_required: 426,
-    rate_limited: 429
-  }
-
-  defp reply(conn, result, status \\ 200)
-
-  defp reply(conn, {:ok, value}, status) do
-    conn |> put_resp_content_type("application/json") |> send_resp(status, JSON.encode!(value))
-  end
-
-  defp reply(conn, {:error, code}, _status) do
-    error(conn, Map.fetch!(@statuses, code), Atom.to_string(code))
-  end
-
-  @doc false
-  def error(conn, status, code) do
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(status, JSON.encode!(%{"error" => code}))
-  end
-
   defp decode(conn) do
-    case JSON.decode(conn.assigns.body) do
+    case Json.decode(conn.assigns.body) do
       {:ok, %{} = body} -> {:ok, body}
       _ -> {:error, :invalid}
     end
   end
+
+  defp reply(conn, result, status \\ 200)
+  defp reply(conn, :ok, _status), do: send_resp(conn, 204, "")
+  defp reply(conn, {:ok, value}, status), do: Reply.json(conn, status, value)
+  defp reply(conn, {:error, code}, _status), do: Reply.error(conn, code)
 end

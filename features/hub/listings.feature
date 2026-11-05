@@ -124,8 +124,10 @@ Feature: Listings
       Then the hub answers 204
 
     Scenario: An expired listing is removed
-      Given law has a listing that a person can find
-      When the listing expires and the hub sweeps expired listings
+      Given it is 8 days ago
+      And law has a listing that a person can find
+      And it is now
+      When the hub sweeps expired listings
       Then the hub keeps no listing for law
       And the search index has no entry for the listing
       And a person cannot find law

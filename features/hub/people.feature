@@ -77,7 +77,8 @@ Feature: Finding people
     Then the hub answers 200
 
   Scenario: A node can make 30 searches and lookups a minute
-    Given alice has a name
+    Given it is the start of a minute
+    And alice has a name
     And bob has a name
     When alice looks up the tag of bob 15 times and searches for his name 15 times
     Then the hub answers all 30
