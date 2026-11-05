@@ -54,18 +54,7 @@
     "aether": {
       "transport": "stdio",
       "command": "aether",
-      "args": ["mcp", "serve", "--caller-only"],
-      "toolFilter": {
-        "include": [
-          "aether.agents.list",
-          "aether.agents.find",
-          "aether.people.find",
-          "aether.task.send",
-          "aether.task.cancel",
-          "aether.inbox.list",
-          "aether.inbox.read"
-        ]
-      }
+      "args": ["mcp", "serve", "--caller-only"]
     }
   }
 }
