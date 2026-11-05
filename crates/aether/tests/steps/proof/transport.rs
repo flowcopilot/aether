@@ -107,7 +107,7 @@ fn answer(request: &[Frame]) -> Result<Vec<Frame>, TransportError> {
         payload,
     };
     Ok(vec![
-        frame(FrameKind::Event, event_payload(task_id, A2aTaskStatus::Submitted)),
+        frame(FrameKind::Event, event_payload(task_id, A2aTaskStatus::Submitted, None)),
         frame(
             FrameKind::Result,
             text_result_payload(task_id, A2aTaskStatus::Completed, "ok"),

@@ -14,7 +14,7 @@ use crate::{
     proof::{Identity, ProofError, ProofNode, SubmissionInput},
     transport::{
         A2aCancel, A2aPartContent, A2aRequest, A2aTaskStatus, Frame, FrameKind,
-        MAX_EXCHANGE_BYTES, MAX_FRAMES, TransportError, event_payload_with_sequence,
+        MAX_EXCHANGE_BYTES, MAX_FRAMES, TransportError, event_payload,
         text_result_payload, text_result_payload_with_progress,
     },
 };
@@ -328,7 +328,7 @@ where
                 exchange_id: frame.exchange_id.clone(),
                 scope_id: frame.scope_id.clone(),
                 task_id: Some(task_id.clone()),
-                payload: event_payload_with_sequence(
+                payload: event_payload(
                     &task_id,
                     event_status(event.event_type, state),
                     Some(event.sequence),
@@ -424,7 +424,7 @@ where
                 exchange_id: frame.exchange_id.clone(),
                 scope_id: frame.scope_id.clone(),
                 task_id: frame.task_id.clone(),
-                payload: event_payload_with_sequence(
+                payload: event_payload(
                     task_id,
                     event_status(event.event_type, aether_store::TaskState::Cancelled),
                     Some(event.sequence),
@@ -1300,7 +1300,8 @@ mod tests {
             WIRE_TASK_ID
         );
         assert_eq!(
-            response[0].payload["statusUpdate"]["metadata"]["aetherEventSequence"],
+            response[0].payload["statusUpdate"]["metadata"]
+                [crate::transport::EVENT_SEQUENCE],
             2
         );
         assert_eq!(
@@ -1926,7 +1927,8 @@ mod tests {
             .iter()
             .filter(|frame| frame.kind == FrameKind::Event)
             .map(|frame| {
-                frame.payload["statusUpdate"]["metadata"]["aetherEventSequence"]
+                frame.payload["statusUpdate"]["metadata"]
+                    [crate::transport::EVENT_SEQUENCE]
                     .as_i64()
                     .expect("event sequence must exist")
             })

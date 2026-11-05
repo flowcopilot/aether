@@ -40,10 +40,10 @@ pub use a2a::{
 
 pub const ALPN: &[u8] = b"aether/a2a/0";
 pub const A2A_PROTOCOL_VERSION: &str = "1.0";
-pub const MAX_FRAME_BYTES: usize = 1_048_576;
+const MAX_FRAME_BYTES: usize = 1_048_576;
 pub const MAX_EXCHANGE_BYTES: usize = 4_194_304;
 pub const MAX_FRAMES: usize = 64;
-pub const MAX_CONNECTIONS: usize = 32;
+const MAX_CONNECTIONS: usize = 32;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 const STREAM_TIMEOUT: Duration = Duration::from_secs(10);
 const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -286,13 +286,15 @@ fn decode_key(value: &str) -> Result<[u8; 32], TransportError> {
     <[u8; 32]>::from_hex(value).map_err(|_| TransportError::BadFrame)
 }
 
-#[must_use]
-pub fn event_payload(task_id: &str, status: A2aTaskStatus) -> serde_json::Value {
-    event_payload_with_sequence(task_id, status, None)
-}
+/// The metadata key of an event's sequence in the task's event journal.
+pub const EVENT_SEQUENCE: &str = "aetherEventSequence";
+/// The metadata key of the last event sequence a result page delivers.
+pub const EVENT_CURSOR: &str = "aetherEventCursor";
+/// The metadata key that marks a result page with more events after it.
+pub const MORE_EVENTS: &str = "aetherMoreEvents";
 
 #[must_use]
-pub fn event_payload_with_sequence(
+pub fn event_payload(
     task_id: &str,
     status: A2aTaskStatus,
     sequence: Option<i64>,
@@ -303,7 +305,7 @@ pub fn event_payload_with_sequence(
         status: A2aTaskStatusValue { state: status, message: None, timestamp: None },
         metadata: sequence.map(|sequence| {
             HashMap::from([(
-                "aetherEventSequence".to_owned(),
+                EVENT_SEQUENCE.to_owned(),
                 serde_json::Value::from(sequence),
             )])
         }),
@@ -311,36 +313,12 @@ pub fn event_payload_with_sequence(
 }
 
 #[must_use]
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "a2a's `TaskState` is not `Copy`; callers build it for this call"
-)]
 pub fn text_result_payload(
     task_id: &str,
     status: A2aTaskStatus,
     text: &str,
 ) -> serde_json::Value {
-    payload(A2aResult::Task(A2aTask {
-        id: task_id.to_owned(),
-        context_id: task_id.to_owned(),
-        status: A2aTaskStatusValue {
-            state: status.clone(),
-            message: None,
-            timestamp: None,
-        },
-        artifacts: (status == A2aTaskStatus::Completed).then(|| {
-            vec![a2a::Artifact {
-                artifact_id: Uuid::new_v4().to_string(),
-                name: None,
-                description: None,
-                parts: vec![A2aPart::text(text)],
-                metadata: None,
-                extensions: None,
-            }]
-        }),
-        history: None,
-        metadata: None,
-    }))
+    result_payload(task_id, status, text, None)
 }
 
 /// Like [`text_result_payload`], but for a bounded page of a task's progress.
@@ -351,10 +329,6 @@ pub fn text_result_payload(
 /// status, without checking `more_events`, can otherwise silently drop
 /// events a truncated page omitted.
 #[must_use]
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "a2a's `TaskState` is not `Copy`; callers build it for this call"
-)]
 pub fn text_result_payload_with_progress(
     task_id: &str,
     status: A2aTaskStatus,
@@ -363,12 +337,25 @@ pub fn text_result_payload_with_progress(
     more_events: bool,
 ) -> serde_json::Value {
     let mut metadata = HashMap::from([(
-        "aetherEventCursor".to_owned(),
+        EVENT_CURSOR.to_owned(),
         serde_json::Value::from(event_cursor),
     )]);
     if more_events {
-        metadata.insert("aetherMoreEvents".to_owned(), serde_json::Value::from(true));
+        metadata.insert(MORE_EVENTS.to_owned(), serde_json::Value::from(true));
     }
+    result_payload(task_id, status, text, Some(metadata))
+}
+
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "a2a's `TaskState` is not `Copy`; callers build it for this call"
+)]
+fn result_payload(
+    task_id: &str,
+    status: A2aTaskStatus,
+    text: &str,
+    metadata: Option<HashMap<String, serde_json::Value>>,
+) -> serde_json::Value {
     payload(A2aResult::Task(A2aTask {
         id: task_id.to_owned(),
         context_id: task_id.to_owned(),
@@ -388,7 +375,7 @@ pub fn text_result_payload_with_progress(
             }]
         }),
         history: None,
-        metadata: Some(metadata),
+        metadata,
     }))
 }
 
@@ -1062,7 +1049,6 @@ fn validate_response_frames(frames: &[Frame]) -> Result<(), TransportError> {
     validate_payloads(frames)
 }
 
-/// The address of `endpoint_id` at the IP address `address`.
 pub fn ip_endpoint_addr(
     endpoint_id: &str,
     address: &str,
@@ -1079,7 +1065,6 @@ pub fn ip_endpoint_addr(
     ))
 }
 
-/// The address of `endpoint_id` through the relay `relay_url`.
 pub fn relay_endpoint_addr(
     endpoint_id: &str,
     relay_url: &str,
@@ -1175,7 +1160,7 @@ pub async fn request_once(
     request_once_at(data_dir, remote, None, request).await
 }
 
-pub fn endpoint_addr_from_record(
+fn endpoint_addr_from_record(
     record: &Record,
 ) -> Result<iroh::EndpointAddr, TransportError> {
     validate_record(record).map_err(|_| TransportError::Address)?;
@@ -1250,7 +1235,7 @@ pub fn response_exit_code(response: &[Frame]) -> std::process::ExitCode {
     clippy::needless_pass_by_value,
     reason = "a2a's `TaskState` is not `Copy`; callers read it for this call"
 )]
-pub const fn is_terminal_task_status(status: A2aTaskStatus) -> bool {
+const fn is_terminal_task_status(status: A2aTaskStatus) -> bool {
     matches!(
         status,
         A2aTaskStatus::Completed
@@ -1282,7 +1267,7 @@ pub fn response_last_event_sequence(response: &[Frame]) -> u64 {
         .filter_map(|frame| {
             frame
                 .payload
-                .pointer("/statusUpdate/metadata/aetherEventSequence")
+                .pointer(&format!("/statusUpdate/metadata/{EVENT_SEQUENCE}"))
                 .and_then(serde_json::Value::as_i64)
                 .and_then(|sequence| u64::try_from(sequence).ok())
         })
@@ -1294,7 +1279,7 @@ pub fn response_last_event_sequence(response: &[Frame]) -> u64 {
         .and_then(|frame| {
             frame
                 .payload
-                .pointer("/task/metadata/aetherEventCursor")
+                .pointer(&format!("/task/metadata/{EVENT_CURSOR}"))
                 .and_then(serde_json::Value::as_i64)
         })
         .and_then(|cursor| u64::try_from(cursor).ok())
@@ -1311,7 +1296,7 @@ pub fn response_more_events_remain(response: &[Frame]) -> bool {
         |frame| {
             frame
                 .payload
-                .pointer("/task/metadata/aetherMoreEvents")
+                .pointer(&format!("/task/metadata/{MORE_EVENTS}"))
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false)
         },
@@ -1371,7 +1356,6 @@ async fn request_with_polling_on(
     }
 }
 
-/// Sends `request` on a new stream of `connection` and reads the answer.
 async fn exchange_stream(
     connection: &iroh::endpoint::Connection,
     request: Frame,
@@ -1401,9 +1385,8 @@ mod tests {
     use super::{
         A2aAccessMode, A2aAuthorization, A2aClaim, A2aRequest, A2aTaskStatus, Frame,
         FrameKind, TransportError, endpoint_addr_from_record, event_payload,
-        event_payload_with_sequence, response_last_event_sequence,
-        response_more_events_remain, text_request_payload, text_result_payload,
-        text_result_payload_with_progress,
+        response_last_event_sequence, response_more_events_remain,
+        text_request_payload, text_result_payload, text_result_payload_with_progress,
     };
     use crate::discovery::signed_record;
     use ed25519_dalek::SigningKey;
@@ -1463,7 +1446,7 @@ mod tests {
             exchange_id: "00000000-0000-4000-8000-000000000001".to_owned(),
             scope_id: "scope".to_owned(),
             task_id: Some(TASK_ID.to_owned()),
-            payload: event_payload(TASK_ID, A2aTaskStatus::Submitted),
+            payload: event_payload(TASK_ID, A2aTaskStatus::Submitted, None),
         }
     }
 
@@ -1549,8 +1532,7 @@ mod tests {
         // The event frames' own sequence numbers still win when they are
         // ahead of the snapshot's cursor.
         let mut event_frame = event();
-        event_frame.payload =
-            event_payload_with_sequence(TASK_ID, A2aTaskStatus::Working, Some(12));
+        event_frame.payload = event_payload(TASK_ID, A2aTaskStatus::Working, Some(12));
         assert_eq!(
             response_last_event_sequence(&[event_frame, truncated_with_cursor(5)]),
             12
@@ -2515,7 +2497,7 @@ mod tests {
                         exchange_id: "00000000-0000-4000-8000-000000000001".to_owned(),
                         scope_id: "scope".to_owned(),
                         task_id: Some(TASK_ID.to_owned()),
-                        payload: event_payload(TASK_ID, A2aTaskStatus::Submitted),
+                        payload: event_payload(TASK_ID, A2aTaskStatus::Submitted, None),
                     },
                     super::Frame {
                         version: 0,
