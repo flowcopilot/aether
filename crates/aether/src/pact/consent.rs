@@ -202,7 +202,7 @@ impl PactConsent {
             &issuer,
             crate::identity::GrantInput {
                 id: GrantId::new(format!("pact_{}", uuid::Uuid::new_v4().simple())),
-                issuer_agent_id: AgentId::new(crate::node_config::NODE_ISSUER),
+                issuer_agent_id: AgentId::new(crate::identity::NODE_ISSUER),
                 subject_agent_id: AgentId::new(caller_agent_id(&caller.issuer)),
                 subject_endpoint_id: EndpointId::new(caller_endpoint_id(caller)),
                 scope_id: ScopeId::new(SCOPE_ID),

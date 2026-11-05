@@ -13,7 +13,6 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::admin::{AdminError, AuditEntry, ChangeRequest, SharedAdministration};
-use crate::node_config::settings;
 
 const MAX_SOCKET_BYTES: u64 = 65_536;
 /// A busy node can delay its accept loop. One second was too short under load,
@@ -196,19 +195,19 @@ fn handle(
         },
         Request::CreateInvite { friend_name, endpoint_id, days } => {
             // The hub name comes first, as on the host page.
-            let Some(agent_name) =
-                crate::node_config::setting::<settings::HubName>(data_dir)
-                    .ok()
-                    .flatten()
-                    .or_else(|| {
-                        crate::node_config::setting::<settings::HostName>(data_dir).ok()
-                    })
-            else {
+            let Some(agent_name) = crate::settings::setting::<
+                crate::hub_client::settings::HubName,
+            >(data_dir)
+            .ok()
+            .flatten()
+            .or_else(|| {
+                crate::settings::setting::<crate::direct::HostName>(data_dir).ok()
+            }) else {
                 return Response::Error { code: "unavailable".to_owned() };
             };
-            let Ok(relay_url) =
-                crate::node_config::setting::<settings::ActiveRelay>(data_dir)
-            else {
+            let Ok(relay_url) = crate::settings::setting::<
+                crate::transport::relay::ActiveRelay,
+            >(data_dir) else {
                 return Response::Error { code: "unavailable".to_owned() };
             };
             // The card comes first: when it fails, the node applies no grant.

@@ -23,8 +23,6 @@ use crate::admin::{AuditEntry, ChangeRequest};
 use crate::hub_client::{
     AgentKind, HUB_OFF, HubClient, valid_full_name, valid_name_part,
 };
-use crate::node_config;
-use crate::node_config::settings;
 use crate::outbox::{self, Courier};
 
 #[derive(Clone)]
@@ -107,7 +105,9 @@ impl McpServer {
         let data_dir = self.data_dir()?;
         let url = crate::hub_client::resolve_url(
             self.hub_flag.as_deref(),
-            node_config::setting::<settings::Hub>(data_dir).ok().flatten(),
+            crate::settings::setting::<crate::hub_client::settings::Hub>(data_dir)
+                .ok()
+                .flatten(),
         )
         .ok_or("the hub is off")?;
         self.hubs.client(&url, data_dir).map_err(|_| "the hub URL is invalid")
@@ -572,7 +572,7 @@ impl McpServer {
         let Ok(data_dir) = self.data_dir() else {
             return tool_error("this MCP server has no node data directory");
         };
-        let policy = match node_config::policy_settings(data_dir) {
+        let policy = match crate::policy::policy_settings(data_dir) {
             Ok(policy) => policy.map(|settings| {
                 json!({
                     "workspace": settings.workspace,
@@ -586,8 +586,8 @@ impl McpServer {
         };
         tool_success(json!({
             "policy": policy,
-            "relayUrl": node_config::setting::<settings::Relay>(data_dir).ok().flatten(),
-            "hubUrl": crate::hub_client::resolve_url(None, node_config::setting::<settings::Hub>(data_dir).ok().flatten()),
+            "relayUrl": crate::settings::setting::<crate::transport::relay::Relay>(data_dir).ok().flatten(),
+            "hubUrl": crate::hub_client::resolve_url(None, crate::settings::setting::<crate::hub_client::settings::Hub>(data_dir).ok().flatten()),
             "policyChangesNeedRestart": true,
         }).to_string())
     }
@@ -611,7 +611,7 @@ impl McpServer {
         {
             return tool_error("give at least one policy field");
         }
-        let Some(mut settings) = (match node_config::policy_settings(data_dir) {
+        let Some(mut settings) = (match crate::policy::policy_settings(data_dir) {
             Ok(settings) => settings,
             Err(_) => return tool_error("the node policy is unavailable"),
         }) else {
@@ -633,9 +633,9 @@ impl McpServer {
             settings.queue_per_peer = value;
         }
         let result = if arguments.dry_run {
-            node_config::validate_policy_settings(&settings)
+            crate::policy::validate_policy_settings(&settings)
         } else {
-            node_config::save_policy_settings(data_dir, &settings)
+            crate::policy::save_policy_settings(data_dir, &settings)
         };
         match result {
             Ok(()) => tool_success(
@@ -661,8 +661,12 @@ impl McpServer {
             return tool_error("this MCP server has no node data directory");
         };
         let url = arguments.url.trim();
-        let relay = if url.is_empty() || url == "off" { None } else { Some(url) };
-        if relay.is_some_and(|url| !node_config::valid_relay_url(url)) {
+        let relay = if url.is_empty() || url == crate::transport::relay::RELAY_OFF {
+            None
+        } else {
+            Some(url)
+        };
+        if relay.is_some_and(|url| !crate::transport::relay::valid_relay_url(url)) {
             return tool_error("use a relay URL that starts with https://, or 'off'");
         }
         if arguments.dry_run {
@@ -680,7 +684,7 @@ impl McpServer {
             }
             // No node runs: it uses the saved choice on its next start.
             Err(error) if no_node(&error) => {
-                match node_config::store_setting::<settings::Relay>(
+                match crate::settings::store_setting::<crate::transport::relay::Relay>(
                     data_dir,
                     &relay.map(str::to_owned),
                 ) {
@@ -766,10 +770,12 @@ impl McpServer {
         // The hub sets the type once: only the first claim names it.
         let kind = match hub.account().await {
             Ok(None) => Some(
-                node_config::setting::<settings::AgentKind>(data_dir)
-                    .ok()
-                    .flatten()
-                    .unwrap_or(AgentKind::Personal),
+                crate::settings::setting::<crate::hub_client::settings::AgentKind>(
+                    data_dir,
+                )
+                .ok()
+                .flatten()
+                .unwrap_or(AgentKind::Personal),
             ),
             Ok(Some(_)) => None,
             Err(error) => return tool_error(error.to_string()),
@@ -777,7 +783,10 @@ impl McpServer {
         match hub.claim(handle, kind).await {
             Ok(account) => {
                 crate::hub_membership::keep_hub_name(data_dir, &account.handle);
-                let _ = node_config::store_agent_kind(data_dir, account.kind);
+                let _ = crate::hub_client::settings::store_agent_kind(
+                    data_dir,
+                    account.kind,
+                );
                 tool_success(json!({"name": account.handle}).to_string())
             }
             Err(error) => tool_error(error.to_string()),
@@ -1822,7 +1831,6 @@ mod tests {
         InviteNameArguments, McpServer, NameArguments, PolicyUpdateArguments,
         RevokeArguments, UrlSettingArguments,
     };
-    use crate::node_config::settings;
     use crate::{
         admin::{
             ChangeRequest, shared_with_store,
@@ -1836,7 +1844,7 @@ mod tests {
         let caller = tempfile::tempdir().expect("directory must create");
         let with_card = tempfile::tempdir().expect("directory must create");
         let without_card = tempfile::tempdir().expect("directory must create");
-        crate::node_config::store_setting::<settings::Hub>(
+        crate::settings::store_setting::<crate::hub_client::settings::Hub>(
             caller.path(),
             &Some(crate::hub_client::HUB_OFF.to_owned()),
         )
@@ -2226,7 +2234,7 @@ mod tests {
     fn caller() -> (tempfile::TempDir, tempfile::TempDir) {
         let host = tempfile::tempdir().expect("directory must create");
         let caller = tempfile::tempdir().expect("directory must create");
-        crate::node_config::store_setting::<settings::Hub>(
+        crate::settings::store_setting::<crate::hub_client::settings::Hub>(
             caller.path(),
             &Some(crate::hub_client::HUB_OFF.to_owned()),
         )
@@ -2243,7 +2251,7 @@ mod tests {
     /// A caller data directory that uses `hub`, with the name `me#0001`.
     fn hub_caller(hub: &crate::hub_client::test_hub::TestHub) -> tempfile::TempDir {
         let caller = tempfile::tempdir().expect("directory must create");
-        crate::node_config::store_setting::<settings::Hub>(
+        crate::settings::store_setting::<crate::hub_client::settings::Hub>(
             caller.path(),
             &Some(hub.url.clone()),
         )
@@ -2894,10 +2902,11 @@ mod tests {
     async fn settings_tools_save_the_policy_used_by_the_owner_page() {
         let directory = tempfile::tempdir().expect("directory must create");
         let data_dir = directory.path().join("node");
-        crate::node_config::load_or_create_service(
+        crate::node_builder::load_or_create_service(
             &directory.path().join("missing-policy.json"),
             &data_dir,
             "codex".into(),
+            None,
         )
         .expect("first policy must create");
         // No node runs, so the relay setting is saved for the next start.
@@ -2917,7 +2926,7 @@ mod tests {
             Some(false)
         );
         assert_eq!(
-            crate::node_config::policy_settings(&data_dir)
+            crate::policy::policy_settings(&data_dir)
                 .expect("policy must read")
                 .expect("policy must exist")
                 .max_seconds,
@@ -2935,7 +2944,7 @@ mod tests {
             .await;
         assert_eq!(saved.is_error, Some(false));
         assert_eq!(decode(&saved)["restartRequired"], true);
-        let settings = crate::node_config::policy_settings(&data_dir)
+        let settings = crate::policy::policy_settings(&data_dir)
             .expect("policy must read")
             .expect("policy must exist");
         assert_eq!(settings.max_seconds, 75);
@@ -2948,7 +2957,9 @@ mod tests {
             .await;
         assert_eq!(relay.is_error, Some(false));
         assert_eq!(
-            crate::node_config::setting::<settings::Relay>(&data_dir).ok().flatten(),
+            crate::settings::setting::<crate::transport::relay::Relay>(&data_dir)
+                .ok()
+                .flatten(),
             None
         );
         let hub = server
@@ -2959,7 +2970,7 @@ mod tests {
             .await;
         assert_eq!(hub.is_error, Some(false));
         assert_eq!(
-            crate::node_config::setting::<settings::Hub>(&data_dir)
+            crate::settings::setting::<crate::hub_client::settings::Hub>(&data_dir)
                 .ok()
                 .flatten()
                 .as_deref(),
@@ -2973,19 +2984,20 @@ mod tests {
         let caller = tempfile::tempdir().expect("caller must create");
         let data_dir = host.path().join("node");
         let service = Arc::new(
-            crate::node_config::load_or_create_service(
+            crate::node_builder::load_or_create_service(
                 &host.path().join("missing-policy.json"),
                 &data_dir,
                 "codex".into(),
+                None,
             )
             .expect("node must create"),
         );
-        crate::node_config::store_setting::<settings::HostName>(
+        crate::settings::store_setting::<crate::direct::HostName>(
             &data_dir,
             &"bob".to_owned(),
         )
         .expect("host name must save");
-        crate::node_config::store_setting::<settings::ActiveRelay>(
+        crate::settings::store_setting::<crate::transport::relay::ActiveRelay>(
             &data_dir,
             &Some("https://relay.example.com".to_owned()),
         )
@@ -3065,7 +3077,7 @@ mod tests {
         let hub = crate::hub_client::test_hub::TestHub::start().await;
         let host = hub_caller(&hub);
         let friend = tempfile::tempdir().expect("directory must create");
-        crate::node_config::store_setting::<settings::Hub>(
+        crate::settings::store_setting::<crate::hub_client::settings::Hub>(
             friend.path(),
             &Some(hub.url.clone()),
         )
@@ -3116,7 +3128,7 @@ mod tests {
     async fn name_tools_keep_the_hub_name_that_invites_carry() {
         let hub = crate::hub_client::test_hub::TestHub::start().await;
         let directory = tempfile::tempdir().expect("directory must create");
-        crate::node_config::store_setting::<settings::Hub>(
+        crate::settings::store_setting::<crate::hub_client::settings::Hub>(
             directory.path(),
             &Some(hub.url.clone()),
         )
@@ -3134,15 +3146,19 @@ mod tests {
             decode(&claimed)["name"].as_str().expect("name must return").to_owned();
         assert!(name.starts_with("ana#"));
         assert_eq!(
-            crate::node_config::setting::<settings::HubName>(directory.path())
-                .ok()
-                .flatten(),
+            crate::settings::setting::<crate::hub_client::settings::HubName>(
+                directory.path()
+            )
+            .ok()
+            .flatten(),
             Some(name)
         );
         assert_eq!(
-            crate::node_config::setting::<settings::AgentKind>(directory.path())
-                .ok()
-                .flatten(),
+            crate::settings::setting::<crate::hub_client::settings::AgentKind>(
+                directory.path()
+            )
+            .ok()
+            .flatten(),
             Some(crate::hub_client::AgentKind::Personal)
         );
         let changed = server
@@ -3153,9 +3169,11 @@ mod tests {
             .await;
         assert_eq!(changed.is_error, Some(false));
         assert_eq!(
-            crate::node_config::setting::<settings::HubName>(directory.path())
-                .ok()
-                .flatten(),
+            crate::settings::setting::<crate::hub_client::settings::HubName>(
+                directory.path()
+            )
+            .ok()
+            .flatten(),
             None
         );
     }

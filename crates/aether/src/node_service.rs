@@ -621,12 +621,13 @@ where
     fn set_relay(&self, relay: Option<String>) -> Result<(), AdminError> {
         let (endpoint, runtime) =
             self.endpoint.get().ok_or(AdminError::Unsupported("relay"))?;
-        let previous = crate::node_config::setting::<
-            crate::node_config::settings::ActiveRelay,
-        >(&self.data_dir)
-        .map_err(|_| AdminError::Store)?;
+        let previous =
+            crate::settings::setting::<crate::transport::relay::ActiveRelay>(
+                &self.data_dir,
+            )
+            .map_err(|_| AdminError::Store)?;
         runtime
-            .block_on(crate::node_config::apply_relay(
+            .block_on(crate::transport::relay::apply_relay(
                 &self.data_dir,
                 &relay,
                 crate::transport::switch_relay(

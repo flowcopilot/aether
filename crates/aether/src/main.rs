@@ -4,7 +4,6 @@ use std::{
     sync::Arc,
 };
 
-use aether::node_config::settings;
 use hex::FromHex;
 
 use usage_rs::{Args, Cli, Subcommands};
@@ -581,7 +580,9 @@ fn hub_client(
 ) -> Result<Option<aether::hub_client::HubClient>, ExitCode> {
     aether::hub_client::resolve_url(
         hub_url,
-        aether::node_config::setting::<settings::Hub>(data_dir).ok().flatten(),
+        aether::settings::setting::<aether::hub_client::settings::Hub>(data_dir)
+            .ok()
+            .flatten(),
     )
     .map(|url| aether::hub_client::HubClient::for_data_dir(&url, data_dir))
     .transpose()
@@ -696,7 +697,7 @@ async fn run_node(node: Node) -> ExitCode {
                 eprintln!("aether: --adapter must be codex or connected");
                 return ExitCode::from(2);
             };
-            let service = match aether::node_config::load_or_create_service_with_adapter(
+            let service = match aether::node_builder::load_or_create_service(
                 &arguments.policy,
                 &arguments.data_dir,
                 arguments.codex_bin.clone(),
@@ -842,9 +843,11 @@ async fn run_node(node: Node) -> ExitCode {
                 .relay_url
                 .clone()
                 .or_else(|| {
-                    aether::node_config::setting::<settings::Relay>(&arguments.data_dir)
-                        .ok()
-                        .flatten()
+                    aether::settings::setting::<aether::transport::relay::Relay>(
+                        &arguments.data_dir,
+                    )
+                    .ok()
+                    .flatten()
                 })
                 .filter(|relay| relay != "off");
             let endpoint = match aether::transport::bind_node(
@@ -857,14 +860,14 @@ async fn run_node(node: Node) -> ExitCode {
                 Ok(endpoint) => endpoint,
                 Err(error) => return transport_error(&error),
             };
-            if aether::node_config::store_setting::<settings::ActiveRelay>(
+            if aether::settings::store_setting::<aether::transport::relay::ActiveRelay>(
                 &arguments.data_dir,
                 &relay_url,
             )
             .and_then(|()| {
                 // The name of connect codes from the admin socket while the
                 // node has no name on the hub, as on the host page.
-                aether::node_config::store_setting::<settings::HostName>(
+                aether::settings::store_setting::<aether::direct::HostName>(
                     &arguments.data_dir,
                     &arguments.invite_name.clone().unwrap_or_else(|| {
                         aether::direct::default_agent_name(

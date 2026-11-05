@@ -47,6 +47,22 @@ pub struct InvitationBundle {
     pub agent_card_signature: Option<String>,
 }
 
+/// The name of connect codes while the node has no name on the hub.
+pub struct HostName;
+
+impl crate::settings::Setting for HostName {
+    const KEY: &'static str = "node.runtime.host_name";
+    type Value = String;
+
+    fn decode(stored: String) -> Result<Self::Value, aether_store::StoreError> {
+        Ok(stored)
+    }
+
+    fn encode(value: &Self::Value) -> Result<Option<String>, aether_store::StoreError> {
+        Ok(Some(value.clone()))
+    }
+}
+
 /// The prefix of an [`InvitationBundle`]'s one-line form.
 pub const INVITE_PREFIX: &str = "aether-invite:";
 
@@ -152,7 +168,7 @@ pub fn sign_invite_access(
     let issuer =
         DataDir::new(data_dir).issuer_key().map_err(|_| DirectError::Unavailable)?;
     let access = crate::identity::AccessInput {
-        issuer_agent_id: crate::node_config::NODE_ISSUER.to_owned(),
+        issuer_agent_id: crate::identity::NODE_ISSUER.to_owned(),
         subject_agent_id: friend_name.to_owned(),
         subject_endpoint_id: endpoint_id.to_owned(),
         scope_id: SCOPE.to_owned(),

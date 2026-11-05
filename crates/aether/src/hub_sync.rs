@@ -27,7 +27,7 @@ pub enum HostStep {
 }
 
 /// The step for `invite` with the local `approval` of its id. `own_name` is
-/// this node's name on the hub (`node_config::stored_hub_name`), never a
+/// this node's name on the hub (the `HubName` setting), never a
 /// flag: without it the host makes no step. `blocked` is whether the owner
 /// blocked the endpoint that the row names: the host never signs for it.
 #[must_use]

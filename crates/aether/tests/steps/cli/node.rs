@@ -232,7 +232,7 @@ fn task_workspace_exists(world: &mut World, path: String) {
 async fn policy_uses_workspace(world: &mut World, tokens: u32) {
     let home = world.cli.node_files.home();
     let settings = blocking(move || {
-        aether::node_config::policy_settings(&home.join(".aether/host"))
+        aether::policy::policy_settings(&home.join(".aether/host"))
             .expect("policy must read")
             .expect("policy must exist")
     })
@@ -282,8 +282,13 @@ fn policy_paths(world: &mut World) -> (PathBuf, PathBuf) {
 async fn node_loads_policy(world: &mut World) {
     let (policy, data_dir) = policy_paths(world);
     blocking(move || {
-        aether::node_config::load_or_create_service(&policy, &data_dir, "codex".into())
-            .expect("the node must load its policy");
+        aether::node_builder::load_or_create_service(
+            &policy,
+            &data_dir,
+            "codex".into(),
+            None,
+        )
+        .expect("the node must load its policy");
     })
     .await;
 }
@@ -292,11 +297,11 @@ async fn node_loads_policy(world: &mut World) {
 async fn owner_changes_time_limit(world: &mut World, seconds: u64) {
     let (_, data_dir) = policy_paths(world);
     blocking(move || {
-        let mut settings = aether::node_config::policy_settings(&data_dir)
+        let mut settings = aether::policy::policy_settings(&data_dir)
             .expect("policy must read")
             .expect("policy must exist");
         settings.max_seconds = seconds;
-        aether::node_config::save_policy_settings(&data_dir, &settings)
+        aether::policy::save_policy_settings(&data_dir, &settings)
             .expect("policy must save");
     })
     .await;
@@ -312,7 +317,7 @@ fn policy_file_replaced(world: &mut World) {
 async fn policy_allows_seconds(world: &mut World, seconds: u64) {
     let (_, data_dir) = policy_paths(world);
     let settings = blocking(move || {
-        aether::node_config::policy_settings(&data_dir)
+        aether::policy::policy_settings(&data_dir)
             .expect("policy must read")
             .expect("policy must exist")
     })

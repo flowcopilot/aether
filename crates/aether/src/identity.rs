@@ -11,6 +11,10 @@ use ed25519_dalek::SigningKey;
 
 use crate::signed::{SignedBytes, sign, verify};
 
+/// The issuer name of the node's own signing key, which the node always
+/// trusts. The admin UI signs a friend's access with it.
+pub const NODE_ISSUER: &str = "node";
+
 pub struct SignedClaims {
     trusted_keys: BTreeMap<AgentId, [u8; 32]>,
     clock_skew: Duration,
@@ -676,5 +680,29 @@ mod tests {
             .revoke_managed_member("https://control.test", 2, "managed", "subject")
             .expect("member must revoke");
         assert!(trust.verify(&claim, &EndpointId::new("endpoint"), &scope,).is_err());
+    }
+
+    #[test]
+    fn a_signed_access_grant_survives_the_policy_form() {
+        let key = SigningKey::from_bytes(&[5; 32]);
+        let access = super::AccessInput {
+            issuer_agent_id: "node".to_owned(),
+            subject_agent_id: "friend".to_owned(),
+            subject_endpoint_id: "friend-endpoint".to_owned(),
+            scope_id: "direct".to_owned(),
+            capabilities: vec!["review".to_owned()],
+            workspaces: vec!["workspace".to_owned()],
+            access_mode: AccessMode::ReadOnly,
+            approval_rule: ApprovalRule::Automatic,
+            lifetime: Duration::from_secs(60),
+        };
+        let (claim, grant) =
+            super::sign_access(&key, &access).expect("access must sign");
+        let text = super::encode_grant(&grant).expect("grant must encode");
+        let parsed = super::decode_grant(&text).expect("grant must parse back");
+        // `SystemTime` keeps sub-second precision; the policy form does not.
+        assert_eq!(super::encode_grant(&parsed).expect("grant must encode"), text);
+        assert_eq!(claim.subject_endpoint_id.as_str(), "friend-endpoint");
+        assert_eq!(claim.signing_key, grant.signing_key);
     }
 }

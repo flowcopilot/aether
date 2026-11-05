@@ -43,7 +43,6 @@ mod pact;
 
 use crate::admin::SharedAdministration;
 use crate::admin_components::status_dot;
-use crate::node_config::settings;
 use advanced::dashboard;
 use caller::caller_screen;
 use host::host_screen;
@@ -339,7 +338,9 @@ pub(super) async fn node_header(cx: &Cx, current: Tab) -> TopcoatResult<impl Vie
         })
     });
     let name = data_dir.as_deref().and_then(|dir| {
-        crate::node_config::setting::<settings::HubName>(dir).ok().flatten()
+        crate::settings::setting::<crate::hub_client::settings::HubName>(dir)
+            .ok()
+            .flatten()
     });
     let tabs = host.is_some() || caller.is_some();
     let agents_href = if host.is_some() { "/agents" } else { "/" };
@@ -667,7 +668,7 @@ impl HostContext {
     /// endpoint ID. The hub name comes first, so invites carry the name that
     /// people find this node by.
     pub(super) fn agent_name(&self) -> String {
-        crate::node_config::setting::<settings::HubName>(&self.data_dir)
+        crate::settings::setting::<crate::hub_client::settings::HubName>(&self.data_dir)
             .ok()
             .flatten()
             .or_else(|| self.name.clone())
@@ -693,7 +694,7 @@ impl HostContext {
 
     /// The relay the node listens through now.
     fn relay_url(&self) -> Option<String> {
-        crate::node_config::setting::<settings::ActiveRelay>(&self.data_dir)
+        crate::settings::setting::<crate::transport::relay::ActiveRelay>(&self.data_dir)
             .unwrap_or_else(|_| {
                 self.relay_url.lock().unwrap_or_else(PoisonError::into_inner).clone()
             })
@@ -704,7 +705,7 @@ impl HostContext {
         &self,
         relay: Option<String>,
     ) -> Result<(), crate::transport::TransportError> {
-        crate::node_config::apply_relay(
+        crate::transport::relay::apply_relay(
             &self.data_dir,
             &relay,
             (self.switch_relay)(self.relay_url(), relay.clone()),
@@ -731,13 +732,18 @@ struct HubState {
 impl HubSlot {
     fn new(data_dir: PathBuf) -> Self {
         let stored_url =
-            crate::node_config::setting::<settings::Hub>(&data_dir).ok().flatten();
+            crate::settings::setting::<crate::hub_client::settings::Hub>(&data_dir)
+                .ok()
+                .flatten();
         Self { data_dir, state: Mutex::new(HubState { client: None, stored_url }) }
     }
 
     fn get(&self) -> Option<crate::hub_client::HubClient> {
-        let stored_url =
-            crate::node_config::setting::<settings::Hub>(&self.data_dir).ok().flatten();
+        let stored_url = crate::settings::setting::<crate::hub_client::settings::Hub>(
+            &self.data_dir,
+        )
+        .ok()
+        .flatten();
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if state.stored_url != stored_url {
             state.client = crate::hub_client::resolve_url(None, stored_url.clone())
@@ -751,8 +757,11 @@ impl HubSlot {
     }
 
     fn set(&self, hub: Option<crate::hub_client::HubClient>) {
-        let stored_url =
-            crate::node_config::setting::<settings::Hub>(&self.data_dir).ok().flatten();
+        let stored_url = crate::settings::setting::<crate::hub_client::settings::Hub>(
+            &self.data_dir,
+        )
+        .ok()
+        .flatten();
         *self.state.lock().unwrap_or_else(PoisonError::into_inner) =
             HubState { client: hub, stored_url };
     }
@@ -988,7 +997,6 @@ mod tests {
         ChangeRequest, SharedAdministration, shared_with_store,
         test_support::{FakeNode, shared_in},
     };
-    use crate::node_config::settings;
     use aether_store::{
         AuditActor, AuditResult, ManagedMember, NodeStore, QueueLimits, TaskInput,
     };
@@ -1007,7 +1015,7 @@ mod tests {
             .expect("hub client must create"),
         ));
         assert!(slot.get().is_some());
-        crate::node_config::store_setting::<settings::Hub>(
+        crate::settings::store_setting::<crate::hub_client::settings::Hub>(
             directory.path(),
             &Some("off".to_owned()),
         )
@@ -1104,7 +1112,7 @@ mod tests {
         assert!(host(None).agent_name().starts_with("agent-"));
         assert_eq!(host(None).agent_name().len(), "agent-".len() + 8);
         assert_eq!(host(Some("server")).agent_name(), "server");
-        crate::node_config::store_setting::<settings::HubName>(
+        crate::settings::store_setting::<crate::hub_client::settings::HubName>(
             directory.path(),
             &Some("tudor".to_owned()),
         )
@@ -1164,7 +1172,7 @@ mod tests {
         let host =
             test_host(directory.path(), Arc::new(std::sync::Mutex::new(Vec::new())))
                 .with_hub(Some(hub.client(directory.path())));
-        crate::node_config::store_setting::<settings::HubName>(
+        crate::settings::store_setting::<crate::hub_client::settings::HubName>(
             directory.path(),
             &Some("tudor".to_owned()),
         )
@@ -1328,10 +1336,12 @@ mod tests {
         assert!(claimed.body.contains("tudor#0001"), "{}", claimed.body);
         assert!(claimed.body.contains("bob#0042"));
         assert_eq!(
-            crate::node_config::setting::<settings::HubName>(directory.path())
-                .ok()
-                .flatten()
-                .as_deref(),
+            crate::settings::setting::<crate::hub_client::settings::HubName>(
+                directory.path()
+            )
+            .ok()
+            .flatten()
+            .as_deref(),
             Some("tudor#0001")
         );
     }
@@ -1366,9 +1376,11 @@ mod tests {
         assert!(claimed.body.contains("This is a service agent."), "{}", claimed.body);
         assert!(!claimed.body.contains("Their name on Aether"));
         assert_eq!(
-            crate::node_config::setting::<settings::AgentKind>(directory.path())
-                .ok()
-                .flatten(),
+            crate::settings::setting::<crate::hub_client::settings::AgentKind>(
+                directory.path()
+            )
+            .ok()
+            .flatten(),
             Some(crate::hub_client::AgentKind::Service)
         );
         let endpoint = crate::direct::endpoint_id(directory.path()).expect("endpoint");
@@ -1434,10 +1446,11 @@ mod tests {
         hub: &crate::hub_client::test_hub::TestHub,
     ) -> (axum::Router, String, std::path::PathBuf) {
         let data_dir = directory.join("node");
-        crate::node_config::load_or_create_service(
+        crate::node_builder::load_or_create_service(
             &directory.join("missing-policy.json"),
             &data_dir,
             "codex".into(),
+            None,
         )
         .expect("first node policy must create");
         let page = hub_host_ui(&data_dir, hub);
@@ -1482,10 +1495,12 @@ mod tests {
             listing.description,
             crate::agent_card::settings(&data_dir).description
         );
-        let state = crate::node_config::setting::<settings::ListingState>(&data_dir)
-            .ok()
-            .flatten()
-            .expect("state");
+        let state = crate::settings::setting::<crate::listing::settings::ListingState>(
+            &data_dir,
+        )
+        .ok()
+        .flatten()
+        .expect("state");
         assert_eq!(state.listing, text);
 
         let stopped =
@@ -1493,9 +1508,11 @@ mod tests {
         assert!(stopped.body.contains("Not listed."), "{}", stopped.body);
         assert!(!hub.state().listings.contains_key(&endpoint));
         assert_eq!(
-            crate::node_config::setting::<settings::ListingState>(&data_dir)
-                .ok()
-                .flatten(),
+            crate::settings::setting::<crate::listing::settings::ListingState>(
+                &data_dir
+            )
+            .ok()
+            .flatten(),
             None
         );
     }
@@ -2035,7 +2052,7 @@ mod tests {
             Arc::new(|_, _| Box::pin(async { Ok(()) })),
         )
         .with_hub(Some(hub.client(directory.path())));
-        crate::node_config::store_setting::<settings::HubName>(
+        crate::settings::store_setting::<crate::hub_client::settings::HubName>(
             directory.path(),
             &Some("tudor".to_owned()),
         )
@@ -2126,10 +2143,12 @@ mod tests {
         assert_eq!(response.status, StatusCode::OK, "{}", response.body);
         assert!(response.body.contains("Reachable through relay.example.com"));
         assert_eq!(
-            crate::node_config::setting::<settings::Relay>(directory.path())
-                .ok()
-                .flatten()
-                .as_deref(),
+            crate::settings::setting::<crate::transport::relay::Relay>(
+                directory.path()
+            )
+            .ok()
+            .flatten()
+            .as_deref(),
             Some("https://relay.example.com/")
         );
 
@@ -2148,9 +2167,11 @@ mod tests {
         assert_eq!(response.status, StatusCode::OK);
         assert!(response.body.contains("No relay yet"));
         assert_eq!(
-            crate::node_config::setting::<settings::Relay>(directory.path())
-                .ok()
-                .flatten(),
+            crate::settings::setting::<crate::transport::relay::Relay>(
+                directory.path()
+            )
+            .ok()
+            .flatten(),
             None
         );
 
@@ -2649,7 +2670,7 @@ mod tests {
             )),
             ..UiOptions::default()
         };
-        crate::node_config::store_setting::<settings::HubName>(
+        crate::settings::store_setting::<crate::hub_client::settings::HubName>(
             directory.path(),
             &Some("tudor#0042".to_owned()),
         )
@@ -3052,10 +3073,11 @@ mod tests {
     async fn advanced_page_saves_task_policy_in_the_node_database() {
         let directory = tempfile::tempdir().expect("directory must create");
         let data_dir = directory.path().join("node");
-        crate::node_config::load_or_create_service(
+        crate::node_builder::load_or_create_service(
             &directory.path().join("missing-policy.json"),
             &data_dir,
             "codex".into(),
+            None,
         )
         .expect("first node policy must create");
         let (admin_ui, _) = host_ui(&data_dir);
@@ -3089,7 +3111,7 @@ mod tests {
         .await;
         assert_eq!(response.status, StatusCode::OK, "{}", response.body);
         assert!(response.body.contains("Policy saved"));
-        let settings = crate::node_config::policy_settings(&data_dir)
+        let settings = crate::policy::policy_settings(&data_dir)
             .expect("policy must read")
             .expect("policy must exist");
         assert_eq!(settings.max_context_tokens, 12_000);

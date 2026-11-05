@@ -31,7 +31,7 @@ use crate::{
         input::input,
         label::label,
     },
-    node_config::{PolicySettings, policy_settings, save_policy_settings},
+    policy::{PolicySettings, policy_settings, save_policy_settings},
 };
 use aether_store::{ChangeKind, ManagedMember};
 

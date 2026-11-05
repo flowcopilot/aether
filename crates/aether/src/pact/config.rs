@@ -2,7 +2,7 @@
 
 use aether_core::AccessMode;
 use reqwest::Url;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// The id of the scope every PACT task runs in.
 pub const SCOPE_ID: &str = "pact";
@@ -17,7 +17,7 @@ pub enum PactConfigError {
     Brand(usize),
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PactFile {
     public_url: String,
@@ -27,7 +27,7 @@ pub struct PactFile {
     brands: Vec<BrandFile>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct BrandFile {
     id: String,
@@ -39,7 +39,7 @@ struct BrandFile {
     scope: ScopeFile,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ScopeFile {
     id: String,

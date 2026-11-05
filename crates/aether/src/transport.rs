@@ -1394,6 +1394,8 @@ pub(crate) const fn key_error(error: KeyFileError) -> TransportError {
     }
 }
 
+pub mod relay;
+
 #[cfg(test)]
 mod tests {
     use super::{
