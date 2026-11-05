@@ -312,7 +312,7 @@ where
         {
             return Err(TransportError::ResultExpired);
         }
-        let status = task_state_status(state);
+        let status = a2a_status(state);
         let result_text = if state == aether_store::TaskState::Succeeded {
             result.unwrap_or_default()
         } else {
@@ -330,7 +330,7 @@ where
                 task_id: Some(task_id.clone()),
                 payload: event_payload_with_sequence(
                     &task_id,
-                    event_status(event.event_type.as_str()),
+                    event_status(event.event_type, state),
                     Some(event.sequence),
                 ),
             };
@@ -362,19 +362,16 @@ where
     }
 }
 
-fn event_status(event_type: &str) -> A2aTaskStatus {
-    match event_type {
-        "queued" | "leased" => A2aTaskStatus::Submitted,
-        "cancelled" => A2aTaskStatus::Canceled,
-        "succeeded" => A2aTaskStatus::Completed,
-        "failed" => A2aTaskStatus::Failed,
-        "rejected" => A2aTaskStatus::Rejected,
-        // "running", and any event that does not end the task.
-        _ => A2aTaskStatus::Working,
-    }
+/// The A2A status of `event`, which happened to a task that is in `current`
+/// now.
+fn event_status(
+    event: aether_store::EventType,
+    current: aether_store::TaskState,
+) -> A2aTaskStatus {
+    a2a_status(event.task_state().unwrap_or(current))
 }
 
-const fn task_state_status(state: aether_store::TaskState) -> A2aTaskStatus {
+const fn a2a_status(state: aether_store::TaskState) -> A2aTaskStatus {
     match state {
         aether_store::TaskState::PendingApproval => A2aTaskStatus::InputRequired,
         aether_store::TaskState::Queued | aether_store::TaskState::Leased => {
@@ -429,7 +426,7 @@ where
                 task_id: frame.task_id.clone(),
                 payload: event_payload_with_sequence(
                     task_id,
-                    event_status(event.event_type.as_str()),
+                    event_status(event.event_type, aether_store::TaskState::Cancelled),
                     Some(event.sequence),
                 ),
             },
@@ -1597,6 +1594,31 @@ mod tests {
             }],
         );
         assert_eq!(result, Err(crate::transport::TransportError::ResultExpired));
+    }
+
+    #[test]
+    fn an_event_has_the_status_of_the_state_it_leaves_the_task_in() {
+        use aether_store::{EventType, TaskState};
+
+        use crate::transport::A2aTaskStatus;
+
+        for (event, status) in [
+            (
+                EventType::Entered(TaskState::PendingApproval),
+                A2aTaskStatus::InputRequired,
+            ),
+            (EventType::Entered(TaskState::UnknownResult), A2aTaskStatus::Failed),
+            (EventType::Entered(TaskState::OperatorReviewed), A2aTaskStatus::Failed),
+            (EventType::Requeued, A2aTaskStatus::Submitted),
+            (EventType::LeaseExpired, A2aTaskStatus::Submitted),
+            (EventType::Progress, A2aTaskStatus::Working),
+        ] {
+            assert_eq!(super::event_status(event, TaskState::Succeeded), status);
+        }
+        assert_eq!(
+            super::event_status(EventType::ContentExpired, TaskState::Rejected),
+            A2aTaskStatus::Rejected
+        );
     }
 
     #[test]
