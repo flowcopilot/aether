@@ -85,7 +85,7 @@ impl PactConsent {
         data_dir: &Path,
     ) -> Result<Self, aether_store::StoreError> {
         Ok(Self {
-            store: Mutex::new(PactStore::open(data_dir.join("pact.sqlite"))?),
+            store: Mutex::new(PactStore::in_dir(data_dir)?),
             config,
             data_dir: data_dir.to_owned(),
         })

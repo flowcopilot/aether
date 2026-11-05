@@ -4,7 +4,8 @@
 
 use std::path::Path;
 
-use rusqlite::{Connection, params};
+use aether_core::ScopeKind;
+use rusqlite::{Connection, OptionalExtension, params};
 
 mod access_groups;
 mod admin;
@@ -19,16 +20,30 @@ pub mod pact;
 mod summary;
 mod tasks;
 
-pub use access_groups::*;
-pub use admin::*;
-pub use control::*;
-pub use directory::*;
-pub use hub::*;
-pub use managed::*;
-pub use migrate::{BACKUP_RETENTION, restore};
-pub use outbox::*;
-pub use summary::*;
-pub use tasks::*;
+pub use access_groups::{
+    AccessGroup, AccessGroupMember, FRIENDS_GROUP, REQUESTS_GROUP,
+};
+pub use admin::{
+    AuditAction, AuditActor, AuditRecord, AuditResult, ChangeKind, PendingChange,
+};
+pub use control::{
+    CONTROL_MIGRATIONS, ControlStore, DirectoryEvent, DirectoryEventType, ManagedEvent,
+    ManagedEventType,
+};
+pub use directory::SignedRecord;
+pub use hub::{
+    AccessRequestDraft, ApprovalKind, ApprovalSide, HubApproval, KeptListing,
+    MAX_ACCESS_REQUEST_DRAFTS,
+};
+pub use managed::ManagedMember;
+pub use migrate::BACKUP_RETENTION;
+pub use outbox::{SentAttempt, SentState, SentTask, SentTaskInput};
+pub use summary::NodeSummary;
+pub use tasks::{
+    CONTENT_CLEANUP_BATCH, CONTENT_RETENTION_SECONDS, EventType, LastTask, QueueLimits,
+    StoredTask, TaskActivity, TaskAdmission, TaskCounts, TaskEvent, TaskExecutionData,
+    TaskInput, TaskState,
+};
 
 use aether_core::time::now;
 use migrate::open_connection;
@@ -49,9 +64,10 @@ pub const NODE_MIGRATIONS: &[&str] = &[
     include_str!("../migrations/node/013_sent_tasks.sql"),
     include_str!("../migrations/node/014_access_requests.sql"),
     include_str!("../migrations/node/015_access_request_drafts.sql"),
+    include_str!("../migrations/node/016_signed_record_kinds.sql"),
+    include_str!("../migrations/node/017_drop_unused_grants.sql"),
 ];
 
-/// The file name of the node store in a data directory.
 pub const NODE_DATABASE: &str = "node.sqlite";
 
 #[derive(Debug, thiserror::Error)]
@@ -70,6 +86,8 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Sql(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Migration(#[from] rusqlite_migration::Error),
 }
 
 impl PartialEq for StoreError {
@@ -93,13 +111,84 @@ impl NodeStore {
         Self::open(dir.join(NODE_DATABASE))
     }
 
-    pub fn put_scope(&self, id: &str, kind: &str) -> Result<(), StoreError> {
-        self.connection.execute(
-            "INSERT INTO scopes(id, kind) VALUES (?1, ?2) ON CONFLICT(id) DO UPDATE SET kind=excluded.kind",
-            params![id, kind],
-        )?;
-        Ok(())
+    pub fn put_scope(&self, id: &str, kind: ScopeKind) -> Result<(), StoreError> {
+        put_scope(&self.connection, id, kind)
     }
+}
+
+pub(crate) fn put_scope(
+    connection: &Connection,
+    id: &str,
+    kind: ScopeKind,
+) -> Result<(), StoreError> {
+    connection.execute(
+        "INSERT INTO scopes(id,kind) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET kind=excluded.kind",
+        params![id, kind.as_str()],
+    )?;
+    Ok(())
+}
+
+/// Adds the scope `id` of `kind` unless it is there; a scope of another
+/// kind is [`StoreError::InvalidState`].
+pub(crate) fn ensure_scope(
+    connection: &Connection,
+    id: &str,
+    kind: ScopeKind,
+) -> Result<(), StoreError> {
+    connection.execute(
+        "INSERT INTO scopes(id,kind) VALUES(?1,?2) ON CONFLICT(id) DO NOTHING",
+        params![id, kind.as_str()],
+    )?;
+    let stored: Option<String> = connection
+        .query_row("SELECT kind FROM scopes WHERE id=?1", [id], |row| row.get(0))
+        .optional()?;
+    if stored.as_deref() == Some(kind.as_str()) {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidState)
+    }
+}
+
+/// Stores an enum that [`aether_core::named!`] names as its name.
+macro_rules! sql_named {
+    ($($name:ty),+ $(,)?) => {$(
+        impl rusqlite::ToSql for $name {
+            fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+                Ok(self.as_str().into())
+            }
+        }
+
+        impl rusqlite::types::FromSql for $name {
+            fn column_result(
+                value: rusqlite::types::ValueRef<'_>,
+            ) -> rusqlite::types::FromSqlResult<Self> {
+                let text = value.as_str()?;
+                Self::parse(text).ok_or_else(|| {
+                    rusqlite::types::FromSqlError::Other(
+                        format!("unknown {} {text:?}", stringify!($name)).into(),
+                    )
+                })
+            }
+        }
+    )+};
+}
+pub(crate) use sql_named;
+
+/// The column `index` of `row`, which holds a count that is never
+/// negative.
+pub(crate) fn column_u64(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<u64> {
+    let value: i64 = row.get(index)?;
+    u64::try_from(value)
+        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(index, value))
+}
+
+/// `names` as a quoted SQL list, for `IN (...)`. Every name comes from a
+/// [`aether_core::named!`] table, so none holds a quote.
+pub(crate) fn sql_names(names: &[&str]) -> String {
+    names.iter().map(|name| format!("'{name}'")).collect::<Vec<_>>().join(",")
 }
 
 /// A row count for `LIMIT` or `OFFSET`; a count past `i64::MAX` is no limit.
@@ -109,20 +198,23 @@ pub(crate) fn sql_count(count: usize) -> i64 {
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
-    use rusqlite::params;
+    use aether_core::{
+        AccessMode, AgentId, CapabilityId, EndpointId, Request, RequestId, ScopeId,
+        ScopeKind, TaskId, WorkspaceId,
+    };
 
     use crate::{NodeStore, TaskInput};
 
-    pub fn put_grant(store: &NodeStore, id: &str, expires_at: i64) {
-        store
-            .connection
-            .execute(
-                "INSERT INTO grants(id,scope_id,subject_agent_id,subject_endpoint_id,expires_at) VALUES(?1,'scope','agent','endpoint',?2)",
-                params![id, expires_at],
-            )
-            .expect("grant must store");
+    /// How many backups of `database` sit next to it.
+    pub fn backup_count(database: &Path) -> usize {
+        let prefix = format!("{}.backup.", database.display());
+        std::fs::read_dir(database.parent().expect("parent must exist"))
+            .expect("parent must read")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().to_string_lossy().starts_with(&prefix))
+            .count()
     }
 
     pub fn path(name: &str) -> PathBuf {
@@ -138,16 +230,18 @@ pub(crate) mod test_support {
 
     pub fn input(id: &str, peer: &str) -> TaskInput {
         TaskInput {
-            id: id.to_owned(),
-            request_id: format!("request-{id}"),
+            request: Request {
+                id: RequestId::new(format!("request-{id}")),
+                task_id: TaskId::new(id),
+                caller_agent_id: AgentId::new(peer),
+                caller_endpoint_id: EndpointId::new(format!("endpoint-{peer}")),
+                scope_id: ScopeId::new("scope"),
+                capability_id: CapabilityId::new("capability"),
+                workspace_id: WorkspaceId::new("workspace"),
+                access_mode: AccessMode::ReadOnly,
+            },
             idempotency_key: format!("key-{id}"),
-            caller_agent_id: peer.to_owned(),
-            caller_endpoint_id: format!("endpoint-{peer}"),
             request_fingerprint: format!("fingerprint-{id}"),
-            scope_id: "scope".to_owned(),
-            capability_id: "capability".to_owned(),
-            workspace_id: "workspace".to_owned(),
-            access_mode: "read_only".to_owned(),
             skill: "capability".to_owned(),
             remote_text: "task input".to_owned(),
         }
@@ -156,7 +250,7 @@ pub(crate) mod test_support {
     pub fn store() -> (NodeStore, PathBuf) {
         let database = path("node");
         let store = NodeStore::open(&database).expect("store must open");
-        store.put_scope("scope", "direct").expect("scope must store");
+        store.put_scope("scope", ScopeKind::Direct).expect("scope must store");
         (store, database)
     }
 }

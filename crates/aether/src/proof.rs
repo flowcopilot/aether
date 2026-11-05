@@ -16,7 +16,7 @@ use aether_core::{
 };
 use aether_store::TaskExecutionData;
 use aether_store::{
-    Admission as StoreAdmission, NodeStore, QueueLimits, StoreError, TaskInput,
+    NodeStore, QueueLimits, StoreError, TaskAdmission as StoreAdmission, TaskInput,
     TaskState,
 };
 use tokio::sync::broadcast;
@@ -450,10 +450,10 @@ where
                                 }
                             }
                             let event_task_id = dispatch_task_id.clone();
-                            let event_type = event.event_type().to_owned();
+                            let event_type = event.event_type();
                             event_error = store
                                 .call(move |store| {
-                                    store.append_event(&event_task_id, &event_type)
+                                    store.append_event(&event_task_id, event_type)
                                 })
                                 .err();
                             if event_error.is_none() {
@@ -735,7 +735,7 @@ where
             store.recover_expired_leases(timestamp_after(Duration::ZERO))?;
             store.clear_expired_content(timestamp_after(Duration::ZERO))?;
             for scope in stored_scopes {
-                store.put_scope(scope.id.as_str(), scope.kind.as_str())?;
+                store.put_scope(scope.id.as_str(), scope.kind)?;
             }
             Ok(())
         })?;
@@ -933,7 +933,11 @@ where
                 if store.access_group_allows(&agent, &endpoint)? {
                     return Ok(());
                 }
-                store.add_access_group_member("friends", &agent, &endpoint)
+                store.add_access_group_member(
+                    aether_store::FRIENDS_GROUP,
+                    &agent,
+                    &endpoint,
+                )
             })?;
         }
         policy.replace_grant(grant);
@@ -1045,16 +1049,12 @@ where
         replay_key: Option<String>,
     ) -> Result<StoreAdmission, ProofError> {
         let input = TaskInput {
-            id: task.id.clone(),
-            request_id: request.id.as_str().to_owned(),
+            request: Request {
+                caller_endpoint_id: authenticated_endpoint.clone(),
+                ..request.clone()
+            },
             idempotency_key: idempotency_key.to_owned(),
-            caller_agent_id: request.caller_agent_id.as_str().to_owned(),
-            caller_endpoint_id: authenticated_endpoint.as_str().to_owned(),
             request_fingerprint: request_fingerprint(request, task),
-            scope_id: request.scope_id.as_str().to_owned(),
-            capability_id: request.capability_id.as_str().to_owned(),
-            workspace_id: request.workspace_id.as_str().to_owned(),
-            access_mode: request.access_mode.as_str().to_owned(),
             skill: task.skill.clone(),
             remote_text: task.remote_text.clone(),
         };
@@ -1623,16 +1623,20 @@ mod tests {
             .call(move |store| {
                 store.admit(
                     &TaskInput {
-                        id: "task".to_owned(),
-                        request_id: "request".to_owned(),
+                        request: aether_core::Request {
+                            task_id: aether_core::TaskId::new("task"),
+                            id: aether_core::RequestId::new("request"),
+                            caller_agent_id: aether_core::AgentId::new("caller"),
+                            caller_endpoint_id: aether_core::EndpointId::new(
+                                "endpoint",
+                            ),
+                            scope_id: aether_core::ScopeId::new("direct"),
+                            capability_id: aether_core::CapabilityId::new("review"),
+                            workspace_id: aether_core::WorkspaceId::new("workspace"),
+                            access_mode: aether_core::AccessMode::ReadOnly,
+                        },
                         idempotency_key: "key".to_owned(),
-                        caller_agent_id: "caller".to_owned(),
-                        caller_endpoint_id: "endpoint".to_owned(),
                         request_fingerprint: "fingerprint".to_owned(),
-                        scope_id: "direct".to_owned(),
-                        capability_id: "review".to_owned(),
-                        workspace_id: "workspace".to_owned(),
-                        access_mode: "read_only".to_owned(),
                         skill: "review".to_owned(),
                         remote_text: "task input".to_owned(),
                     },
@@ -1648,7 +1652,7 @@ mod tests {
             node.events("task")
                 .expect("events must load")
                 .into_iter()
-                .map(|event| event.event_type)
+                .map(|event| event.event_type.as_str())
                 .collect::<Vec<_>>(),
             ["queued", "cancelled"]
         );
@@ -1740,23 +1744,27 @@ mod tests {
     #[test]
     fn startup_recovers_an_expired_running_lease() {
         let directory = tempfile::tempdir().expect("directory must create");
-        let path = directory.path().join("node.sqlite");
+        let path = directory.path().join(aether_store::NODE_DATABASE);
         let scope = Scope { id: ScopeId::new("direct"), kind: ScopeKind::Direct };
         let mut store = NodeStore::open(&path).expect("store must open");
-        store.put_scope("direct", "direct").expect("scope must store");
+        store
+            .put_scope("direct", aether_core::ScopeKind::Direct)
+            .expect("scope must store");
         store
             .admit(
                 &TaskInput {
-                    id: "task".to_owned(),
-                    request_id: "request".to_owned(),
+                    request: aether_core::Request {
+                        task_id: aether_core::TaskId::new("task"),
+                        id: aether_core::RequestId::new("request"),
+                        caller_agent_id: aether_core::AgentId::new("caller"),
+                        caller_endpoint_id: aether_core::EndpointId::new("endpoint"),
+                        scope_id: aether_core::ScopeId::new("direct"),
+                        capability_id: aether_core::CapabilityId::new("review"),
+                        workspace_id: aether_core::WorkspaceId::new("workspace"),
+                        access_mode: aether_core::AccessMode::ReadOnly,
+                    },
                     idempotency_key: "key".to_owned(),
-                    caller_agent_id: "caller".to_owned(),
-                    caller_endpoint_id: "endpoint".to_owned(),
                     request_fingerprint: "fingerprint".to_owned(),
-                    scope_id: "direct".to_owned(),
-                    capability_id: "review".to_owned(),
-                    workspace_id: "workspace".to_owned(),
-                    access_mode: "read_only".to_owned(),
                     skill: "review".to_owned(),
                     remote_text: "task input".to_owned(),
                 },
@@ -1790,10 +1798,12 @@ mod tests {
     #[test]
     fn restart_preserves_every_terminal_task_state() {
         let directory = tempfile::tempdir().expect("directory must create");
-        let path = directory.path().join("node.sqlite");
+        let path = directory.path().join(aether_store::NODE_DATABASE);
         let scope = Scope { id: ScopeId::new("direct"), kind: ScopeKind::Direct };
         let mut store = NodeStore::open(&path).expect("store must open");
-        store.put_scope("direct", "direct").expect("scope must store");
+        store
+            .put_scope("direct", aether_core::ScopeKind::Direct)
+            .expect("scope must store");
 
         let mut expected = BTreeMap::from([
             ("succeeded-task".to_owned(), TaskState::Succeeded),
@@ -1806,16 +1816,20 @@ mod tests {
             store
                 .admit(
                     &TaskInput {
-                        id: id.clone(),
-                        request_id: format!("request-{id}"),
+                        request: aether_core::Request {
+                            task_id: aether_core::TaskId::new(id.clone()),
+                            id: aether_core::RequestId::new(format!("request-{id}")),
+                            caller_agent_id: aether_core::AgentId::new("caller"),
+                            caller_endpoint_id: aether_core::EndpointId::new(
+                                "endpoint",
+                            ),
+                            scope_id: aether_core::ScopeId::new("direct"),
+                            capability_id: aether_core::CapabilityId::new("review"),
+                            workspace_id: aether_core::WorkspaceId::new("workspace"),
+                            access_mode: aether_core::AccessMode::ReadOnly,
+                        },
                         idempotency_key: format!("key-{id}"),
-                        caller_agent_id: "caller".to_owned(),
-                        caller_endpoint_id: "endpoint".to_owned(),
                         request_fingerprint: format!("fingerprint-{id}"),
-                        scope_id: "direct".to_owned(),
-                        capability_id: "review".to_owned(),
-                        workspace_id: "workspace".to_owned(),
-                        access_mode: "read_only".to_owned(),
                         skill: "review".to_owned(),
                         remote_text: "task input".to_owned(),
                     },
@@ -2059,7 +2073,7 @@ mod tests {
     fn shutdown_stops_active_execution_and_preserves_waiting_tasks() {
         let directory = tempfile::tempdir().expect("directory must create");
         let workspace = directory.path().to_path_buf();
-        let db_path = workspace.join("node.sqlite");
+        let db_path = workspace.join(aether_store::NODE_DATABASE);
         let gate = Arc::new(AtomicBool::new(false));
         let cancelled = Arc::new(AtomicBool::new(false));
         let active = Arc::new(AtomicUsize::new(0));
@@ -2117,7 +2131,7 @@ mod tests {
     #[test]
     fn configured_node_admits_a_task_in_a_non_primary_scope() {
         let temporary = tempfile::tempdir().expect("directory must create");
-        let path = temporary.path().join("node.sqlite");
+        let path = temporary.path().join(aether_store::NODE_DATABASE);
         let now = SystemTime::now();
         let direct = Scope { id: ScopeId::new("direct"), kind: ScopeKind::Direct };
         let directory =

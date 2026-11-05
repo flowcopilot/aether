@@ -376,7 +376,7 @@ async fn groups_section(
                 <div class="flex flex-col gap-2 rounded-xl border border-border bg-background px-5 py-4">
                     <div class="flex items-baseline justify-between gap-3">
                         <h3 class="text-[15px] font-semibold">(&group.name)</h3>
-                        if group.name != "friends" && group.name != crate::access_groups::REQUESTS_GROUP {
+                        if group.name != crate::access_groups::FRIENDS_GROUP && group.name != crate::access_groups::REQUESTS_GROUP {
                             <form method="post" action="/groups">
                                 <input type="hidden" name="action" value="delete" />
                                 <input type="hidden" name="group" value=(&group.name) />
@@ -960,7 +960,7 @@ fn create_invite(
         friend_name,
         endpoint_id,
         days,
-        "friends",
+        crate::access_groups::FRIENDS_GROUP,
     )
     .map(|(line, _)| line)
     .map_err(|error| match error {

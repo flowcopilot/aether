@@ -537,11 +537,11 @@ mod tests {
     #[test]
     fn managed_claims_require_an_active_durable_roster_member() {
         let directory = tempfile::tempdir().expect("directory must create");
-        let database = directory.path().join("node.sqlite");
+        let database = directory.path().join(aether_store::NODE_DATABASE);
         let mut store = NodeStore::open(&database).expect("store must open");
         store
             .apply_managed_member(
-                "managed.cursor",
+                "https://control.test",
                 1,
                 &ManagedMember {
                     scope_id: "managed".to_owned(),
@@ -572,7 +572,7 @@ mod tests {
         let scope = Scope { id: ScopeId::new("managed"), kind: ScopeKind::Managed };
         assert!(trust.verify(&claim, &EndpointId::new("endpoint"), &scope,).is_ok());
         store
-            .revoke_managed_member("managed.cursor", 2, "managed", "subject")
+            .revoke_managed_member("https://control.test", 2, "managed", "subject")
             .expect("member must revoke");
         assert!(trust.verify(&claim, &EndpointId::new("endpoint"), &scope,).is_err());
     }

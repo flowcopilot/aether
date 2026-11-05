@@ -4,7 +4,7 @@ use aether_core::{
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
-use crate::{NodeStore, StoreError, now, sql_count};
+use crate::{NodeStore, StoreError, now, sql_count, sql_named, sql_names};
 
 pub const CONTENT_RETENTION_SECONDS: i64 = 24 * 60 * 60;
 /// Maximum rows `clear_expired_content` clears in one call.
@@ -12,10 +12,7 @@ pub const CONTENT_CLEANUP_BATCH: i64 = 500;
 
 /// The strings are the `tasks.state` column. Changing one breaks every
 /// stored row that holds it.
-#[derive(
-    Debug, Clone, Copy, Eq, PartialEq, strum::IntoStaticStr, strum::EnumString,
-)]
-#[strum(serialize_all = "snake_case")]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum TaskState {
     PendingApproval,
     Queued,
@@ -29,14 +26,35 @@ pub enum TaskState {
     Cancelled,
 }
 
-impl TaskState {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        self.into()
-    }
+aether_core::named!(TaskState {
+    PendingApproval => "pending_approval",
+    Queued => "queued",
+    Leased => "leased",
+    Running => "running",
+    UnknownResult => "unknown_result",
+    OperatorReviewed => "operator_reviewed",
+    Succeeded => "succeeded",
+    Failed => "failed",
+    Rejected => "rejected",
+    Cancelled => "cancelled",
+});
 
-    fn parse(value: &str) -> Result<Self, StoreError> {
-        value.parse().map_err(|_| StoreError::InvalidState)
+impl TaskState {
+    /// The states that hold an execution lease.
+    const ACTIVE: [Self; 2] = [Self::Leased, Self::Running];
+
+    /// The states whose input and result expire after
+    /// [`CONTENT_RETENTION_SECONDS`].
+    const CONTENT_EXPIRES: [Self; 5] = [
+        Self::Succeeded,
+        Self::Failed,
+        Self::Rejected,
+        Self::Cancelled,
+        Self::UnknownResult,
+    ];
+
+    fn sql_list(states: &[Self]) -> String {
+        sql_names(&states.iter().map(Self::as_str).collect::<Vec<_>>())
     }
 
     fn allows(self, next: Self) -> bool {
@@ -69,18 +87,77 @@ impl TaskState {
     }
 }
 
+/// What happened to a task. The names are the `task_events.event_type`
+/// column.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum EventType {
+    /// The task entered this state.
+    Entered(TaskState),
+    /// A lease ended before the task ran, and the task waits again.
+    Requeued,
+    /// A lease expired before the task ran, and the task waits again.
+    LeaseExpired,
+    /// The input and result of an ended task were cleared.
+    ContentExpired,
+    /// The agent reported progress.
+    Progress,
+    /// The agent asked for a person's approval.
+    ApprovalRequested,
+    /// The agent gave its answer.
+    Result,
+}
+
+impl EventType {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Entered(state) => state.as_str(),
+            Self::Requeued => "requeued",
+            Self::LeaseExpired => "lease_expired",
+            Self::ContentExpired => "content_expired",
+            Self::Progress => "progress",
+            Self::ApprovalRequested => "approval_requested",
+            Self::Result => "result",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        TaskState::parse(value).map(Self::Entered).or(match value {
+            "requeued" => Some(Self::Requeued),
+            "lease_expired" => Some(Self::LeaseExpired),
+            "content_expired" => Some(Self::ContentExpired),
+            "progress" => Some(Self::Progress),
+            "approval_requested" => Some(Self::ApprovalRequested),
+            "result" => Some(Self::Result),
+            _ => None,
+        })
+    }
+
+    /// The state of the task right after this event. `None` for
+    /// [`Self::ContentExpired`], which happens to a task in any ended state
+    /// and leaves that state as it is.
+    #[must_use]
+    pub const fn task_state(self) -> Option<TaskState> {
+        match self {
+            Self::Entered(state) => Some(state),
+            Self::Requeued | Self::LeaseExpired => Some(TaskState::Queued),
+            Self::Progress | Self::ApprovalRequested | Self::Result => {
+                Some(TaskState::Running)
+            }
+            Self::ContentExpired => None,
+        }
+    }
+}
+
+sql_named!(TaskState, EventType);
+
+/// A task to queue: the admitted request and what the caller sent with it.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct TaskInput {
-    pub id: String,
-    pub request_id: String,
+    pub request: Request,
     pub idempotency_key: String,
-    pub caller_agent_id: String,
-    pub caller_endpoint_id: String,
     pub request_fingerprint: String,
-    pub scope_id: String,
-    pub capability_id: String,
-    pub workspace_id: String,
-    pub access_mode: String,
     pub skill: String,
     pub remote_text: String,
 }
@@ -91,8 +168,10 @@ pub struct QueueLimits {
     pub per_peer: usize,
 }
 
+/// How the queue took a task: as a new one, or as the task that the same
+/// request already queued.
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub enum Admission {
+pub enum TaskAdmission {
     Accepted(String),
     Existing(String),
 }
@@ -100,7 +179,7 @@ pub enum Admission {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct TaskEvent {
     pub sequence: i64,
-    pub event_type: String,
+    pub event_type: EventType,
 }
 
 impl TaskEvent {
@@ -114,7 +193,7 @@ impl TaskEvent {
 pub struct TaskActivity {
     pub cursor: i64,
     pub task_id: String,
-    pub event_type: String,
+    pub event_type: EventType,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -162,6 +241,15 @@ fn request_from_row(
     })
 }
 
+/// How many tasks the queue holds.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct TaskCounts {
+    pub all: usize,
+    pub queued: usize,
+    /// The callers with a leased or running task.
+    pub active_callers: usize,
+}
+
 /// The newest task one caller endpoint started in a scope.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct LastTask {
@@ -173,6 +261,33 @@ pub struct LastTask {
 }
 
 impl NodeStore {
+    pub fn task_counts(&self) -> Result<TaskCounts, StoreError> {
+        let count =
+            |sql: &str, state: Option<TaskState>| -> Result<usize, StoreError> {
+                let value: i64 = match state {
+                    Some(state) => {
+                        self.connection.query_row(sql, [state], |row| row.get(0))?
+                    }
+                    None => self.connection.query_row(sql, [], |row| row.get(0))?,
+                };
+                usize::try_from(value).map_err(|_| StoreError::InvalidState)
+            };
+        Ok(TaskCounts {
+            all: count("SELECT COUNT(*) FROM tasks", None)?,
+            queued: count(
+                "SELECT COUNT(*) FROM tasks WHERE state=?1",
+                Some(TaskState::Queued),
+            )?,
+            active_callers: count(
+                &format!(
+                    "SELECT COUNT(DISTINCT caller_endpoint_id) FROM tasks WHERE state IN ({})",
+                    TaskState::sql_list(&TaskState::ACTIVE)
+                ),
+                None,
+            )?,
+        })
+    }
+
     pub fn last_tasks(&self, scope_id: &str) -> Result<Vec<LastTask>, StoreError> {
         let mut statement = self.connection.prepare(
             "SELECT caller_endpoint_id,state,created_at,remote_text,final_result FROM (
@@ -184,32 +299,22 @@ impl NodeStore {
              ) WHERE rank=1",
         )?;
         let rows = statement.query_map([scope_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-            ))
-        })?;
-        rows.map(|row| {
-            let (caller_endpoint_id, state, created_at, remote_text, result) = row?;
             Ok(LastTask {
-                caller_endpoint_id,
-                state: TaskState::parse(&state)?,
-                created_at,
-                remote_text,
-                result,
+                caller_endpoint_id: row.get(0)?,
+                state: row.get(1)?,
+                created_at: row.get(2)?,
+                remote_text: row.get(3)?,
+                result: row.get(4)?,
             })
-        })
-        .collect()
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     pub fn admit(
         &mut self,
         input: &TaskInput,
         limits: QueueLimits,
-    ) -> Result<Admission, StoreError> {
+    ) -> Result<TaskAdmission, StoreError> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -225,7 +330,7 @@ impl NodeStore {
         replay_key: &str,
         replay_expires_at: i64,
         replay_limit: usize,
-    ) -> Result<Admission, StoreError> {
+    ) -> Result<TaskAdmission, StoreError> {
         if replay_key.is_empty() || replay_limit == 0 {
             return Err(StoreError::InvalidState);
         }
@@ -234,8 +339,8 @@ impl NodeStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         accept_replay_key(
             &tx,
-            &input.caller_endpoint_id,
-            &input.scope_id,
+            input.request.caller_endpoint_id.as_str(),
+            input.request.scope_id.as_str(),
             replay_key,
             replay_expires_at,
             replay_limit,
@@ -250,52 +355,64 @@ fn admit(
     tx: &Transaction<'_>,
     input: &TaskInput,
     limits: QueueLimits,
-) -> Result<Admission, StoreError> {
-    if let Some((id, request_id, fingerprint, caller, scope, capability, workspace, access)) = tx
-            .query_row(
-                "SELECT id,request_id,request_fingerprint,caller_agent_id,scope_id,capability_id,workspace_id,access_mode FROM tasks WHERE caller_endpoint_id=?1 AND idempotency_key=?2",
-                params![input.caller_endpoint_id, input.idempotency_key],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?, row.get::<_, String>(6)?, row.get::<_, String>(7)?)),
-            )
-            .optional()?
-        {
-            return if id == input.id
-                && request_id == input.request_id
-                && fingerprint == input.request_fingerprint
-                && caller == input.caller_agent_id
-                && scope == input.scope_id
-                && capability == input.capability_id
-                && workspace == input.workspace_id
-                && access == input.access_mode
-            {
-                Ok(Admission::Existing(id))
-            } else {
-                Err(StoreError::DuplicateConflict)
-            };
-        }
+) -> Result<TaskAdmission, StoreError> {
+    let request = &input.request;
+    let existing = tx
+        .query_row(
+            &format!(
+                "SELECT {REQUEST_COLUMNS},request_fingerprint FROM tasks WHERE caller_endpoint_id=?1 AND idempotency_key=?2"
+            ),
+            params![request.caller_endpoint_id.as_str(), input.idempotency_key],
+            |row| Ok((request_from_row(row, 0)?, row.get::<_, String>(8)?)),
+        )
+        .optional()?;
+    if let Some((stored, fingerprint)) = existing {
+        return if stored == *request && fingerprint == input.request_fingerprint {
+            Ok(TaskAdmission::Existing(stored.task_id.as_str().to_owned()))
+        } else {
+            Err(StoreError::DuplicateConflict)
+        };
+    }
     if count(tx, None)? >= limits.global
-        || count(tx, Some(&input.caller_agent_id))? >= limits.per_peer
+        || count(tx, Some(request.caller_agent_id.as_str()))? >= limits.per_peer
     {
         return Err(StoreError::Overloaded);
     }
     tx.execute(
-            "INSERT INTO tasks(id,request_id,idempotency_key,caller_agent_id,caller_endpoint_id,request_fingerprint,scope_id,capability_id,workspace_id,access_mode,skill,remote_text,state,created_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'queued',?13)",
-            params![input.id,input.request_id,input.idempotency_key,input.caller_agent_id,input.caller_endpoint_id,input.request_fingerprint,input.scope_id,input.capability_id,input.workspace_id,input.access_mode,input.skill,input.remote_text,now()],
-        )?;
-    event(tx, &input.id, "queued")?;
-    Ok(Admission::Accepted(input.id.clone()))
+        &format!(
+            "INSERT INTO tasks({REQUEST_COLUMNS},idempotency_key,request_fingerprint,skill,remote_text,state,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)"
+        ),
+        params![
+            request.task_id.as_str(),
+            request.id.as_str(),
+            request.caller_agent_id.as_str(),
+            request.caller_endpoint_id.as_str(),
+            request.scope_id.as_str(),
+            request.capability_id.as_str(),
+            request.workspace_id.as_str(),
+            request.access_mode.as_str(),
+            input.idempotency_key,
+            input.request_fingerprint,
+            input.skill,
+            input.remote_text,
+            TaskState::Queued,
+            now(),
+        ],
+    )?;
+    let task_id = request.task_id.as_str();
+    event(tx, task_id, EventType::Entered(TaskState::Queued))?;
+    Ok(TaskAdmission::Accepted(task_id.to_owned()))
 }
 
 impl NodeStore {
     pub fn state(&self, task_id: &str) -> Result<TaskState, StoreError> {
         self.connection
             .query_row("SELECT state FROM tasks WHERE id=?1", [task_id], |row| {
-                row.get::<_, String>(0)
+                row.get(0)
             })
             .optional()?
             .ok_or(StoreError::NotFound)
-            .and_then(|value| TaskState::parse(&value))
     }
 
     pub fn events(&self, task_id: &str) -> Result<Vec<TaskEvent>, StoreError> {
@@ -305,7 +422,7 @@ impl NodeStore {
     pub fn stored_task(&self, task_id: &str) -> Result<StoredTask, StoreError> {
         let (id, state, skill, remote_text, result): (
             String,
-            String,
+            TaskState,
             String,
             String,
             Option<String>,
@@ -328,7 +445,7 @@ impl NodeStore {
             .ok_or(StoreError::NotFound)?;
         Ok(StoredTask {
             id,
-            state: TaskState::parse(&state)?,
+            state,
             skill,
             remote_text,
             events: self.events(task_id)?,
@@ -356,7 +473,7 @@ impl NodeStore {
         last_sequence: i64,
         limit: usize,
     ) -> Result<(Vec<TaskEvent>, bool), StoreError> {
-        let fetch = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+        let fetch = sql_count(limit.saturating_add(1));
         let mut statement = self.connection.prepare(
             "SELECT sequence,event_type FROM task_events WHERE task_id=?1 AND sequence>?2 ORDER BY sequence LIMIT ?3",
         )?;
@@ -378,11 +495,10 @@ impl NodeStore {
             .query_row(
                 "SELECT state,final_result FROM tasks WHERE id=?1",
                 [task_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?
             .ok_or(StoreError::NotFound)
-            .and_then(|(state, result)| Ok((TaskState::parse(&state)?, result)))
     }
 
     /// Reads a task's snapshot and one page of its events together, so a
@@ -426,7 +542,7 @@ impl NodeStore {
     pub fn append_event(
         &mut self,
         task_id: &str,
-        event_type: &str,
+        event_type: EventType,
     ) -> Result<(), StoreError> {
         let tx = self.connection.transaction()?;
         state(&tx, task_id)?;
@@ -442,13 +558,19 @@ impl NodeStore {
         expires_at: i64,
     ) -> Result<Option<String>, StoreError> {
         let tx = self.connection.transaction()?;
-        let task = tx.query_row(
-            "SELECT queued.id FROM tasks queued WHERE queued.state='queued'
-             ORDER BY (SELECT COUNT(*) FROM tasks active WHERE active.caller_agent_id=queued.caller_agent_id AND active.state IN ('leased','running')), queued.created_at, queued.id LIMIT 1",
-            [], |row| row.get::<_, String>(0),
-        ).optional()?;
+        let task = tx
+            .query_row(
+                &format!(
+                    "SELECT queued.id FROM tasks queued WHERE queued.state=?1
+                     ORDER BY (SELECT COUNT(*) FROM tasks active WHERE active.caller_agent_id=queued.caller_agent_id AND active.state IN ({})), queued.created_at, queued.id LIMIT 1",
+                    TaskState::sql_list(&TaskState::ACTIVE),
+                ),
+                [TaskState::Queued],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
         let Some(task) = task else { return Ok(None) };
-        change(&tx, &task, TaskState::Leased, "leased")?;
+        enter(&tx, &task, TaskState::Leased)?;
         tx.execute("INSERT INTO execution_leases(task_id,owner,execution_id,expires_at) VALUES(?1,?2,?3,?4)", params![task,owner,execution_id,expires_at])?;
         tx.commit()?;
         Ok(Some(task))
@@ -466,7 +588,7 @@ impl NodeStore {
         if state(&tx, task_id)? != TaskState::Leased {
             return Err(StoreError::InvalidState);
         }
-        change(&tx, task_id, TaskState::Running, "running")?;
+        enter(&tx, task_id, TaskState::Running)?;
         tx.commit()?;
         Ok(())
     }
@@ -500,7 +622,7 @@ impl NodeStore {
         let tx = self.connection.transaction()?;
         if state(&tx, task_id)? == TaskState::Cancelled {
             if !result.is_empty() {
-                event(&tx, task_id, "result")?;
+                event(&tx, task_id, EventType::Result)?;
             }
             tx.commit()?;
             return Ok(());
@@ -508,7 +630,7 @@ impl NodeStore {
         if !lease_matches(&tx, task_id, execution_id)? {
             return Err(StoreError::NotFound);
         }
-        change(&tx, task_id, TaskState::Succeeded, "succeeded")?;
+        enter(&tx, task_id, TaskState::Succeeded)?;
         tx.execute(
             "UPDATE tasks SET final_result=?1,result_expires_at=?2 WHERE id=?3",
             params![result, result_expires_at, task_id],
@@ -539,14 +661,15 @@ impl NodeStore {
     ) -> Result<usize, StoreError> {
         let tx = self.connection.transaction()?;
         let ids = {
-            let mut statement = tx.prepare(
+            let mut statement = tx.prepare(&format!(
                 "SELECT id FROM tasks
                  WHERE content_expired_at IS NULL
-                   AND state IN ('succeeded','failed','rejected','cancelled','unknown_result')
+                   AND state IN ({})
                    AND ((input_expires_at IS NOT NULL AND input_expires_at<=?1)
                         OR (result_expires_at IS NOT NULL AND result_expires_at<=?1))
                  LIMIT ?2",
-            )?;
+                TaskState::sql_list(&TaskState::CONTENT_EXPIRES),
+            ))?;
             statement
                 .query_map(params![timestamp, batch], |row| row.get::<_, String>(0))?
                 .collect::<Result<Vec<_>, _>>()?
@@ -556,7 +679,7 @@ impl NodeStore {
                 "UPDATE tasks SET remote_text='',final_result=NULL,result_expires_at=NULL,content_expired_at=?1 WHERE id=?2",
                 params![timestamp, task_id],
             )?;
-            event(&tx, task_id, "content_expired")?;
+            event(&tx, task_id, EventType::ContentExpired)?;
         }
         tx.commit()?;
         Ok(ids.len())
@@ -586,7 +709,7 @@ impl NodeStore {
         if !lease_matches(&tx, task_id, execution_id)? {
             return Err(StoreError::NotFound);
         }
-        change(&tx, task_id, TaskState::Failed, "failed")?;
+        enter(&tx, task_id, TaskState::Failed)?;
         set_input_expiry(&tx, task_id)?;
         tx.execute("DELETE FROM execution_leases WHERE task_id=?1", [task_id])?;
         tx.commit()?;
@@ -610,7 +733,7 @@ impl NodeStore {
         if !lease_matches(&tx, task_id, execution_id)? {
             return Err(StoreError::NotFound);
         }
-        change(&tx, task_id, TaskState::UnknownResult, "unknown_result")?;
+        enter(&tx, task_id, TaskState::UnknownResult)?;
         set_input_expiry(&tx, task_id)?;
         tx.execute("DELETE FROM execution_leases WHERE task_id=?1", [task_id])?;
         tx.commit()?;
@@ -626,7 +749,7 @@ impl NodeStore {
         if !lease_matches(&tx, task_id, execution_id)? {
             return Err(StoreError::NotFound);
         }
-        change(&tx, task_id, TaskState::Rejected, "rejected")?;
+        enter(&tx, task_id, TaskState::Rejected)?;
         set_input_expiry(&tx, task_id)?;
         tx.execute("DELETE FROM execution_leases WHERE task_id=?1", [task_id])?;
         tx.commit()?;
@@ -639,7 +762,7 @@ impl NodeStore {
             tx.commit()?;
             return Ok(());
         }
-        change(&tx, task_id, TaskState::Cancelled, "cancelled")?;
+        enter(&tx, task_id, TaskState::Cancelled)?;
         set_input_expiry(&tx, task_id)?;
         tx.execute("DELETE FROM execution_leases WHERE task_id=?1", [task_id])?;
         tx.commit()?;
@@ -668,7 +791,7 @@ impl NodeStore {
             tx.commit()?;
             return Ok(());
         }
-        change(&tx, task_id, TaskState::Cancelled, "cancelled")?;
+        enter(&tx, task_id, TaskState::Cancelled)?;
         set_input_expiry(&tx, task_id)?;
         tx.execute("DELETE FROM execution_leases WHERE task_id=?1", [task_id])?;
         tx.commit()?;
@@ -700,7 +823,7 @@ impl NodeStore {
     pub fn requeue_leased(&mut self, task_id: &str) -> Result<(), StoreError> {
         let tx = self.connection.transaction()?;
         if state(&tx, task_id)? == TaskState::Leased {
-            change(&tx, task_id, TaskState::Queued, "requeued")?;
+            change(&tx, task_id, TaskState::Queued, EventType::Requeued)?;
             tx.execute("DELETE FROM execution_leases WHERE task_id=?1", [task_id])?;
         }
         tx.commit()?;
@@ -730,10 +853,10 @@ impl NodeStore {
         for id in ids {
             match state(&tx, &id)? {
                 TaskState::Leased => {
-                    change(&tx, &id, TaskState::Queued, "lease_expired")?;
+                    change(&tx, &id, TaskState::Queued, EventType::LeaseExpired)?;
                 }
                 TaskState::Running => {
-                    change(&tx, &id, TaskState::UnknownResult, "unknown_result")?;
+                    enter(&tx, &id, TaskState::UnknownResult)?;
                     // `UnknownResult` still gets a definite retention
                     // deadline: it must not keep its input forever just
                     // because it also requires operator review.
@@ -774,7 +897,7 @@ fn accept_replay_key(
         params![caller_endpoint_id, scope_id],
         |row| row.get(0),
     )?;
-    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let limit = sql_count(limit);
     if count >= limit {
         // Make room for the new entry: remove the oldest ones over the limit.
         let excess = count.saturating_sub(limit).saturating_add(1);
@@ -793,13 +916,13 @@ fn accept_replay_key(
 fn count(tx: &Transaction<'_>, peer: Option<&str>) -> Result<usize, StoreError> {
     let count: i64 = match peer {
         Some(peer) => tx.query_row(
-            "SELECT COUNT(*) FROM tasks WHERE state='queued' AND caller_agent_id=?1",
-            [peer],
+            "SELECT COUNT(*) FROM tasks WHERE state=?1 AND caller_agent_id=?2",
+            params![TaskState::Queued, peer],
             |row| row.get(0),
         )?,
         None => tx.query_row(
-            "SELECT COUNT(*) FROM tasks WHERE state='queued'",
-            [],
+            "SELECT COUNT(*) FROM tasks WHERE state=?1",
+            [TaskState::Queued],
             |row| row.get(0),
         )?,
     };
@@ -816,16 +939,13 @@ fn lease_matches(
         params![task_id, execution_id],
         |row| row.get(0),
     )
-    .map_err(|_| StoreError::NotFound)
+    .map_err(StoreError::from)
 }
 
 fn state(tx: &Transaction<'_>, task_id: &str) -> Result<TaskState, StoreError> {
-    tx.query_row("SELECT state FROM tasks WHERE id=?1", [task_id], |row| {
-        row.get::<_, String>(0)
-    })
-    .optional()?
-    .ok_or(StoreError::NotFound)
-    .and_then(|value| TaskState::parse(&value))
+    tx.query_row("SELECT state FROM tasks WHERE id=?1", [task_id], |row| row.get(0))
+        .optional()?
+        .ok_or(StoreError::NotFound)
 }
 
 fn set_input_expiry(tx: &Transaction<'_>, task_id: &str) -> Result<(), StoreError> {
@@ -836,33 +956,42 @@ fn set_input_expiry(tx: &Transaction<'_>, task_id: &str) -> Result<(), StoreErro
     Ok(())
 }
 
+/// Moves the task to `next` and records that it entered it.
+fn enter(
+    tx: &Transaction<'_>,
+    task_id: &str,
+    next: TaskState,
+) -> Result<(), StoreError> {
+    change(tx, task_id, next, EventType::Entered(next))
+}
+
 fn change(
     tx: &Transaction<'_>,
     task_id: &str,
     next: TaskState,
-    event_type: &str,
+    event_type: EventType,
 ) -> Result<(), StoreError> {
     if !state(tx, task_id)?.allows(next) {
         return Err(StoreError::InvalidState);
     }
-    tx.execute(
-        "UPDATE tasks SET state=?1 WHERE id=?2",
-        params![next.as_str(), task_id],
-    )?;
+    tx.execute("UPDATE tasks SET state=?1 WHERE id=?2", params![next, task_id])?;
     event(tx, task_id, event_type)
 }
 
 fn event(
     tx: &Transaction<'_>,
     task_id: &str,
-    event_type: &str,
+    event_type: EventType,
 ) -> Result<(), StoreError> {
     let sequence: i64 = tx.query_row(
         "SELECT COALESCE(MAX(sequence),0)+1 FROM task_events WHERE task_id=?1",
         [task_id],
         |row| row.get(0),
     )?;
-    tx.execute("INSERT INTO task_events(task_id,sequence,event_type,data,created_at) VALUES(?1,?2,?3,'{}',?4)", params![task_id,sequence,event_type,now()])?;
+    tx.execute(
+        "INSERT INTO task_events(task_id,sequence,event_type,data,created_at) VALUES(?1,?2,?3,'{}',?4)",
+        params![task_id, sequence, event_type, now()],
+    )?;
     Ok(())
 }
 
@@ -925,7 +1054,7 @@ mod tests {
 
         let database = path("concurrent-admission");
         let store = NodeStore::open(&database).expect("store must open");
-        store.put_scope("scope", "direct").expect("scope must store");
+        store.put_scope("scope", ScopeKind::Direct).expect("scope must store");
         drop(store);
         let barrier = Arc::new(Barrier::new(2));
         let input = input("one", "a");
@@ -954,14 +1083,14 @@ mod tests {
         assert_eq!(
             results
                 .iter()
-                .filter(|result| matches!(result, Admission::Accepted(_)))
+                .filter(|result| matches!(result, TaskAdmission::Accepted(_)))
                 .count(),
             1
         );
         assert_eq!(
             results
                 .iter()
-                .filter(|result| matches!(result, Admission::Existing(_)))
+                .filter(|result| matches!(result, TaskAdmission::Existing(_)))
                 .count(),
             1
         );
@@ -1001,7 +1130,7 @@ mod tests {
     fn replay_admission_is_atomic_and_capacity_is_per_caller_scope() {
         let (mut store, database) = store();
         let mut missing_scope = input("missing", "a");
-        missing_scope.scope_id = "missing".to_owned();
+        missing_scope.request.scope_id = ScopeId::new("missing");
         assert!(
             store
                 .admit_with_replay(
@@ -1028,7 +1157,7 @@ mod tests {
                     1,
                 )
                 .expect("first replay and task must store"),
-            Admission::Accepted("one".to_owned())
+            TaskAdmission::Accepted("one".to_owned())
         );
         accept_replay_key(&mut store, "endpoint-b", "peer-replay", i64::MAX, 1)
             .expect("other caller replay must store");
@@ -1050,7 +1179,7 @@ mod tests {
         // One `queued` event already exists from admission; add more so the
         // journal holds more events than a small page can carry.
         for _ in 0..9 {
-            store.append_event("task", "progress").expect("event must append");
+            store.append_event("task", EventType::Progress).expect("event must append");
         }
         let (first_page, first_more) =
             store.events_page("task", 0, 4).expect("first page must load");
@@ -1118,8 +1247,14 @@ mod tests {
                 TaskState::Succeeded,
                 Some("final result".to_owned()),
                 vec![
-                    TaskEvent { sequence: 1, event_type: "queued".to_owned() },
-                    TaskEvent { sequence: 2, event_type: "leased".to_owned() },
+                    TaskEvent {
+                        sequence: 1,
+                        event_type: EventType::parse("queued").expect("event names")
+                    },
+                    TaskEvent {
+                        sequence: 2,
+                        event_type: EventType::parse("leased").expect("event names")
+                    },
                 ],
                 true
             )
@@ -1130,8 +1265,14 @@ mod tests {
                 TaskState::Succeeded,
                 Some("final result".to_owned()),
                 vec![
-                    TaskEvent { sequence: 3, event_type: "running".to_owned() },
-                    TaskEvent { sequence: 4, event_type: "succeeded".to_owned() },
+                    TaskEvent {
+                        sequence: 3,
+                        event_type: EventType::parse("running").expect("event names")
+                    },
+                    TaskEvent {
+                        sequence: 4,
+                        event_type: EventType::parse("succeeded").expect("event names")
+                    },
                 ],
                 false
             )
@@ -1304,10 +1445,22 @@ mod tests {
                 skill: "capability".to_owned(),
                 remote_text: "task input".to_owned(),
                 events: vec![
-                    TaskEvent { sequence: 1, event_type: "queued".to_owned() },
-                    TaskEvent { sequence: 2, event_type: "leased".to_owned() },
-                    TaskEvent { sequence: 3, event_type: "running".to_owned() },
-                    TaskEvent { sequence: 4, event_type: "succeeded".to_owned() },
+                    TaskEvent {
+                        sequence: 1,
+                        event_type: EventType::parse("queued").expect("event names")
+                    },
+                    TaskEvent {
+                        sequence: 2,
+                        event_type: EventType::parse("leased").expect("event names")
+                    },
+                    TaskEvent {
+                        sequence: 3,
+                        event_type: EventType::parse("running").expect("event names")
+                    },
+                    TaskEvent {
+                        sequence: 4,
+                        event_type: EventType::parse("succeeded").expect("event names")
+                    },
                 ],
                 result: Some("final result".to_owned()),
             }
@@ -1334,7 +1487,7 @@ mod tests {
         );
         assert_eq!(
             store.admit(&input("one", "a"), QueueLimits { global: 3, per_peer: 2 }),
-            Ok(Admission::Existing("one".to_owned()))
+            Ok(TaskAdmission::Existing("one".to_owned()))
         );
         assert_eq!(store.lease_next("worker", "one", 1), Ok(Some("one".to_owned())));
         assert_eq!(store.lease_next("worker", "two", 1), Ok(Some("three".to_owned())));
@@ -1394,7 +1547,7 @@ mod tests {
                 .events("task")
                 .expect("events must load")
                 .into_iter()
-                .map(|event| event.event_type)
+                .map(|event| event.event_type.as_str())
                 .collect::<Vec<_>>(),
             ["queued"]
         );
@@ -1412,7 +1565,7 @@ mod tests {
                 .events("task")
                 .expect("events must load")
                 .into_iter()
-                .map(|event| event.event_type)
+                .map(|event| event.event_type.as_str())
                 .collect::<Vec<_>>(),
             ["queued", "cancelled"]
         );
@@ -1518,25 +1671,20 @@ mod tests {
             (TaskState::Cancelled, "cancelled"),
         ] {
             assert_eq!(state.as_str(), name);
-            assert_eq!(TaskState::parse(name), Ok(state));
+            assert_eq!(TaskState::parse(name), Some(state));
+            assert_eq!(EventType::parse(name), Some(EventType::Entered(state)));
         }
-        assert_eq!(TaskState::parse("Queued"), Err(StoreError::InvalidState));
-        assert_eq!(AuditActor::Mcp.as_str(), "mcp");
-        assert_eq!(AuditActor::Ui.as_str(), "ui");
-        assert_eq!(AuditAction::Change.as_str(), "change");
-        assert_eq!(AuditResult::Pending.as_str(), "pending");
-        assert_eq!(AuditResult::Applied.as_str(), "applied");
-        assert_eq!(AuditResult::Confirmed.as_str(), "confirmed");
-        assert_eq!(AuditResult::Failed.as_str(), "failed");
-        for (state, name) in [
-            (SentState::Waiting, "waiting"),
-            (SentState::Working, "working"),
-            (SentState::Answered, "answered"),
-            (SentState::Failed, "failed"),
-            (SentState::NotDelivered, "not_delivered"),
+        assert_eq!(TaskState::parse("Queued"), None);
+        for (event, name) in [
+            (EventType::Requeued, "requeued"),
+            (EventType::LeaseExpired, "lease_expired"),
+            (EventType::ContentExpired, "content_expired"),
+            (EventType::Progress, "progress"),
+            (EventType::ApprovalRequested, "approval_requested"),
+            (EventType::Result, "result"),
         ] {
-            assert_eq!(state.as_str(), name);
-            assert_eq!(name.parse::<SentState>(), Ok(state));
+            assert_eq!(event.as_str(), name);
+            assert_eq!(EventType::parse(name), Some(event));
         }
     }
 }

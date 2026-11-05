@@ -1315,10 +1315,10 @@ impl McpServer {
         if !(1..=50).contains(&limit) {
             return tool_error("aether.inbox.list limit must be from 1 to 50");
         }
-        let state = match arguments.status.as_deref().map(str::parse::<SentState>) {
+        let state = match arguments.status.as_deref().map(SentState::parse) {
             None => None,
-            Some(Ok(state)) => Some(state),
-            Some(Err(_)) => {
+            Some(Some(state)) => Some(state),
+            Some(None) => {
                 return tool_error(
                     "status must be waiting, working, answered, failed or not_delivered",
                 );
@@ -3204,7 +3204,7 @@ mod tests {
     async fn a_signed_grant_and_workspace_change_apply_live_through_mcp_and_the_socket()
     {
         let directory = tempfile::tempdir().expect("directory must create");
-        let database = directory.path().join("node.sqlite");
+        let database = directory.path().join(aether_store::NODE_DATABASE);
         let socket = path(directory.path());
         let store = NodeStore::open(&database).expect("store must open");
         let administration = shared_with_store(store);
@@ -3270,13 +3270,10 @@ mod tests {
         // guarantee an actual restart depends on, without needing to stop the
         // socket's own background listener thread to prove it.
         let restarted = NodeStore::open(&database).expect("store must reopen");
+        assert_eq!(restarted.current_workspace(), Ok(Some("project".to_owned())));
         assert_eq!(
-            restarted.configuration("admin.current.workspace"),
-            Ok("project".to_owned())
-        );
-        assert_eq!(
-            restarted.configuration("admin.grant.peer"),
-            Ok("signed-grant".to_owned())
+            restarted.applied_change(aether_store::ChangeKind::Grant, "peer"),
+            Ok(Some("signed-grant".to_owned()))
         );
     }
 }

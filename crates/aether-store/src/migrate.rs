@@ -108,17 +108,6 @@ fn retain_backups(path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// Writes `backup` over the database at `path` with the SQLite backup API,
-/// so that a WAL file of `path` cannot outlive the restore.
-pub fn restore(
-    backup: impl AsRef<Path>,
-    path: impl AsRef<Path>,
-) -> Result<(), StoreError> {
-    let mut connection = Connection::open(path)?;
-    connection.restore(MAIN_DB, backup, None::<fn(rusqlite::backup::Progress)>)?;
-    Ok(())
-}
-
 pub fn migrate(
     connection: &mut Connection,
     migrations: &[&str],
@@ -131,7 +120,7 @@ pub fn migrate(
     }
     let migrations =
         Migrations::new(migrations.iter().map(|migration| M::up(migration)).collect());
-    migrations.to_latest(connection).map_err(|_| StoreError::InvalidState)?;
+    migrations.to_latest(connection)?;
     let foreign_key_error: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_check)",
         [],
@@ -234,20 +223,14 @@ mod tests {
         assert_eq!(groups[0].members.len(), 1);
         assert_eq!(groups[0].members[0].agent_id, "ana");
         assert!(groups[1].members.is_empty());
-        let prefix = format!("{}{}", database.display(), ".backup.");
-        let backups = fs::read_dir(database.parent().expect("parent must exist"))
-            .expect("parent must read")
-            .filter_map(Result::ok)
-            .filter(|entry| entry.path().to_string_lossy().starts_with(&prefix))
-            .count();
-        assert_eq!(backups, 1);
+        assert_eq!(backup_count(&database), 1);
         drop(store);
 
         // The code of 0.2.8 knows 11 migrations and refuses the newer schema.
         let mut connection = Connection::open(&database).expect("database must open");
         assert!(matches!(
             migrate(&mut connection, &NODE_MIGRATIONS[..11]),
-            Err(StoreError::InvalidState)
+            Err(StoreError::Migration(_))
         ));
     }
 
@@ -260,7 +243,7 @@ mod tests {
         connection
             .pragma_update(None, "user_version", latest + 1)
             .expect("version must write");
-        assert!(matches!(NodeStore::open(&database), Err(StoreError::InvalidState)));
+        assert!(matches!(NodeStore::open(&database), Err(StoreError::Migration(_))));
         connection
             .pragma_update(None, "user_version", latest)
             .expect("version must write");
@@ -274,29 +257,21 @@ mod tests {
     }
 
     #[test]
-    fn migrations_and_backup_restore_work() {
+    fn a_backup_keeps_the_store_as_it_was_when_taken() {
         let (mut store, database) = store();
         ControlStore::open(path("control")).expect("control must open");
         store.put_configuration("owner", "operator").expect("configuration must store");
-        put_grant(&store, "grant", 1);
         store
             .admit(&input("one", "a"), QueueLimits { global: 2, per_peer: 2 })
             .expect("task must admit");
         let saved = backup(&database).expect("backup must work");
-        assert_eq!(
-            store.cancel_if_owned("one", "endpoint-other", "scope"),
-            Err(StoreError::Unauthorized)
-        );
-        assert_eq!(store.state("one"), Ok(TaskState::Queued));
-        store.cancel_if_owned("one", "endpoint-a", "scope").expect("task must cancel");
+        store.cancel("one").expect("task must cancel");
         drop(store);
-        restore(&saved, &database).expect("restore must work");
-        let restored = NodeStore::open(&database).expect("restored store must open");
-        assert_eq!(restored.configuration("owner"), Ok("operator".to_owned()));
-        assert_eq!(restored.has_grant("grant"), Ok(true));
-        assert_eq!(restored.state("one"), Ok(TaskState::Queued));
+        let saved_store = NodeStore::open(&saved).expect("backup must open");
+        assert_eq!(saved_store.configuration("owner"), Ok("operator".to_owned()));
+        assert_eq!(saved_store.state("one"), Ok(TaskState::Queued));
         assert_eq!(
-            restored
+            saved_store
                 .events("one")
                 .expect("events must load")
                 .into_iter()
@@ -304,6 +279,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1]
         );
+        drop(saved_store);
         fs::remove_file(database).expect("database must remove");
         fs::remove_file(saved).expect("backup must remove");
     }
@@ -401,13 +377,7 @@ mod tests {
         let store = NodeStore::open(&database).expect("store must open");
         drop(store);
         NodeStore::open(&database).expect("current store must open");
-        let prefix = format!("{}{}", database.display(), ".backup.");
-        let backups = fs::read_dir(database.parent().expect("parent must exist"))
-            .expect("parent must read")
-            .filter_map(Result::ok)
-            .filter(|entry| entry.path().to_string_lossy().starts_with(&prefix))
-            .count();
-        assert_eq!(backups, 0);
+        assert_eq!(backup_count(&database), 0);
         fs::remove_file(database).expect("database must remove");
     }
 
@@ -437,9 +407,11 @@ mod tests {
     #[test]
     fn constraints_cancellation_and_failed_migrations_keep_the_database_usable() {
         let (mut store, database) = store();
+        let mut missing_scope = input("missing", "a");
+        missing_scope.request.scope_id = aether_core::ScopeId::new("missing");
         assert!(
             store
-                .put_signed_record("record", "missing", "agent", b"record", 1)
+                .admit(&missing_scope, QueueLimits { global: 1, per_peer: 1 })
                 .is_err()
         );
         store

@@ -62,11 +62,11 @@ pub enum ExecutionEvent {
 
 impl ExecutionEvent {
     #[must_use]
-    pub const fn event_type(self) -> &'static str {
+    pub const fn event_type(self) -> aether_store::EventType {
         match self {
-            Self::Progress => "progress",
-            Self::ApprovalRequested => "approval_requested",
-            Self::Completed => "result",
+            Self::Progress => aether_store::EventType::Progress,
+            Self::ApprovalRequested => aether_store::EventType::ApprovalRequested,
+            Self::Completed => aether_store::EventType::Result,
         }
     }
 }

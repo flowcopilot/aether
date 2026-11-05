@@ -560,7 +560,7 @@ impl ActivityFeed {
                 Event::new().id(self.cursor.id()).event("task").data(
                     serde_json::json!({
                         "taskId": task.task_id,
-                        "event": task.event_type,
+                        "event": task.event_type.as_str(),
                     })
                     .to_string(),
                 ),
@@ -1501,7 +1501,7 @@ mod tests {
         let (page, cookie, data_dir) = service_page(directory.path(), &hub).await;
         NodeStore::in_dir(&data_dir)
             .expect("store must open")
-            .put_configuration("admin.limit.queue_global", "3")
+            .apply_change(aether_store::ChangeKind::Limit, "queue_global", "3")
             .expect("limit must store");
         let home = get_with(page, "/", &cookie).await;
         assert!(
@@ -2244,23 +2244,30 @@ mod tests {
         }
         let mut store = NodeStore::in_dir(directory.path()).expect("store must open");
         assert_eq!(
-            store.configuration_values("admin.grant.").expect("grants must read").len(),
+            store
+                .applied_changes(aether_store::ChangeKind::Grant)
+                .expect("grants must read")
+                .len(),
             1
         );
-        store.put_scope(crate::direct::SCOPE, "direct").expect("scope must store");
+        store
+            .put_scope(crate::direct::SCOPE, aether_core::ScopeKind::Direct)
+            .expect("scope must store");
         store
             .admit(
                 &TaskInput {
-                    id: "greeting".to_owned(),
-                    request_id: "greeting-request".to_owned(),
+                    request: aether_core::Request {
+                        task_id: aether_core::TaskId::new("greeting"),
+                        id: aether_core::RequestId::new("greeting-request"),
+                        caller_agent_id: aether_core::AgentId::new("ana"),
+                        caller_endpoint_id: aether_core::EndpointId::new(friend),
+                        scope_id: aether_core::ScopeId::new(crate::direct::SCOPE),
+                        capability_id: aether_core::CapabilityId::new("review"),
+                        workspace_id: aether_core::WorkspaceId::new("workspace"),
+                        access_mode: aether_core::AccessMode::ReadOnly,
+                    },
                     idempotency_key: "greeting-key".to_owned(),
-                    caller_agent_id: "ana".to_owned(),
-                    caller_endpoint_id: friend,
                     request_fingerprint: "greeting-fingerprint".to_owned(),
-                    scope_id: crate::direct::SCOPE.to_owned(),
-                    capability_id: "review".to_owned(),
-                    workspace_id: "workspace".to_owned(),
-                    access_mode: "read_only".to_owned(),
                     skill: "review".to_owned(),
                     remote_text: "Greet Bob".to_owned(),
                 },
@@ -2318,11 +2325,7 @@ mod tests {
         .await;
         assert_eq!(asked.status, StatusCode::OK);
         assert!(asked.body.contains("Revoke ana's access?"), "{}", asked.body);
-        assert!(
-            store
-                .configuration(&crate::admin::revoked_grant_key(grant_id.as_str()))
-                .is_err()
-        );
+        assert_eq!(store.grant_revoked(grant_id.as_str()), Ok(false));
         let response = post(
             application,
             "/revoke",
@@ -2332,12 +2335,13 @@ mod tests {
         .await;
         assert_eq!(response.status, StatusCode::OK);
         assert!(response.body.contains("Nobody has access."));
+        assert_eq!(store.grant_revoked(grant_id.as_str()), Ok(true));
         assert!(
             store
-                .configuration(&crate::admin::revoked_grant_key(grant_id.as_str()))
-                .is_ok()
+                .applied_changes(aether_store::ChangeKind::Grant)
+                .expect("grants")
+                .is_empty()
         );
-        assert!(store.configuration_values("admin.grant.").expect("grants").is_empty());
     }
 
     #[tokio::test]
@@ -3090,25 +3094,33 @@ mod tests {
         let directory = tempfile::tempdir().expect("directory must create");
         let mut store = NodeStore::in_dir(directory.path()).expect("store must open");
         store
-            .put_configuration("admin.capability.review", "private-credential")
+            .apply_change(
+                aether_store::ChangeKind::Capability,
+                "review",
+                "private-credential",
+            )
             .expect("change must apply");
         store
             .record_change(AuditActor::Mcp, AuditResult::Applied)
             .expect("change must record");
-        store.put_scope("scope", "direct").expect("scope must store");
+        store
+            .put_scope("scope", aether_core::ScopeKind::Direct)
+            .expect("scope must store");
         store
             .admit(
                 &TaskInput {
-                    id: "task".to_owned(),
-                    request_id: "request".to_owned(),
+                    request: aether_core::Request {
+                        task_id: aether_core::TaskId::new("task"),
+                        id: aether_core::RequestId::new("request"),
+                        caller_agent_id: aether_core::AgentId::new("agent"),
+                        caller_endpoint_id: aether_core::EndpointId::new("endpoint"),
+                        scope_id: aether_core::ScopeId::new("scope"),
+                        capability_id: aether_core::CapabilityId::new("review"),
+                        workspace_id: aether_core::WorkspaceId::new("workspace"),
+                        access_mode: aether_core::AccessMode::ReadOnly,
+                    },
                     idempotency_key: "key".to_owned(),
-                    caller_agent_id: "agent".to_owned(),
-                    caller_endpoint_id: "endpoint".to_owned(),
                     request_fingerprint: "fingerprint".to_owned(),
-                    scope_id: "scope".to_owned(),
-                    capability_id: "review".to_owned(),
-                    workspace_id: "workspace".to_owned(),
-                    access_mode: "read_only".to_owned(),
                     skill: "review".to_owned(),
                     remote_text: "private task data".to_owned(),
                 },
@@ -3149,7 +3161,7 @@ mod tests {
         ] {
             store
                 .apply_managed_member(
-                    "managed.cursor",
+                    "https://control.test",
                     cursor,
                     &ManagedMember {
                         scope_id: "managed".to_owned(),
@@ -3163,7 +3175,12 @@ mod tests {
                 .expect("member must store");
         }
         store
-            .revoke_managed_member("managed.cursor", 4, "managed", "revoked-agent")
+            .revoke_managed_member(
+                "https://control.test",
+                4,
+                "managed",
+                "revoked-agent",
+            )
             .expect("member must revoke");
         let admin_ui =
             build_admin_ui(shared_with_store(store), managed_options(), PORT);
@@ -3179,7 +3196,7 @@ mod tests {
         let mut store = NodeStore::in_dir(directory.path()).expect("store must open");
         store
             .apply_managed_member(
-                "managed.cursor",
+                "https://control.test",
                 1,
                 &ManagedMember {
                     scope_id: "managed".to_owned(),
@@ -3465,20 +3482,24 @@ mod tests {
     async fn router_streams_durable_task_events_without_task_content() {
         let directory = tempfile::tempdir().expect("directory must create");
         let mut store = NodeStore::in_dir(directory.path()).expect("store must open");
-        store.put_scope("scope", "direct").expect("scope must store");
+        store
+            .put_scope("scope", aether_core::ScopeKind::Direct)
+            .expect("scope must store");
         store
             .admit(
                 &TaskInput {
-                    id: "task".to_owned(),
-                    request_id: "request".to_owned(),
+                    request: aether_core::Request {
+                        task_id: aether_core::TaskId::new("task"),
+                        id: aether_core::RequestId::new("request"),
+                        caller_agent_id: aether_core::AgentId::new("agent"),
+                        caller_endpoint_id: aether_core::EndpointId::new("endpoint"),
+                        scope_id: aether_core::ScopeId::new("scope"),
+                        capability_id: aether_core::CapabilityId::new("review"),
+                        workspace_id: aether_core::WorkspaceId::new("workspace"),
+                        access_mode: aether_core::AccessMode::ReadOnly,
+                    },
                     idempotency_key: "key".to_owned(),
-                    caller_agent_id: "agent".to_owned(),
-                    caller_endpoint_id: "endpoint".to_owned(),
                     request_fingerprint: "fingerprint".to_owned(),
-                    scope_id: "scope".to_owned(),
-                    capability_id: "review".to_owned(),
-                    workspace_id: "workspace".to_owned(),
-                    access_mode: "read_only".to_owned(),
                     skill: "review".to_owned(),
                     remote_text: "private task data".to_owned(),
                 },

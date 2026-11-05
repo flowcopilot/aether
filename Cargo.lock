@@ -115,10 +115,10 @@ name = "aether-store"
 version = "0.3.0"
 dependencies = [
  "aether-core",
+ "blake3",
  "rusqlite",
  "rusqlite_migration",
  "serde",
- "strum",
  "tempfile",
  "thiserror 2.0.21",
 ]

@@ -56,7 +56,7 @@ const FOLLOWED_TASK_ID: &str = "00000000-0000-4000-8000-0000000000c1";
 /// The agent id under which a caller imports the host's invitation.
 const HOST_AGENT_ID: &str = "server";
 /// The roster cursor of the managed scope.
-const ROSTER_CURSOR: &str = "managed.cursor";
+const ROSTER_CONTROL: &str = "https://control.test";
 
 /// Holds the turn open for a second after it starts, so a scenario can act
 /// on a task that is surely `running`.
@@ -1405,7 +1405,7 @@ async fn roster_member(world: &mut World) {
         .tasks
         .store(move |store| {
             store
-                .apply_managed_member(ROSTER_CURSOR, 1, &member)
+                .apply_managed_member(ROSTER_CONTROL, 1, &member)
                 .expect("managed membership must apply");
         })
         .await;
@@ -1417,7 +1417,7 @@ async fn roster_revokes(world: &mut World) {
         .tasks
         .store(|store| {
             store
-                .revoke_managed_member(ROSTER_CURSOR, 2, "managed", "caller")
+                .revoke_managed_member(ROSTER_CONTROL, 2, "managed", "caller")
                 .expect("managed membership must revoke");
         })
         .await;

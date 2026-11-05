@@ -1,20 +1,59 @@
+//! The database of the control service, a separate process that runs a
+//! directory and managed scopes.
+
 use std::path::Path;
 
+use aether_core::ScopeKind;
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::{ManagedMember, SignedRecord, StoreError, migrate::open_connection, now};
+use crate::{
+    ManagedMember, SignedRecord, StoreError,
+    directory::{RECORD_COLUMNS, upsert_record},
+    ensure_scope,
+    managed::members_in_scope,
+    migrate::open_connection,
+    now, put_scope, sql_count, sql_named,
+};
 
 pub const CONTROL_MIGRATIONS: &[&str] = &[
     include_str!("../migrations/control/001_initial.sql"),
     include_str!("../migrations/control/002_directory_events.sql"),
     include_str!("../migrations/control/003_managed_members.sql"),
     include_str!("../migrations/control/004_managed_events.sql"),
+    include_str!("../migrations/control/005_drop_unused_tables.sql"),
 ];
+
+/// What happened to a directory record. The names are the
+/// `directory_events.event_type` column.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum DirectoryEventType {
+    Published,
+    Renewed,
+    Revoked,
+}
+
+aether_core::named!(DirectoryEventType {
+    Published => "published",
+    Renewed => "renewed",
+    Revoked => "revoked",
+});
+
+/// What happened to a member of a managed scope. The names are the
+/// `managed_events.event_type` column.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ManagedEventType {
+    Joined,
+    Revoked,
+}
+
+aether_core::named!(ManagedEventType { Joined => "joined", Revoked => "revoked" });
+
+sql_named!(DirectoryEventType, ManagedEventType);
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct DirectoryEvent {
     pub sequence: i64,
-    pub event_type: String,
+    pub event_type: DirectoryEventType,
     pub scope_id: String,
     pub agent_id: String,
     pub record: Option<Vec<u8>>,
@@ -23,12 +62,14 @@ pub struct DirectoryEvent {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ManagedEvent {
     pub sequence: i64,
-    pub event_type: String,
+    pub event_type: ManagedEventType,
     pub scope_id: String,
     pub agent_id: String,
     pub member: Option<ManagedMember>,
 }
 
+/// The control service keeps one directory record for each agent, so the
+/// agent id is the record id.
 pub struct ControlStore {
     connection: Connection,
 }
@@ -38,69 +79,37 @@ impl ControlStore {
         Ok(Self { connection: open_connection(path.as_ref(), CONTROL_MIGRATIONS)? })
     }
 
-    pub fn put_scope(&mut self, id: &str, kind: &str) -> Result<(), StoreError> {
-        self.connection.execute(
-            "INSERT INTO scopes(id,kind) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET kind=excluded.kind",
-            params![id, kind],
-        )?;
-        Ok(())
-    }
-
-    pub fn put_signed_record(
-        &mut self,
-        record: &SignedRecord,
-    ) -> Result<(), StoreError> {
-        self.connection.execute(
-            "INSERT INTO signed_records(id,scope_id,agent_id,record,expires_at) VALUES(?1,?2,?3,?4,?5)
-             ON CONFLICT(id) DO UPDATE SET scope_id=excluded.scope_id,agent_id=excluded.agent_id,record=excluded.record,expires_at=excluded.expires_at",
-            params![record.id, record.scope_id, record.agent_id, record.record, record.expires_at],
-        )?;
-        Ok(())
-    }
-
+    /// Keeps `record` and its `event`, which publishes or renews it.
     pub fn publish_signed_record(
         &mut self,
         record: &SignedRecord,
-        event_type: &str,
+        event: DirectoryEventType,
     ) -> Result<(), StoreError> {
-        if !matches!(event_type, "published" | "renewed") {
+        if event == DirectoryEventType::Revoked {
             return Err(StoreError::InvalidState);
         }
         let transaction = self.connection.transaction()?;
-        transaction.execute(
-            "INSERT INTO scopes(id,kind) VALUES(?1,'directory') ON CONFLICT(id) DO UPDATE SET kind=excluded.kind",
-            [&record.scope_id],
-        )?;
-        transaction.execute(
-            "INSERT INTO signed_records(id,scope_id,agent_id,record,expires_at) VALUES(?1,?2,?3,?4,?5)
-             ON CONFLICT(id) DO UPDATE SET scope_id=excluded.scope_id,agent_id=excluded.agent_id,record=excluded.record,expires_at=excluded.expires_at",
-            params![record.id, record.scope_id, record.agent_id, record.record, record.expires_at],
-        )?;
+        put_scope(&transaction, &record.scope_id, ScopeKind::Directory)?;
+        upsert_record(&transaction, &record.agent_id, record)?;
         transaction.execute(
             "INSERT INTO directory_events(event_type,scope_id,agent_id,record,created_at) VALUES(?1,?2,?3,?4,?5)",
-            params![event_type, record.scope_id, record.agent_id, record.record, now()],
+            params![event, record.scope_id, record.agent_id, record.record, now()],
         )?;
         transaction.commit()?;
         Ok(())
     }
 
     pub fn signed_record(&self, agent_id: &str) -> Result<SignedRecord, StoreError> {
-        self.connection.query_row(
-            "SELECT id,scope_id,agent_id,record,expires_at FROM signed_records WHERE agent_id=?1 ORDER BY expires_at DESC LIMIT 1",
-            [agent_id],
-            SignedRecord::from_row,
-        ).optional()?.ok_or(StoreError::NotFound)
-    }
-
-    pub fn remove_signed_record(&mut self, agent_id: &str) -> Result<(), StoreError> {
-        if self
-            .connection
-            .execute("DELETE FROM signed_records WHERE agent_id=?1", [agent_id])?
-            == 0
-        {
-            return Err(StoreError::NotFound);
-        }
-        Ok(())
+        self.connection
+            .query_row(
+                &format!(
+                    "SELECT {RECORD_COLUMNS} FROM signed_records WHERE agent_id=?1 ORDER BY expires_at DESC LIMIT 1"
+                ),
+                [agent_id],
+                SignedRecord::from_row,
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)
     }
 
     pub fn revoke_signed_record(&mut self, agent_id: &str) -> Result<(), StoreError> {
@@ -113,15 +122,11 @@ impl ControlStore {
             )
             .optional()?
             .ok_or(StoreError::NotFound)?;
-        if transaction
-            .execute("DELETE FROM signed_records WHERE agent_id=?1", [agent_id])?
-            == 0
-        {
-            return Err(StoreError::NotFound);
-        }
+        transaction
+            .execute("DELETE FROM signed_records WHERE agent_id=?1", [agent_id])?;
         transaction.execute(
-            "INSERT INTO directory_events(event_type,scope_id,agent_id,record,created_at) VALUES('revoked',?1,?2,NULL,?3)",
-            params![scope_id, agent_id, now()],
+            "INSERT INTO directory_events(event_type,scope_id,agent_id,record,created_at) VALUES(?1,?2,?3,NULL,?4)",
+            params![DirectoryEventType::Revoked, scope_id, agent_id, now()],
         )?;
         transaction.commit()?;
         Ok(())
@@ -131,9 +136,9 @@ impl ControlStore {
         &self,
         timestamp: i64,
     ) -> Result<Vec<SignedRecord>, StoreError> {
-        let mut statement = self.connection.prepare(
-            "SELECT id,scope_id,agent_id,record,expires_at FROM signed_records WHERE expires_at>?1 ORDER BY agent_id",
-        )?;
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT {RECORD_COLUMNS} FROM signed_records WHERE expires_at>?1 ORDER BY agent_id"
+        ))?;
         Ok(statement
             .query_map([timestamp], SignedRecord::from_row)?
             .collect::<Result<_, _>>()?)
@@ -147,12 +152,11 @@ impl ControlStore {
         if sequence < 0 || limit == 0 {
             return Err(StoreError::InvalidState);
         }
-        let limit = i64::try_from(limit).map_err(|_| StoreError::InvalidState)?;
         let mut statement = self.connection.prepare(
             "SELECT sequence,event_type,scope_id,agent_id,record FROM directory_events WHERE sequence>?1 ORDER BY sequence LIMIT ?2",
         )?;
         Ok(statement
-            .query_map(params![sequence, limit], |row| {
+            .query_map(params![sequence, sql_count(limit)], |row| {
                 Ok(DirectoryEvent {
                     sequence: row.get(0)?,
                     event_type: row.get(1)?,
@@ -175,18 +179,7 @@ impl ControlStore {
             return Err(StoreError::InvalidState);
         }
         let transaction = self.connection.transaction()?;
-        transaction.execute(
-            "INSERT INTO scopes(id,kind) VALUES(?1,'managed') ON CONFLICT(id) DO NOTHING",
-            [scope_id],
-        )?;
-        let kind: String = transaction.query_row(
-            "SELECT kind FROM scopes WHERE id=?1",
-            [scope_id],
-            |row| row.get(0),
-        )?;
-        if kind != "managed" {
-            return Err(StoreError::InvalidState);
-        }
+        ensure_scope(&transaction, scope_id, ScopeKind::Managed)?;
         transaction.execute(
             "INSERT INTO managed_invitations(id,scope_id,token_hash,expires_at) VALUES(?1,?2,?3,?4)",
             params![id, scope_id, token_hash, expires_at],
@@ -200,16 +193,8 @@ impl ControlStore {
         token_hash: &[u8; 32],
         member: &ManagedMember,
     ) -> Result<(), StoreError> {
-        if member.scope_id.is_empty()
-            || member.agent_id.is_empty()
-            || member.endpoint_id.is_empty()
-            || member.role.is_empty()
-            || member.expires_at <= now()
-            || member.revoked_at.is_some()
-        {
-            return Err(StoreError::InvalidState);
-        }
         let timestamp = now();
+        member.check_new(timestamp)?;
         let transaction = self.connection.transaction()?;
         let changed = transaction.execute(
             "UPDATE managed_invitations SET redeemed_at=?1,redeemed_agent_id=?2 WHERE token_hash=?3 AND redeemed_at IS NULL AND expires_at>?1 AND scope_id=?4",
@@ -223,8 +208,8 @@ impl ControlStore {
             params![member.scope_id, member.agent_id, member.endpoint_id, member.role, member.expires_at],
         )?;
         transaction.execute(
-            "INSERT INTO managed_events(event_type,scope_id,agent_id,endpoint_id,role,expires_at,created_at) VALUES('joined',?1,?2,?3,?4,?5,?6)",
-            params![member.scope_id, member.agent_id, member.endpoint_id, member.role, member.expires_at, timestamp],
+            "INSERT INTO managed_events(event_type,scope_id,agent_id,endpoint_id,role,expires_at,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![ManagedEventType::Joined, member.scope_id, member.agent_id, member.endpoint_id, member.role, member.expires_at, timestamp],
         )?;
         transaction.commit()?;
         Ok(())
@@ -247,8 +232,8 @@ impl ControlStore {
             return Err(StoreError::NotFound);
         }
         transaction.execute(
-            "INSERT INTO managed_events(event_type,scope_id,agent_id,endpoint_id,role,expires_at,created_at) VALUES('revoked',?1,?2,NULL,NULL,NULL,?3)",
-            params![scope_id, agent_id, timestamp],
+            "INSERT INTO managed_events(event_type,scope_id,agent_id,endpoint_id,role,expires_at,created_at) VALUES(?1,?2,?3,NULL,NULL,NULL,?4)",
+            params![ManagedEventType::Revoked, scope_id, agent_id, timestamp],
         )?;
         transaction.commit()?;
         Ok(())
@@ -258,15 +243,7 @@ impl ControlStore {
         &self,
         scope_id: &str,
     ) -> Result<Vec<ManagedMember>, StoreError> {
-        if scope_id.is_empty() {
-            return Err(StoreError::InvalidState);
-        }
-        let mut statement = self.connection.prepare(
-            "SELECT scope_id,agent_id,endpoint_id,role,expires_at,revoked_at FROM managed_members WHERE scope_id=?1 ORDER BY agent_id",
-        )?;
-        Ok(statement
-            .query_map([scope_id], ManagedMember::from_row)?
-            .collect::<Result<_, _>>()?)
+        members_in_scope(&self.connection, scope_id)
     }
 
     pub fn managed_events_after(
@@ -278,15 +255,14 @@ impl ControlStore {
         if scope_id.is_empty() || sequence < 0 || limit == 0 {
             return Err(StoreError::InvalidState);
         }
-        let limit = i64::try_from(limit).map_err(|_| StoreError::InvalidState)?;
         let mut statement = self.connection.prepare(
             "SELECT sequence,event_type,scope_id,agent_id,endpoint_id,role,expires_at FROM managed_events WHERE scope_id=?1 AND sequence>?2 ORDER BY sequence LIMIT ?3",
         )?;
         Ok(statement
-            .query_map(params![scope_id, sequence, limit], |row| {
-                let event_type: String = row.get(1)?;
-                let member = match event_type.as_str() {
-                    "joined" => Some(ManagedMember {
+            .query_map(params![scope_id, sequence, sql_count(limit)], |row| {
+                let event_type = row.get(1)?;
+                let member = match event_type {
+                    ManagedEventType::Joined => Some(ManagedMember {
                         scope_id: row.get(2)?,
                         agent_id: row.get(3)?,
                         endpoint_id: row.get(4)?,
@@ -294,8 +270,7 @@ impl ControlStore {
                         expires_at: row.get(6)?,
                         revoked_at: None,
                     }),
-                    "revoked" => None,
-                    _ => return Err(rusqlite::Error::InvalidQuery),
+                    ManagedEventType::Revoked => None,
                 };
                 Ok(ManagedEvent {
                     sequence: row.get(0)?,
@@ -314,28 +289,55 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use crate::{test_support::*, *};
+    use crate::test_support::path;
+
+    fn record(agent_id: &str, expires_at: i64) -> SignedRecord {
+        SignedRecord {
+            scope_id: "scope".to_owned(),
+            agent_id: agent_id.to_owned(),
+            record: vec![1],
+            expires_at,
+        }
+    }
 
     #[test]
-    fn control_records_are_durable() {
+    fn published_records_are_durable_and_a_revocation_is_an_event() {
         let database = path("control-record");
         let mut store = ControlStore::open(&database).expect("control must open");
-        store.put_scope("scope", "directory").expect("scope must store");
-        let record = SignedRecord {
-            id: "record".to_owned(),
-            scope_id: "scope".to_owned(),
-            agent_id: "agent".to_owned(),
-            record: vec![1],
-            expires_at: 1,
-        };
-        store.put_signed_record(&record).expect("record must store");
+        assert_eq!(
+            store.publish_signed_record(
+                &record("agent", 1),
+                DirectoryEventType::Revoked
+            ),
+            Err(StoreError::InvalidState)
+        );
+        store
+            .publish_signed_record(&record("agent", 1), DirectoryEventType::Published)
+            .expect("record must publish");
+        store
+            .publish_signed_record(&record("agent", 2), DirectoryEventType::Renewed)
+            .expect("record must renew");
         drop(store);
-        let mut store = ControlStore::open(database).expect("control must open");
-        assert_eq!(store.signed_record("agent"), Ok(record));
-        assert_eq!(store.active_signed_records(0).expect("records must load").len(), 1);
-        assert!(store.active_signed_records(1).expect("records must load").is_empty());
-        store.remove_signed_record("agent").expect("record must remove");
+        let mut store = ControlStore::open(&database).expect("control must reopen");
+        assert_eq!(store.signed_record("agent"), Ok(record("agent", 2)));
+        assert_eq!(store.active_signed_records(1).expect("records must load").len(), 1);
+        assert!(store.active_signed_records(2).expect("records must load").is_empty());
+        store.revoke_signed_record("agent").expect("record must revoke");
         assert_eq!(store.signed_record("agent"), Err(StoreError::NotFound));
+        assert_eq!(
+            store
+                .directory_events_after(0, 10)
+                .expect("events must load")
+                .iter()
+                .map(|event| event.event_type)
+                .collect::<Vec<_>>(),
+            [
+                DirectoryEventType::Published,
+                DirectoryEventType::Renewed,
+                DirectoryEventType::Revoked
+            ]
+        );
+        fs::remove_file(database).expect("database must remove");
     }
 
     #[test]
@@ -386,9 +388,9 @@ mod tests {
         let events =
             store.managed_events_after("managed", 0, 128).expect("events must load");
         assert_eq!(events.len(), 3);
-        assert_eq!(events[0].event_type, "joined");
-        assert_eq!(events[1].event_type, "joined");
-        assert_eq!(events[2].event_type, "revoked");
+        assert_eq!(events[0].event_type, ManagedEventType::Joined);
+        assert_eq!(events[1].event_type, ManagedEventType::Joined);
+        assert_eq!(events[2].event_type, ManagedEventType::Revoked);
         assert!(events[0].member.is_some());
         assert!(events[2].member.is_none());
         assert!(

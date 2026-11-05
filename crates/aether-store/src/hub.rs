@@ -1,13 +1,10 @@
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
-use crate::{NodeStore, StoreError};
+use crate::{NodeStore, StoreError, sql_named};
 
 /// The side of a hub invite that this node's page acted on. The strings are
 /// the `hub_approvals.side` column.
-#[derive(
-    Debug, Clone, Copy, Eq, PartialEq, strum::IntoStaticStr, strum::EnumString,
-)]
-#[strum(serialize_all = "snake_case")]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ApprovalSide {
     /// This node offers its agent: its page sent the invite or approved a
     /// request.
@@ -18,16 +15,17 @@ pub enum ApprovalSide {
 
 /// How a hub invite started. The strings are the `hub_approvals.kind`
 /// column.
-#[derive(
-    Debug, Clone, Copy, Eq, PartialEq, strum::IntoStaticStr, strum::EnumString,
-)]
-#[strum(serialize_all = "snake_case")]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ApprovalKind {
     /// The host invited someone by name.
     Invite,
     /// Someone asked a listed service agent for access.
     Request,
 }
+
+aether_core::named!(ApprovalSide { Sender => "sender", Receiver => "receiver" });
+aether_core::named!(ApprovalKind { Invite => "invite", Request => "request" });
+sql_named!(ApprovalSide, ApprovalKind);
 
 /// A hub invite that this node's own page sent or approved. The node signs
 /// a grant for a hub row only when such a record names that row.
@@ -80,14 +78,12 @@ pub const MAX_ACCESS_REQUEST_DRAFTS: i64 = 5;
 impl NodeStore {
     /// Keeps `approval`, in place of a record with the same invite id.
     pub fn put_hub_approval(&self, approval: &HubApproval) -> Result<(), StoreError> {
-        let side: &str = approval.side.into();
-        let kind: &str = approval.kind.into();
         self.connection.execute(
             "INSERT OR REPLACE INTO hub_approvals(invite_id,side,kind,peer_name,peer_endpoint,days,access_group,bundle,created_at,expires_at,listing,listing_signature,listing_expires_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![
                 approval.invite_id,
-                side,
-                kind,
+                approval.side,
+                approval.kind,
                 approval.peer_name,
                 approval.peer_endpoint,
                 approval.days,
@@ -103,68 +99,38 @@ impl NodeStore {
         Ok(())
     }
 
-    /// The approval of the hub invite `invite_id`, if this node made one.
     pub fn hub_approval(
         &self,
         invite_id: &str,
     ) -> Result<Option<HubApproval>, StoreError> {
-        let row = self
+        Ok(self
             .connection
             .query_row(
                 "SELECT invite_id,side,kind,peer_name,peer_endpoint,days,access_group,bundle,created_at,expires_at,listing,listing_signature,listing_expires_at FROM hub_approvals WHERE invite_id=?1",
                 [invite_id],
                 |row| {
-                    let listing = match (
-                        row.get::<_, Option<String>>(10)?,
-                        row.get::<_, Option<String>>(11)?,
-                        row.get::<_, Option<i64>>(12)?,
-                    ) {
+                    let listing = match (row.get(10)?, row.get(11)?, row.get(12)?) {
                         (Some(text), Some(signature), Some(expires_at)) => {
                             Some(KeptListing { text, signature, expires_at })
                         }
                         _ => None,
                     };
-                    Ok((
-                        (
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, Option<String>>(4)?,
-                        ),
-                        (
-                            row.get::<_, u32>(5)?,
-                            row.get::<_, String>(6)?,
-                            row.get::<_, Option<String>>(7)?,
-                            row.get::<_, i64>(8)?,
-                            row.get::<_, i64>(9)?,
-                        ),
+                    Ok(HubApproval {
+                        invite_id: row.get(0)?,
+                        side: row.get(1)?,
+                        kind: row.get(2)?,
+                        peer_name: row.get(3)?,
+                        peer_endpoint: row.get(4)?,
+                        days: row.get(5)?,
+                        access_group: row.get(6)?,
+                        bundle: row.get(7)?,
+                        created_at: row.get(8)?,
+                        expires_at: row.get(9)?,
                         listing,
-                    ))
+                    })
                 },
             )
-            .optional()?;
-        let Some((
-            (invite_id, side, kind, peer_name, peer_endpoint),
-            (days, access_group, bundle, created_at, expires_at),
-            listing,
-        )) = row
-        else {
-            return Ok(None);
-        };
-        Ok(Some(HubApproval {
-            invite_id,
-            side: side.parse().map_err(|_| StoreError::InvalidState)?,
-            kind: kind.parse().map_err(|_| StoreError::InvalidState)?,
-            peer_name,
-            peer_endpoint,
-            days,
-            access_group,
-            bundle,
-            created_at,
-            expires_at,
-            listing,
-        }))
+            .optional()?)
     }
 
     /// Binds `approval`, the record that the caller read, to `endpoint` and
@@ -209,7 +175,7 @@ impl NodeStore {
     }
 
     /// Keeps a draft that waits for the person. [`StoreError::Overloaded`]
-    /// when 5 drafts wait, and [`StoreError::DuplicateConflict`] when a
+    /// when [`MAX_ACCESS_REQUEST_DRAFTS`] drafts wait, and [`StoreError::DuplicateConflict`] when a
     /// draft names the same agent.
     pub fn add_access_request_draft(
         &mut self,
@@ -217,7 +183,7 @@ impl NodeStore {
     ) -> Result<(), StoreError> {
         let transaction = self
             .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let open: i64 = transaction.query_row(
             "SELECT COUNT(*) FROM access_request_drafts WHERE expires_at > ?1",
             [draft.created_at],
@@ -264,7 +230,6 @@ impl NodeStore {
         Ok(drafts)
     }
 
-    /// The draft `id`, if it is there.
     pub fn access_request_draft(
         &self,
         id: &str,
@@ -291,8 +256,8 @@ impl NodeStore {
     /// request to it, and the request is open at Unix time `now`.
     pub fn access_requested(&self, name: &str, now: i64) -> Result<bool, StoreError> {
         Ok(self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM access_request_drafts WHERE target_name=?1 AND expires_at > ?2) OR EXISTS(SELECT 1 FROM hub_approvals WHERE peer_name=?1 AND side='receiver' AND kind='request' AND expires_at > ?2)",
-            params![name, now],
+            "SELECT EXISTS(SELECT 1 FROM access_request_drafts WHERE target_name=?1 AND expires_at > ?2) OR EXISTS(SELECT 1 FROM hub_approvals WHERE peer_name=?1 AND side=?3 AND kind=?4 AND expires_at > ?2)",
+            params![name, now, ApprovalSide::Receiver, ApprovalKind::Request],
             |row| row.get(0),
         )?)
     }
@@ -312,7 +277,6 @@ impl NodeStore {
         Ok(())
     }
 
-    /// Whether the owner blocked `endpoint`.
     pub fn hub_blocked(&self, endpoint: &str) -> Result<bool, StoreError> {
         Ok(self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM hub_blocks WHERE endpoint=?1)",

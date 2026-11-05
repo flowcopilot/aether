@@ -2,6 +2,17 @@ use rusqlite::params;
 
 use crate::{NodeStore, StoreError};
 
+/// The default group of direct contacts. Migration 011 makes it.
+pub const FRIENDS_GROUP: &str = "friends";
+
+/// The group of callers whose access request the owner approved. Migration
+/// 014 makes it.
+pub const REQUESTS_GROUP: &str = "requests";
+
+/// The `configuration` key that marks the move of direct grants into
+/// [`FRIENDS_GROUP`] as done.
+const INITIALIZED_KEY: &str = "access_groups.initialized";
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct AccessGroup {
     pub name: String,
@@ -29,20 +40,20 @@ impl NodeStore {
     ) -> Result<(), StoreError> {
         let transaction = self.connection.transaction()?;
         let initialized: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM configuration WHERE key='access_groups.initialized')",
-            [],
+            "SELECT EXISTS(SELECT 1 FROM configuration WHERE key=?1)",
+            [INITIALIZED_KEY],
             |row| row.get(0),
         )?;
         if !initialized {
             for (agent, endpoint) in identities {
                 transaction.execute(
-                    "INSERT OR IGNORE INTO access_group_members(group_name,agent_id,endpoint_id) VALUES ('friends',?1,?2)",
-                    params![agent, endpoint],
+                    "INSERT OR IGNORE INTO access_group_members(group_name,agent_id,endpoint_id) VALUES (?1,?2,?3)",
+                    params![FRIENDS_GROUP, agent, endpoint],
                 )?;
             }
             transaction.execute(
-                "INSERT INTO configuration(key,value) VALUES ('access_groups.initialized','1')",
-                [],
+                "INSERT INTO configuration(key,value) VALUES (?1,'1')",
+                [INITIALIZED_KEY],
             )?;
         }
         transaction.commit()?;

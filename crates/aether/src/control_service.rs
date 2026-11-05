@@ -130,7 +130,6 @@ impl ControlService {
         };
         store.publish_signed_record(
             &aether_store::SignedRecord {
-                id: wire.agent_id.clone(),
                 scope_id: wire.scope_id.clone(),
                 agent_id: wire.agent_id.clone(),
                 record: serde_json::to_vec(wire)
@@ -138,7 +137,11 @@ impl ControlService {
                 expires_at: i64::try_from(wire.expires_at)
                     .map_err(|_| ControlError::InvalidRecord)?,
             },
-            if is_renewal { "renewed" } else { "published" },
+            if is_renewal {
+                aether_store::DirectoryEventType::Renewed
+            } else {
+                aether_store::DirectoryEventType::Published
+            },
         )?;
         // Held from the read to the write, so two publishes cannot interleave.
         drop(store);
@@ -220,7 +223,7 @@ impl ControlService {
             .map(|event| {
                 Ok(WireDirectoryEvent {
                     cursor: event.sequence,
-                    event: event.event_type,
+                    event: event.event_type.as_str().to_owned(),
                     scope_id: event.scope_id,
                     agent_id: event.agent_id,
                     record: event.record.as_deref().map(decode_record).transpose()?,
@@ -327,7 +330,7 @@ impl ControlService {
             .into_iter()
             .map(|event| WireManagedEvent {
                 cursor: event.sequence,
-                event: event.event_type,
+                event: event.event_type.as_str().to_owned(),
                 scope_id: event.scope_id,
                 agent_id: event.agent_id,
                 member: event.member,

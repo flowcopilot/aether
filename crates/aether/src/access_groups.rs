@@ -17,8 +17,7 @@ fn store(data_dir: &Path) -> Result<NodeStore, &'static str> {
     NodeStore::in_dir(data_dir).map_err(|_| "the node store is unavailable")
 }
 
-/// The group of the grants that the owner gave after an access request.
-pub const REQUESTS_GROUP: &str = "requests";
+pub use aether_store::{FRIENDS_GROUP, REQUESTS_GROUP};
 
 pub fn list(data_dir: &Path) -> Result<Vec<AccessGroup>, &'static str> {
     store(data_dir)?.access_groups().map_err(|_| "the groups are unavailable")
@@ -53,7 +52,7 @@ pub fn change(
             .create_access_group(group)
             .map_err(|_| "the group already exists or cannot be created"),
         Action::Delete => {
-            if group == "friends" {
+            if group == FRIENDS_GROUP {
                 return Err("friends is the default group and cannot be deleted");
             }
             if group == REQUESTS_GROUP {

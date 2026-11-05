@@ -158,7 +158,7 @@ async fn serving_node_in_scope(world: &mut World, scope_id: String) {
                     .expect("managed roster must open");
                 store
                     .apply_managed_member(
-                        "managed.cursor",
+                        "https://control.test",
                         1,
                         &managed_member("server", &endpoint_id, "managed"),
                     )

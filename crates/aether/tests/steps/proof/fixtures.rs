@@ -233,16 +233,18 @@ pub fn managed_member(
 /// A stored task from the caller in the direct scope.
 pub fn task_input(id: &str, request_id: &str, idempotency_key: &str) -> TaskInput {
     TaskInput {
-        id: id.to_owned(),
-        request_id: request_id.to_owned(),
+        request: aether_core::Request {
+            task_id: aether_core::TaskId::new(id),
+            id: aether_core::RequestId::new(request_id),
+            caller_agent_id: aether_core::AgentId::new(CALLER),
+            caller_endpoint_id: aether_core::EndpointId::new(CALLER_ENDPOINT),
+            scope_id: aether_core::ScopeId::new("direct"),
+            capability_id: aether_core::CapabilityId::new("review"),
+            workspace_id: aether_core::WorkspaceId::new("workspace"),
+            access_mode: aether_core::AccessMode::ReadOnly,
+        },
         idempotency_key: idempotency_key.to_owned(),
-        caller_agent_id: CALLER.to_owned(),
-        caller_endpoint_id: CALLER_ENDPOINT.to_owned(),
         request_fingerprint: "fingerprint".to_owned(),
-        scope_id: "direct".to_owned(),
-        capability_id: "review".to_owned(),
-        workspace_id: "workspace".to_owned(),
-        access_mode: "read_only".to_owned(),
         skill: "review".to_owned(),
         remote_text: "untrusted task text".to_owned(),
     }

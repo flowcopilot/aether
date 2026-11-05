@@ -241,7 +241,7 @@ fn handle(
             // New invites join friends, as on the host page.
             match crate::access_groups::join_and_apply(
                 data_dir,
-                "friends",
+                crate::access_groups::FRIENDS_GROUP,
                 &friend_name,
                 &endpoint_id,
                 || administration.apply_ui(&change),

@@ -275,7 +275,7 @@ pub fn save_policy_settings(
     // Older live admin changes must not override the new saved limits.
     for id in ["queue_global", "queue_per_peer"] {
         store
-            .delete_configuration(&format!("admin.limit.{id}"))
+            .remove_applied_change(aether_store::ChangeKind::Limit, id)
             .map_err(|_| NodeConfigError::Read)?;
     }
     Ok(())
@@ -709,15 +709,18 @@ fn load_service_source(
         .insert(AgentId::new(NODE_ISSUER), node_issuer.verifying_key().to_bytes());
     let mut store =
         NodeStore::in_dir(data_dir).map_err(|_| NodeConfigError::Invalid)?;
-    let mut grants =
-        policy.grants.into_iter().map(parse_grant).collect::<Result<Vec<_>, _>>()?;
     // A grant revoked from the admin UI stays revoked, even when the policy
     // file still lists it.
-    grants.retain(|grant| {
-        store
-            .configuration(&crate::admin::revoked_grant_key(grant.id.as_str()))
-            .is_err()
-    });
+    let mut grants = Vec::new();
+    for grant in policy.grants {
+        let grant = parse_grant(grant)?;
+        if !store
+            .grant_revoked(grant.id.as_str())
+            .map_err(|_| NodeConfigError::Invalid)?
+        {
+            grants.push(grant);
+        }
+    }
     let signed_claims = SignedClaims::new(trusted_issuers, Duration::from_secs(5));
     for grant in &grants {
         let scope = scopes
@@ -732,13 +735,10 @@ fn load_service_source(
         global: stored_limit(&store, "queue_global", policy.queue_global)?,
         per_peer: stored_limit(&store, "queue_per_peer", policy.queue_per_peer)?,
     };
-    let stored_workspace = match store.configuration("admin.current.workspace") {
-        Ok(value) => Some(value),
-        Err(StoreError::NotFound) => None,
-        Err(_) => return Err(NodeConfigError::Invalid),
-    };
+    let stored_workspace =
+        store.current_workspace().map_err(|_| NodeConfigError::Invalid)?;
     let stored_grants = store
-        .configuration_values("admin.grant.")
+        .applied_changes(aether_store::ChangeKind::Grant)
         .map_err(|_| NodeConfigError::Invalid)?;
     let mut initial_members = grants
         .iter()
@@ -769,7 +769,8 @@ fn load_service_source(
     store
         .initialize_access_groups(&initial_members)
         .map_err(|_| NodeConfigError::Invalid)?;
-    let trust = RosterClaims::new(signed_claims, data_dir.join("node.sqlite"));
+    let trust =
+        RosterClaims::new(signed_claims, data_dir.join(aether_store::NODE_DATABASE));
     // The folder must exist; say which field names it.
     let workspace = policy
         .workspace
@@ -988,13 +989,13 @@ fn stored_limit(
     id: &str,
     fallback: usize,
 ) -> Result<usize, NodeConfigError> {
-    match store.configuration(&format!("admin.limit.{id}")) {
-        Ok(value) => {
+    match store.applied_change(aether_store::ChangeKind::Limit, id) {
+        Ok(Some(value)) => {
             value.parse::<usize>().ok().filter(|value| *value > 0).ok_or_else(|| {
                 NodeConfigError::InvalidField(format!("admin.limit.{id}"))
             })
         }
-        Err(StoreError::NotFound) => Ok(fallback),
+        Ok(None) => Ok(fallback),
         Err(_) => Err(NodeConfigError::Invalid),
     }
 }
@@ -1236,9 +1237,9 @@ mod tests {
         fs::write(&path, serde_json::to_vec(&policy).expect("policy must encode"))
             .expect("policy must write");
         assert!(load_service(&path, &root, "codex".into()).is_ok());
-        let store = NodeStore::in_dir(&root).expect("store must open");
+        let mut store = NodeStore::in_dir(&root).expect("store must open");
         store
-            .put_configuration("admin.limit.queue_global", "2")
+            .apply_change(aether_store::ChangeKind::Limit, "queue_global", "2")
             .expect("queue limit must store");
         drop(store);
         let service = load_service(&path, &root, "codex".into())
@@ -1635,16 +1636,16 @@ mod tests {
                 nonce: [7; 32],
             },
         );
-        let store = NodeStore::in_dir(&root).expect("store must open");
+        let mut store = NodeStore::in_dir(&root).expect("store must open");
         store
-            .put_configuration(
-                "admin.current.workspace",
+            .set_current_workspace(
                 other_workspace.to_str().expect("path must be valid utf-8"),
             )
             .expect("workspace must store");
         store
-            .put_configuration(
-                "admin.grant.restored",
+            .apply_change(
+                aether_store::ChangeKind::Grant,
+                "restored",
                 &grant_json(&restored_grant).to_string(),
             )
             .expect("grant must store");
@@ -1694,8 +1695,7 @@ mod tests {
         drop(service);
         let store = NodeStore::in_dir(&root).expect("store must open");
         store
-            .put_configuration(
-                "admin.current.workspace",
+            .set_current_workspace(
                 root.join("missing").to_str().expect("path must be valid utf-8"),
             )
             .expect("workspace must store");

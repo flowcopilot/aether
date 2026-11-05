@@ -33,7 +33,7 @@ use crate::{
     },
     node_config::{PolicySettings, policy_settings, save_policy_settings},
 };
-use aether_store::ManagedMember;
+use aether_store::{ChangeKind, ManagedMember};
 
 #[page("/advanced")]
 pub(super) async fn advanced() -> TopcoatResult<impl View> {
@@ -74,10 +74,11 @@ pub(super) async fn dashboard(
     let tokens = app_context::<Arc<AdminConfirmations>>(cx).reset(pending)?;
     let Managed(managed) = *app_context::<Managed>(cx);
 
-    let capabilities = configured.get("capability").copied().unwrap_or(0);
-    let directories = configured.get("directory").copied().unwrap_or(0);
-    let grants = configured.get("grant").copied().unwrap_or(0);
-    let workspaces = configured.get("workspace").copied().unwrap_or(0);
+    let applied = |kind| configured.get(&kind).copied().unwrap_or(0);
+    let capabilities = applied(ChangeKind::Capability);
+    let directories = applied(ChangeKind::Directory);
+    let grants = applied(ChangeKind::Grant);
+    let workspaces = applied(ChangeKind::Workspace);
 
     Ok(view! {
         node_header(current: Tab::Advanced)

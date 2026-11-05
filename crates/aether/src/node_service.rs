@@ -91,8 +91,8 @@ where
             task,
         };
         match self.node.admit(input, Identity::Verified, None)? {
-            aether_store::Admission::Accepted(task_id)
-            | aether_store::Admission::Existing(task_id) => Ok(task_id),
+            aether_store::TaskAdmission::Accepted(task_id)
+            | aether_store::TaskAdmission::Existing(task_id) => Ok(task_id),
         }
     }
 
@@ -284,8 +284,8 @@ where
                 Some(format!("{}:{}", frame.exchange_id, payload.request_nonce)),
             )
             .map_err(map_error)?;
-        let (aether_store::Admission::Accepted(task_id)
-        | aether_store::Admission::Existing(task_id)) = admission;
+        let (aether_store::TaskAdmission::Accepted(task_id)
+        | aether_store::TaskAdmission::Existing(task_id)) = admission;
         let last_sequence = i64::try_from(payload.last_event_sequence.unwrap_or(0))
             .map_err(|_| TransportError::BadFrame)?;
         // Bound the page in SQL first (by frame count), then trim further by
@@ -330,7 +330,7 @@ where
                 task_id: Some(task_id.clone()),
                 payload: event_payload_with_sequence(
                     &task_id,
-                    event_status(&event.event_type),
+                    event_status(event.event_type.as_str()),
                     Some(event.sequence),
                 ),
             };
@@ -429,7 +429,7 @@ where
                 task_id: frame.task_id.clone(),
                 payload: event_payload_with_sequence(
                     task_id,
-                    event_status(&event.event_type),
+                    event_status(event.event_type.as_str()),
                     Some(event.sequence),
                 ),
             },
@@ -719,7 +719,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("directory must create");
         let root = directory.path().to_path_buf();
         let workspace = root.join("workspace");
-        let database = root.join("node.sqlite");
+        let database = root.join(aether_store::NODE_DATABASE);
         fs::create_dir_all(&workspace).expect("workspace must create");
         let endpoint = aether_core::EndpointId::new(
             iroh::SecretKey::from_bytes(&[4; 32]).public().to_string(),
@@ -839,7 +839,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("directory must create");
         let root = directory.path().to_path_buf();
         let workspace = root.join("workspace");
-        let database = root.join("node.sqlite");
+        let database = root.join(aether_store::NODE_DATABASE);
         let server_data = root.join("server");
         let client_data = root.join("client");
         fs::create_dir_all(&workspace).expect("workspace must create");
@@ -1234,20 +1234,24 @@ mod tests {
         fs::create_dir_all(&workspace).expect("workspace must create");
         let scope = Scope { id: ScopeId::new("direct"), kind: ScopeKind::Direct };
         let mut store = NodeStore::in_dir(&root).expect("store must open");
-        store.put_scope("direct", "direct").expect("scope must store");
+        store
+            .put_scope("direct", aether_core::ScopeKind::Direct)
+            .expect("scope must store");
         store
             .admit(
                 &TaskInput {
-                    id: WIRE_TASK_ID.to_owned(),
-                    request_id: WIRE_REQUEST_ID.to_owned(),
+                    request: aether_core::Request {
+                        task_id: aether_core::TaskId::new(WIRE_TASK_ID),
+                        id: aether_core::RequestId::new(WIRE_REQUEST_ID),
+                        caller_agent_id: aether_core::AgentId::new("caller"),
+                        caller_endpoint_id: aether_core::EndpointId::new("endpoint"),
+                        scope_id: aether_core::ScopeId::new("direct"),
+                        capability_id: aether_core::CapabilityId::new("review"),
+                        workspace_id: aether_core::WorkspaceId::new("workspace"),
+                        access_mode: aether_core::AccessMode::ReadOnly,
+                    },
                     idempotency_key: "key".to_owned(),
-                    caller_agent_id: "caller".to_owned(),
-                    caller_endpoint_id: "endpoint".to_owned(),
                     request_fingerprint: "fingerprint".to_owned(),
-                    scope_id: "direct".to_owned(),
-                    capability_id: "review".to_owned(),
-                    workspace_id: "workspace".to_owned(),
-                    access_mode: "read_only".to_owned(),
                     skill: "review".to_owned(),
                     remote_text: "remote text".to_owned(),
                 },
@@ -1350,22 +1354,26 @@ mod tests {
             context_tokens: 0,
         };
         let mut store = NodeStore::in_dir(&root).expect("store must open");
-        store.put_scope("direct", "direct").expect("scope must store");
+        store
+            .put_scope("direct", aether_core::ScopeKind::Direct)
+            .expect("scope must store");
         store
             .admit(
                 &TaskInput {
-                    id: WIRE_TASK_ID.to_owned(),
-                    request_id: "request".to_owned(),
+                    request: aether_core::Request {
+                        task_id: aether_core::TaskId::new(WIRE_TASK_ID),
+                        id: aether_core::RequestId::new("request"),
+                        caller_agent_id: aether_core::AgentId::new("caller"),
+                        caller_endpoint_id: aether_core::EndpointId::new("endpoint"),
+                        scope_id: aether_core::ScopeId::new("direct"),
+                        capability_id: aether_core::CapabilityId::new("review"),
+                        workspace_id: aether_core::WorkspaceId::new("workspace"),
+                        access_mode: aether_core::AccessMode::ReadOnly,
+                    },
                     idempotency_key: "key".to_owned(),
-                    caller_agent_id: "caller".to_owned(),
-                    caller_endpoint_id: "endpoint".to_owned(),
                     request_fingerprint: crate::proof::request_fingerprint(
                         &request, &task,
                     ),
-                    scope_id: "direct".to_owned(),
-                    capability_id: "review".to_owned(),
-                    workspace_id: "workspace".to_owned(),
-                    access_mode: "read_only".to_owned(),
                     skill: "general".to_owned(),
                     remote_text: "remote text".to_owned(),
                 },
@@ -1483,22 +1491,26 @@ mod tests {
             context_tokens: 0,
         };
         let mut store = NodeStore::in_dir(&root).expect("store must open");
-        store.put_scope("direct", "direct").expect("scope must store");
+        store
+            .put_scope("direct", aether_core::ScopeKind::Direct)
+            .expect("scope must store");
         store
             .admit(
                 &TaskInput {
-                    id: WIRE_TASK_ID.to_owned(),
-                    request_id: "request".to_owned(),
+                    request: aether_core::Request {
+                        task_id: aether_core::TaskId::new(WIRE_TASK_ID),
+                        id: aether_core::RequestId::new("request"),
+                        caller_agent_id: aether_core::AgentId::new("caller"),
+                        caller_endpoint_id: aether_core::EndpointId::new("endpoint"),
+                        scope_id: aether_core::ScopeId::new("direct"),
+                        capability_id: aether_core::CapabilityId::new("review"),
+                        workspace_id: aether_core::WorkspaceId::new("workspace"),
+                        access_mode: aether_core::AccessMode::ReadOnly,
+                    },
                     idempotency_key: "key".to_owned(),
-                    caller_agent_id: "caller".to_owned(),
-                    caller_endpoint_id: "endpoint".to_owned(),
                     request_fingerprint: crate::proof::request_fingerprint(
                         &request, &task,
                     ),
-                    scope_id: "direct".to_owned(),
-                    capability_id: "review".to_owned(),
-                    workspace_id: "workspace".to_owned(),
-                    access_mode: "read_only".to_owned(),
                     skill: "general".to_owned(),
                     remote_text: "remote text".to_owned(),
                 },
@@ -1614,22 +1626,26 @@ mod tests {
             context_tokens: 0,
         };
         let mut store = NodeStore::in_dir(&root).expect("store must open");
-        store.put_scope("direct", "direct").expect("scope must store");
+        store
+            .put_scope("direct", aether_core::ScopeKind::Direct)
+            .expect("scope must store");
         store
             .admit(
                 &TaskInput {
-                    id: WIRE_TASK_ID.to_owned(),
-                    request_id: "request".to_owned(),
+                    request: aether_core::Request {
+                        task_id: aether_core::TaskId::new(WIRE_TASK_ID),
+                        id: aether_core::RequestId::new("request"),
+                        caller_agent_id: aether_core::AgentId::new("caller"),
+                        caller_endpoint_id: aether_core::EndpointId::new("endpoint"),
+                        scope_id: aether_core::ScopeId::new("direct"),
+                        capability_id: aether_core::CapabilityId::new("review"),
+                        workspace_id: aether_core::WorkspaceId::new("workspace"),
+                        access_mode: aether_core::AccessMode::ReadOnly,
+                    },
                     idempotency_key: "key".to_owned(),
-                    caller_agent_id: "caller".to_owned(),
-                    caller_endpoint_id: "endpoint".to_owned(),
                     request_fingerprint: crate::proof::request_fingerprint(
                         &request, &task,
                     ),
-                    scope_id: "direct".to_owned(),
-                    capability_id: "review".to_owned(),
-                    workspace_id: "workspace".to_owned(),
-                    access_mode: "read_only".to_owned(),
                     skill: "general".to_owned(),
                     remote_text: "remote text".to_owned(),
                 },
@@ -1763,22 +1779,28 @@ mod tests {
                 context_tokens: 0,
             };
             let mut store = NodeStore::in_dir(&root).expect("store must open");
-            store.put_scope("direct", "direct").expect("scope must store");
+            store
+                .put_scope("direct", aether_core::ScopeKind::Direct)
+                .expect("scope must store");
             store
                 .admit(
                     &TaskInput {
-                        id: WIRE_TASK_ID.to_owned(),
-                        request_id: "request".to_owned(),
+                        request: aether_core::Request {
+                            task_id: aether_core::TaskId::new(WIRE_TASK_ID),
+                            id: aether_core::RequestId::new("request"),
+                            caller_agent_id: aether_core::AgentId::new("caller"),
+                            caller_endpoint_id: aether_core::EndpointId::new(
+                                "endpoint",
+                            ),
+                            scope_id: aether_core::ScopeId::new("direct"),
+                            capability_id: aether_core::CapabilityId::new("review"),
+                            workspace_id: aether_core::WorkspaceId::new("workspace"),
+                            access_mode: aether_core::AccessMode::ReadOnly,
+                        },
                         idempotency_key: "key".to_owned(),
-                        caller_agent_id: "caller".to_owned(),
-                        caller_endpoint_id: "endpoint".to_owned(),
                         request_fingerprint: crate::proof::request_fingerprint(
                             &request, &task,
                         ),
-                        scope_id: "direct".to_owned(),
-                        capability_id: "review".to_owned(),
-                        workspace_id: "workspace".to_owned(),
-                        access_mode: "read_only".to_owned(),
                         skill: "general".to_owned(),
                         remote_text: "remote text".to_owned(),
                     },

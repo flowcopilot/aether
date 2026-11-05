@@ -49,7 +49,7 @@ pub fn start(
 ) -> Result<Started, StartError> {
     let key =
         Arc::new(ProviderKey::load_or_create(data_dir).map_err(|_| StartError::Key)?);
-    let store = aether_store::pact::PactStore::open(data_dir.join("pact.sqlite"))
+    let store = aether_store::pact::PactStore::in_dir(data_dir)
         .map_err(|_| StartError::Store)?;
     let consent = Arc::new(
         PactConsent::open(config.clone(), data_dir).map_err(|_| StartError::Store)?,

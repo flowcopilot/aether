@@ -10,7 +10,9 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
-use crate::{StoreError, open_connection};
+use crate::{StoreError, migrate::open_connection};
+
+pub const PACT_DATABASE: &str = "pact.sqlite";
 
 pub const PACT_MIGRATIONS: &[&str] =
     &[include_str!("../migrations/pact/001_initial.sql")];
@@ -112,6 +114,10 @@ const GRANT_COLUMNS: &str = "grant_id, brand_id, pa_issuer, pa_subject, brand_us
 impl PactStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         Ok(Self { connection: open_connection(path.as_ref(), PACT_MIGRATIONS)? })
+    }
+
+    pub fn in_dir(dir: &Path) -> Result<Self, StoreError> {
+        Self::open(dir.join(PACT_DATABASE))
     }
 
     // -- Contexts (§4.2) --
@@ -399,7 +405,7 @@ impl PactStore {
         let poll = if expires_at <= now {
             DevicePoll::Expired
         } else {
-            match DeviceStatus::parse(&status)? {
+            match DeviceStatus::parse(&status).ok_or(StoreError::InvalidState)? {
                 DeviceStatus::Denied => DevicePoll::Denied,
                 DeviceStatus::Consumed => DevicePoll::Consumed,
                 DeviceStatus::Pending => {
@@ -505,10 +511,7 @@ impl PactStore {
 
 /// The strings are the `pact_device_authorizations.status` column and its
 /// `CHECK` constraint. Changing one breaks every stored row that holds it.
-#[derive(
-    Debug, Clone, Copy, Eq, PartialEq, strum::IntoStaticStr, strum::EnumString,
-)]
-#[strum(serialize_all = "snake_case")]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum DeviceStatus {
     Pending,
     Approved,
@@ -516,15 +519,12 @@ enum DeviceStatus {
     Consumed,
 }
 
-impl DeviceStatus {
-    fn as_str(self) -> &'static str {
-        self.into()
-    }
-
-    fn parse(value: &str) -> Result<Self, StoreError> {
-        value.parse().map_err(|_| StoreError::InvalidState)
-    }
-}
+aether_core::named!(DeviceStatus {
+    Pending => "pending",
+    Approved => "approved",
+    Denied => "denied",
+    Consumed => "consumed",
+});
 
 /// The device-authorization columns `poll_device` decides on.
 struct DeviceRow {
@@ -616,9 +616,9 @@ mod tests {
             (DeviceStatus::Consumed, "consumed"),
         ] {
             assert_eq!(status.as_str(), name);
-            assert_eq!(DeviceStatus::parse(name), Ok(status));
+            assert_eq!(DeviceStatus::parse(name), Some(status));
         }
-        assert_eq!(DeviceStatus::parse("Pending"), Err(StoreError::InvalidState));
+        assert_eq!(DeviceStatus::parse("Pending"), None);
     }
 
     #[test]

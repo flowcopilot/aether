@@ -46,8 +46,9 @@ impl State {
             let opened = blocking(|| {
                 let root =
                     tempfile::tempdir().expect("temporary directory must create");
-                let store = NodeStore::open(root.path().join("node.sqlite"))
-                    .expect("managed roster must open");
+                let store =
+                    NodeStore::open(root.path().join(aether_store::NODE_DATABASE))
+                        .expect("managed roster must open");
                 (root, Arc::new(Mutex::new(store)))
             })
             .await;
@@ -77,7 +78,7 @@ async fn known_peer(world: &mut World, scope_id: String) {
                     .lock()
                     .expect("roster lock")
                     .apply_managed_member(
-                        "managed.cursor",
+                        "https://control.test",
                         1,
                         &managed_member(CALLER, CALLER_ENDPOINT, "managed"),
                     )
@@ -159,7 +160,7 @@ async fn hub_revokes(world: &mut World) {
         roster
             .lock()
             .expect("roster lock")
-            .revoke_managed_member("managed.cursor", 2, "managed", CALLER)
+            .revoke_managed_member("https://control.test", 2, "managed", CALLER)
             .expect("membership must revoke");
     })
     .await;

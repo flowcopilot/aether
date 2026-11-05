@@ -128,7 +128,7 @@ fn fixture() -> Fixture {
     let node = Arc::new(FakeNode::default());
     let link = Arc::new(ConsentLink::new());
     link.set("https://127.0.0.1:3000".to_owned());
-    let path = directory.path().join("pact.sqlite");
+    let path = directory.path().join(aether_store::pact::PACT_DATABASE);
     let mut gateway = Gateway::new(
         config(),
         PaVerifier::new(

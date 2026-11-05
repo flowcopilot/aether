@@ -1716,15 +1716,7 @@ async fn sync_managed(
 ) -> Result<(i64, usize), ()> {
     std::fs::create_dir_all(data_dir).map_err(|_| ())?;
     let mut store = aether_store::NodeStore::in_dir(data_dir).map_err(|_| ())?;
-    let cursor_key = managed_cursor_key(control, scope_id);
-    let mut cursor = match store.configuration(&cursor_key) {
-        Ok(value) => value.parse::<i64>().map_err(|_| ())?,
-        Err(aether_store::StoreError::NotFound) => 0,
-        Err(_) => return Err(()),
-    };
-    if cursor < 0 {
-        return Err(());
-    }
+    let mut cursor = store.managed_cursor(control, scope_id).map_err(|_| ())?;
     let mut changes = 0usize;
     loop {
         let events = client.events_after(scope_id, cursor).await.map_err(|_| ())?;
@@ -1739,13 +1731,13 @@ async fn sync_managed(
                 "joined" => {
                     let member = event.member.ok_or(())?;
                     store
-                        .apply_managed_member(&cursor_key, event.cursor, &member)
+                        .apply_managed_member(control, event.cursor, &member)
                         .map_err(|_| ())?;
                 }
                 "revoked" if event.member.is_none() => {
                     store
                         .revoke_managed_member(
-                            &cursor_key,
+                            control,
                             event.cursor,
                             &event.scope_id,
                             &event.agent_id,
@@ -1873,12 +1865,7 @@ async fn sync_directory(
 ) -> Result<(i64, usize), ()> {
     std::fs::create_dir_all(data_dir).map_err(|_| ())?;
     let store = aether_store::NodeStore::in_dir(data_dir).map_err(|_| ())?;
-    let cursor_key = directory_cursor_key(directory, trusted_key);
-    let mut cursor = match store.configuration(&cursor_key) {
-        Ok(value) => value.parse::<i64>().map_err(|_| ())?,
-        Err(aether_store::StoreError::NotFound) => 0,
-        Err(_) => return Err(()),
-    };
+    let mut cursor = store.directory_cursor(directory, &trusted_key).map_err(|_| ())?;
     let mut records = 0usize;
     loop {
         let changes = client.events_after(cursor).await.map_err(|_| ())?;
@@ -1896,14 +1883,15 @@ async fn sync_directory(
                     records = records.checked_add(1).ok_or(())?;
                 }
                 "revoked" => {
-                    let id = format!("{}:{}", change.scope_id, change.agent_id);
-                    store.mark_signed_record_stale(&id).map_err(|_| ())?;
+                    store
+                        .mark_directory_record_stale(&change.scope_id, &change.agent_id)
+                        .map_err(|_| ())?;
                 }
                 _ => return Err(()),
             }
             cursor = change.cursor;
             store
-                .put_configuration(&cursor_key, &cursor.to_string())
+                .advance_directory_cursor(directory, &trusted_key, cursor)
                 .map_err(|_| ())?;
         }
     }
@@ -1942,16 +1930,13 @@ fn cache_wire_directory_record(
     store: &aether_store::NodeStore,
     record: &aether::control_service::WireRecord,
 ) -> Result<(), ()> {
-    let expires_at = i64::try_from(record.expires_at).map_err(|_| ())?;
-    store.put_scope(&record.scope_id, "directory").map_err(|_| ())?;
     store
-        .put_signed_record(
-            &format!("{}:{}", record.scope_id, record.agent_id),
-            &record.scope_id,
-            &record.agent_id,
-            &serde_json::to_vec(record).map_err(|_| ())?,
-            expires_at,
-        )
+        .cache_directory_record(&aether_store::SignedRecord {
+            scope_id: record.scope_id.clone(),
+            agent_id: record.agent_id.clone(),
+            record: serde_json::to_vec(record).map_err(|_| ())?,
+            expires_at: i64::try_from(record.expires_at).map_err(|_| ())?,
+        })
         .map_err(|_| ())
 }
 
@@ -1962,8 +1947,7 @@ fn cached_directory_record(
     trusted_key: [u8; 32],
 ) -> Result<aether::discovery::Record, ()> {
     let store = aether_store::NodeStore::in_dir(data_dir).map_err(|_| ())?;
-    let stored =
-        store.signed_record(&format!("{scope_id}:{agent_id}")).map_err(|_| ())?;
+    let stored = store.directory_record(scope_id, agent_id).map_err(|_| ())?;
     if stored.scope_id != scope_id || stored.agent_id != agent_id {
         return Err(());
     }
@@ -1978,19 +1962,6 @@ fn cached_directory_record(
     }
     aether::discovery::validate_record(&record).map_err(|_| ())?;
     Ok(record)
-}
-
-fn directory_cursor_key(directory: &str, trusted_key: [u8; 32]) -> String {
-    let mut value = directory.as_bytes().to_vec();
-    value.extend_from_slice(&trusted_key);
-    format!("directory.cursor.{}", blake3::hash(&value).to_hex())
-}
-
-fn managed_cursor_key(control: &str, scope_id: &str) -> String {
-    let mut value = control.as_bytes().to_vec();
-    value.push(0);
-    value.extend_from_slice(scope_id.as_bytes());
-    format!("managed.cursor.{}", blake3::hash(&value).to_hex())
 }
 
 fn transport_error(error: &aether::transport::TransportError) -> ExitCode {
@@ -2059,7 +2030,7 @@ mod tests {
             aether_store::NodeStore::in_dir(&data_dir).expect("store must open");
         assert!(
             store
-                .mark_signed_record_stale("test-scope:test-agent")
+                .mark_directory_record_stale("test-scope", "test-agent")
                 .expect("record must become stale")
         );
         assert!(
@@ -2158,7 +2129,7 @@ mod tests {
             aether_store::NodeStore::in_dir(&data_dir).expect("store must open");
         store
             .apply_managed_member(
-                "managed.cursor",
+                "https://control.test",
                 1,
                 &aether_store::ManagedMember {
                     scope_id: "managed".to_owned(),
@@ -2172,7 +2143,7 @@ mod tests {
             .expect("member must store");
         assert!(cached_managed_member(&data_dir, "managed", "member-agent").is_ok());
         store
-            .revoke_managed_member("managed.cursor", 2, "managed", "member-agent")
+            .revoke_managed_member("https://control.test", 2, "managed", "member-agent")
             .expect("member must revoke");
         assert!(cached_managed_member(&data_dir, "managed", "member-agent").is_err());
     }

@@ -207,12 +207,6 @@ pub enum DirectError {
     NameInUse,
 }
 
-/// The stored record id of the contact named `agent_id`.
-#[must_use]
-pub fn contact_id(agent_id: &str) -> String {
-    format!("direct:{agent_id}")
-}
-
 /// Signs an invitation to this node, valid for `expires_in`. `agent_id` is
 /// the name the caller will know this node by.
 pub fn create_invitation(
@@ -287,15 +281,13 @@ pub fn import_invitation(
     std::fs::create_dir_all(data_dir).map_err(|_| DirectError::Unavailable)?;
     let store = aether_store::NodeStore::in_dir(data_dir)
         .map_err(|_| DirectError::Unavailable)?;
-    store.put_scope(SCOPE, SCOPE).map_err(|_| DirectError::Unavailable)?;
     store
-        .put_signed_record(
-            &contact_id(&invitation.agent_id),
-            SCOPE,
-            &invitation.agent_id,
-            &record,
+        .put_contact_record(&aether_store::SignedRecord {
+            scope_id: SCOPE.to_owned(),
+            agent_id: invitation.agent_id.clone(),
+            record,
             expires_at,
-        )
+        })
         .map_err(|_| DirectError::Unavailable)?;
     Ok(invitation)
 }
@@ -318,9 +310,8 @@ fn contact_in(
     if agent_id.is_empty() {
         return Err(DirectError::UnknownContact);
     }
-    let stored = store
-        .signed_record(&contact_id(agent_id))
-        .map_err(|_| DirectError::UnknownContact)?;
+    let stored =
+        store.contact_record(agent_id).map_err(|_| DirectError::UnknownContact)?;
     let now = aether_core::time::now();
     if stored.scope_id != SCOPE
         || stored.agent_id != agent_id
@@ -500,7 +491,7 @@ pub fn remove_contact(data_dir: &Path, agent_id: &str) -> Result<(), DirectError
             .delete_configuration(&card_key(&bundle.invitation.endpoint_id))
             .map_err(|_| DirectError::Unavailable)?;
     }
-    let record = store.remove_signed_record(&contact_id(agent_id));
+    let record = store.remove_contact_record(agent_id);
     let had_bundle = store.configuration(&bundle_key(agent_id)).is_ok();
     store
         .delete_configuration(&bundle_key(agent_id))

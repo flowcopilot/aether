@@ -1,13 +1,12 @@
+use std::sync::LazyLock;
+
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
-use crate::{NodeStore, StoreError};
+use crate::{NodeStore, StoreError, column_u64, sql_count, sql_named, sql_names};
 
 /// The state of a task that this node sent. The strings are the
 /// `sent_tasks.state` column.
-#[derive(
-    Debug, Clone, Copy, Eq, PartialEq, strum::IntoStaticStr, strum::EnumString,
-)]
-#[strum(serialize_all = "snake_case")]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum SentState {
     /// Not on the host yet, or the host did not accept it yet.
     Waiting,
@@ -21,18 +20,30 @@ pub enum SentState {
     NotDelivered,
 }
 
-impl SentState {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        self.into()
-    }
+aether_core::named!(SentState {
+    Waiting => "waiting",
+    Working => "working",
+    Answered => "answered",
+    Failed => "failed",
+    NotDelivered => "not_delivered",
+});
 
-    /// Whether the outbox still sends or polls the task.
+sql_named!(SentState);
+
+impl SentState {
+    /// The states in which the outbox still sends or polls the task.
+    const ACTIVE: [Self; 2] = [Self::Waiting, Self::Working];
+
     #[must_use]
-    pub const fn is_active(self) -> bool {
-        matches!(self, Self::Waiting | Self::Working)
+    pub fn is_active(self) -> bool {
+        Self::ACTIVE.contains(&self)
     }
 }
+
+/// `state IN (...)` of the active states, for SQL.
+static ACTIVE: LazyLock<String> = LazyLock::new(|| {
+    format!("state IN ({})", sql_names(&SentState::ACTIVE.map(|state| state.as_str())))
+});
 
 /// A new task for the outbox.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -84,45 +95,35 @@ pub struct SentAttempt {
 
 const SENT_COLUMNS: &str = "task_id,idempotency_key,agent_id,endpoint_id,authorization_json,text,state,reason,host_state,answer,last_event_sequence,attempts,created_at,updated_at,next_attempt_at,expires_at,finished_at,read_at,lease_until";
 
-fn sent_task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(SentTask, String)> {
-    let state: String = row.get(6)?;
-    Ok((
-        SentTask {
-            task_id: row.get(0)?,
-            idempotency_key: row.get(1)?,
-            agent_id: row.get(2)?,
-            endpoint_id: row.get(3)?,
-            authorization_json: row.get(4)?,
-            text: row.get(5)?,
-            state: SentState::Waiting,
-            reason: row.get(7)?,
-            host_state: row.get(8)?,
-            answer: row.get(9)?,
-            last_event_sequence: u64::try_from(row.get::<_, i64>(10)?).unwrap_or(0),
-            attempts: u64::try_from(row.get::<_, i64>(11)?).unwrap_or(0),
-            created_at: row.get(12)?,
-            updated_at: row.get(13)?,
-            next_attempt_at: row.get(14)?,
-            expires_at: row.get(15)?,
-            finished_at: row.get(16)?,
-            read_at: row.get(17)?,
-            lease_until: row.get(18)?,
-        },
-        state,
-    ))
-}
-
-/// Gives the parsed `state` to a row that [`sent_task_from_row`] read.
-fn with_state((mut task, state): (SentTask, String)) -> Result<SentTask, StoreError> {
-    task.state = state.parse().map_err(|_| StoreError::InvalidState)?;
-    Ok(task)
+fn sent_task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SentTask> {
+    Ok(SentTask {
+        task_id: row.get(0)?,
+        idempotency_key: row.get(1)?,
+        agent_id: row.get(2)?,
+        endpoint_id: row.get(3)?,
+        authorization_json: row.get(4)?,
+        text: row.get(5)?,
+        state: row.get(6)?,
+        reason: row.get(7)?,
+        host_state: row.get(8)?,
+        answer: row.get(9)?,
+        last_event_sequence: column_u64(row, 10)?,
+        attempts: column_u64(row, 11)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
+        next_attempt_at: row.get(14)?,
+        expires_at: row.get(15)?,
+        finished_at: row.get(16)?,
+        read_at: row.get(17)?,
+        lease_until: row.get(18)?,
+    })
 }
 
 impl NodeStore {
     /// Keeps a new task for the outbox, waiting and due at once.
     pub fn insert_sent_task(&self, input: &SentTaskInput) -> Result<(), StoreError> {
         self.connection.execute(
-            "INSERT INTO sent_tasks(task_id,idempotency_key,agent_id,endpoint_id,authorization_json,text,state,created_at,updated_at,next_attempt_at,expires_at) VALUES (?1,?2,?3,?4,?5,?6,'waiting',?7,?7,?7,?8)",
+            "INSERT INTO sent_tasks(task_id,idempotency_key,agent_id,endpoint_id,authorization_json,text,state,created_at,updated_at,next_attempt_at,expires_at) VALUES (?1,?2,?3,?4,?5,?6,?9,?7,?7,?7,?8)",
             params![
                 input.task_id,
                 input.idempotency_key,
@@ -132,22 +133,21 @@ impl NodeStore {
                 input.text,
                 input.created_at,
                 input.expires_at,
+                SentState::Waiting,
             ],
         )?;
         Ok(())
     }
 
-    /// The sent task `task_id`, if there is one.
     pub fn sent_task(&self, task_id: &str) -> Result<Option<SentTask>, StoreError> {
-        self.connection
+        Ok(self
+            .connection
             .query_row(
                 &format!("SELECT {SENT_COLUMNS} FROM sent_tasks WHERE task_id=?1"),
                 [task_id],
                 sent_task_from_row,
             )
-            .optional()?
-            .map(with_state)
-            .transpose()
+            .optional()?)
     }
 
     fn sent_tasks_where(
@@ -159,7 +159,7 @@ impl NodeStore {
             "SELECT {SENT_COLUMNS} FROM sent_tasks WHERE {clause}"
         ))?;
         let rows = statement.query_map(values, sent_task_from_row)?;
-        rows.map(|row| with_state(row?)).collect()
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     /// Leases at most `limit` active tasks that are due at `now` until
@@ -177,10 +177,10 @@ impl NodeStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let candidates = {
             let mut statement = transaction.prepare(&format!(
-                "SELECT {SENT_COLUMNS} FROM sent_tasks s WHERE state IN ('waiting','working') AND next_attempt_at<=?1 AND (lease_until IS NULL OR lease_until<=?1) AND NOT EXISTS (SELECT 1 FROM sent_tasks o WHERE o.endpoint_id=s.endpoint_id AND o.task_id<>s.task_id AND o.state IN ('waiting','working') AND o.lease_until>?1) ORDER BY next_attempt_at, created_at, task_id"
+                "SELECT {SENT_COLUMNS} FROM sent_tasks s WHERE {ACTIVE} AND next_attempt_at<=?1 AND (lease_until IS NULL OR lease_until<=?1) AND NOT EXISTS (SELECT 1 FROM sent_tasks o WHERE o.endpoint_id=s.endpoint_id AND o.task_id<>s.task_id AND o.{ACTIVE} AND o.lease_until>?1) ORDER BY next_attempt_at, created_at, task_id", ACTIVE = ACTIVE.as_str()
             ))?;
             let rows = statement.query_map([now], sent_task_from_row)?;
-            rows.map(|row| with_state(row?)).collect::<Result<Vec<_>, _>>()?
+            rows.collect::<Result<Vec<_>, _>>()?
         };
         let mut endpoints = std::collections::BTreeSet::new();
         let mut claimed = Vec::new();
@@ -214,7 +214,7 @@ impl NodeStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = transaction.execute(
-            "UPDATE sent_tasks SET lease_until=?3 WHERE task_id=?1 AND state IN ('waiting','working') AND (lease_until IS NULL OR lease_until<=?2)",
+            &format!("UPDATE sent_tasks SET lease_until=?3 WHERE task_id=?1 AND {ACTIVE} AND (lease_until IS NULL OR lease_until<=?2)", ACTIVE = ACTIVE.as_str()),
             params![task_id, now, lease_until],
         )?;
         transaction.commit()?;
@@ -238,14 +238,15 @@ impl NodeStore {
     ) -> Result<bool, StoreError> {
         let finished = (!attempt.state.is_active()).then_some(now);
         let changed = self.connection.execute(
-            "UPDATE sent_tasks SET state=?2, reason=?3, host_state=?4, answer=?5, last_event_sequence=?6, next_attempt_at=?7, attempts=attempts+1, updated_at=?8, finished_at=?9, lease_until=NULL WHERE task_id=?1 AND state IN ('waiting','working') AND lease_until IS ?10",
+            &format!("UPDATE sent_tasks SET state=?2, reason=?3, host_state=?4, answer=?5, last_event_sequence=?6, next_attempt_at=?7, attempts=attempts+1, updated_at=?8, finished_at=?9, lease_until=NULL WHERE task_id=?1 AND {ACTIVE} AND lease_until IS ?10", ACTIVE = ACTIVE.as_str()),
             params![
                 task_id,
-                attempt.state.as_str(),
+                attempt.state,
                 attempt.reason,
                 attempt.host_state,
                 attempt.answer,
-                i64::try_from(attempt.last_event_sequence).unwrap_or(i64::MAX),
+                i64::try_from(attempt.last_event_sequence)
+                    .map_err(|_| StoreError::InvalidState)?,
                 attempt.next_attempt_at,
                 now,
                 finished,
@@ -263,7 +264,7 @@ impl NodeStore {
         now: i64,
     ) -> Result<usize, StoreError> {
         Ok(self.connection.execute(
-            "UPDATE sent_tasks SET next_attempt_at=?2 WHERE endpoint_id=?1 AND state IN ('waiting','working') AND next_attempt_at>?2",
+            &format!("UPDATE sent_tasks SET next_attempt_at=?2 WHERE endpoint_id=?1 AND {ACTIVE} AND next_attempt_at>?2", ACTIVE = ACTIVE.as_str()),
             params![endpoint_id, now],
         )?)
     }
@@ -276,23 +277,24 @@ impl NodeStore {
         until: i64,
     ) -> Result<usize, StoreError> {
         Ok(self.connection.execute(
-            "UPDATE sent_tasks SET next_attempt_at=MAX(next_attempt_at, ?2) WHERE endpoint_id=?1 AND state IN ('waiting','working') AND lease_until IS NULL",
+            &format!("UPDATE sent_tasks SET next_attempt_at=MAX(next_attempt_at, ?2) WHERE endpoint_id=?1 AND {ACTIVE} AND lease_until IS NULL", ACTIVE = ACTIVE.as_str()),
             params![endpoint_id, until],
         )?)
     }
 
-    /// Every task that waits or works, oldest first.
     pub fn active_sent_tasks(&self) -> Result<Vec<SentTask>, StoreError> {
         self.sent_tasks_where(
-            "state IN ('waiting','working') ORDER BY created_at, task_id",
+            &format!("{ACTIVE} ORDER BY created_at, task_id", ACTIVE = ACTIVE.as_str()),
             &[],
         )
     }
 
-    /// Whether any task waits or works.
     pub fn has_active_sent_tasks(&self) -> Result<bool, StoreError> {
         Ok(self.connection.query_row(
-            "SELECT EXISTS (SELECT 1 FROM sent_tasks WHERE state IN ('waiting','working'))",
+            &format!(
+                "SELECT EXISTS (SELECT 1 FROM sent_tasks WHERE {ACTIVE})",
+                ACTIVE = ACTIVE.as_str()
+            ),
             [],
             |row| row.get(0),
         )?)
@@ -306,8 +308,8 @@ impl NodeStore {
         now: i64,
     ) -> Result<usize, StoreError> {
         Ok(self.connection.execute(
-            "UPDATE sent_tasks SET state='not_delivered', reason=?2, updated_at=?3, finished_at=?3, lease_until=NULL WHERE endpoint_id=?1 AND state IN ('waiting','working')",
-            params![endpoint_id, reason, now],
+            &format!("UPDATE sent_tasks SET state=?4, reason=?2, updated_at=?3, finished_at=?3, lease_until=NULL WHERE endpoint_id=?1 AND {ACTIVE}", ACTIVE = ACTIVE.as_str()),
+            params![endpoint_id, reason, now, SentState::NotDelivered],
         )?)
     }
 
@@ -319,8 +321,8 @@ impl NodeStore {
         reason: &str,
     ) -> Result<usize, StoreError> {
         Ok(self.connection.execute(
-            "UPDATE sent_tasks SET state='not_delivered', reason=?2, updated_at=?1, finished_at=?1, lease_until=NULL WHERE state IN ('waiting','working') AND expires_at<=?1",
-            params![now, reason],
+            &format!("UPDATE sent_tasks SET state=?3, reason=?2, updated_at=?1, finished_at=?1, lease_until=NULL WHERE {ACTIVE} AND expires_at<=?1", ACTIVE = ACTIVE.as_str()),
+            params![now, reason, SentState::NotDelivered],
         )?)
     }
 
@@ -335,8 +337,7 @@ impl NodeStore {
         unread_only: bool,
     ) -> Result<Vec<SentTask>, StoreError> {
         let (after_time, after_id) = after.unwrap_or((i64::MAX, ""));
-        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let state = state.map(SentState::as_str);
+        let limit = sql_count(limit);
         self.sent_tasks_where(
             "(created_at<?1 OR (created_at=?1 AND task_id<?2)) AND (?3 IS NULL OR state=?3) AND (?4=0 OR read_at IS NULL) ORDER BY created_at DESC, task_id DESC LIMIT ?5",
             &[&after_time, &after_id, &state, &i64::from(unread_only), &limit],
@@ -351,7 +352,7 @@ impl NodeStore {
         now: i64,
     ) -> Result<bool, StoreError> {
         Ok(self.connection.execute(
-            "UPDATE sent_tasks SET read_at=COALESCE(read_at, ?2) WHERE task_id=?1 AND state NOT IN ('waiting','working')",
+            &format!("UPDATE sent_tasks SET read_at=COALESCE(read_at, ?2) WHERE task_id=?1 AND NOT {ACTIVE}", ACTIVE = ACTIVE.as_str()),
             params![task_id, now],
         )? == 1)
     }
@@ -359,7 +360,10 @@ impl NodeStore {
     /// Deletes the ended tasks that ended at `before` or earlier.
     pub fn purge_sent_tasks(&self, before: i64) -> Result<usize, StoreError> {
         Ok(self.connection.execute(
-            "DELETE FROM sent_tasks WHERE state NOT IN ('waiting','working') AND finished_at<=?1",
+            &format!(
+                "DELETE FROM sent_tasks WHERE NOT {ACTIVE} AND finished_at<=?1",
+                ACTIVE = ACTIVE.as_str()
+            ),
             [before],
         )?)
     }
@@ -367,7 +371,7 @@ impl NodeStore {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::path::PathBuf;
 
     use rusqlite::Connection;
 
@@ -418,13 +422,7 @@ mod tests {
         store
             .insert_sent_task(&sent("task", "endpoint", 10))
             .expect("sent task must insert");
-        let prefix = format!("{}{}", database.display(), ".backup.");
-        let backups = fs::read_dir(database.parent().expect("parent must exist"))
-            .expect("parent must read")
-            .filter_map(Result::ok)
-            .filter(|entry| entry.path().to_string_lossy().starts_with(&prefix))
-            .count();
-        assert_eq!(backups, 1);
+        assert_eq!(backup_count(&database), 1);
     }
 
     #[test]
@@ -587,5 +585,20 @@ mod tests {
         assert_eq!(store.sent_task("old"), Ok(None));
         assert!(store.sent_task("recent").expect("read").is_some());
         assert!(store.sent_task("active").expect("read").is_some());
+    }
+
+    #[test]
+    fn sent_state_names_stay_the_same() {
+        for (state, name, active) in [
+            (SentState::Waiting, "waiting", true),
+            (SentState::Working, "working", true),
+            (SentState::Answered, "answered", false),
+            (SentState::Failed, "failed", false),
+            (SentState::NotDelivered, "not_delivered", false),
+        ] {
+            assert_eq!(state.as_str(), name);
+            assert_eq!(SentState::parse(name), Some(state));
+            assert_eq!(state.is_active(), active);
+        }
     }
 }

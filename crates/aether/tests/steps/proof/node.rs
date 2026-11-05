@@ -19,7 +19,7 @@ use aether_core::{
     Claim, Denial, EndpointId, PolicyEngine, Request, RequestId, TaskId,
 };
 use aether_store::{
-    Admission as StoreAdmission, NodeStore, QueueLimits, StoreError, TaskState,
+    NodeStore, QueueLimits, StoreError, TaskAdmission as StoreAdmission, TaskState,
 };
 use cucumber::{given, then, when};
 use tempfile::TempDir;
@@ -111,7 +111,9 @@ impl Seed {
         match self {
             Self::Nothing => {}
             Self::LostResult => {
-                store.put_scope("direct", "direct").expect("scope must store");
+                store
+                    .put_scope("direct", aether_core::ScopeKind::Direct)
+                    .expect("scope must store");
                 store
                     .admit(&task_input("task", "request", "key"), limits)
                     .expect("task must queue");
@@ -120,13 +122,15 @@ impl Seed {
                 store.recover_expired_leases(1).expect("task must recover");
             }
             Self::FullQueue => {
-                store.put_scope("direct", "direct").expect("scope must store");
-                let other = aether_store::TaskInput {
-                    caller_agent_id: "other-caller".to_owned(),
-                    caller_endpoint_id: "other-endpoint".to_owned(),
-                    request_fingerprint: "other-fingerprint".to_owned(),
-                    ..task_input("other-task", "other-request", "other-key")
-                };
+                store
+                    .put_scope("direct", aether_core::ScopeKind::Direct)
+                    .expect("scope must store");
+                let mut other = task_input("other-task", "other-request", "other-key");
+                other.request.caller_agent_id =
+                    aether_core::AgentId::new("other-caller");
+                other.request.caller_endpoint_id =
+                    aether_core::EndpointId::new("other-endpoint");
+                "other-fingerprint".clone_into(&mut other.request_fingerprint);
                 store.admit(&other, limits).expect("task must queue");
             }
         }
@@ -203,8 +207,9 @@ impl State {
             let root = tempfile::tempdir().expect("temporary directory must create");
             let workspace = root.path().join("workspace");
             fs::create_dir_all(&workspace).expect("workspace must exist");
-            let mut store = NodeStore::open(root.path().join("node.sqlite"))
-                .expect("store must open");
+            let mut store =
+                NodeStore::open(root.path().join(aether_store::NODE_DATABASE))
+                    .expect("store must open");
             seed.apply(&mut store);
             let scope = scope("direct");
             let grants = if grants { vec![grant(&scope)] } else { Vec::new() };
@@ -280,7 +285,7 @@ fn submit_review(node: &Node, claim: &Claim) -> Outcome {
 }
 
 fn event_types(events: Vec<aether_store::TaskEvent>) -> Vec<String> {
-    events.into_iter().map(|event| event.event_type).collect()
+    events.into_iter().map(|event| event.event_type.as_str().to_owned()).collect()
 }
 
 #[given("a proof node that grants review to the caller")]
@@ -451,7 +456,7 @@ fn agent_turns(world: &mut World, turns: usize) {
 
 #[then(expr = "the task is {word}")]
 async fn task_is(world: &mut World, state: String) {
-    let expected = state.parse::<TaskState>().expect("a known task state");
+    let expected = TaskState::parse(&state).expect("a known task state");
     let actual = world.proof.node.with_node(|node| node.state("task")).await;
     assert_eq!(actual.expect("task state must load"), expected);
 }

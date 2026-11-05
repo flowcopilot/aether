@@ -5,8 +5,8 @@ use std::{
 };
 
 use aether_store::{
-    AuditActor, AuditResult, ManagedMember, NodeStore, NodeSummary, StoreError,
-    TaskActivity,
+    AuditActor, AuditResult, ChangeKind, ManagedMember, NodeStore, NodeSummary,
+    StoreError, TaskActivity,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -70,19 +70,22 @@ impl ChangeRequest {
         Ok(Change { request: self, expires_at })
     }
 
-    /// Rebuilds a request from the `kind` and `value` strings that the store
-    /// keeps for a pending change.
-    fn from_stored(kind: &str, id: String, value: String) -> Result<Self, AdminError> {
+    /// Rebuilds a request from the value that the store keeps for a pending
+    /// change.
+    fn from_stored(
+        kind: ChangeKind,
+        id: String,
+        value: String,
+    ) -> Result<Self, AdminError> {
         match kind {
-            "workspace" => Ok(Self::Workspace { id, path: value }),
-            "grant" => Ok(Self::Grant { id, grant: value }),
-            "directory" => Ok(Self::Directory { id, url: value }),
-            "capability" => Ok(Self::Capability { id, capability: value }),
-            "limit" => value
+            ChangeKind::Workspace => Ok(Self::Workspace { id, path: value }),
+            ChangeKind::Grant => Ok(Self::Grant { id, grant: value }),
+            ChangeKind::Directory => Ok(Self::Directory { id, url: value }),
+            ChangeKind::Capability => Ok(Self::Capability { id, capability: value }),
+            ChangeKind::Limit => value
                 .parse::<u32>()
                 .map(|limit| Self::Limit { id, limit })
                 .map_err(|_| AdminError::InvalidField("limit")),
-            _ => Err(AdminError::InvalidField("change_type")),
         }
     }
 
@@ -97,16 +100,14 @@ impl ChangeRequest {
         }
     }
 
-    /// The kind string that the store keeps, and that names the
-    /// `admin.<kind>.<id>` configuration key.
     #[must_use]
-    pub const fn kind(&self) -> &'static str {
+    pub const fn kind(&self) -> ChangeKind {
         match self {
-            Self::Workspace { .. } => "workspace",
-            Self::Grant { .. } => "grant",
-            Self::Directory { .. } => "directory",
-            Self::Capability { .. } => "capability",
-            Self::Limit { .. } => "limit",
+            Self::Workspace { .. } => ChangeKind::Workspace,
+            Self::Grant { .. } => ChangeKind::Grant,
+            Self::Directory { .. } => ChangeKind::Directory,
+            Self::Capability { .. } => ChangeKind::Capability,
+            Self::Limit { .. } => ChangeKind::Limit,
         }
     }
 
@@ -385,20 +386,12 @@ pub mod test_support {
     }
 }
 impl Administration {
-    /// Recovers the durable revision (`admin.revision`) if one was ever
-    /// written, so a restart resumes counting from where the last process
-    /// left off instead of resetting to 0 and silently letting a
-    /// since-restart confirmation attempt for a pending change queued
-    /// before the restart look "not stale" when the live policy has, in
-    /// fact, moved on. Missing or unreadable defaults to 0 — the same
-    /// starting point a node that never had this column would have had.
+    /// Resumes the durable admin revision, so that a pending change queued
+    /// before a restart is still found stale. An unreadable revision counts
+    /// as 0, as on a node that never applied a change.
     #[must_use]
     pub fn with_store(store: NodeStore) -> Self {
-        let revision = store
-            .configuration("admin.revision")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(0);
+        let revision = store.admin_revision().unwrap_or(0);
         Self {
             revision: std::sync::atomic::AtomicU64::new(revision),
             store,
@@ -445,18 +438,13 @@ impl Administration {
                 self.revision.load(std::sync::atomic::Ordering::Acquire);
             self.store
                 .queue_change(
-                    change.id(),
                     change.kind(),
+                    change.id(),
                     &change.value(),
                     expires_at(change.expires_at),
+                    base_revision,
                 )
                 .map_err(|_| AdminError::Store)?;
-            // Durable, so a confirmation attempted after a restart can
-            // still detect staleness.
-            let _ = self.store.put_configuration(
-                &pending_revision_key(change.id()),
-                &base_revision.to_string(),
-            );
         } else {
             self.apply_now(change, AuditActor::Mcp)?;
         }
@@ -479,50 +467,43 @@ impl Administration {
         change: &Change,
         actor: AuditActor,
     ) -> Result<(), AdminError> {
-        let key = format!("admin.{}.{}", change.kind(), change.id());
-        let previous = self.store.configuration(&key).ok();
-        self.store
-            .put_configuration(&key, &change.value())
+        let previous = self
+            .store
+            .apply_change(change.kind(), change.id(), &change.value())
             .map_err(|_| AdminError::Store)?;
-        let error = match self.apply_live(change) {
-            Ok(()) => {
-                return self
-                    .store
-                    .record_change(actor, AuditResult::Applied)
-                    .map_err(|_| AdminError::Store);
-            }
-            Err(error) => error,
-        };
-        self.store
-            .revert_change(change.id(), change.kind(), previous.as_deref(), actor)
-            .map_err(|_| AdminError::Store)?;
-        Err(error)
+        self.finish_live(change, previous.as_deref(), actor)
     }
 
-    /// Applies `change` live, and — only on success — advances the policy
-    /// revision every pending change's confirmation is bound to. This is
-    /// the part of "one typed policy revision" this session's scoped work
-    /// could reach without the full architecture phase 36 defers: a single
-    /// counter, incremented once per applied change and kept durably under
-    /// `admin.revision`.
-    fn apply_live(&self, change: &Change) -> Result<(), AdminError> {
-        let result = self.apply_live_inner(change);
-        if result.is_ok() {
-            // `fetch_add` wraps, so the new value wraps with it.
-            let revision = self
-                .revision
-                .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-                .wrapping_add(1);
-            // Best-effort: the live change already succeeded, so a failure
-            // to persist the new revision number does not undo it. It does
-            // mean a crash in this exact window recovers one revision
-            // behind on the next restart — the same order of risk the
-            // existing durable-then-live sequence elsewhere in this file
-            // already accepts, not a new one this introduces.
-            let _ =
-                self.store.put_configuration("admin.revision", &revision.to_string());
+    /// Applies `change` live once its durable value is written. Success
+    /// records the new admin revision with the audit record; a live failure
+    /// restores `previous`, the durable value that the change replaced.
+    fn finish_live(
+        &mut self,
+        change: &Change,
+        previous: Option<&str>,
+        actor: AuditActor,
+    ) -> Result<(), AdminError> {
+        match self.apply_live(change) {
+            Ok(revision) => self
+                .store
+                .record_applied_change(actor, revision)
+                .map_err(|_| AdminError::Store),
+            Err(error) => {
+                self.store
+                    .revert_change(change.kind(), change.id(), previous, actor)
+                    .map_err(|_| AdminError::Store)?;
+                Err(error)
+            }
         }
-        result
+    }
+
+    /// Applies `change` live and returns the admin revision it moved to.
+    fn apply_live(&self, change: &Change) -> Result<u64, AdminError> {
+        self.apply_live_inner(change)?;
+        Ok(self
+            .revision
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            .wrapping_add(1))
     }
 
     fn apply_live_inner(&self, change: &Change) -> Result<(), AdminError> {
@@ -533,14 +514,9 @@ impl Administration {
             }
             ChangeRequest::Workspace { id, path } => {
                 live.map_or(Ok(()), |live| live.apply_workspace(id, path))?;
-                // Multiple ids can each hold their own workspace history under
-                // `admin.workspace.<id>`, but exactly one workspace is ever
-                // live at a time. This single key records which stored value
-                // that is, so a restart can restore it — see
-                // `node_config::load_service`.
-                self.store
-                    .put_configuration("admin.current.workspace", path)
-                    .map_err(|_| AdminError::Store)
+                // Each workspace id keeps its own path, and one of them is
+                // live; a restart makes that one live again.
+                self.store.set_current_workspace(path).map_err(|_| AdminError::Store)
             }
             ChangeRequest::Grant { id, grant } => {
                 live.map_or(Ok(()), |live| live.apply_grant(id, grant))
@@ -600,42 +576,20 @@ impl Administration {
         )?;
         let change = change_from_pending(&pending)?;
         self.check_not_stale(id)?;
-        let key = format!("admin.{}.{}", change.kind(), change.id());
-        let previous = self.store.configuration(&key).ok();
-        self.store.confirm_pending_change(id).map_err(|error| match error {
-            StoreError::InvalidState => AdminError::Expired,
-            StoreError::NotFound => AdminError::ConfirmationRequired,
-            _ => AdminError::Store,
-        })?;
-        match self.apply_live(&change) {
-            Ok(()) => self
-                .store
-                .record_change(AuditActor::Ui, AuditResult::Applied)
-                .map_err(|_| AdminError::Store),
-            Err(error) => {
-                self.store
-                    .revert_change(
-                        change.id(),
-                        change.kind(),
-                        previous.as_deref(),
-                        AuditActor::Ui,
-                    )
-                    .map_err(|_| AdminError::Store)?;
-                Err(error)
-            }
-        }
+        let previous =
+            self.store.confirm_pending_change(id).map_err(|error| match error {
+                StoreError::InvalidState => AdminError::Expired,
+                StoreError::NotFound => AdminError::ConfirmationRequired,
+                _ => AdminError::Store,
+            })?;
+        self.finish_live(&change, previous.as_deref(), AuditActor::Ui)
     }
 
     /// Rejects confirming `id` if some other change was applied live after
-    /// it was queued. The base revision is the durable one, so this works
-    /// across a restart. Finding none skips the check rather than blocking
-    /// confirmation forever.
+    /// it was queued. A change that an older node queued has no revision and
+    /// is not checked.
     fn check_not_stale(&self, id: &str) -> Result<(), AdminError> {
-        let base = self
-            .store
-            .configuration(&pending_revision_key(id))
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok());
+        let base = self.store.pending_revision(id).map_err(|_| AdminError::Store)?;
         match base {
             Some(base)
                 if base != self.revision.load(std::sync::atomic::Ordering::Acquire) =>
@@ -672,15 +626,10 @@ impl Administration {
         self.audited(result)
     }
 
-    fn revoke(&self, id: &str) -> Result<(), AdminError> {
+    fn revoke(&mut self, id: &str) -> Result<(), AdminError> {
         valid(id, "id")?;
         let live = self.live.clone().ok_or(AdminError::Unsupported("revoke"))?;
-        self.store
-            .put_configuration(&revoked_grant_key(id), "revoked")
-            .and_then(|()| {
-                self.store.delete_configuration(&format!("admin.grant.{id}"))
-            })
-            .map_err(|_| AdminError::Store)?;
+        self.store.revoke_applied_grant(id).map_err(|_| AdminError::Store)?;
         live.revoke_grant(id)?;
         self.store
             .record_change(AuditActor::Ui, AuditResult::Applied)
@@ -714,9 +663,9 @@ impl Administration {
                 records
                     .into_iter()
                     .map(|record| AuditEntry {
-                        actor: record.actor_type,
-                        action: record.action,
-                        result: record.result,
+                        actor: record.actor.as_str().to_owned(),
+                        action: record.action.as_str().to_owned(),
+                        result: record.result.as_str().to_owned(),
                     })
                     .collect()
             },
@@ -731,7 +680,7 @@ impl Administration {
                     .into_iter()
                     .map(|change| PendingChange {
                         id: change.id,
-                        kind: change.change_type,
+                        kind: change.kind.as_str().to_owned(),
                     })
                     .collect()
             },
@@ -739,8 +688,8 @@ impl Administration {
     }
 
     #[must_use]
-    pub fn configured_change_counts(&self) -> BTreeMap<String, usize> {
-        self.store.configuration_key_counts("admin.").unwrap_or_default()
+    pub fn configured_change_counts(&self) -> BTreeMap<ChangeKind, usize> {
+        self.store.applied_change_counts().unwrap_or_default()
     }
 
     #[must_use]
@@ -759,7 +708,12 @@ impl Administration {
     pub fn audit_page(&self, skip: usize, limit: usize) -> Vec<String> {
         self.store.audit_records_page(skip, limit).map_or_else(
             |_| Vec::new(),
-            |records| records.into_iter().map(|record| record.result).collect(),
+            |records| {
+                records
+                    .into_iter()
+                    .map(|record| record.result.as_str().to_owned())
+                    .collect()
+            },
         )
     }
 
@@ -791,7 +745,7 @@ impl Change {
     }
 
     #[must_use]
-    pub const fn kind(&self) -> &'static str {
+    pub const fn kind(&self) -> ChangeKind {
         self.request.kind()
     }
 
@@ -804,19 +758,6 @@ fn expires_at(value: SystemTime) -> i64 {
     aether_core::time::unix_timestamp(value).unwrap_or(i64::MAX)
 }
 
-/// Durable key holding the revision a pending change was queued against,
-/// so `check_not_stale` can detect staleness even after a restart.
-fn pending_revision_key(id: &str) -> String {
-    format!("admin.pending_revision.{id}")
-}
-
-/// The configuration key that marks grant `id` as revoked, which
-/// `node_config::load_service` reads at start.
-#[must_use]
-pub fn revoked_grant_key(id: &str) -> String {
-    format!("admin.revoked.{id}")
-}
-
 /// Rebuilds a typed `Change` from a durably stored pending change so
 /// `confirm_ui` can apply it live the same way an immediate change is
 /// applied. `expires_at` is not meaningful here: the store checks the
@@ -825,7 +766,7 @@ fn change_from_pending(
     pending: &aether_store::PendingChange,
 ) -> Result<Change, AdminError> {
     let request = ChangeRequest::from_stored(
-        &pending.change_type,
+        pending.kind,
         pending.id.clone(),
         pending.value.clone(),
     )?;
@@ -972,7 +913,7 @@ mod tests {
     #[test]
     fn confirmed_change_updates_durable_node_state() {
         let directory = tempfile::tempdir().expect("directory must create");
-        let database = directory.path().join("node.sqlite");
+        let database = directory.path().join(aether_store::NODE_DATABASE);
         let store = NodeStore::open(&database).expect("store must open");
         let node = Arc::new(FakeNode::default());
         let mut administration = Administration::with_store(store);
@@ -997,8 +938,8 @@ mod tests {
         drop(administration);
         let store = NodeStore::open(&database).expect("store must reopen");
         assert_eq!(
-            store.configuration("admin.workspace.workspace"),
-            Ok("project".to_owned())
+            store.applied_change(aether_store::ChangeKind::Workspace, "workspace"),
+            Ok(Some("project".to_owned()))
         );
     }
 
@@ -1038,7 +979,7 @@ mod tests {
     #[test]
     fn a_stale_confirmation_is_detected_after_a_restart() {
         let directory = tempfile::tempdir().expect("directory must create");
-        let database = directory.path().join("node.sqlite");
+        let database = directory.path().join(aether_store::NODE_DATABASE);
         let mut administration = Administration::with_store(
             NodeStore::open(&database).expect("store must open"),
         );
@@ -1080,7 +1021,7 @@ mod tests {
     #[test]
     fn a_failed_confirmation_reverts_the_durable_value() {
         let directory = tempfile::tempdir().expect("directory must create");
-        let database = directory.path().join("node.sqlite");
+        let database = directory.path().join(aether_store::NODE_DATABASE);
         let store = NodeStore::open(&database).expect("store must open");
         let mut administration = Administration::with_store(store);
         let node = Arc::new(FakeNode::default());
@@ -1107,15 +1048,15 @@ mod tests {
         drop(administration);
         let store = NodeStore::open(&database).expect("store must reopen");
         assert_eq!(
-            store.configuration("admin.grant.peer"),
-            Err(aether_store::StoreError::NotFound)
+            store.applied_change(aether_store::ChangeKind::Grant, "peer"),
+            Ok(None)
         );
     }
 
     #[test]
     fn a_storage_failure_during_confirmation_leaves_the_live_node_unchanged() {
         let directory = tempfile::tempdir().expect("directory must create");
-        let database = directory.path().join("node.sqlite");
+        let database = directory.path().join(aether_store::NODE_DATABASE);
         let store = NodeStore::open(&database).expect("store must open");
         let mut administration = Administration::with_store(store);
         let node = Arc::new(FakeNode::default());
@@ -1159,7 +1100,7 @@ mod tests {
     )]
     fn concurrent_workspace_changes_apply_or_go_stale_without_corrupting_state() {
         let directory = tempfile::tempdir().expect("directory must create");
-        let database = directory.path().join("node.sqlite");
+        let database = directory.path().join(aether_store::NODE_DATABASE);
         let store = NodeStore::open(&database).expect("store must open");
         let administration = shared_with_store(store);
         let node = Arc::new(FakeNode::default());
@@ -1229,8 +1170,9 @@ mod tests {
                 assert_eq!(
                     administration
                         .store
-                        .configuration(&format!("admin.workspace.{id}"))
-                        .ok(),
+                        .applied_change(aether_store::ChangeKind::Workspace, id)
+                        .ok()
+                        .flatten(),
                     Some(path.clone())
                 );
             } else {
@@ -1338,7 +1280,13 @@ mod tests {
         let directory = tempfile::tempdir().expect("directory must create");
         let mut store = NodeStore::in_dir(directory.path()).expect("store must open");
         store
-            .queue_change("workspace", "workspace", "project", 1)
+            .queue_change(
+                aether_store::ChangeKind::Workspace,
+                "workspace",
+                "project",
+                1,
+                0,
+            )
             .expect("change must queue");
         let mut administration = Administration::with_store(store);
         assert_eq!(administration.confirm_ui("workspace"), Err(AdminError::Expired));
@@ -1351,7 +1299,7 @@ mod tests {
     #[test]
     fn a_failed_live_change_restores_the_durable_value() {
         let directory = tempfile::tempdir().expect("directory must create");
-        let database = directory.path().join("node.sqlite");
+        let database = directory.path().join(aether_store::NODE_DATABASE);
         let store = NodeStore::open(&database).expect("store must open");
         let node = Arc::new(FakeNode::default().with_queue_limit(10));
         let mut administration = Administration::with_store(store);
@@ -1368,13 +1316,16 @@ mod tests {
         drop(administration);
 
         let store = NodeStore::open(&database).expect("store must reopen");
-        assert_eq!(store.configuration("admin.limit.queue_global"), Ok("2".to_owned()));
+        assert_eq!(
+            store.applied_change(aether_store::ChangeKind::Limit, "queue_global"),
+            Ok(Some("2".to_owned()))
+        );
     }
 
     #[test]
     fn a_failed_first_live_change_leaves_no_durable_value() {
         let directory = tempfile::tempdir().expect("directory must create");
-        let database = directory.path().join("node.sqlite");
+        let database = directory.path().join(aether_store::NODE_DATABASE);
         let store = NodeStore::open(&database).expect("store must open");
         let mut administration = Administration::with_store(store);
         let node = Arc::new(FakeNode::default().with_queue_limit(10));
@@ -1388,8 +1339,8 @@ mod tests {
 
         let store = NodeStore::open(&database).expect("store must reopen");
         assert_eq!(
-            store.configuration("admin.limit.queue_per_peer"),
-            Err(aether_store::StoreError::NotFound)
+            store.applied_change(aether_store::ChangeKind::Limit, "queue_per_peer"),
+            Ok(None)
         );
     }
 
@@ -1409,7 +1360,7 @@ mod tests {
     #[test]
     fn pending_typed_change_survives_a_restart() {
         let directory = tempfile::tempdir().expect("directory must create");
-        let database = directory.path().join("node.sqlite");
+        let database = directory.path().join(aether_store::NODE_DATABASE);
         let store = NodeStore::open(&database).expect("store must open");
         let mut administration = Administration::with_store(store);
         administration
@@ -1439,8 +1390,8 @@ mod tests {
 
         let store = NodeStore::open(&database).expect("store must reopen");
         assert_eq!(
-            store.configuration("admin.workspace.workspace"),
-            Ok("project".to_owned())
+            store.applied_change(aether_store::ChangeKind::Workspace, "workspace"),
+            Ok(Some("project".to_owned()))
         );
     }
 }
