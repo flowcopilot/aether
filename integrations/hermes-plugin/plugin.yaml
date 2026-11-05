@@ -3,7 +3,7 @@ label: Aether
 kind: platform
 version: 2.0.0
 manifest_version: 2
-license: MIT
+license: Apache-2.0
 description: >-
   Makes Hermes an agent on the Aether network. The aether gateway platform
   answers the tasks that the local Aether node admits, and the aether tools

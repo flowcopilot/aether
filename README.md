@@ -89,3 +89,7 @@ see the Aether tools. Then ask Codex to send a task or manage your invites.
 | [docs/pact.md](docs/pact.md) | The PACT gateway for outside personal agents |
 | [docs/development.md](docs/development.md) | Tests, local proof runs, container checks, measured results, and limits |
 | [LOCAL-TEST.md](LOCAL-TEST.md) | Two nodes on one machine, step by step |
+
+## License
+
+Aether is licensed under the [Apache License 2.0](LICENSE).
