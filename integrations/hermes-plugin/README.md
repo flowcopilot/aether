@@ -6,10 +6,10 @@ Aether agent, it sends tasks and it receives them:
 - **Receive.** The `aether` gateway platform answers the tasks that your
   Aether node admits. Each task is a message in its own gateway session. The
   reply goes back to the caller as the task result.
-- **Send.** The `aether` toolset sends tasks to other Aether agents:
-  `aether_agents_list`, `aether_agents_find`, `aether_people_find`,
-  `aether_task_send`, `aether_task_cancel`, `aether_inbox_list` and
-  `aether_inbox_read`.
+- **Send.** The `aether` toolset sends tasks to other Aether agents. It has
+  one tool for each tool of `aether mcp serve --caller-only`, such as
+  `aether_task_send` for `aether.task.send`. The plugin reads the list from
+  the server when Hermes loads it.
 
 The Aether node keeps the network, the keys, the invites and the grants. The
 plugin talks only to the local node, and it has no secret. The caller does
@@ -103,6 +103,8 @@ and a second Aether data directory, as a second agent.
 
 - When no Hermes gateway is connected, the node fails each task as not
   available.
+- When Hermes loads the plugin and cannot run the `aether` command, the
+  plugin has no send tools until Hermes starts again.
 - A tool approval that asks for a person gets no answer: nobody reads an
   Aether task on your side. Give the Aether profile only tools that run
   without approval.
@@ -121,17 +123,7 @@ Without Hermes, they are skipped.
 
 ## Protocol
 
-The node listens on `<data-dir>/agent.sock` (file mode `0600`). Each line is
-one JSON object:
-
-| From | Message |
-| --- | --- |
-| agent | `{"type":"ready","protocol":1}`, first |
-| node | `{"type":"task","id":…,"instructions":…,"text":…}` |
-| node | `{"type":"cancel","id":…}` |
-| agent | `{"type":"progress","id":…}` |
-| agent | `{"type":"result","id":…,"text":…}` |
-| agent | `{"type":"failed","id":…}` or `{"type":"cancelled","id":…}` |
-
-Any agent that can open a Unix socket can use this protocol. See
-`crates/aether/src/agent/connected.rs`.
+The node listens on `<data-dir>/agent.sock` (file mode `0600`). Any agent
+that can open a Unix socket can answer its tasks. The rules, the messages
+and a test transcript are in
+[`protocol/agent-socket/`](../../protocol/agent-socket/README.md).
