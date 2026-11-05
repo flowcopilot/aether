@@ -5,6 +5,7 @@
 # By default the model is the mock at $MOCK_MODEL_URL. With
 # OPENROUTER_API_KEY and DEMO_MODEL set, an OpenRouter model answers.
 set -eu
+. /opt/demo/node.sh
 
 data_dir=/root/.aether/host
 logs=/root/.openclaw/logs/demo
@@ -19,17 +20,12 @@ else
   openclaw config set models.providers.mock.baseUrl "$MOCK_MODEL_URL" >"$logs/config.log" 2>&1
 fi
 
-aether node serve --adapter connected --data-dir "$data_dir" --port 4242 \
-  --admin-port 8442 --hub-url "${AETHER_HUB_URL:-off}" --invite-name bob \
-  >"$logs/node.log" 2>&1 &
-
-# The admin page listens on 127.0.0.1 only. Forward the container address
-# to it, so the host can open https://127.0.0.1:8442/.
-socat "TCP-LISTEN:8442,bind=$(hostname -i | cut -d' ' -f1),fork,reuseaddr" TCP:127.0.0.1:8442 &
+# The node page is https://127.0.0.1:8442/ on the host.
+start_node "$data_dir" 8442 bob "$logs/node.log"
 
 # The OpenClaw Control UI, served by the gateway on 127.0.0.1:18789.
 # `openclaw dashboard --no-open` prints the URL with a sign-in token.
-socat "TCP-LISTEN:18789,bind=$(hostname -i | cut -d' ' -f1),fork,reuseaddr" TCP:127.0.0.1:18789 &
+forward 18789
 
 # The plugin connects to agent.sock and tries again every 2 seconds, so the
 # gateway may start before the node has made the socket.

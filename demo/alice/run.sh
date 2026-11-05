@@ -5,6 +5,7 @@
 # By default the model is the mock at $MOCK_MODEL_URL. With
 # OPENROUTER_API_KEY and DEMO_MODEL set, an OpenRouter model answers.
 set -eu
+. /opt/demo/node.sh
 
 data_dir="$AETHER_DATA_DIR"
 logs=/opt/data/logs/demo
@@ -57,19 +58,14 @@ CONFIG
 
 rm -rf /opt/data/plugins/aether
 cp -r /opt/aether-plugin /opt/data/plugins/aether
-aether node serve --adapter connected --data-dir "$data_dir" --port 4242 \
-  --admin-port 8441 --hub-url "${AETHER_HUB_URL:-off}" --invite-name alice \
-  >"$logs/node.log" 2>&1 &
-
-# The admin page listens on 127.0.0.1 only. Forward the container address
-# to it, so the host can open https://127.0.0.1:8441/.
-socat "TCP-LISTEN:8441,bind=$(hostname -i | cut -d' ' -f1),fork,reuseaddr" TCP:127.0.0.1:8441 &
+# The node page is https://127.0.0.1:8441/ on the host.
+start_node "$data_dir" 8441 alice "$logs/node.log"
 
 # The Hermes web dashboard. It listens on 127.0.0.1, where it needs no
-# login. The forward below makes it http://127.0.0.1:9119/ on the host.
+# login. The forward makes it http://127.0.0.1:9119/ on the host.
 hermes dashboard --host 127.0.0.1 --port 9119 --no-open --skip-build \
   >"$logs/dashboard.log" 2>&1 &
-socat "TCP-LISTEN:9119,bind=$(hostname -i | cut -d' ' -f1),fork,reuseaddr" TCP:127.0.0.1:9119 &
+forward 9119
 
 # The plugin connects to agent.sock and tries again every 2 seconds, so the
 # gateway may start before the node has made the socket.

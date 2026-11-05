@@ -10,6 +10,7 @@
 set -eu
 
 here="$(cd "$(dirname "$0")" && pwd)"
+. "$here/../scripts/lib.sh"
 compose="docker compose -f $here/compose.yml"
 call="python3 $here/mcp-call.py"
 live=""
@@ -30,22 +31,21 @@ fail() {
   exit 1
 }
 
-cleanup() {
+down() {
   [ -n "${KEEP:-}" ] || $compose down -v >/dev/null 2>&1 || true
 }
 
-trap cleanup EXIT INT TERM
+trap down EXIT INT TERM
 $compose down -v >/dev/null 2>&1 || true
 $compose up -d --build >/dev/null 2>&1 || fail "docker compose up failed"
 
+gateways_ready() {
+  $compose logs alice 2>&1 | grep -qF 'aether connected' \
+    && $compose logs bob 2>&1 | grep -qF '[gateway] ready'
+}
+
 # Each agent connects to its node's agent.sock a few seconds after start.
-attempt=0
-until $compose logs alice 2>&1 | grep -qF 'aether connected' \
-  && $compose logs bob 2>&1 | grep -qF '[gateway] ready'; do
-  attempt=$((attempt + 1))
-  [ "$attempt" -lt 180 ] || fail "the Hermes or the OpenClaw gateway did not start"
-  sleep 1
-done
+retry 180 1 gateways_ready || fail "the Hermes or the OpenClaw gateway did not start"
 echo "ok: alice runs Hermes and bob runs OpenClaw"
 
 agents="$(sh "$here/connect.sh")" || fail "alice and bob did not connect"
@@ -53,21 +53,18 @@ alice_agent="$(printf '%s\n' "$agents" | sed -n 's/^ALICE_AGENT=//p')"
 bob_agent="$(printf '%s\n' "$agents" | sed -n 's/^BOB_AGENT=//p')"
 echo "ok: bob can send to '$alice_agent' and alice can send to '$bob_agent'"
 
+answered() {
+  result="$($call "$1" aether.task.send "{\"agent\":\"$2\",\"text\":\"$3\"}" 2>&1)" || true
+  printf '%s\n' "$result" | grep -qF '"status":"answered"'
+}
+
 # send <from> <to agent> <text>: send a task and print the answer text. The
 # plugin connects a few seconds after its gateway starts; until then the node
 # fails the task as not available, so try again.
 send() {
-  attempt=0
-  while :; do
-    attempt=$((attempt + 1))
-    result="$($call "$1" aether.task.send "{\"agent\":\"$2\",\"text\":\"$3\"}" 2>&1)" || true
-    if printf '%s\n' "$result" | grep -qF '"status":"answered"'; then
-      printf '%s\n' "$result"
-      return 0
-    fi
-    [ "$attempt" -lt "${live:+6}${live:-15}" ] || fail "$1 got no answer from $2: $result"
-    sleep "${live:+20}${live:-3}"
-  done
+  retry "${live:+6}${live:-15}" "${live:+20}${live:-3}" answered "$1" "$2" "$3" \
+    || fail "$1 got no answer from $2: $result"
+  printf '%s\n' "$result"
 }
 
 # expect <answer> <text>: in mock mode, the answer holds the mock's text.

@@ -9,7 +9,7 @@ RUN apt-get -o Acquire::Retries=3 update \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=aether /usr/local/bin/aether /usr/local/bin/aether
 COPY --exclude=tests --exclude=__pycache__ . /opt/aether-plugin/
-COPY --from=demo run.sh /opt/demo/
+COPY --from=demo alice/run.sh node.sh /opt/demo/
 # The node's data directory is a volume. Make it here so the volume belongs
 # to the hermes user. /opt/data is a VOLUME of the base image, so build
 # changes there are lost.
