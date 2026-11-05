@@ -7,9 +7,8 @@ brief-tehnologic/*.pdf
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
 
-# Personal editor and MCP settings.
+# Personal editor settings.
 .vscode/
-.mcp.json
 
 # A global `*.sql` ignore rule (meant for local dump/log files) otherwise
 # silently excludes this crate's migration sources from every commit.
