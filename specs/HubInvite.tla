@@ -16,14 +16,14 @@
 (*                                          remove_hub_approval,           *)
 (*                                          clear_expired_hub_approvals,   *)
 (*                                          put_hub_block, remove_hub_block*)
-(*   server/lib/aether_hub/hub.ex           the honest hub rows            *)
+(*   server/lib/aether_hub/invites.ex       the honest hub rows            *)
 (*                                                                         *)
 (* The hub is untrusted. When `honest` is FALSE, every row that a node     *)
 (* reads can be any row: the hub can change any field, replay old lines,   *)
 (* reorder rows, or drop them. When `honest` is TRUE, the hub follows      *)
-(* hub.ex. `honest` is chosen in Init and does not change, so one TLC run  *)
-(* checks the safety properties against an attacker hub and the liveness  *)
-(* property against an honest hub.                                         *)
+(* invites.ex. `honest` is chosen in Init and does not change, so one TLC  *)
+(* run checks the safety properties against an attacker hub and the        *)
+(* liveness property against an honest hub.                                *)
 (*                                                                         *)
 (* Abstracted away: days (host_step refuses more days than approved; this  *)
 (* spec has no days), access groups (approve always sets "requests"), the  *)
@@ -81,7 +81,7 @@ CallerApp == [kind: Origins \cup {None}, peer: HostNames \cup {None}, lep: HostE
 NoCallerApp == [kind |-> None, peer |-> None, lep |-> None]
 
 VARIABLES
-    honest,       \* whether the hub follows hub.ex (fixed in Init)
+    honest,       \* whether the hub follows invites.ex (fixed in Init)
     hub,          \* the honest hub rows
     hApp,         \* host: hub_approvals
     hVer,         \* ghost: the last approval version of each id
