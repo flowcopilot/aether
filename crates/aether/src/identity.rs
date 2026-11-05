@@ -159,8 +159,7 @@ impl TrustProvider for RosterClaims {
             .any(|member| {
                 member.agent_id == claim.subject_agent_id.as_str()
                     && member.endpoint_id == authenticated_endpoint.as_str()
-                    && member.expires_at > now
-                    && member.revoked_at.is_none()
+                    && member.is_active(now)
             });
         if active {
             Ok(())

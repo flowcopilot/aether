@@ -12,7 +12,11 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::admin::{AdminError, AuditEntry, ChangeRequest, SharedAdministration};
+use aether_store::AuditActor;
+
+use crate::admin::{
+    AdminError, AuditEntry, ChangeOutcome, ChangeRequest, SharedAdministration,
+};
 
 const MAX_SOCKET_BYTES: u64 = 65_536;
 /// A busy node can delay its accept loop. One second was too short under load,
@@ -39,16 +43,14 @@ pub enum Request {
         task_id: String,
     },
     Change {
-        change: ChangeRequest,
+        change: Box<ChangeRequest>,
         dry_run: bool,
-    },
-    ConfirmMcp {
-        id: String,
     },
     /// Starts a round of the node's outbox.
     OutboxWake,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum Response {
@@ -171,6 +173,15 @@ fn handle(
     data_dir: &Path,
     request: Request,
 ) -> Response {
+    if let Request::CreateInvite { friend_name, endpoint_id, days } = &request {
+        return create_invite_response(
+            administration,
+            data_dir,
+            friend_name,
+            endpoint_id,
+            *days,
+        );
+    }
     let Ok(mut administration) = administration.lock() else {
         return Response::Error { code: "unavailable".to_owned() };
     };
@@ -193,76 +204,6 @@ fn handle(
                 })
                 .collect(),
         },
-        Request::CreateInvite { friend_name, endpoint_id, days } => {
-            // The hub name comes first, as on the host page.
-            let Some(agent_name) = crate::settings::setting::<
-                crate::hub_client::settings::HubName,
-            >(data_dir)
-            .ok()
-            .flatten()
-            .or_else(|| {
-                crate::settings::setting::<crate::direct::HostName>(data_dir).ok()
-            }) else {
-                return Response::Error { code: "unavailable".to_owned() };
-            };
-            let Ok(relay_url) = crate::settings::setting::<
-                crate::transport::relay::ActiveRelay,
-            >(data_dir) else {
-                return Response::Error { code: "unavailable".to_owned() };
-            };
-            // The card comes first: when it fails, the node applies no grant.
-            let Ok(agent_card) = crate::direct::create_card(data_dir, &agent_name)
-            else {
-                return Response::Error { code: "unavailable".to_owned() };
-            };
-            let Ok((authorization, grant)) = crate::direct::sign_invite_access(
-                data_dir,
-                &friend_name,
-                &endpoint_id,
-                days,
-            ) else {
-                return Response::Error { code: "invalid".to_owned() };
-            };
-            let Ok(grant_text) = crate::identity::encode_grant(&grant) else {
-                return Response::Error { code: "invalid".to_owned() };
-            };
-            let change = match (crate::admin::ChangeRequest::Grant {
-                id: grant.id.as_str().to_owned(),
-                grant: grant_text,
-            })
-            .into_change()
-            {
-                Ok(change) => change,
-                Err(error) => return error_response(&error),
-            };
-            // New invites join friends, as on the host page.
-            match crate::access_groups::join_and_apply(
-                data_dir,
-                crate::access_groups::FRIENDS_GROUP,
-                &friend_name,
-                &endpoint_id,
-                || administration.apply_ui(&change),
-            ) {
-                Ok(()) => {}
-                Err(crate::access_groups::JoinError::Apply(error)) => {
-                    return error_response(&error);
-                }
-                Err(crate::access_groups::JoinError::Store(_)) => {
-                    return Response::Error { code: "unavailable".to_owned() };
-                }
-            }
-            match crate::direct::encode_invite_after_grant(
-                data_dir,
-                &agent_name,
-                days,
-                authorization,
-                relay_url,
-                agent_card,
-            ) {
-                Ok(line) => Response::Invitation { line },
-                Err(_) => Response::Error { code: "unavailable".to_owned() },
-            }
-        }
         Request::RevokeGrant { id } => {
             if !administration.grants().iter().any(|grant| {
                 grant.id.as_str() == id
@@ -270,12 +211,12 @@ fn handle(
             }) {
                 return Response::Error { code: "not_found".to_owned() };
             }
-            match administration.revoke_ui(&id) {
+            match administration.revoke(&id, AuditActor::Mcp) {
                 Ok(()) => Response::Applied,
                 Err(error) => error_response(&error),
             }
         }
-        Request::SetRelay { url } => match administration.set_relay_ui(url) {
+        Request::SetRelay { url } => match administration.set_relay(url) {
             Ok(()) => Response::Applied,
             Err(error) => error_response(&error),
         },
@@ -287,29 +228,61 @@ fn handle(
             Ok(()) => Response::Applied,
             Err(error) => error_response(&error),
         },
-        Request::ConfirmMcp { id } => match administration.confirm_mcp(&id) {
-            Ok(()) => Response::Applied,
-            Err(error) => error_response(&error),
-        },
         Request::Change { change, dry_run } => {
-            let change = match change.into_change() {
+            let change = match change.as_ref().clone().into_change() {
                 Ok(change) => change,
                 Err(error) => return error_response(&error),
             };
-            let classified_high_risk = change.is_high_risk();
-            match administration.change(&change, dry_run) {
-                Ok(()) if dry_run => Response::Validated,
-                Ok(()) if classified_high_risk => Response::Pending,
-                Ok(()) => Response::Applied,
+            match administration.submit(&change, AuditActor::Mcp, dry_run) {
+                Ok(ChangeOutcome::Validated) => Response::Validated,
+                Ok(ChangeOutcome::Applied) => Response::Applied,
+                Ok(ChangeOutcome::Pending) => Response::Pending,
                 Err(error) => error_response(&error),
             }
         }
+        Request::CreateInvite { .. } => Response::Error { code: "invalid".to_owned() },
     }
 }
 
 /// Whether a message of `length` bytes is over the socket's limit.
 fn over_limit(length: usize) -> bool {
     u64::try_from(length).map_or(true, |length| length > MAX_SOCKET_BYTES)
+}
+
+fn create_invite_response(
+    administration: &SharedAdministration,
+    data_dir: &Path,
+    friend_name: &str,
+    endpoint_id: &str,
+    days: u64,
+) -> Response {
+    let agent_name = crate::invites::invite_agent_name(data_dir, None);
+    let page = crate::admin_ui::PageContext::host(
+        data_dir.to_path_buf(),
+        None,
+        crate::settings::setting::<crate::transport::relay::ActiveRelay>(data_dir)
+            .ok()
+            .flatten(),
+        std::sync::Arc::new(|_, _| Box::pin(async { Ok(()) })),
+    );
+    match crate::invites::sign_direct_invite(
+        administration,
+        &page,
+        &agent_name,
+        friend_name,
+        endpoint_id,
+        days,
+        crate::access_groups::FRIENDS_GROUP,
+        AuditActor::Mcp,
+    ) {
+        Ok((line, _)) => Response::Invitation { line },
+        Err(crate::invites::InviteError::Refused) => {
+            Response::Error { code: "unavailable".to_owned() }
+        }
+        Err(crate::invites::InviteError::Internal(_)) => {
+            Response::Error { code: "invalid".to_owned() }
+        }
+    }
 }
 
 fn error_response(error: &AdminError) -> Response {
@@ -336,6 +309,32 @@ mod tests {
     use crate::admin::{AuditEntry, test_support::shared_in};
 
     #[test]
+    fn queue_limit_increase_returns_pending_on_the_socket() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let socket = crate::data_dir::DataDir::new(directory.path()).admin_socket();
+        let administration = shared_in(directory.path());
+        let node = std::sync::Arc::new(
+            crate::admin::test_support::FakeNode::default().with_queue_limit(1),
+        );
+        administration.lock().expect("administration must unlock").set_live(node);
+        start(&socket, administration).expect("socket must start");
+        assert!(matches!(
+            send(
+                &socket,
+                &Request::Change {
+                    change: Box::new(crate::admin::ChangeRequest::Limit {
+                        id: "queue_global".to_owned(),
+                        limit: 2,
+                    }),
+                    dry_run: false,
+                }
+            )
+            .expect("change must send"),
+            Response::Pending
+        ));
+    }
+
+    #[test]
     fn socket_shares_pending_changes_without_mcp_confirmation() {
         let directory = tempfile::tempdir().expect("directory must create");
         let socket = crate::data_dir::DataDir::new(directory.path()).admin_socket();
@@ -345,20 +344,15 @@ mod tests {
             send(
                 &socket,
                 &Request::Change {
-                    change: crate::admin::ChangeRequest::Workspace {
+                    change: Box::new(crate::admin::ChangeRequest::Workspace {
                         id: "workspace".to_owned(),
                         path: "project".to_owned(),
-                    },
+                    }),
                     dry_run: false,
                 }
             )
             .expect("change must send"),
             Response::Pending
-        ));
-        assert!(matches!(
-            send(&socket, &Request::ConfirmMcp { id: "workspace".to_owned() })
-                .expect("confirmation must send"),
-            Response::Error { code } if code == "confirmation_required"
         ));
         administration
             .lock()

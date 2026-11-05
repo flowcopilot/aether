@@ -18,7 +18,7 @@ use topcoat::{
     view::{View, attributes, component, view},
 };
 
-use super::{Host, HostContext, host::host_screen, require_admin_session};
+use super::{Page, PageContext, host::host_screen, require_admin_session};
 use crate::{
     components::button::{ButtonSize, ButtonVariant, button},
     hub_client::{AgentKind, HubClient, HubError},
@@ -220,11 +220,11 @@ pub(super) async fn publish_listing(
     Form(form): Form<ListingForm>,
 ) -> TopcoatResult<impl View> {
     require_admin_session(cx).await?;
-    let Host(Some(host)) = app_context::<Host>(cx) else {
+    let Page(Some(page)) = app_context::<Page>(cx) else {
         return Err(bad_request("this node has no listing").into());
     };
     if crate::settings::setting::<crate::hub_client::settings::AgentKind>(
-        &host.data_dir,
+        &page.data_dir,
     )
     .ok()
     .flatten()
@@ -232,12 +232,12 @@ pub(super) async fn publish_listing(
     {
         return Err(bad_request("only a service agent has a public listing").into());
     }
-    let result = match (form.action.as_str(), host.hub.get()) {
+    let result = match (form.action.as_str(), page.hub.get()) {
         (_, None) => Err(PublishError::Hub(HubError::Unreachable)),
         ("list", Some(hub)) => {
-            publish(&host.data_dir, &hub, now_seconds()).await.map(drop)
+            publish(&page.data_dir, &hub, now_seconds()).await.map(drop)
         }
-        ("stop", Some(hub)) => stop(&host.data_dir, &hub).await,
+        ("stop", Some(hub)) => stop(&page.data_dir, &hub).await,
         _ => return Err(bad_request("unknown listing action").into()),
     };
     let error = result.err().map(publish_message).unwrap_or_default().to_owned();
@@ -246,17 +246,18 @@ pub(super) async fn publish_listing(
 
 /// Keeps the listing of a service agent on the hub: when less than 7 days
 /// remain, it signs the current card text again.
-pub(super) async fn listing_worker(host: Arc<HostContext>) {
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) async fn listing_worker(page: Arc<PageContext>) {
     loop {
-        renew(&host).await;
+        renew(&page).await;
         tokio::time::sleep(RENEW_INTERVAL).await;
     }
 }
 
-async fn renew(host: &HostContext) {
+async fn renew(page: &PageContext) {
     let now = now_seconds();
     let due = crate::settings::setting::<crate::listing::settings::ListingState>(
-        &host.data_dir,
+        &page.data_dir,
     )
     .ok()
     .flatten()
@@ -264,15 +265,15 @@ async fn renew(host: &HostContext) {
         state.listed && state.expires_at.saturating_sub(now) < RENEW_BEFORE.as_secs()
     });
     let service = crate::settings::setting::<crate::hub_client::settings::AgentKind>(
-        &host.data_dir,
+        &page.data_dir,
     )
     .ok()
     .flatten()
         == Some(AgentKind::Service);
-    let (true, true, Some(hub)) = (due, service, host.hub.get()) else {
+    let (true, true, Some(hub)) = (due, service, page.hub.get()) else {
         return;
     };
-    let event = match publish(&host.data_dir, &hub, now).await {
+    let event = match publish(&page.data_dir, &hub, now).await {
         Ok(_) => "listing_renewed",
         Err(_) => "listing_renew_failed",
     };

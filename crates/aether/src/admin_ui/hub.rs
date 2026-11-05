@@ -28,7 +28,7 @@ use topcoat::{
 };
 
 use super::{
-    Caller, CallerContext, Host, HostContext,
+    Page, PageContext,
     caller::caller_screen,
     host::{Notice, host_screen, sign_invite},
     page_data_dir, require_admin_session,
@@ -113,8 +113,8 @@ pub(super) async fn hub_section(
     #[default]
     child: topcoat::view::Child<'_>,
 ) -> TopcoatResult<impl View> {
-    let Host(host) = app_context::<Host>(cx);
-    let hosting = host.is_some();
+    let Page(page) = app_context::<Page>(cx);
+    let hosting = page.as_ref().is_some_and(|page| page.host_ui);
     let state = load(&hub).await;
     if let (HubState::Ready { account: Some(account), .. }, Some(data_dir)) =
         (&state, page_data_dir(cx))
@@ -692,11 +692,8 @@ fn page_hub(cx: &Cx) -> TopcoatResult<HubClient> {
 
 /// The hub of this page's side now, if there is one.
 fn current_hub(cx: &Cx) -> Option<HubClient> {
-    let Host(host) = app_context::<Host>(cx);
-    let Caller(caller) = app_context::<Caller>(cx);
-    host.as_ref()
-        .and_then(|host| host.hub.get())
-        .or_else(|| caller.as_ref().and_then(|caller| caller.hub.get()))
+    let Page(page) = app_context::<Page>(cx);
+    page.as_ref().and_then(|page| page.current_hub())
 }
 
 #[component]
@@ -705,8 +702,8 @@ async fn screen(
     #[default] error: String,
     #[default] setting_error: String,
 ) -> TopcoatResult<impl View> {
-    let Host(host) = app_context::<Host>(cx);
-    let hosting = host.is_some();
+    let Page(page) = app_context::<Page>(cx);
+    let hosting = page.as_ref().is_some_and(|page| page.host_ui);
     Ok(view! {
         if hosting {
             host_screen(notice: Notice::hub(error.clone(), setting_error.clone()))
@@ -732,11 +729,12 @@ pub(super) async fn claim_name(
 ) -> TopcoatResult<impl View> {
     require_admin_session(cx).await?;
     let hub = page_hub(cx)?;
-    let Host(host) = app_context::<Host>(cx);
+    let Page(page) = app_context::<Page>(cx);
     let data_dir = page_data_dir(cx);
     let name = form.name.trim();
     // A page without a host has only a personal agent.
-    let chosen = match (host.is_some(), form.kind.as_deref()) {
+    let host_ui = page.as_ref().is_some_and(|page| page.host_ui);
+    let chosen = match (host_ui, form.kind.as_deref()) {
         (false, _) | (true, None) => Some(AgentKind::Personal),
         (true, Some(kind)) => AgentKind::parse(kind),
     };
@@ -812,17 +810,17 @@ pub(super) async fn invite_by_name(
     Form(form): Form<InviteForm>,
 ) -> TopcoatResult<impl View> {
     require_admin_session(cx).await?;
-    let Host(Some(host)) = app_context::<Host>(cx) else {
+    let Page(Some(page)) = app_context::<Page>(cx) else {
         return Err(bad_request("this node cannot invite").into());
     };
-    let hub = host.hub.get().ok_or_else(|| bad_request("this node has no hub"))?;
+    let hub = page.current_hub().ok_or_else(|| bad_request("this node has no hub"))?;
     let to = form.to.trim();
     let error = if !valid_full_name(to) {
         "Use their full name on Aether, with the four digits, such as bob#0042."
     } else if !ACCESS_DAYS.contains(&form.days) {
         "Choose how long they can use your agent."
     } else {
-        offer(&hub, &host.data_dir, to, form.days).await.err().unwrap_or_default()
+        offer(&hub, &page.data_dir, to, form.days).await.err().unwrap_or_default()
     };
     Ok(view! { screen(error: error.to_owned()) })
 }
@@ -840,11 +838,14 @@ pub(super) async fn accept_invite(
     Form(form): Form<InviteIdForm>,
 ) -> TopcoatResult<impl View> {
     require_admin_session(cx).await?;
-    let Caller(Some(caller)) = app_context::<Caller>(cx) else {
+    let Page(Some(page)) = app_context::<Page>(cx) else {
         return Err(bad_request("this node cannot accept invites").into());
     };
+    if !page.caller {
+        return Err(bad_request("this node cannot accept invites").into());
+    }
     let hub = page_hub(cx)?;
-    let error = match accept(&hub, &caller.data_dir, &form.id).await {
+    let error = match accept(&hub, &page.data_dir, &form.id).await {
         Ok(_) => "",
         Err(error) => hub_message(error),
     };
@@ -866,12 +867,12 @@ pub(super) async fn approve_request(
     Form(form): Form<ApproveForm>,
 ) -> TopcoatResult<impl View> {
     require_admin_session(cx).await?;
-    let Host(Some(host)) = app_context::<Host>(cx) else {
+    let Page(Some(page)) = app_context::<Page>(cx) else {
         return Err(bad_request("this node has no access requests").into());
     };
-    let hub = host.hub.get().ok_or_else(|| bad_request("this node has no hub"))?;
+    let hub = page.current_hub().ok_or_else(|| bad_request("this node has no hub"))?;
     let error = if ACCESS_DAYS.contains(&form.days) {
-        approve(&hub, &host.data_dir, &form.id, form.days)
+        approve(&hub, &page.data_dir, &form.id, form.days)
             .await
             .err()
             .map(hub_message)
@@ -952,11 +953,11 @@ pub(super) async fn block_request(
     Form(form): Form<InviteIdForm>,
 ) -> TopcoatResult<impl View> {
     require_admin_session(cx).await?;
-    let Host(Some(host)) = app_context::<Host>(cx) else {
+    let Page(Some(page)) = app_context::<Page>(cx) else {
         return Err(bad_request("this node has no access requests").into());
     };
-    let hub = host.hub.get().ok_or_else(|| bad_request("this node has no hub"))?;
-    let error = block_requester(&hub, host, &form.id)
+    let hub = page.current_hub().ok_or_else(|| bad_request("this node has no hub"))?;
+    let error = block_requester(&hub, page, &form.id)
         .await
         .err()
         .map(hub_message)
@@ -966,14 +967,14 @@ pub(super) async fn block_request(
 
 async fn block_requester(
     hub: &HubClient,
-    host: &HostContext,
+    page: &PageContext,
     id: &str,
 ) -> Result<(), HubError> {
     let (invite, endpoint) = open_request(hub, id).await?;
     {
-        let _sign = host.hub_sign.lock().unwrap_or_else(PoisonError::into_inner);
+        let _sign = page.hub_sign().lock().unwrap_or_else(PoisonError::into_inner);
         let store =
-            NodeStore::in_dir(&host.data_dir).map_err(|_| HubError::Unexpected)?;
+            NodeStore::in_dir(&page.data_dir).map_err(|_| HubError::Unexpected)?;
         store
             .put_hub_block(&endpoint, &invite.to, now())
             .map_err(|_| HubError::Unexpected)?;
@@ -1207,13 +1208,11 @@ pub(super) async fn hub_url(
     Form(form): Form<HubUrlForm>,
 ) -> TopcoatResult<impl View> {
     require_admin_session(cx).await?;
-    let Host(host) = app_context::<Host>(cx);
-    let Caller(caller) = app_context::<Caller>(cx);
-    let (data_dir, slot) = match (host, caller) {
-        (Some(host), _) => (host.data_dir.clone(), &host.hub),
-        (None, Some(caller)) => (caller.data_dir.clone(), &caller.hub),
-        (None, None) => return Err(bad_request("this page has no hub").into()),
+    let Page(page) = app_context::<Page>(cx);
+    let Some(page) = page.as_ref() else {
+        return Err(bad_request("this page has no hub").into());
     };
+    let data_dir = page.data_dir.clone();
     let url = form.hub_url.trim().trim_end_matches('/');
     let chosen = crate::hub_client::hub_setting(url).ok().and_then(|stored| {
         if url.is_empty() {
@@ -1226,12 +1225,7 @@ pub(super) async fn hub_url(
         Some((stored, hub)) => {
             crate::hub_client::set_hub_url(&data_dir, &stored)
                 .map_err(internal_server_error)?;
-            slot.set(hub.clone());
-            if let (Some(host), Some(caller)) = (host, caller)
-                && host.data_dir == caller.data_dir
-            {
-                caller.hub.set(hub);
-            }
+            page.set_hub(hub);
             String::new()
         }
         None => "Use an https:// address, such as the public hub.".to_owned(),
@@ -1293,33 +1287,32 @@ where
 
 /// The host's worker: when someone accepts, sign their access for the
 /// endpoint that accepted and send the invite line.
-pub(super) async fn host_worker(
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) async fn host_worker(
     administration: SharedAdministration,
-    host: Arc<HostContext>,
+    page: Arc<PageContext>,
 ) {
     let current = {
-        let host = Arc::clone(&host);
-        move || host.hub.get()
+        let page = Arc::clone(&page);
+        move || page.current_hub()
     };
     follow(current, |hub, invites| {
         let administration = administration.clone();
-        let host = Arc::clone(&host);
+        let page = Arc::clone(&page);
         async move {
-            let Ok(store) = NodeStore::in_dir(&host.data_dir) else {
+            let Ok(store) = NodeStore::in_dir(&page.data_dir) else {
                 return;
             };
             let _ = store.clear_expired_hub_approvals(now());
-            // The host's own name on the hub is the agent ID the friend
-            // sends tasks to. Without it, the host signs nothing.
             let own_name = crate::settings::setting::<
                 crate::hub_client::settings::HubName,
-            >(&host.data_dir)
+            >(&page.data_dir)
             .ok()
             .flatten();
             for invite in invites {
                 let line = match host_action(
                     &administration,
-                    &host,
+                    &page,
                     &store,
                     &invite,
                     own_name.as_deref(),
@@ -1360,12 +1353,12 @@ enum HostAction {
 /// cannot be pinned is revoked: the next pass would sign a second one.
 fn host_action(
     administration: &SharedAdministration,
-    host: &HostContext,
+    page: &PageContext,
     store: &NodeStore,
     invite: &Invite,
     own_name: Option<&str>,
 ) -> HostAction {
-    let _sign = host.hub_sign.lock().unwrap_or_else(PoisonError::into_inner);
+    let _sign = page.hub_sign().lock().unwrap_or_else(PoisonError::into_inner);
     let approval = store.hub_approval(&invite.id).ok().flatten();
     // A block that cannot be read counts as a block.
     let blocked = invite
@@ -1382,7 +1375,7 @@ fn host_action(
             };
             let Ok((line, grant_id)) = sign_invite(
                 administration,
-                host,
+                page,
                 own_name,
                 &friend_name,
                 &endpoint,
@@ -1395,7 +1388,7 @@ fn host_action(
                 let _ = administration
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .revoke_ui(&grant_id);
+                    .revoke(&grant_id, aether_store::AuditActor::Ui);
                 return HostAction::Failed;
             }
             HostAction::Deliver(line)
@@ -1405,15 +1398,16 @@ fn host_action(
 
 /// The caller's worker: keep each delivered invite line that is for this
 /// computer, then remove the invite from the hub.
-pub(super) async fn caller_worker(caller: Arc<CallerContext>) {
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) async fn caller_worker(page: Arc<PageContext>) {
     let current = {
-        let caller = Arc::clone(&caller);
-        move || caller.hub.get()
+        let page = Arc::clone(&page);
+        move || page.current_hub()
     };
     follow(current, |hub, invites| {
-        let caller = Arc::clone(&caller);
+        let page = Arc::clone(&page);
         async move {
-            let Ok(store) = NodeStore::in_dir(&caller.data_dir) else {
+            let Ok(store) = NodeStore::in_dir(&page.data_dir) else {
                 return;
             };
             for invite in invites {
@@ -1421,7 +1415,7 @@ pub(super) async fn caller_worker(caller: Arc<CallerContext>) {
                 match caller_step(&invite, approval.as_ref()) {
                     CallerStep::Skip => continue,
                     CallerStep::Import(bundle) => {
-                        match crate::direct::import_bundle(&caller.data_dir, &bundle) {
+                        match crate::direct::import_bundle(&page.data_dir, &bundle) {
                             Ok(_) => log("hub_invite_kept", &invite),
                             Err(error) => {
                                 log_reason(

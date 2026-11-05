@@ -17,7 +17,7 @@ use topcoat::{
 };
 
 use super::{
-    Caller, Host, HostContext, Tab, ensure_admin_session,
+    Page, PageContext, Tab, ensure_admin_session,
     hub::{hub_section, hub_setting},
     listing::listing_section,
     node_header, require_admin_session,
@@ -109,22 +109,19 @@ pub(super) async fn host_screen(
     #[default] notice: Notice,
 ) -> TopcoatResult<impl View> {
     ensure_admin_session(cx).await?;
-    let Host(Some(host)) = app_context::<Host>(cx) else {
+    let Page(Some(page)) = app_context::<Page>(cx) else {
         return Err(internal_server_error(std::io::Error::other(
             "the host screen needs a node",
         ))
         .into());
     };
-    // The access requests that this person's own agent prepared, when the
-    // caller side uses the same data directory.
-    let drafts = match app_context::<Caller>(cx) {
-        Caller(Some(caller)) if caller.data_dir == host.data_dir => {
-            let now = aether_core::time::now_seconds();
-            super::caller::request_drafts_of(&caller.data_dir, now).len()
-        }
-        _ => 0,
+    let drafts = if page.caller {
+        let now = aether_core::time::now_seconds();
+        super::caller::request_drafts_of(&page.data_dir, now).len()
+    } else {
+        0
     };
-    let relay_url = host.relay_url();
+    let relay_url = page.relay_url();
     let relay_host = relay_url.as_deref().map(|url| {
         reqwest::Url::parse(url)
             .ok()
@@ -143,7 +140,7 @@ pub(super) async fn host_screen(
         )
     };
     let now = SystemTime::now();
-    let groups = access_groups::list(&host.data_dir)
+    let groups = access_groups::list(&page.data_dir)
         .map_err(|error| internal_server_error(std::io::Error::other(error)))?;
     let mut friends = grants
         .into_iter()
@@ -176,10 +173,10 @@ pub(super) async fn host_screen(
         || !notice.card_error.is_empty()
         || !notice.listing_error.is_empty();
     let command = format!("aether node direct import '{}'", invitation.line);
-    let hub = host.hub.get();
+    let hub = page.current_hub();
     let service = hub.is_some()
         && crate::settings::setting::<crate::hub_client::settings::AgentKind>(
-            &host.data_dir,
+            &page.data_dir,
         )
         .ok()
         .flatten()
@@ -188,7 +185,7 @@ pub(super) async fn host_screen(
     // is in use.
     let code_open = !invitation.line.is_empty() || !notice.invite_error.is_empty();
 
-    let agent_name = host.agent_name();
+    let agent_name = page.agent_name();
     Ok(view! {
         if refused {
             (StatusCode::BAD_REQUEST)
@@ -200,7 +197,7 @@ pub(super) async fn host_screen(
                     <div id="people">
                         page_title(
                             title: "Who can use your agent",
-                            workspace_line(path: folder, error: notice.workspace_error.clone(), task_folder_mode: host.task_folder_mode)
+                            workspace_line(path: folder, error: notice.workspace_error.clone(), task_folder_mode: page.task_folder_mode)
                         )
                     </div>
                     if drafts > 0 {
@@ -227,7 +224,7 @@ pub(super) async fn host_screen(
                     people(friends: friends, confirm_revoke: notice.confirm_revoke.clone())
                     if service {
                         listing_section(
-                            data_dir: host.data_dir.clone(),
+                            data_dir: page.data_dir.clone(),
                             error: notice.listing_error.clone(),
                         )
                     }
@@ -287,7 +284,7 @@ pub(super) async fn host_screen(
             </div>
             <div class="grid items-start gap-10 border-t border-border pt-10 lg:grid-cols-[minmax(0,1fr)_30rem]">
                 card_section(
-                    settings: crate::agent_card::settings(&host.data_dir),
+                    settings: crate::agent_card::settings(&page.data_dir),
                     error: notice.card_error.clone(),
                     saved: notice.card_saved,
                 )
@@ -437,7 +434,7 @@ pub(super) async fn change_group(
     Form(form): Form<GroupForm>,
 ) -> TopcoatResult<impl View> {
     require_admin_session(cx).await?;
-    let Host(Some(host)) = app_context::<Host>(cx) else {
+    let Page(Some(page)) = app_context::<Page>(cx) else {
         return Err(bad_request("this node has no groups").into());
     };
     let action = match form.action.as_str() {
@@ -464,7 +461,7 @@ pub(super) async fn change_group(
         })
         .collect::<Vec<_>>();
     let group_error = access_groups::change(
-        &host.data_dir,
+        &page.data_dir,
         action,
         &form.group,
         form.agent.as_deref(),
@@ -537,14 +534,14 @@ pub(super) async fn relay(
     Form(form): Form<RelayForm>,
 ) -> TopcoatResult<impl View> {
     require_admin_session(cx).await?;
-    let Host(Some(host)) = app_context::<Host>(cx) else {
+    let Page(Some(page)) = app_context::<Page>(cx) else {
         return Err(bad_request("this node has no relay to change").into());
     };
     let relay = form.relay_url.trim();
     let relay = (!relay.is_empty()).then(|| relay.to_owned());
     let valid = relay.as_deref().is_none_or(crate::transport::relay::valid_relay_url);
     let relay_error = if valid {
-        match host.set_relay_url(relay).await {
+        match page.set_relay_url(relay).await {
             Ok(()) => String::new(),
             Err(crate::transport::TransportError::Timeout) => {
                 "The relay did not answer. The node keeps its current relay.".to_owned()
@@ -626,7 +623,7 @@ pub(super) async fn save_card(
     Form(form): Form<CardForm>,
 ) -> TopcoatResult<impl View> {
     require_admin_session(cx).await?;
-    let Host(Some(host)) = app_context::<Host>(cx) else {
+    let Page(Some(page)) = app_context::<Page>(cx) else {
         return Err(bad_request("this node has no agent card").into());
     };
     let card_input = crate::agent_card::CardInput {
@@ -641,7 +638,7 @@ pub(super) async fn save_card(
             .map(str::to_owned)
             .collect(),
     };
-    let notice = match crate::agent_card::save_settings(&host.data_dir, &card_input) {
+    let notice = match crate::agent_card::save_settings(&page.data_dir, &card_input) {
         Ok(_) => Notice { card_saved: true, ..Notice::default() },
         Err(crate::agent_card::CardError::Invalid(reason)) => Notice {
             card_error: format!("The card was not saved: {reason}."),
@@ -916,7 +913,7 @@ pub(super) async fn invite(
     Form(form): Form<InviteForm>,
 ) -> TopcoatResult<impl View> {
     require_admin_session(cx).await?;
-    let Host(Some(host)) = app_context::<Host>(cx) else {
+    let Page(Some(page)) = app_context::<Page>(cx) else {
         return Err(bad_request("this node cannot invite").into());
     };
     // A code copied from the caller's page may keep its groups of four.
@@ -940,7 +937,7 @@ pub(super) async fn invite(
             Notice { invite_error: refusal.to_owned(), ..Notice::default() },
         )
     } else {
-        let line = create_invite(cx, host, &form.friend_name, &endpoint_id, form.days)?;
+        let line = create_invite(cx, page, &form.friend_name, &endpoint_id, form.days)?;
         (NewInvitation { friend_name: form.friend_name, line }, Notice::default())
     };
     Ok(view! { host_screen(invitation: invitation, notice: notice) })
@@ -949,15 +946,15 @@ pub(super) async fn invite(
 /// Signs the access, applies the grant, and returns the one-line invite.
 fn create_invite(
     cx: &Cx,
-    host: &HostContext,
+    page: &PageContext,
     friend_name: &str,
     endpoint_id: &str,
     days: u64,
 ) -> TopcoatResult<String> {
     sign_invite(
         app_context::<SharedAdministration>(cx),
-        host,
-        &host.agent_name(),
+        page,
+        &page.agent_name(),
         friend_name,
         endpoint_id,
         days,
@@ -965,77 +962,34 @@ fn create_invite(
     )
     .map(|(line, _)| line)
     .map_err(|error| match error {
-        InviteError::Refused => bad_request("the node refused the new access").into(),
-        InviteError::Internal(error) => internal_server_error(error).into(),
+        crate::invites::InviteError::Refused => {
+            bad_request("the node refused the new access").into()
+        }
+        crate::invites::InviteError::Internal(error) => {
+            internal_server_error(error).into()
+        }
     })
 }
 
-#[derive(Debug)]
-pub(super) enum InviteError {
-    /// The running node did not take the grant.
-    Refused,
-    Internal(std::io::Error),
-}
-
-/// Gives `friend_name` at `endpoint_id` access for `days` days in the
-/// access group `access_group`, applies the grant to the running node, and
-/// returns the one-line invite that names this node `agent_name` and the ID
-/// of the grant.
 pub(super) fn sign_invite(
     administration: &SharedAdministration,
-    host: &HostContext,
+    page: &PageContext,
     agent_name: &str,
     friend_name: &str,
     endpoint_id: &str,
     days: u64,
     access_group: &str,
-) -> Result<(String, String), InviteError> {
-    let internal = |error: &dyn std::fmt::Display| {
-        InviteError::Internal(std::io::Error::other(error.to_string()))
-    };
-    // The card comes first: when it fails, the node applies no grant.
-    let agent_card = crate::direct::create_card(&host.data_dir, agent_name)
-        .map_err(|error| internal(&error))?;
-    let (authorization, grant) = crate::direct::sign_invite_access(
-        &host.data_dir,
-        friend_name,
-        endpoint_id,
-        days,
-    )
-    .map_err(|error| internal(&error))?;
-    let change = crate::admin::ChangeRequest::Grant {
-        id: grant.id.as_str().to_owned(),
-        grant: crate::identity::encode_grant(&grant)
-            .map_err(|error| internal(&error))?,
-    }
-    .into_change()
-    .map_err(|error| internal(&error))?;
-    crate::access_groups::join_and_apply(
-        &host.data_dir,
-        access_group,
-        friend_name,
-        endpoint_id,
-        || {
-            administration
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .apply_ui(&change)
-        },
-    )
-    .map_err(|error| match error {
-        crate::access_groups::JoinError::Store(error) => internal(&error),
-        crate::access_groups::JoinError::Apply(_) => InviteError::Refused,
-    })?;
-    crate::direct::encode_invite_after_grant(
-        &host.data_dir,
+) -> Result<(String, String), crate::invites::InviteError> {
+    crate::invites::sign_direct_invite(
+        administration,
+        page,
         agent_name,
+        friend_name,
+        endpoint_id,
         days,
-        authorization,
-        host.relay_url(),
-        agent_card,
+        access_group,
+        aether_store::AuditActor::Ui,
     )
-    .map(|line| (line, grant.id.as_str().to_owned()))
-    .map_err(|error| internal(&error))
 }
 
 #[derive(Deserialize)]
@@ -1055,14 +1009,14 @@ pub(super) async fn revoke(
     Form(form): Form<RevokeForm>,
 ) -> TopcoatResult<impl View> {
     require_admin_session(cx).await?;
-    let Host(Some(_)) = app_context::<Host>(cx) else {
+    let Page(Some(_page)) = app_context::<Page>(cx) else {
         return Err(bad_request("this node cannot revoke").into());
     };
     let notice = if form.confirm.as_deref() == Some("yes") {
         app_context::<SharedAdministration>(cx)
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .revoke_ui(&form.grant_id)
+            .revoke(&form.grant_id, aether_store::AuditActor::Ui)
             .map_err(|_| bad_request("the access cannot be revoked"))?;
         Notice::default()
     } else {
@@ -1086,10 +1040,10 @@ pub(super) async fn workspace(
     Form(form): Form<WorkspaceForm>,
 ) -> TopcoatResult<impl View> {
     require_admin_session(cx).await?;
-    let Host(Some(host)) = app_context::<Host>(cx) else {
+    let Page(Some(page)) = app_context::<Page>(cx) else {
         return Err(bad_request("this node has no workspace to change").into());
     };
-    if host.task_folder_mode {
+    if page.task_folder_mode {
         return Err(bad_request("task folders do not allow folder changes").into());
     }
     let applied = crate::admin::ChangeRequest::Workspace {
@@ -1101,7 +1055,8 @@ pub(super) async fn workspace(
         app_context::<SharedAdministration>(cx)
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .apply_ui(&change)
+            .apply(&change, aether_store::AuditActor::Ui)
+            .map(|_| ())
             .is_ok()
     });
     let notice = if applied {

@@ -148,17 +148,13 @@ impl PactConsent {
         };
         let grant = self.sign_grant(brand, &caller)?;
         let grant_id = grant.id.as_str().to_owned();
-        let change = crate::admin::ChangeRequest::Grant {
-            id: grant_id.clone(),
-            grant: crate::identity::encode_grant(&grant)
-                .map_err(|_| ConsentError::Sign)?,
-        }
-        .into_change()
-        .map_err(|_| ConsentError::Refused)?;
+        let change = crate::admin::ChangeRequest::Grant { id: grant_id.clone(), grant }
+            .into_change()
+            .map_err(|_| ConsentError::Refused)?;
         administration
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .apply_ui(&change)
+            .apply(&change, aether_store::AuditActor::Ui)
             .map_err(|_| ConsentError::Refused)?;
         let record = new_grant(
             grant_id.clone(),
@@ -174,7 +170,7 @@ impl PactConsent {
             let _ = administration
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .revoke_ui(&grant_id);
+                .revoke(&grant_id, aether_store::AuditActor::Ui);
             return Err(ConsentError::NotPending);
         }
         Ok(granted)

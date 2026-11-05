@@ -349,7 +349,10 @@ impl McpServer {
         }
         match crate::admin_socket::send(
             &self.socket,
-            &crate::admin_socket::Request::Change { change: request, dry_run },
+            &crate::admin_socket::Request::Change {
+                change: Box::new(request),
+                dry_run,
+            },
         ) {
             Ok(crate::admin_socket::Response::Validated) => Ok("validated"),
             Ok(crate::admin_socket::Response::Pending) => {
@@ -1972,18 +1975,18 @@ mod tests {
             // One queued and confirmed change writes three audit records:
             // pending, confirmed and applied.
             let mut locked = administration.lock().expect("administration must lock");
+            let grant = crate::admin::peer_grant();
+            let id = grant.id.as_str().to_owned();
             locked
-                .change(
-                    &ChangeRequest::Grant {
-                        id: "grant".to_owned(),
-                        grant: "private-grant-token".to_owned(),
-                    }
-                    .into_change()
-                    .expect("change must parse"),
+                .submit(
+                    &ChangeRequest::Grant { id: id.clone(), grant }
+                        .into_change()
+                        .expect("change must parse"),
+                    aether_store::AuditActor::Mcp,
                     false,
                 )
                 .expect("change must queue");
-            locked.confirm_ui("grant").expect("change must confirm");
+            locked.confirm_ui(&id).expect("change must confirm");
         }
         let server = served(directory.path(), administration);
         let first = server
@@ -3271,9 +3274,9 @@ mod tests {
         // added earlier this phase must reject.
         let grant_response = McpServer::socket(socket.clone())
             .change(Parameters(ChangeArguments {
-                change: ChangeRequest::Grant {
-                    id: "peer".to_owned(),
-                    grant: "signed-grant".to_owned(),
+                change: {
+                    let grant = crate::admin::peer_grant();
+                    ChangeRequest::Grant { id: grant.id.as_str().to_owned(), grant }
                 },
                 dry_run: false,
             }))
@@ -3286,7 +3289,8 @@ mod tests {
             .confirm_ui("peer")
             .expect("grant must confirm");
         assert_eq!(node.calls(), ["workspace workspace project", "grant peer"]);
-        assert_eq!(node.granted(), ["signed-grant"]);
+        let grant_text = node.granted().into_iter().next().expect("grant must apply");
+        crate::identity::decode_grant(&grant_text).expect("grant must decode");
 
         // Both changes must have left durable state behind, readable through
         // an independent connection to the same database — the same
@@ -3296,7 +3300,7 @@ mod tests {
         assert_eq!(restarted.current_workspace(), Ok(Some("project".to_owned())));
         assert_eq!(
             restarted.applied_change(aether_store::ChangeKind::Grant, "peer"),
-            Ok(Some("signed-grant".to_owned()))
+            Ok(Some(grant_text))
         );
     }
 }
