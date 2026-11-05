@@ -15,5 +15,5 @@ git-repository-url = "https://github.com/flowcopilot/aether"
 edit-url-template = "https://github.com/flowcopilot/aether/edit/main/docs/{path}"
 additional-css = ["assets/aether.css"]
 default-theme = "light"
-preferred-dark-theme = "navy"
+preferred-dark-theme = "coal"
 no-section-label = true
