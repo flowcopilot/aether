@@ -177,6 +177,32 @@ impl From<&Path> for DataDir {
     }
 }
 
+/// The node data directory when `--data-dir` is not given: trimmed
+/// `$AETHER_DATA_DIR` when it is not blank, else `home/.aether/host`.
+#[must_use]
+pub fn default_node_data_dir(
+    explicit: Option<PathBuf>,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> PathBuf {
+    if let Some(path) = explicit {
+        return path;
+    }
+    if let Some(value) =
+        env("AETHER_DATA_DIR").and_then(|value| value.into_string().ok())
+    {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    if let Some(home) = home {
+        home.join(".aether").join("host")
+    } else {
+        PathBuf::from(".aether/host")
+    }
+}
+
 /// The login file in the Codex home `codex_home`.
 #[must_use]
 pub fn codex_login(codex_home: &Path) -> PathBuf {
@@ -185,7 +211,50 @@ pub fn codex_login(codex_home: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::DataDir;
+    use super::{DataDir, default_node_data_dir};
+    use std::path::PathBuf;
+
+    #[test]
+    fn default_node_data_dir_follows_the_agent_socket_contract() {
+        let home = PathBuf::from("/home/ana");
+        let env = |key: &str| match key {
+            "AETHER_DATA_DIR" => Some(std::ffi::OsString::from("/srv/aether")),
+            _ => None,
+        };
+        assert_eq!(
+            default_node_data_dir(None, env, Some(home.clone())),
+            PathBuf::from("/srv/aether")
+        );
+        let env = |key: &str| match key {
+            "AETHER_DATA_DIR" => Some(std::ffi::OsString::from("  /srv/aether  ")),
+            _ => None,
+        };
+        assert_eq!(
+            default_node_data_dir(None, env, Some(home.clone())),
+            PathBuf::from("/srv/aether")
+        );
+        let env = |_key: &str| None;
+        assert_eq!(
+            default_node_data_dir(None, env, Some(home.clone())),
+            PathBuf::from("/home/ana/.aether/host")
+        );
+        let env = |key: &str| match key {
+            "AETHER_DATA_DIR" => Some(std::ffi::OsString::from("   ")),
+            _ => None,
+        };
+        assert_eq!(
+            default_node_data_dir(None, env, Some(home)),
+            PathBuf::from("/home/ana/.aether/host")
+        );
+        assert_eq!(
+            default_node_data_dir(
+                Some(PathBuf::from("/explicit")),
+                |_key: &str| None,
+                None
+            ),
+            PathBuf::from("/explicit")
+        );
+    }
 
     #[test]
     fn each_key_is_its_own_file_and_is_kept() {

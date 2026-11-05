@@ -5,6 +5,8 @@ use std::{
 };
 
 use aether_core::{EndpointId, ScopeKind, TrustProvider};
+
+use crate::policy::AgentAdapter;
 use aether_store::StoreError;
 
 use crate::{
@@ -31,9 +33,7 @@ pub struct NodeService<T, P> {
     // change can extend, only pick from.
     approved_workspaces: BTreeMap<String, PathBuf>,
     task_folder_mode: bool,
-    /// The name of the agent adapter, for the owner's own startup notes. It
-    /// never reaches a caller.
-    agent_adapter: &'static str,
+    agent_adapter: AgentAdapter,
     /// The `pact` section of the policy file, when the node offers PACT.
     pact: Option<crate::pact::config::PactConfig>,
 }
@@ -61,7 +61,7 @@ where
             node,
             approved_workspaces: BTreeMap::new(),
             task_folder_mode: false,
-            agent_adapter: "",
+            agent_adapter: AgentAdapter::Codex,
             pact: None,
         }
     }
@@ -122,12 +122,12 @@ where
         self.task_folder_mode
     }
 
-    pub const fn set_agent_adapter(&mut self, adapter: &'static str) {
+    pub const fn set_agent_adapter(&mut self, adapter: AgentAdapter) {
         self.agent_adapter = adapter;
     }
 
     #[must_use]
-    pub const fn agent_adapter(&self) -> &'static str {
+    pub const fn agent_adapter(&self) -> AgentAdapter {
         self.agent_adapter
     }
 

@@ -568,11 +568,11 @@ mod tests {
             Some(AgentAdapter::Connected),
         )
         .expect("node must start");
-        assert_eq!(service.agent_adapter(), "connected");
+        assert_eq!(service.agent_adapter(), AgentAdapter::Connected);
         drop(service);
         let service = load_or_create_service(&import, &data_dir, "codex".into(), None)
             .expect("node must start again");
-        assert_eq!(service.agent_adapter(), "connected");
+        assert_eq!(service.agent_adapter(), AgentAdapter::Connected);
         drop(service);
         let service = load_or_create_service(
             &import,
@@ -581,7 +581,7 @@ mod tests {
             Some(AgentAdapter::Codex),
         )
         .expect("node must start with Codex");
-        assert_eq!(service.agent_adapter(), "codex");
+        assert_eq!(service.agent_adapter(), AgentAdapter::Codex);
         assert!(service.task_folder_mode());
     }
 
@@ -690,16 +690,20 @@ mod tests {
         ));
         let change = crate::admin::ChangeRequest::Grant {
             id: ui_grant.id.as_str().to_owned(),
-            grant: encode_grant(&ui_grant).expect("grant must encode"),
+            grant: ui_grant.clone(),
         }
         .into_change()
         .expect("change must parse");
-        administration.apply_ui(&change).expect("the UI grant must apply");
+        administration
+            .apply(&change, aether_store::AuditActor::Ui)
+            .expect("the UI grant must apply");
         assert!(service.has_grant(&file_grant.id).expect("grants must read"));
         assert!(service.has_grant(&ui_grant.id).expect("grants must read"));
 
         for grant in [&file_grant, &ui_grant] {
-            administration.revoke_ui(grant.id.as_str()).expect("grant must revoke");
+            administration
+                .revoke(grant.id.as_str(), aether_store::AuditActor::Ui)
+                .expect("grant must revoke");
             assert!(!service.has_grant(&grant.id).expect("grants must read"));
         }
         service.shutdown();
