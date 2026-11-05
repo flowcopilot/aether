@@ -8,7 +8,7 @@ chooses how the node reaches it:
 | `adapter` | The agent | Setup |
 | --- | --- | --- |
 | `codex` (default) | The node starts `codex app-server` for each task. | See "Real Codex" below. |
-| `connected` | An agent that runs on its own connects to `<data-dir>/agent.sock`. | For Hermes Agent, see [integrations/hermes-plugin](../integrations/hermes-plugin/README.md). For OpenClaw, see [integrations/openclaw-plugin](../integrations/openclaw-plugin/README.md). |
+| `connected` | An agent that runs on its own connects to `<data-dir>/agent.sock`. | For Hermes Agent, see [integrations/hermes-plugin](https://github.com/flowcopilot/aether/blob/main/integrations/hermes-plugin/README.md). For OpenClaw, see [integrations/openclaw-plugin](https://github.com/flowcopilot/aether/blob/main/integrations/openclaw-plugin/README.md). |
 
 Set the adapter once with `aether node serve --adapter codex|connected`. The
 node saves it in its policy, and later starts keep it. Each data directory has
