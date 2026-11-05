@@ -3,8 +3,6 @@
 //! caller's own agent (MCP) or the CLI, so the page shows the commands that
 //! connect them instead of a task form.
 
-use std::time::SystemTime;
-
 use serde::Deserialize;
 use topcoat::{
     Result as TopcoatResult,
@@ -63,7 +61,7 @@ pub(super) async fn caller_screen(
     };
     let endpoint_id =
         crate::direct::endpoint_id(&caller.data_dir).map_err(internal_server_error)?;
-    let now = aether_core::time::unix_seconds(SystemTime::now()).unwrap_or(0);
+    let now = aether_core::time::now_seconds();
     let mut contacts = crate::direct::contact_bundles(&caller.data_dir)
         .map_err(internal_server_error)?
         .into_iter()
@@ -419,10 +417,10 @@ async fn confirm(
     id: &str,
     days: u64,
 ) -> Result<(), &'static str> {
-    if !(1..=30).contains(&days) {
+    if !(1..=u64::from(aether_core::limits::MAX_HUB_ACCESS_DAYS)).contains(&days) {
         return Err("Choose 1 to 30 days.");
     }
-    let now = aether_core::time::unix_timestamp(SystemTime::now()).unwrap_or(0);
+    let now = aether_core::time::now();
     let store = aether_store::NodeStore::in_dir(data_dir)
         .map_err(|_| "The requests are unavailable.")?;
     let draft = store

@@ -2,10 +2,11 @@
 //! text of the Agent Card; this section shows what people see, and lists the
 //! agent or stops the listing.
 
+use aether_core::time::now_seconds;
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -35,10 +36,6 @@ enum PublishError {
     Key,
     Store,
     Hub(HubError),
-}
-
-fn unix_now() -> u64 {
-    aether_core::time::unix_seconds(SystemTime::now()).unwrap_or_default()
 }
 
 /// Signs the current card text for 30 days and sends it to `hub`.
@@ -126,7 +123,7 @@ pub(super) async fn listing_section(
     let settings = crate::agent_card::settings(&data_dir);
     let name =
         crate::node_config::setting::<settings::HubName>(&data_dir).ok().flatten();
-    let now = unix_now();
+    let now = now_seconds();
     let days_left = crate::node_config::setting::<settings::ListingState>(&data_dir)
         .ok()
         .flatten()
@@ -228,7 +225,7 @@ pub(super) async fn publish_listing(
     let result = match (form.action.as_str(), host.hub.get()) {
         (_, None) => Err(PublishError::Hub(HubError::Unreachable)),
         ("list", Some(hub)) => {
-            publish(&host.data_dir, &hub, unix_now()).await.map(drop)
+            publish(&host.data_dir, &hub, now_seconds()).await.map(drop)
         }
         ("stop", Some(hub)) => stop(&host.data_dir, &hub).await,
         _ => return Err(bad_request("unknown listing action").into()),
@@ -247,7 +244,7 @@ pub(super) async fn listing_worker(host: Arc<HostContext>) {
 }
 
 async fn renew(host: &HostContext) {
-    let now = unix_now();
+    let now = now_seconds();
     let due = crate::node_config::setting::<settings::ListingState>(&host.data_dir)
         .ok()
         .flatten()

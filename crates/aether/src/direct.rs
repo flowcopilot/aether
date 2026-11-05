@@ -144,7 +144,7 @@ pub fn sign_invite_access(
 ) -> Result<(A2aAuthorization, aether_core::Grant), DirectError> {
     if !valid_name(friend_name)
         || endpoint_id.parse::<iroh::EndpointId>().is_err()
-        || !(1..=365).contains(&days)
+        || !(1..=u64::from(aether_core::limits::MAX_DIRECT_ACCESS_DAYS)).contains(&days)
     {
         return Err(DirectError::Invalid);
     }
@@ -178,7 +178,9 @@ pub fn encode_invite_after_grant(
     relay_url: Option<String>,
     agent_card: (String, String),
 ) -> Result<String, DirectError> {
-    if !valid_name(agent_name) || !(1..=365).contains(&days) {
+    if !valid_name(agent_name)
+        || !(1..=u64::from(aether_core::limits::MAX_DIRECT_ACCESS_DAYS)).contains(&days)
+    {
         return Err(DirectError::Invalid);
     }
     let invitation = create_invitation(
@@ -319,7 +321,7 @@ fn contact_in(
     let stored = store
         .signed_record(&contact_id(agent_id))
         .map_err(|_| DirectError::UnknownContact)?;
-    let now = aether_core::time::unix_timestamp(SystemTime::now()).unwrap_or(i64::MAX);
+    let now = aether_core::time::now();
     if stored.scope_id != SCOPE
         || stored.agent_id != agent_id
         || stored.expires_at <= now

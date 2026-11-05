@@ -665,7 +665,12 @@ fn route(
             }
             match body.get("days").map(Value::as_u64) {
                 None => {}
-                Some(Some(days)) if (1..=30).contains(&days) => invite.days = days,
+                Some(Some(days))
+                    if (1..=u64::from(aether_core::limits::MAX_HUB_ACCESS_DAYS))
+                        .contains(&days) =>
+                {
+                    invite.days = days;
+                }
                 Some(_) => return error(StatusCode::BAD_REQUEST, "invalid"),
             }
             invite.status = "accepted".to_owned();

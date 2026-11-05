@@ -52,7 +52,7 @@ pub fn draft(
     if listing_expires_at <= now {
         return Err(DraftError::Invalid("the listing of this agent has expired"));
     }
-    if !(1..=30).contains(&days) {
+    if !(1..=u64::from(aether_core::limits::MAX_HUB_ACCESS_DAYS)).contains(&days) {
         return Err(DraftError::Invalid("days must be from 1 to 30"));
     }
     if crate::direct::contact_by_name(data_dir, target_name).is_ok() {

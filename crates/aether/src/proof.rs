@@ -11,9 +11,8 @@ use std::{
 };
 
 use aether_core::{
-    AccessMode, Admission, AgentId, CapabilityId, Claim, Denial, DispatchRequest,
-    EndpointId, PolicyEngine, Request, Scope, ScopeId, ScopeKind, TrustProvider,
-    WorkspaceId,
+    Admission, Claim, Denial, EndpointId, PolicyEngine, Request, Scope, ScopeId,
+    ScopeKind, TrustProvider,
 };
 use aether_store::TaskExecutionData;
 use aether_store::{
@@ -30,6 +29,8 @@ use crate::execution::{
 #[derive(Debug)]
 pub enum ProofError {
     Denied(Denial),
+    /// No access group of a direct scope holds the caller.
+    GroupDenied,
     Store(StoreError),
     Execution(ExecutionError),
     TaskMismatch,
@@ -151,10 +152,6 @@ struct ExecutionBundle {
     task: Task,
 }
 
-fn dispatch_access_mode(value: &str) -> Result<AccessMode, Denial> {
-    AccessMode::parse(value).ok_or(Denial::GrantDenied)
-}
-
 fn permits_dispatch<T>(
     policy: &PolicyEngine<T>,
     scopes: &BTreeMap<ScopeId, Scope>,
@@ -163,18 +160,8 @@ fn permits_dispatch<T>(
 where
     T: TrustProvider,
 {
-    let access_mode = dispatch_access_mode(&data.access_mode)?;
-    let scope_id = ScopeId::new(&data.scope_id);
-    let scope = scopes.get(&scope_id).ok_or(Denial::ScopeMismatch)?;
-    let request = DispatchRequest {
-        caller_agent_id: AgentId::new(&data.caller_agent_id),
-        caller_endpoint_id: EndpointId::new(&data.caller_endpoint_id),
-        scope_id,
-        capability_id: CapabilityId::new(&data.capability_id),
-        workspace_id: WorkspaceId::new(&data.workspace_id),
-        access_mode,
-    };
-    policy.permits_dispatch(&request, scope)
+    let scope = scopes.get(&data.request.scope_id).ok_or(Denial::ScopeMismatch)?;
+    policy.permits_dispatch(&data.request, scope)
 }
 
 fn group_allows_dispatch(
@@ -183,13 +170,13 @@ fn group_allows_dispatch(
     data: &TaskExecutionData,
 ) -> Result<bool, ProofError> {
     if scopes
-        .get(&ScopeId::new(&data.scope_id))
+        .get(&data.request.scope_id)
         .is_none_or(|scope| scope.kind != ScopeKind::Direct)
     {
         return Ok(true);
     }
-    let agent = data.caller_agent_id.clone();
-    let endpoint = data.caller_endpoint_id.clone();
+    let agent = data.request.caller_agent_id.as_str().to_owned();
+    let endpoint = data.request.caller_endpoint_id.as_str().to_owned();
     store.call(move |store| store.access_group_allows(&agent, &endpoint))
 }
 
@@ -256,9 +243,8 @@ where
             let task_id = task_id.clone();
             move |store| store.task_execution_data(&task_id)
         })?;
-        if execution_data.workspace_id.contains("..")
-            || execution_data.workspace_id.starts_with('/')
-        {
+        let workspace_id = execution_data.request.workspace_id.as_str();
+        if workspace_id.contains("..") || workspace_id.starts_with('/') {
             return Err(ProofError::Execution(ExecutionError::Path));
         }
         let policy = self.policy.lock().map_err(|_| ProofError::Queue)?;
@@ -266,20 +252,24 @@ where
         drop(policy);
         let allowed =
             group_allows_dispatch(&self.store, &self.scopes, &execution_data)?;
-        if dispatch.is_err() || !allowed {
-            let denial = dispatch.err().unwrap_or(Denial::GroupDenied);
+        let refusal = match dispatch {
+            Err(denial) => Some(ProofError::Denied(denial)),
+            Ok(()) if !allowed => Some(ProofError::GroupDenied),
+            Ok(()) => None,
+        };
+        if let Some(refusal) = refusal {
             let reject_id = task_id.clone();
             let reject_execution = execution_id;
             let _ = self
                 .store
                 .call(move |store| store.mark_rejected(&reject_id, &reject_execution));
             let _ = self.event_sender.send(task_id);
-            return Err(ProofError::Denied(denial));
+            return Err(refusal);
         }
         let task = Task {
             id: task_id.clone(),
             skill: execution_data.skill,
-            workspace_id: execution_data.workspace_id,
+            workspace_id: execution_data.request.workspace_id.as_str().to_owned(),
             remote_text: execution_data.remote_text,
             context_tokens: 0,
         };
@@ -1039,7 +1029,7 @@ where
                 .store
                 .call(move |store| store.access_group_allows(&agent, &endpoint))?
             {
-                return Err(ProofError::Denied(Denial::GroupDenied));
+                return Err(ProofError::GroupDenied);
             }
         }
         Ok(())
@@ -1257,8 +1247,8 @@ mod tests {
     };
 
     use aether_core::{
-        AccessMode, AgentId, ApprovalRule, CapabilityId, Claim, ClaimId, Denial,
-        EndpointId, Grant, GrantId, ProviderError, Request, RequestId, ScopeId, TaskId,
+        AccessMode, AgentId, ApprovalRule, CapabilityId, Claim, ClaimId, EndpointId,
+        Grant, GrantId, ProviderError, Request, RequestId, ScopeId, TaskId,
         WorkspaceId,
     };
 
@@ -1402,7 +1392,7 @@ mod tests {
             .expect("access must remove");
         assert!(matches!(
             submit_and_wait(&node, &request, &claim, &endpoint, "key", &task),
-            Err(ProofError::Denied(Denial::GroupDenied))
+            Err(ProofError::GroupDenied)
         ));
         store.create_access_group("work").expect("group must create");
         store

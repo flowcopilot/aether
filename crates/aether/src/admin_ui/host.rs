@@ -46,7 +46,6 @@ use topcoat::icon::icon;
 /// The lengths of access the invite form offers, in days.
 const ACCESS_DAYS: [u64; 3] = [1, 7, 30];
 const DEFAULT_ACCESS_DAYS: u64 = 7;
-const MAX_ACCESS_DAYS: u64 = 365;
 
 /// The workspace id that friends' grants name; the node has one workspace
 /// and the folder form changes its path.
@@ -121,7 +120,7 @@ pub(super) async fn host_screen(
     // caller side uses the same data directory.
     let drafts = match app_context::<Caller>(cx) {
         Caller(Some(caller)) if caller.data_dir == host.data_dir => {
-            let now = aether_core::time::unix_seconds(SystemTime::now()).unwrap_or(0);
+            let now = aether_core::time::now_seconds();
             super::caller::request_drafts_of(&caller.data_dir, now).len()
         }
         _ => 0,
@@ -701,7 +700,7 @@ async fn people(
     friends: Vec<Friend>,
     confirm_revoke: String,
 ) -> TopcoatResult<impl View> {
-    let now = aether_core::time::unix_timestamp(SystemTime::now()).unwrap_or(i64::MAX);
+    let now = aether_core::time::now();
     Ok(view! {
         if friends.is_empty() {
             <div class="rounded-xl border border-dashed border-border p-6 text-muted-foreground">
@@ -927,7 +926,9 @@ pub(super) async fn invite(
         )
     } else if !crate::direct::valid_name(&form.friend_name) {
         Some("Use letters, digits, dots, dashes or underscores for their name.")
-    } else if !(1..=MAX_ACCESS_DAYS).contains(&form.days) {
+    } else if !(1..=u64::from(aether_core::limits::MAX_DIRECT_ACCESS_DAYS))
+        .contains(&form.days)
+    {
         Some("Choose how long they can use your agent.")
     } else {
         None

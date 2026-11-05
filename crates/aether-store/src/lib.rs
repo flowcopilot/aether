@@ -30,6 +30,7 @@ pub use outbox::*;
 pub use summary::*;
 pub use tasks::*;
 
+use aether_core::time::now;
 use migrate::open_connection;
 
 pub const NODE_MIGRATIONS: &[&str] = &[
@@ -104,10 +105,6 @@ impl NodeStore {
 /// A row count for `LIMIT` or `OFFSET`; a count past `i64::MAX` is no limit.
 pub(crate) fn sql_count(count: usize) -> i64 {
     i64::try_from(count).unwrap_or(i64::MAX)
-}
-
-pub(crate) fn now() -> i64 {
-    aether_core::time::unix_timestamp(std::time::SystemTime::now()).unwrap_or(0)
 }
 
 #[cfg(test)]

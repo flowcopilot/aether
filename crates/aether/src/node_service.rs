@@ -451,7 +451,9 @@ where
 )]
 fn map_error(error: ProofError) -> TransportError {
     match error {
-        ProofError::Denied(_) | ProofError::Store(StoreError::Unauthorized) => {
+        ProofError::Denied(_)
+        | ProofError::GroupDenied
+        | ProofError::Store(StoreError::Unauthorized) => {
             TransportError::PermissionDenied
         }
         ProofError::Store(StoreError::Overloaded) => TransportError::Overloaded,
@@ -829,7 +831,7 @@ mod tests {
             .task_execution_data(WIRE_TASK_ID)
             .expect("task must persist");
         assert_eq!(stored.skill, crate::execution::GENERAL_SKILL);
-        assert_eq!(stored.capability_id, "review");
+        assert_eq!(stored.request.capability_id.as_str(), "review");
     }
 
     #[tokio::test]

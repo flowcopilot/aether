@@ -1,3 +1,7 @@
+use aether_core::{
+    AccessMode, AgentId, CapabilityId, EndpointId, Request, RequestId, ScopeId, TaskId,
+    WorkspaceId,
+};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
 use crate::{NodeStore, StoreError, now, sql_count};
@@ -125,14 +129,37 @@ pub struct StoredTask {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct TaskExecutionData {
-    pub caller_agent_id: String,
-    pub caller_endpoint_id: String,
-    pub scope_id: String,
-    pub capability_id: String,
-    pub workspace_id: String,
-    pub access_mode: String,
+    pub request: Request,
     pub skill: String,
     pub remote_text: String,
+}
+
+/// The columns [`request_from_row`] reads, in its order.
+const REQUEST_COLUMNS: &str = "id,request_id,caller_agent_id,caller_endpoint_id,scope_id,capability_id,workspace_id,access_mode";
+
+/// Reads the [`REQUEST_COLUMNS`] that start at column `first`.
+fn request_from_row(
+    row: &rusqlite::Row<'_>,
+    first: usize,
+) -> rusqlite::Result<Request> {
+    let column = |offset: usize| first.saturating_add(offset);
+    let access_mode: String = row.get(column(7))?;
+    Ok(Request {
+        task_id: TaskId::new(row.get::<_, String>(column(0))?),
+        id: RequestId::new(row.get::<_, String>(column(1))?),
+        caller_agent_id: AgentId::new(row.get::<_, String>(column(2))?),
+        caller_endpoint_id: EndpointId::new(row.get::<_, String>(column(3))?),
+        scope_id: ScopeId::new(row.get::<_, String>(column(4))?),
+        capability_id: CapabilityId::new(row.get::<_, String>(column(5))?),
+        workspace_id: WorkspaceId::new(row.get::<_, String>(column(6))?),
+        access_mode: AccessMode::parse(&access_mode).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                column(7),
+                rusqlite::types::Type::Text,
+                "unknown access mode".into(),
+            )
+        })?,
+    })
 }
 
 /// The newest task one caller endpoint started in a scope.
@@ -654,18 +681,15 @@ impl NodeStore {
     ) -> Result<TaskExecutionData, StoreError> {
         self.connection
             .query_row(
-                "SELECT caller_agent_id,caller_endpoint_id,scope_id,capability_id,workspace_id,access_mode,skill,remote_text FROM tasks WHERE id=?1",
+                &format!(
+                    "SELECT {REQUEST_COLUMNS},skill,remote_text FROM tasks WHERE id=?1"
+                ),
                 [task_id],
                 |row| {
                     Ok(TaskExecutionData {
-                        caller_agent_id: row.get(0)?,
-                        caller_endpoint_id: row.get(1)?,
-                        scope_id: row.get(2)?,
-                        capability_id: row.get(3)?,
-                        workspace_id: row.get(4)?,
-                        access_mode: row.get(5)?,
-                        skill: row.get(6)?,
-                        remote_text: row.get(7)?,
+                        request: request_from_row(row, 0)?,
+                        skill: row.get(8)?,
+                        remote_text: row.get(9)?,
                     })
                 },
             )

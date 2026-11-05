@@ -1,10 +1,24 @@
 //! Whole seconds since the Unix epoch, the form every signed field, wire
 //! field and database column uses for a time.
 //!
-//! Each function returns `None` where the conversion has no answer, and the
-//! caller picks what that means: an error, a clamp, or a panic in a test.
+//! A conversion returns `None` where it has no answer, and the caller picks
+//! what that means. The clock functions pick once for every caller: a clock
+//! set before 1970 reads as the latest time, so every expiry check fails
+//! closed.
 
 use std::time::{Duration, SystemTime};
+
+/// The current time in seconds since the epoch, as the database stores it.
+#[must_use]
+pub fn now() -> i64 {
+    unix_timestamp(SystemTime::now()).unwrap_or(i64::MAX)
+}
+
+/// The current time in seconds since the epoch.
+#[must_use]
+pub fn now_seconds() -> u64 {
+    unix_seconds(SystemTime::now()).unwrap_or(u64::MAX)
+}
 
 /// Seconds since the epoch, or `None` for a time before it.
 #[must_use]

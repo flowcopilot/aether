@@ -1352,7 +1352,7 @@ async fn managed_request(
         .find(|member| {
             member.agent_id == agent_id
                 && member.revoked_at.is_none()
-                && member.expires_at > unix_timestamp()
+                && member.expires_at > aether_core::time::now()
         })
         .ok_or(aether::transport::TransportError::Address)?;
     let relay_url = arguments
@@ -1381,7 +1381,7 @@ fn cached_managed_member(
         .find(|member| {
             member.agent_id == agent_id
                 && member.revoked_at.is_none()
-                && member.expires_at > unix_timestamp()
+                && member.expires_at > aether_core::time::now()
         })
         .ok_or(())
 }
@@ -1967,7 +1967,7 @@ fn cached_directory_record(
     if stored.scope_id != scope_id || stored.agent_id != agent_id {
         return Err(());
     }
-    if stored.expires_at <= unix_timestamp() {
+    if stored.expires_at <= aether_core::time::now() {
         return Err(());
     }
     let wire: aether::control_service::WireRecord =
@@ -1991,10 +1991,6 @@ fn managed_cursor_key(control: &str, scope_id: &str) -> String {
     value.push(0);
     value.extend_from_slice(scope_id.as_bytes());
     format!("managed.cursor.{}", blake3::hash(&value).to_hex())
-}
-
-fn unix_timestamp() -> i64 {
-    aether_core::time::unix_timestamp(std::time::SystemTime::now()).unwrap_or(i64::MAX)
 }
 
 fn transport_error(error: &aether::transport::TransportError) -> ExitCode {

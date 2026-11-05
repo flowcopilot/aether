@@ -4,6 +4,7 @@
 //! signs the access for the endpoint that accepted, and the caller's keeps
 //! the invite it receives.
 
+use aether_core::time::now;
 use std::{
     collections::BTreeMap,
     sync::{Arc, PoisonError},
@@ -833,10 +834,6 @@ pub(super) async fn invite_by_name(
     Ok(view! { screen(error: error.to_owned()) })
 }
 
-fn unix_now() -> i64 {
-    aether_core::time::unix_timestamp(std::time::SystemTime::now()).unwrap_or(0)
-}
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct InviteIdForm {
@@ -931,7 +928,7 @@ async fn approve(
     if store.hub_blocked(&endpoint).unwrap_or(true) {
         return Err(HubError::Forbidden);
     }
-    let now = unix_now();
+    let now = now();
     store
         .put_hub_approval(&HubApproval {
             invite_id: invite.id.clone(),
@@ -985,7 +982,7 @@ async fn block_requester(
         let store =
             NodeStore::in_dir(&host.data_dir).map_err(|_| HubError::Unexpected)?;
         store
-            .put_hub_block(&endpoint, &invite.to, unix_now())
+            .put_hub_block(&endpoint, &invite.to, now())
             .map_err(|_| HubError::Unexpected)?;
         let _ = store.remove_hub_approval(id);
     }
@@ -1030,7 +1027,7 @@ pub(super) async fn claim_owner(
     }
     let service = form.service.trim();
     let error = if valid_full_name(service) {
-        let expires_at = u64::try_from(unix_now())
+        let expires_at = u64::try_from(now())
             .unwrap_or_default()
             .saturating_add(crate::listing::OWNER_LINK_LIFETIME.as_secs());
         let signature = crate::listing::sign_owner_claim(&key, service, expires_at);
@@ -1318,7 +1315,7 @@ pub(super) async fn host_worker(
             let Ok(store) = NodeStore::in_dir(&host.data_dir) else {
                 return;
             };
-            let _ = store.clear_expired_hub_approvals(unix_now());
+            let _ = store.clear_expired_hub_approvals(now());
             // The host's own name on the hub is the agent ID the friend
             // sends tasks to. Without it, the host signs nothing.
             let own_name =

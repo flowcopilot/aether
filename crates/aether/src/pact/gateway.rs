@@ -4,10 +4,11 @@
 //! is `404` with no A2A body, whatever the token. Every other route but the
 //! Agent Card and the OAuth metadata needs a valid personal-agent JWT.
 
+use aether_core::time::now;
 use std::{
     num::NonZeroU32,
     sync::{Arc, Mutex, PoisonError},
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
 use aether_core::{
@@ -1578,10 +1579,6 @@ fn digest_hex(secret: &str) -> String {
 
 fn sha256(value: &str) -> String {
     URL_SAFE_NO_PAD.encode(digest::digest(&digest::SHA256, value.as_bytes()))
-}
-
-fn now() -> i64 {
-    aether_core::time::unix_timestamp(SystemTime::now()).unwrap_or(0)
 }
 
 /// `seconds` since the Unix epoch as an RFC 3339 UTC time.

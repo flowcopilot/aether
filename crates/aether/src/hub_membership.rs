@@ -2,7 +2,8 @@
 //! node's hub name, offer this node's agent to a name, and accept an invite.
 //! Each step keeps its local approval, which the hub workers need.
 
-use std::time::{Duration, SystemTime};
+use aether_core::time::now;
+use std::time::Duration;
 
 use aether_store::{ApprovalKind, ApprovalSide, HubApproval, NodeStore, StoreError};
 
@@ -67,17 +68,13 @@ pub async fn offer(
     Ok(invite)
 }
 
-fn unix_now() -> i64 {
-    aether_core::time::unix_timestamp(SystemTime::now()).unwrap_or(0)
-}
-
 /// Keeps the local approval of `invite`, which this node just sent.
 fn approve_invite(
     data_dir: &std::path::Path,
     invite: &Invite,
     days: u64,
 ) -> Result<(), StoreError> {
-    let now = unix_now();
+    let now = now();
     NodeStore::in_dir(data_dir)?.put_hub_approval(&HubApproval {
         invite_id: invite.id.clone(),
         side: ApprovalSide::Sender,
@@ -112,7 +109,7 @@ pub async fn accept(
             invite.role == Role::Receiver && invite.status == Status::Pending
         })
         .ok_or(HubError::Forbidden)?;
-    let now = unix_now();
+    let now = now();
     NodeStore::in_dir(data_dir)
         .and_then(|store| {
             store.put_hub_approval(&HubApproval {

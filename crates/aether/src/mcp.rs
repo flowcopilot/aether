@@ -902,7 +902,8 @@ impl McpServer {
                 .collect::<String>()
                 .parse::<iroh::EndpointId>()
                 .is_err()
-            || !(1..=365).contains(&arguments.days)
+            || !(1..=u64::from(aether_core::limits::MAX_DIRECT_ACCESS_DAYS))
+                .contains(&arguments.days)
         {
             return tool_error(
                 "use a valid friend name, endpoint ID and 1 to 365 days",
@@ -1078,8 +1079,7 @@ impl McpServer {
             return tool_error("the contacts are unavailable");
         };
         let presence = self.presence(data_dir).await;
-        let now =
-            aether_core::time::unix_seconds(std::time::SystemTime::now()).unwrap_or(0);
+        let now = aether_core::time::now_seconds();
         let mut agents = bundles
             .iter()
             .map(|bundle| {
@@ -1135,8 +1135,7 @@ impl McpServer {
                 ));
             }
         };
-        let now =
-            aether_core::time::unix_seconds(std::time::SystemTime::now()).unwrap_or(0);
+        let now = aether_core::time::now_seconds();
         let contacts = Contacts::read(data_dir);
         let agents = rows
             .iter()
@@ -1169,8 +1168,7 @@ impl McpServer {
             return tool_error("the contacts are unavailable");
         };
         let presence = self.presence(data_dir).await;
-        let now =
-            aether_core::time::unix_seconds(std::time::SystemTime::now()).unwrap_or(0);
+        let now = aether_core::time::now_seconds();
         let mut listed = std::collections::BTreeSet::new();
         let mut people = Vec::new();
         for bundle in &bundles {
@@ -1233,7 +1231,7 @@ impl McpServer {
             );
         }
         let days = arguments.days.unwrap_or(7);
-        if !(1..=30).contains(&days) {
+        if !(1..=u64::from(aether_core::limits::MAX_HUB_ACCESS_DAYS)).contains(&days) {
             return tool_error("aether.access.request days must be from 1 to 30");
         }
         let Some(hub) = self.hubs.configured(self.hub_flag.as_deref(), data_dir) else {

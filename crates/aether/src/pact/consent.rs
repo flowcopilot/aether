@@ -6,6 +6,7 @@
 //! the administration service, so the grant list, revocation, and the
 //! dispatch-time recheck cover PACT callers too.
 
+use aether_core::time::now;
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
@@ -233,10 +234,6 @@ fn normalize_user_code(user_code: &str) -> String {
         }
         _ => letters,
     }
-}
-
-fn now() -> i64 {
-    aether_core::time::unix_timestamp(SystemTime::now()).unwrap_or(0)
 }
 
 #[cfg(test)]

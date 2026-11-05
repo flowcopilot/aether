@@ -5,6 +5,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use aether_core::time::now;
 use aether_core::time::{from_unix_seconds, unix_seconds, unix_timestamp};
 
 use axum::{
@@ -112,7 +113,7 @@ impl ControlService {
     pub fn publish(&self, wire: &WireRecord) -> Result<bool, ControlError> {
         let record = wire.to_record()?;
         validate_record(&record).map_err(map_discovery_error)?;
-        let timestamp = now()?;
+        let timestamp = now();
         let mut store = self.store.lock().map_err(|_| {
             ControlError::Server("control store lock failed".to_owned())
         })?;
@@ -152,7 +153,7 @@ impl ControlService {
             .signed_record(agent_id)
             .map_err(map_store_error)?;
         let wire = decode_record(&stored.record)?;
-        let now = u64::try_from(now()?)
+        let now = u64::try_from(now())
             .map_err(|_| ControlError::Server("the clock is before 1970".to_owned()))?;
         if wire.expires_at <= now {
             return Err(ControlError::Expired);
@@ -165,7 +166,7 @@ impl ControlService {
         if capability.is_empty() {
             return Err(ControlError::InvalidRecord);
         }
-        let timestamp = now()?;
+        let timestamp = now();
         let records = self
             .store
             .lock()
@@ -236,7 +237,7 @@ impl ControlService {
         if scope_id.is_empty() || expires_in.is_zero() {
             return Err(ControlError::InvalidRecord);
         }
-        let expires_at = now()?
+        let expires_at = now()
             .checked_add(
                 i64::try_from(expires_in.as_secs())
                     .map_err(|_| ControlError::InvalidRecord)?,
@@ -581,10 +582,6 @@ fn map_store_error(error: aether_store::StoreError) -> ControlError {
     } else {
         ControlError::Store(error)
     }
-}
-
-fn now() -> Result<i64, ControlError> {
-    unix_timestamp(SystemTime::now()).ok_or(ControlError::InvalidRecord)
 }
 
 #[cfg(test)]

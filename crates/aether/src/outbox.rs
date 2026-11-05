@@ -5,13 +5,14 @@
 //! idempotency key, so the agent keeps one task however often the node
 //! sends it. The answer stays here for the inbox. The hub carries none of it.
 
+use aether_core::time::now;
 use std::{
     collections::BTreeMap,
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
     sync::{Arc, Mutex, PoisonError},
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
 use aether_store::{
@@ -114,10 +115,6 @@ pub enum OutboxError {
     NoRelay,
     #[error("the outbox is unavailable")]
     Unavailable,
-}
-
-fn unix_now() -> i64 {
-    aether_core::time::unix_timestamp(SystemTime::now()).unwrap_or(0)
 }
 
 fn seconds(duration: Duration) -> i64 {
@@ -336,7 +333,7 @@ async fn attempt_in(
         let endpoint_id = task.endpoint_id.clone();
         return with_store(store, move |store| {
             store
-                .end_sent_tasks_for_endpoint(&endpoint_id, ACCESS_ENDED, unix_now())
+                .end_sent_tasks_for_endpoint(&endpoint_id, ACCESS_ENDED, now())
                 .map_err(|_| OutboxError::Unavailable)?;
             Ok(SentState::NotDelivered)
         })
@@ -347,7 +344,7 @@ async fn attempt_in(
     let lease_until = task.lease_until;
     let attempts = task.attempts;
     with_store(store, move |store| {
-        let now = unix_now();
+        let now = now();
         let delay =
             outcome.delay.map_or(Duration::ZERO, |delay| next_delay(delay, attempts));
         store
@@ -593,8 +590,7 @@ pub async fn run(
             }
             presence_read = Some(std::time::Instant::now());
         }
-        match run_once(&data_dir, Arc::clone(&courier), presence.as_ref(), unix_now())
-            .await
+        match run_once(&data_dir, Arc::clone(&courier), presence.as_ref(), now()).await
         {
             Ok(report) => active = report.active,
             Err(_) => active = true,
@@ -620,8 +616,8 @@ mod tests {
     use aether_store::{NodeStore, SentState};
 
     use super::{
-        Courier, Delay, OutboxError, attempt, enqueue, next_delay, outcome, run_once,
-        unix_now,
+        Courier, Delay, OutboxError, attempt, enqueue, next_delay, now, outcome,
+        run_once,
     };
     use crate::{
         direct::InvitationBundle,
@@ -762,7 +758,7 @@ mod tests {
     #[test]
     fn enqueue_refuses_an_unknown_expired_or_relayless_contact() {
         let (host, caller) = caller();
-        let now = unix_now();
+        let now = now();
         assert_eq!(
             enqueue(caller.path(), "nobody", "x", now).err(),
             Some(OutboxError::UnknownContact)
@@ -790,8 +786,7 @@ mod tests {
     #[tokio::test]
     async fn every_attempt_reuses_the_task_id_and_idempotency_key() {
         let (_host, caller) = caller();
-        let task =
-            enqueue(caller.path(), "tudor", "work", unix_now()).expect("enqueue");
+        let task = enqueue(caller.path(), "tudor", "work", now()).expect("enqueue");
         let courier = Scripted::with(vec![
             result(A2aTaskStatus::Working, ""),
             result(A2aTaskStatus::Completed, "done"),
@@ -831,8 +826,7 @@ mod tests {
     #[tokio::test]
     async fn a_replay_of_an_admitted_frame_asks_again_with_a_new_frame() {
         let (_host, caller) = caller();
-        let task =
-            enqueue(caller.path(), "tudor", "work", unix_now()).expect("enqueue");
+        let task = enqueue(caller.path(), "tudor", "work", now()).expect("enqueue");
         let courier = Scripted::with(vec![
             error("replay rejected"),
             result(A2aTaskStatus::Completed, "done"),
@@ -858,8 +852,7 @@ mod tests {
     #[tokio::test]
     async fn a_second_replay_fails_the_task() {
         let (_host, caller) = caller();
-        let task =
-            enqueue(caller.path(), "tudor", "work", unix_now()).expect("enqueue");
+        let task = enqueue(caller.path(), "tudor", "work", now()).expect("enqueue");
         let courier =
             Scripted::with(vec![error("replay rejected"), error("replay rejected")]);
         let state =
@@ -873,22 +866,19 @@ mod tests {
     #[tokio::test]
     async fn a_full_host_queue_is_tried_again_after_the_backoff() {
         let (_host, caller) = caller();
-        let task =
-            enqueue(caller.path(), "tudor", "work", unix_now()).expect("enqueue");
+        let task = enqueue(caller.path(), "tudor", "work", now()).expect("enqueue");
         let courier = Scripted::with(vec![
             error("node overloaded"),
             result(A2aTaskStatus::Completed, "done"),
         ]);
-        let first = run_once(caller.path(), courier.clone(), None, unix_now())
-            .await
-            .expect("round");
+        let first =
+            run_once(caller.path(), courier.clone(), None, now()).await.expect("round");
         assert_eq!(first.attempted, [(task.task_id.clone(), SentState::Waiting)]);
         let store = NodeStore::in_dir(caller.path()).expect("store");
         let waiting = store.sent_task(&task.task_id).expect("read").expect("exists");
-        assert!(waiting.next_attempt_at >= unix_now().saturating_add(4));
-        let early = run_once(caller.path(), courier.clone(), None, unix_now())
-            .await
-            .expect("round");
+        assert!(waiting.next_attempt_at >= now().saturating_add(4));
+        let early =
+            run_once(caller.path(), courier.clone(), None, now()).await.expect("round");
         assert!(early.attempted.is_empty());
         let later =
             run_once(caller.path(), courier.clone(), None, waiting.next_attempt_at)
@@ -901,8 +891,7 @@ mod tests {
     #[tokio::test]
     async fn an_offline_contact_waits_until_presence_says_online() {
         let (host, caller) = caller();
-        let task =
-            enqueue(caller.path(), "tudor", "work", unix_now()).expect("enqueue");
+        let task = enqueue(caller.path(), "tudor", "work", now()).expect("enqueue");
         let courier = Scripted::with(vec![
             Err(TransportError::Timeout),
             result(A2aTaskStatus::Completed, "done"),
@@ -911,10 +900,9 @@ mod tests {
         let offline = BTreeMap::from([(host_endpoint.clone(), false)]);
         let online = BTreeMap::from([(host_endpoint, true)]);
         // A new task is tried once, also to an offline agent.
-        let first =
-            run_once(caller.path(), courier.clone(), Some(&offline), unix_now())
-                .await
-                .expect("round");
+        let first = run_once(caller.path(), courier.clone(), Some(&offline), now())
+            .await
+            .expect("round");
         assert_eq!(first.attempted, [(task.task_id.clone(), SentState::Waiting)]);
         let store = NodeStore::in_dir(caller.path()).expect("store");
         let due = store
@@ -936,7 +924,7 @@ mod tests {
     #[tokio::test]
     async fn a_task_ends_as_not_delivered_after_seven_days_or_when_access_ends() {
         let (_host, caller) = caller();
-        let now = unix_now();
+        let now = now();
         let expired = enqueue(caller.path(), "tudor", "late", now).expect("enqueue");
         let courier = Scripted::with(Vec::new());
         run_once(caller.path(), courier.clone(), None, expired.expires_at)

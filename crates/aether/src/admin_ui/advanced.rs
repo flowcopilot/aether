@@ -6,7 +6,6 @@
 use std::{
     path::PathBuf,
     sync::{Arc, PoisonError},
-    time::SystemTime,
 };
 
 use serde::Deserialize;
@@ -264,7 +263,7 @@ fn managed_member_state(member: &ManagedMember) -> &'static str {
     if member.revoked_at.is_some() {
         return "revoked";
     }
-    let now = aether_core::time::unix_timestamp(SystemTime::now()).unwrap_or(i64::MAX);
+    let now = aether_core::time::now();
     if member.expires_at <= now { "expired" } else { "active" }
 }
 

@@ -316,7 +316,7 @@ pub(super) async fn node_header(cx: &Cx, current: Tab) -> TopcoatResult<impl Vie
         .map(|host| host.data_dir.clone())
         .or_else(|| caller.as_ref().map(|caller| caller.data_dir.clone()));
     let drafts = caller.as_ref().map_or(0, |caller| {
-        let now = aether_core::time::unix_seconds(SystemTime::now()).unwrap_or(0);
+        let now = aether_core::time::now_seconds();
         caller::request_drafts_of(&caller.data_dir, now).len()
     });
     let pending = app_context::<SharedAdministration>(cx)
