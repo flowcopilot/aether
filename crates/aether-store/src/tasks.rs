@@ -651,14 +651,6 @@ impl NodeStore {
         &mut self,
         timestamp: i64,
     ) -> Result<usize, StoreError> {
-        self.clear_expired_content_batch(timestamp, CONTENT_CLEANUP_BATCH)
-    }
-
-    fn clear_expired_content_batch(
-        &mut self,
-        timestamp: i64,
-        batch: i64,
-    ) -> Result<usize, StoreError> {
         let tx = self.connection.transaction()?;
         let ids = {
             let mut statement = tx.prepare(&format!(
@@ -671,7 +663,9 @@ impl NodeStore {
                 TaskState::sql_list(&TaskState::CONTENT_EXPIRES),
             ))?;
             statement
-                .query_map(params![timestamp, batch], |row| row.get::<_, String>(0))?
+                .query_map(params![timestamp, CONTENT_CLEANUP_BATCH], |row| {
+                    row.get::<_, String>(0)
+                })?
                 .collect::<Result<Vec<_>, _>>()?
         };
         for task_id in &ids {
@@ -999,31 +993,25 @@ fn event(
 mod tests {
     use std::fs;
 
-    use rusqlite::{Connection, TransactionBehavior};
+    use rusqlite::Connection;
 
     use super::*;
     use crate::{migrate::migrate, test_support::*, *};
 
+    /// Admits a new task of `peer` (endpoint `endpoint-<peer>`) under
+    /// `replay_key`.
     fn accept_replay_key(
         store: &mut NodeStore,
-        caller_endpoint_id: &str,
+        peer: &str,
         replay_key: &str,
         expires_at: i64,
         limit: usize,
     ) -> Result<(), StoreError> {
-        let tx = store
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        super::accept_replay_key(
-            &tx,
-            caller_endpoint_id,
-            "scope",
-            replay_key,
-            expires_at,
-            limit,
-        )?;
-        tx.commit()?;
-        Ok(())
+        let input = input(&format!("{peer}-{replay_key}"), peer);
+        let limits = QueueLimits { global: 100, per_peer: 100 };
+        store
+            .admit_with_replay(&input, limits, replay_key, expires_at, limit)
+            .map(|_| ())
     }
 
     #[test]
@@ -1100,27 +1088,27 @@ mod tests {
     #[test]
     fn replay_keys_are_scoped_expire_and_survive_restart() {
         let (mut store, database) = store();
-        accept_replay_key(&mut store, "endpoint-a", "exchange", i64::MAX, 2)
+        accept_replay_key(&mut store, "a", "exchange", i64::MAX, 2)
             .expect("replay key must store");
         assert_eq!(
-            accept_replay_key(&mut store, "endpoint-a", "exchange", i64::MAX, 2),
+            accept_replay_key(&mut store, "a", "exchange", i64::MAX, 2),
             Err(StoreError::DuplicateConflict)
         );
-        accept_replay_key(&mut store, "endpoint-b", "exchange", i64::MAX, 2)
+        accept_replay_key(&mut store, "b", "exchange", i64::MAX, 2)
             .expect("other peer may use the key");
         drop(store);
         let mut store = NodeStore::open(&database).expect("store must reopen");
         assert_eq!(
-            accept_replay_key(&mut store, "endpoint-a", "exchange", i64::MAX, 2),
+            accept_replay_key(&mut store, "a", "exchange", i64::MAX, 2),
             Err(StoreError::DuplicateConflict)
         );
-        accept_replay_key(&mut store, "endpoint-a", "expired", 0, 2)
+        accept_replay_key(&mut store, "a", "expired", 0, 2)
             .expect("expired key must store");
-        accept_replay_key(&mut store, "endpoint-a", "replacement", i64::MAX, 2)
+        accept_replay_key(&mut store, "a", "replacement", i64::MAX, 2)
             .expect("expired key must clear");
-        accept_replay_key(&mut store, "endpoint-a", "limited", i64::MAX, 2)
+        accept_replay_key(&mut store, "a", "limited", i64::MAX, 2)
             .expect("limited key must store");
-        accept_replay_key(&mut store, "endpoint-a", "newer", i64::MAX, 2)
+        accept_replay_key(&mut store, "a", "newer", i64::MAX, 2)
             .expect("oldest key must expire at the limit");
         drop(store);
         fs::remove_file(database).expect("database must remove");
@@ -1159,12 +1147,12 @@ mod tests {
                 .expect("first replay and task must store"),
             TaskAdmission::Accepted("one".to_owned())
         );
-        accept_replay_key(&mut store, "endpoint-b", "peer-replay", i64::MAX, 1)
+        accept_replay_key(&mut store, "b", "peer-replay", i64::MAX, 1)
             .expect("other caller replay must store");
-        accept_replay_key(&mut store, "endpoint-b", "peer-replay-new", i64::MAX, 1)
+        accept_replay_key(&mut store, "b", "peer-replay-new", i64::MAX, 1)
             .expect("other caller capacity may replace only its own key");
         assert_eq!(
-            accept_replay_key(&mut store, "endpoint-a", "replay-one", i64::MAX, 1),
+            accept_replay_key(&mut store, "a", "replay-one", i64::MAX, 1),
             Err(StoreError::DuplicateConflict)
         );
         fs::remove_file(database).expect("database must remove");
@@ -1352,30 +1340,26 @@ mod tests {
     #[test]
     fn clear_expired_content_is_bounded_by_batch_size() {
         let (mut store, database) = store();
-        for index in 0..3 {
+        let tasks = CONTENT_CLEANUP_BATCH.saturating_add(1);
+        let limits = QueueLimits { global: 1_000, per_peer: 1_000 };
+        for index in 0..tasks {
             let id = format!("task-{index}");
-            store
-                .admit(&input(&id, "caller"), QueueLimits { global: 10, per_peer: 10 })
-                .expect("task must admit");
-            let execution_id = format!("exec-{index}");
-            store.lease_next("worker", &execution_id, 10).expect("lease");
-            store.mark_running(&id, &execution_id).expect("task must run");
-            store.mark_failed(&id, &execution_id).expect("task must fail");
+            store.admit(&input(&id, "caller"), limits).expect("task must admit");
+            store.cancel(&id).expect("task must cancel");
         }
         let cutoff = now() + CONTENT_RETENTION_SECONDS;
         assert_eq!(
             store
-                .clear_expired_content_batch(cutoff, 2)
-                .expect("bounded cleanup must run"),
-            2,
-            "a batch limit of 2 must clear only two of the three eligible rows"
+                .clear_expired_content(cutoff)
+                .ok()
+                .and_then(|n| i64::try_from(n).ok()),
+            Some(CONTENT_CLEANUP_BATCH),
+            "one call must clear at most one batch"
         );
         assert_eq!(
-            store
-                .clear_expired_content_batch(cutoff, 2)
-                .expect("remaining cleanup must run"),
-            1,
-            "a later pass must clear whatever the batch limit left behind"
+            store.clear_expired_content(cutoff).ok(),
+            Some(1),
+            "a later call must clear whatever the batch left behind"
         );
         fs::remove_file(database).expect("database must remove");
     }
