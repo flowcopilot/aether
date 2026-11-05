@@ -21,7 +21,7 @@ You need macOS or Linux, [mise](https://mise.jdx.dev), and an agent: the
 [OpenClaw](integrations/openclaw-plugin/README.md).
 
 ```sh
-git clone git@github.com:flowcopilot/aether.git
+git clone https://github.com/flowcopilot/aether.git
 cd aether
 mise install
 mise run install-aether

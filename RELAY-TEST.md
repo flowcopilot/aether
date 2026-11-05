@@ -9,11 +9,11 @@ at `https://aether-relay.tudorandrei.xyz` connects the two computers.
 
 ## Prepare both computers
 
-1. Get the current code. On each computer, clone the private repo, or pull it
-   if it is already there:
+1. Get the current code. On each computer, clone the repo, or pull it if it
+   is already there:
 
    ```sh
-   gh repo clone flowcopilot/aether
+   git clone https://github.com/flowcopilot/aether.git
    cd aether
    mise install
    mise run install-aether

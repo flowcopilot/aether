@@ -13,15 +13,13 @@ task text and no answer.
 
 - macOS or Linux.
 - [mise](https://mise.jdx.dev): `mise --version`
-- Read access to the `flowcopilot/aether` source. Ask your user for it if
-  `git ls-remote git@github.com:flowcopilot/aether.git` fails.
 - An agent for the node to run: the Codex CLI (`codex --version`), or
   Hermes Agent with the Aether plugin.
 
 ## 2. Install the binary
 
 ```sh
-git clone git@github.com:flowcopilot/aether.git ~/aether
+git clone https://github.com/flowcopilot/aether.git ~/aether
 cd ~/aether
 mise install
 mise run install-aether
