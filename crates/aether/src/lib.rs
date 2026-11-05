@@ -120,7 +120,6 @@ pub fn startup_log(command: Command, _config: &Config) -> String {
         "event": "process_ready",
         "command": command.name(),
         "protocol": aether_core::PROTOCOL_FAMILY,
-        "store_protocol": aether_store::protocol_family(),
     })
     .to_string()
 }
