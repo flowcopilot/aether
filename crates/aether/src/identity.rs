@@ -235,13 +235,12 @@ pub enum SignError {
 
 /// Signs a claim and a grant for one caller.
 ///
-/// The caller sends the returned authorization with each request; the
-/// host's node needs the grant. The authorization names the first
-/// capability and workspace of `input`.
+/// The caller sends the claim with each request; the host's node needs the
+/// grant.
 pub fn sign_access(
     signing_key: &SigningKey,
     input: &AccessInput,
-) -> Result<(crate::transport::A2aAuthorization, Grant), SignError> {
+) -> Result<(Claim, Grant), SignError> {
     let now = SystemTime::now();
     // One second back, so a peer whose clock is slightly behind does not
     // see a claim issued in the future.
@@ -291,19 +290,144 @@ pub fn sign_access(
             nonce: random_nonce()?,
         },
     );
-    let authorization = crate::transport::A2aAuthorization {
-        request_id: "pending".to_owned(),
-        caller_agent_id: input.subject_agent_id.clone(),
-        caller_endpoint_id: input.subject_endpoint_id.clone(),
-        capability_id: input.capabilities.first().cloned().unwrap_or_default(),
-        workspace_id: input.workspaces.first().cloned().unwrap_or_default(),
-        access_mode: match input.access_mode {
-            AccessMode::ReadOnly => crate::transport::A2aAccessMode::ReadOnly,
-            AccessMode::ReadWrite => crate::transport::A2aAccessMode::ReadWrite,
-        },
-        claim: (&claim).into(),
-    };
-    Ok((authorization, grant))
+    Ok((claim, grant))
+}
+
+/// The JSON form of a grant, in a policy file and in a stored change.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GrantRecord {
+    id: String,
+    issuer_agent_id: String,
+    subject_agent_id: String,
+    subject_endpoint_id: String,
+    scope_id: String,
+    capabilities: Vec<String>,
+    workspaces: Vec<String>,
+    access_mode: String,
+    approval_rule: String,
+    issued_at: u64,
+    expires_at: u64,
+    #[serde(with = "hex::serde")]
+    signing_key: [u8; 32],
+    #[serde(with = "hex::serde")]
+    nonce: [u8; 32],
+    #[serde(with = "hex::serde")]
+    signature: Vec<u8>,
+}
+
+/// A grant whose JSON form does not read, names an empty field, or holds a
+/// time outside the clock.
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+pub enum InvalidGrant {
+    #[error("grant is invalid at {0}")]
+    Field(String),
+    #[error("grant is invalid")]
+    Invalid,
+}
+
+impl From<&Grant> for GrantRecord {
+    fn from(grant: &Grant) -> Self {
+        let seconds = |time| aether_core::time::unix_seconds(time).unwrap_or(0);
+        Self {
+            id: grant.id.as_str().to_owned(),
+            issuer_agent_id: grant.issuer_agent_id.as_str().to_owned(),
+            subject_agent_id: grant.subject_agent_id.as_str().to_owned(),
+            subject_endpoint_id: grant.subject_endpoint_id.as_str().to_owned(),
+            scope_id: grant.scope_id.as_str().to_owned(),
+            capabilities: grant
+                .capabilities
+                .iter()
+                .map(|id| id.as_str().to_owned())
+                .collect(),
+            workspaces: grant
+                .workspaces
+                .iter()
+                .map(|id| id.as_str().to_owned())
+                .collect(),
+            access_mode: grant.access_mode.as_str().to_owned(),
+            approval_rule: grant.approval_rule.as_str().to_owned(),
+            issued_at: seconds(grant.issued_at),
+            expires_at: seconds(grant.expires_at),
+            signing_key: grant.signing_key,
+            nonce: grant.nonce,
+            signature: grant.signature.clone(),
+        }
+    }
+}
+
+impl TryFrom<GrantRecord> for Grant {
+    type Error = InvalidGrant;
+
+    fn try_from(record: GrantRecord) -> Result<Self, Self::Error> {
+        let capabilities = record
+            .capabilities
+            .into_iter()
+            .filter(|value| !value.is_empty())
+            .map(CapabilityId::new)
+            .collect::<BTreeSet<_>>();
+        let workspaces = record
+            .workspaces
+            .into_iter()
+            .filter(|value| !value.is_empty())
+            .map(WorkspaceId::new)
+            .collect::<BTreeSet<_>>();
+        let access_mode =
+            AccessMode::parse(&record.access_mode).ok_or(InvalidGrant::Invalid)?;
+        let approval_rule =
+            ApprovalRule::parse(&record.approval_rule).ok_or(InvalidGrant::Invalid)?;
+        if record.id.is_empty()
+            || record.issuer_agent_id.is_empty()
+            || record.subject_agent_id.is_empty()
+            || record.subject_endpoint_id.is_empty()
+            || record.scope_id.is_empty()
+            || capabilities.is_empty()
+            || workspaces.is_empty()
+        {
+            return Err(InvalidGrant::Invalid);
+        }
+        let time = |seconds| {
+            aether_core::time::from_unix_seconds(seconds).ok_or(InvalidGrant::Invalid)
+        };
+        Ok(Self {
+            id: GrantId::new(record.id),
+            issuer_agent_id: AgentId::new(record.issuer_agent_id),
+            subject_agent_id: AgentId::new(record.subject_agent_id),
+            subject_endpoint_id: EndpointId::new(record.subject_endpoint_id),
+            scope_id: ScopeId::new(record.scope_id),
+            capabilities,
+            workspaces,
+            access_mode,
+            approval_rule,
+            issued_at: time(record.issued_at)?,
+            expires_at: time(record.expires_at)?,
+            signing_key: record.signing_key,
+            nonce: record.nonce,
+            signature: record.signature,
+        })
+    }
+}
+
+/// The JSON text of `grant`, which [`decode_grant`] reads back.
+///
+/// # Errors
+///
+/// [`InvalidGrant::Invalid`] when the grant has no JSON form.
+pub fn encode_grant(grant: &Grant) -> Result<String, InvalidGrant> {
+    serde_json::to_string(&GrantRecord::from(grant)).map_err(|_| InvalidGrant::Invalid)
+}
+
+/// The grant of the JSON text `text`.
+///
+/// # Errors
+///
+/// [`InvalidGrant::Field`] names the field that does not read; the other
+/// errors are [`InvalidGrant::Invalid`].
+pub fn decode_grant(text: &str) -> Result<Grant, InvalidGrant> {
+    let mut decoder = serde_json::Deserializer::from_str(text);
+    let record: GrantRecord = serde_path_to_error::deserialize(&mut decoder)
+        .map_err(|error| InvalidGrant::Field(error.path().to_string()))?;
+    Grant::try_from(record)
 }
 
 fn random_nonce() -> Result<[u8; 32], SignError> {

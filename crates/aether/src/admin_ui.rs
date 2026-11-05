@@ -1190,8 +1190,8 @@ mod tests {
 
         let applied = node.granted();
         assert_eq!(applied.len(), 1);
-        let grant = crate::node_config::parse_grant_json(&applied[0])
-            .expect("grant must parse");
+        let grant =
+            crate::identity::decode_grant(&applied[0]).expect("grant must parse");
         assert_eq!(grant.subject_endpoint_id.as_str(), ana);
         let state = hub.state();
         let unsent = state.invites.iter().find(|invite| invite.id == unsent);
@@ -1201,21 +1201,24 @@ mod tests {
 
     /// A line that the host in `host_dir` signed as `agent` for `caller`.
     fn signed_line(host_dir: &std::path::Path, agent: &str, caller: &str) -> String {
-        let (authorization, _) = crate::identity::sign_access(
+        let access = crate::identity::AccessInput {
+            issuer_agent_id: "node".to_owned(),
+            subject_agent_id: "ana".to_owned(),
+            subject_endpoint_id: caller.to_owned(),
+            scope_id: crate::direct::SCOPE.to_owned(),
+            capabilities: vec![crate::execution::GENERAL_SKILL.to_owned()],
+            workspaces: vec!["workspace".to_owned()],
+            access_mode: aether_core::AccessMode::ReadOnly,
+            approval_rule: aether_core::ApprovalRule::Automatic,
+            lifetime: std::time::Duration::from_secs(60),
+        };
+        let (claim, _) = crate::identity::sign_access(
             &ed25519_dalek::SigningKey::from_bytes(&[9; 32]),
-            &crate::identity::AccessInput {
-                issuer_agent_id: "node".to_owned(),
-                subject_agent_id: "ana".to_owned(),
-                subject_endpoint_id: caller.to_owned(),
-                scope_id: crate::direct::SCOPE.to_owned(),
-                capabilities: vec![crate::execution::GENERAL_SKILL.to_owned()],
-                workspaces: vec!["workspace".to_owned()],
-                access_mode: aether_core::AccessMode::ReadOnly,
-                approval_rule: aether_core::ApprovalRule::Automatic,
-                lifetime: std::time::Duration::from_secs(60),
-            },
+            &access,
         )
         .expect("access must sign");
+        let authorization =
+            crate::transport::A2aAuthorization::for_access(&access, &claim);
         crate::direct::InvitationBundle {
             format: crate::direct::BUNDLE_FORMAT_V1.to_owned(),
 
@@ -2233,7 +2236,7 @@ mod tests {
             .expect("issuer key must load");
         {
             let applied = node.granted();
-            let grant = crate::node_config::parse_grant_json(
+            let grant = crate::identity::decode_grant(
                 applied.first().expect("the grant must reach the node"),
             )
             .expect("grant must parse");
@@ -2313,7 +2316,7 @@ mod tests {
             "ana must be listed"
         );
         assert!(invited.body.contains("No tasks yet"));
-        let grant_id = crate::node_config::parse_grant_json(
+        let grant_id = crate::identity::decode_grant(
             node.granted().first().expect("grant must exist"),
         )
         .expect("grant must parse")

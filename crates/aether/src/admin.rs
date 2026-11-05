@@ -356,7 +356,7 @@ pub mod test_support {
             let revoked = self.revoked();
             self.granted()
                 .iter()
-                .filter_map(|grant| crate::node_config::parse_grant_json(grant).ok())
+                .filter_map(|grant| crate::identity::decode_grant(grant).ok())
                 .filter(|grant| !revoked.iter().any(|id| id == grant.id.as_str()))
                 .collect()
         }

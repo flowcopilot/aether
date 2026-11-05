@@ -224,9 +224,12 @@ fn handle(
             ) else {
                 return Response::Error { code: "invalid".to_owned() };
             };
+            let Ok(grant_text) = crate::identity::encode_grant(&grant) else {
+                return Response::Error { code: "invalid".to_owned() };
+            };
             let change = match (crate::admin::ChangeRequest::Grant {
                 id: grant.id.as_str().to_owned(),
-                grant: crate::node_config::grant_json(&grant).to_string(),
+                grant: grant_text,
             })
             .into_change()
             {

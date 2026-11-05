@@ -150,7 +150,8 @@ impl PactConsent {
         let grant_id = grant.id.as_str().to_owned();
         let change = crate::admin::ChangeRequest::Grant {
             id: grant_id.clone(),
-            grant: crate::node_config::grant_json(&grant).to_string(),
+            grant: crate::identity::encode_grant(&grant)
+                .map_err(|_| ConsentError::Sign)?,
         }
         .into_change()
         .map_err(|_| ConsentError::Refused)?;

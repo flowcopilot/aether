@@ -138,6 +138,64 @@ pub struct A2aClaim {
     pub signature: String,
 }
 
+impl From<AccessMode> for A2aAccessMode {
+    fn from(mode: AccessMode) -> Self {
+        match mode {
+            AccessMode::ReadOnly => Self::ReadOnly,
+            AccessMode::ReadWrite => Self::ReadWrite,
+        }
+    }
+}
+
+impl From<A2aAccessMode> for AccessMode {
+    fn from(mode: A2aAccessMode) -> Self {
+        match mode {
+            A2aAccessMode::ReadOnly => Self::ReadOnly,
+            A2aAccessMode::ReadWrite => Self::ReadWrite,
+        }
+    }
+}
+
+impl A2aAuthorization {
+    /// What a caller sends with each request under the access `input`, whose
+    /// signed claim is `claim`. It names the first capability and workspace
+    /// of `input`; each request sets its own request id.
+    #[must_use]
+    pub fn for_access(input: &crate::identity::AccessInput, claim: &Claim) -> Self {
+        Self {
+            request_id: "pending".to_owned(),
+            caller_agent_id: input.subject_agent_id.clone(),
+            caller_endpoint_id: input.subject_endpoint_id.clone(),
+            capability_id: input.capabilities.first().cloned().unwrap_or_default(),
+            workspace_id: input.workspaces.first().cloned().unwrap_or_default(),
+            access_mode: input.access_mode.clone().into(),
+            claim: claim.into(),
+        }
+    }
+}
+
+impl TryFrom<&A2aClaim> for Claim {
+    type Error = TransportError;
+
+    fn try_from(claim: &A2aClaim) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: ClaimId::new(claim.id.clone()),
+            issuer_agent_id: AgentId::new(claim.issuer_agent_id.clone()),
+            subject_agent_id: AgentId::new(claim.subject_agent_id.clone()),
+            subject_endpoint_id: EndpointId::new(claim.subject_endpoint_id.clone()),
+            scope_id: ScopeId::new(claim.scope_id.clone()),
+            issued_at: from_unix_seconds(claim.issued_at)
+                .ok_or(TransportError::BadFrame)?,
+            expires_at: from_unix_seconds(claim.expires_at)
+                .ok_or(TransportError::BadFrame)?,
+            signing_key: decode_key(&claim.signing_key)?,
+            nonce: decode_key(&claim.nonce)?,
+            signature: hex::decode(&claim.signature)
+                .map_err(|_| TransportError::BadFrame)?,
+        })
+    }
+}
+
 impl From<&Claim> for A2aClaim {
     fn from(claim: &Claim) -> Self {
         let seconds = |time| aether_core::time::unix_seconds(time).unwrap_or(0);
@@ -208,10 +266,6 @@ impl A2aRequest {
         {
             return Err(TransportError::BadFrame);
         }
-        let access_mode = match authorization.access_mode {
-            A2aAccessMode::ReadOnly => AccessMode::ReadOnly,
-            A2aAccessMode::ReadWrite => AccessMode::ReadWrite,
-        };
         let request = Request {
             id: RequestId::new(authorization.request_id.clone()),
             task_id: TaskId::new(self.task.id.clone()),
@@ -222,28 +276,9 @@ impl A2aRequest {
             scope_id: ScopeId::new(scope_id),
             capability_id: CapabilityId::new(authorization.capability_id.clone()),
             workspace_id: WorkspaceId::new(authorization.workspace_id.clone()),
-            access_mode,
+            access_mode: authorization.access_mode.into(),
         };
-        let claim = Claim {
-            id: ClaimId::new(authorization.claim.id.clone()),
-            issuer_agent_id: AgentId::new(authorization.claim.issuer_agent_id.clone()),
-            subject_agent_id: AgentId::new(
-                authorization.claim.subject_agent_id.clone(),
-            ),
-            subject_endpoint_id: EndpointId::new(
-                authorization.claim.subject_endpoint_id.clone(),
-            ),
-            scope_id: ScopeId::new(authorization.claim.scope_id.clone()),
-            issued_at: from_unix_seconds(authorization.claim.issued_at)
-                .ok_or(TransportError::BadFrame)?,
-            expires_at: from_unix_seconds(authorization.claim.expires_at)
-                .ok_or(TransportError::BadFrame)?,
-            signing_key: decode_key(&authorization.claim.signing_key)?,
-            nonce: decode_key(&authorization.claim.nonce)?,
-            signature: hex::decode(&authorization.claim.signature)
-                .map_err(|_| TransportError::BadFrame)?,
-        };
-        Ok((request, claim))
+        Ok((request, Claim::try_from(&authorization.claim)?))
     }
 }
 

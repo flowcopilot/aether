@@ -1004,7 +1004,8 @@ pub(super) fn sign_invite(
     .map_err(|error| internal(&error))?;
     let change = crate::admin::ChangeRequest::Grant {
         id: grant.id.as_str().to_owned(),
-        grant: crate::node_config::grant_json(&grant).to_string(),
+        grant: crate::identity::encode_grant(&grant)
+            .map_err(|error| internal(&error))?,
     }
     .into_change()
     .map_err(|error| internal(&error))?;

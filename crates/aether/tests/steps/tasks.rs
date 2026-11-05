@@ -26,8 +26,7 @@ use aether::{
     direct::InvitationBundle,
     discovery::wire::WireRecord,
     fixture::FAKE_CODEX_SCRIPT,
-    identity::{ClaimInput, GrantInput, signed_claim, signed_grant},
-    node_config::grant_json,
+    identity::{ClaimInput, GrantInput, GrantRecord, signed_claim, signed_grant},
     transport::{
         A2aAccessMode, A2aAuthorization, A2aRequest, Frame, FrameKind, bind_node,
         request_once, text_request_payload,
@@ -323,7 +322,7 @@ fn policy_json(
 ) -> Value {
     json!({
         "trustedIssuers": {"issuer": hex::encode(trusted_key)},
-        "grants": grants.iter().map(grant_json).collect::<Vec<_>>(),
+        "grants": grants.iter().map(GrantRecord::from).collect::<Vec<_>>(),
         "workspace": workspace,
         "maxContextTokens": 32,
         // The whole fake Codex session (spawn, handshake, turn) must fit in

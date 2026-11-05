@@ -151,21 +151,20 @@ pub fn sign_invite_access(
     }
     let issuer =
         DataDir::new(data_dir).issuer_key().map_err(|_| DirectError::Unavailable)?;
-    crate::identity::sign_access(
-        &issuer,
-        &crate::identity::AccessInput {
-            issuer_agent_id: crate::node_config::NODE_ISSUER.to_owned(),
-            subject_agent_id: friend_name.to_owned(),
-            subject_endpoint_id: endpoint_id.to_owned(),
-            scope_id: SCOPE.to_owned(),
-            capabilities: vec![crate::execution::GENERAL_SKILL.to_owned()],
-            workspaces: vec!["workspace".to_owned()],
-            access_mode: aether_core::AccessMode::ReadOnly,
-            approval_rule: aether_core::ApprovalRule::Automatic,
-            lifetime: Duration::from_secs(days.saturating_mul(24 * 60 * 60)),
-        },
-    )
-    .map_err(|_| DirectError::Invalid)
+    let access = crate::identity::AccessInput {
+        issuer_agent_id: crate::node_config::NODE_ISSUER.to_owned(),
+        subject_agent_id: friend_name.to_owned(),
+        subject_endpoint_id: endpoint_id.to_owned(),
+        scope_id: SCOPE.to_owned(),
+        capabilities: vec![crate::execution::GENERAL_SKILL.to_owned()],
+        workspaces: vec!["workspace".to_owned()],
+        access_mode: aether_core::AccessMode::ReadOnly,
+        approval_rule: aether_core::ApprovalRule::Automatic,
+        lifetime: Duration::from_secs(days.saturating_mul(24 * 60 * 60)),
+    };
+    let (claim, grant) = crate::identity::sign_access(&issuer, &access)
+        .map_err(|_| DirectError::Invalid)?;
+    Ok((A2aAuthorization::for_access(&access, &claim), grant))
 }
 
 /// Finish a connect code after the running node accepts the grant.
@@ -756,21 +755,23 @@ pub(crate) fn test_bundle_named(
     agent: &str,
     with_card: bool,
 ) -> InvitationBundle {
-    let (authorization, _) = crate::identity::sign_access(
+    let access = crate::identity::AccessInput {
+        issuer_agent_id: "node".to_owned(),
+        subject_agent_id: "ana".to_owned(),
+        subject_endpoint_id: caller_endpoint.to_owned(),
+        scope_id: SCOPE.to_owned(),
+        capabilities: vec![crate::execution::GENERAL_SKILL.to_owned()],
+        workspaces: vec!["workspace".to_owned()],
+        access_mode: aether_core::AccessMode::ReadOnly,
+        approval_rule: aether_core::ApprovalRule::Automatic,
+        lifetime: Duration::from_secs(60),
+    };
+    let (claim, _) = crate::identity::sign_access(
         &ed25519_dalek::SigningKey::from_bytes(&[9; 32]),
-        &crate::identity::AccessInput {
-            issuer_agent_id: "node".to_owned(),
-            subject_agent_id: "ana".to_owned(),
-            subject_endpoint_id: caller_endpoint.to_owned(),
-            scope_id: SCOPE.to_owned(),
-            capabilities: vec![crate::execution::GENERAL_SKILL.to_owned()],
-            workspaces: vec!["workspace".to_owned()],
-            access_mode: aether_core::AccessMode::ReadOnly,
-            approval_rule: aether_core::ApprovalRule::Automatic,
-            lifetime: Duration::from_secs(60),
-        },
+        &access,
     )
     .expect("access must sign");
+    let authorization = crate::transport::A2aAuthorization::for_access(&access, &claim);
     let invitation = create_invitation(host_dir, agent, Duration::from_secs(60))
         .expect("invitation");
     let relay_url = Some("https://relay.test".to_owned());
@@ -814,21 +815,24 @@ mod tests {
         caller_endpoint: &str,
         agent: &str,
     ) -> super::InvitationBundle {
-        let (authorization, _) = crate::identity::sign_access(
+        let access = crate::identity::AccessInput {
+            issuer_agent_id: "node".to_owned(),
+            subject_agent_id: "ana".to_owned(),
+            subject_endpoint_id: caller_endpoint.to_owned(),
+            scope_id: super::SCOPE.to_owned(),
+            capabilities: vec![crate::execution::GENERAL_SKILL.to_owned()],
+            workspaces: vec!["workspace".to_owned()],
+            access_mode: aether_core::AccessMode::ReadOnly,
+            approval_rule: aether_core::ApprovalRule::Automatic,
+            lifetime: std::time::Duration::from_secs(60),
+        };
+        let (claim, _) = crate::identity::sign_access(
             &ed25519_dalek::SigningKey::from_bytes(&[9; 32]),
-            &crate::identity::AccessInput {
-                issuer_agent_id: "node".to_owned(),
-                subject_agent_id: "ana".to_owned(),
-                subject_endpoint_id: caller_endpoint.to_owned(),
-                scope_id: super::SCOPE.to_owned(),
-                capabilities: vec![crate::execution::GENERAL_SKILL.to_owned()],
-                workspaces: vec!["workspace".to_owned()],
-                access_mode: aether_core::AccessMode::ReadOnly,
-                approval_rule: aether_core::ApprovalRule::Automatic,
-                lifetime: std::time::Duration::from_secs(60),
-            },
+            &access,
         )
         .expect("access must sign");
+        let authorization =
+            crate::transport::A2aAuthorization::for_access(&access, &claim);
         super::InvitationBundle {
             format: super::BUNDLE_FORMAT_V1.to_owned(),
 

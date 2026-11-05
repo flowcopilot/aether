@@ -2,12 +2,11 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
 use aether_core::{
-    AccessMode, AgentId, ApprovalRule, CapabilityId, Grant, GrantId, PolicyEngine,
-    Scope, ScopeId, ScopeKind, TrustProvider, WorkspaceId,
+    AgentId, Grant, PolicyEngine, Scope, ScopeId, ScopeKind, TrustProvider,
 };
 use aether_store::{NodeStore, QueueLimits, StoreError};
 use hex::FromHex;
@@ -24,7 +23,7 @@ use crate::{
     },
     data_dir::{DataDir, codex_login},
     execution::{Executor, Limits},
-    identity::{RosterClaims, SignedClaims},
+    identity::{GrantRecord, RosterClaims, SignedClaims, decode_grant},
     node_service::NodeService,
     proof::ProofNode,
 };
@@ -50,7 +49,7 @@ struct NodePolicyFile {
     trusted_issuers: BTreeMap<String, String>,
     /// Grants besides the ones added from the admin UI or MCP.
     #[serde(default)]
-    grants: Vec<GrantFile>,
+    grants: Vec<GrantRecord>,
     workspace: PathBuf,
     /// The adapter of the agent that answers this node's tasks. Absent:
     /// Codex.
@@ -151,28 +150,6 @@ impl PolicySandbox {
 struct ScopeFile {
     id: String,
     kind: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct GrantFile {
-    id: String,
-    issuer_agent_id: String,
-    subject_agent_id: String,
-    subject_endpoint_id: String,
-    scope_id: String,
-    capabilities: Vec<String>,
-    workspaces: Vec<String>,
-    access_mode: String,
-    approval_rule: String,
-    issued_at: u64,
-    expires_at: u64,
-    #[serde(with = "hex::serde")]
-    signing_key: [u8; 32],
-    #[serde(with = "hex::serde")]
-    nonce: [u8; 32],
-    #[serde(with = "hex::serde")]
-    signature: Vec<u8>,
 }
 
 /// The issuer name of the node's own signing key, which the node always
@@ -705,7 +682,7 @@ fn load_service_source(
     // file still lists it.
     let mut grants = Vec::new();
     for grant in policy.grants {
-        let grant = parse_grant(grant)?;
+        let grant = Grant::try_from(grant).map_err(|_| NodeConfigError::Invalid)?;
         if !store
             .grant_revoked(grant.id.as_str())
             .map_err(|_| NodeConfigError::Invalid)?
@@ -747,7 +724,7 @@ fn load_service_source(
         })
         .collect::<Vec<_>>();
     for value in &stored_grants {
-        if let Ok(grant) = parse_grant_json(value)
+        if let Ok(grant) = decode_grant(value)
             && scopes.iter().any(|scope| {
                 scope.id == grant.scope_id && scope.kind == ScopeKind::Direct
             })
@@ -1010,84 +987,6 @@ fn parse_scope(file: ScopeFile) -> Result<Scope, NodeConfigError> {
     Ok(Scope { id: ScopeId::new(file.id), kind })
 }
 
-pub fn parse_grant_json(value: &str) -> Result<Grant, NodeConfigError> {
-    let mut decoder = serde_json::Deserializer::from_slice(value.as_bytes());
-    let file: GrantFile = serde_path_to_error::deserialize(&mut decoder)
-        .map_err(|error| NodeConfigError::InvalidField(error.path().to_string()))?;
-    parse_grant(file)
-}
-
-/// The policy-file form of `grant`, which `parse_grant_json` reads back.
-#[must_use]
-pub fn grant_json(grant: &Grant) -> serde_json::Value {
-    let seconds = |time| aether_core::time::unix_seconds(time).unwrap_or(0);
-    serde_json::json!({
-        "id": grant.id.as_str(),
-        "issuerAgentId": grant.issuer_agent_id.as_str(),
-        "subjectAgentId": grant.subject_agent_id.as_str(),
-        "subjectEndpointId": grant.subject_endpoint_id.as_str(),
-        "scopeId": grant.scope_id.as_str(),
-        "capabilities": grant.capabilities.iter().map(CapabilityId::as_str).collect::<Vec<_>>(),
-        "workspaces": grant.workspaces.iter().map(WorkspaceId::as_str).collect::<Vec<_>>(),
-        "accessMode": grant.access_mode.as_str(),
-        "approvalRule": grant.approval_rule.as_str(),
-        "issuedAt": seconds(grant.issued_at),
-        "expiresAt": seconds(grant.expires_at),
-        "signingKey": hex::encode(grant.signing_key),
-        "nonce": hex::encode(grant.nonce),
-        "signature": hex::encode(&grant.signature),
-    })
-}
-
-fn parse_grant(file: GrantFile) -> Result<Grant, NodeConfigError> {
-    let capabilities = file
-        .capabilities
-        .into_iter()
-        .filter(|value| !value.is_empty())
-        .map(CapabilityId::new)
-        .collect::<BTreeSet<_>>();
-    let workspaces = file
-        .workspaces
-        .into_iter()
-        .filter(|value| !value.is_empty())
-        .map(WorkspaceId::new)
-        .collect::<BTreeSet<_>>();
-    let access_mode =
-        AccessMode::parse(&file.access_mode).ok_or(NodeConfigError::Invalid)?;
-    let approval_rule =
-        ApprovalRule::parse(&file.approval_rule).ok_or(NodeConfigError::Invalid)?;
-    if file.id.is_empty()
-        || file.issuer_agent_id.is_empty()
-        || file.subject_agent_id.is_empty()
-        || file.subject_endpoint_id.is_empty()
-        || file.scope_id.is_empty()
-        || capabilities.is_empty()
-        || workspaces.is_empty()
-    {
-        return Err(NodeConfigError::Invalid);
-    }
-    Ok(Grant {
-        id: GrantId::new(file.id),
-        issuer_agent_id: AgentId::new(file.issuer_agent_id),
-        subject_agent_id: AgentId::new(file.subject_agent_id),
-        subject_endpoint_id: aether_core::EndpointId::new(file.subject_endpoint_id),
-        scope_id: ScopeId::new(file.scope_id),
-        capabilities,
-        workspaces,
-        access_mode,
-        approval_rule,
-        issued_at: time(file.issued_at)?,
-        expires_at: time(file.expires_at)?,
-        signing_key: file.signing_key,
-        nonce: file.nonce,
-        signature: file.signature,
-    })
-}
-
-fn time(seconds: u64) -> Result<SystemTime, NodeConfigError> {
-    aether_core::time::from_unix_seconds(seconds).ok_or(NodeConfigError::Invalid)
-}
-
 fn decode_key(value: &str) -> Result<[u8; 32], NodeConfigError> {
     <[u8; 32]>::from_hex(value).map_err(|_| NodeConfigError::Invalid)
 }
@@ -1115,14 +1014,16 @@ mod tests {
 
     use super::{
         AgentAdapter, MAX_ENVIRONMENT, NODE_ISSUER, NodeConfigError, NodePolicyFile,
-        allowed_environment, codex_environment, grant_json, load_or_create_service,
-        load_or_create_service_with_adapter, load_service, parse_grant_json,
-        prepare_codex_home, setting, settings, store_agent_kind, store_setting,
-        with_adapter,
+        allowed_environment, codex_environment, load_or_create_service,
+        load_or_create_service_with_adapter, load_service, prepare_codex_home, setting,
+        settings, store_agent_kind, store_setting, with_adapter,
     };
     use crate::{
         hub_client::AgentKind,
-        identity::{AccessInput, GrantInput, sign_access, signed_grant},
+        identity::{
+            AccessInput, GrantInput, GrantRecord, decode_grant, encode_grant,
+            sign_access, signed_grant,
+        },
     };
 
     #[test]
@@ -1169,25 +1070,24 @@ mod tests {
     #[test]
     fn a_signed_access_grant_survives_the_policy_form() {
         let key = SigningKey::from_bytes(&[5; 32]);
-        let (authorization, grant) = sign_access(
-            &key,
-            &AccessInput {
-                issuer_agent_id: "node".to_owned(),
-                subject_agent_id: "friend".to_owned(),
-                subject_endpoint_id: "friend-endpoint".to_owned(),
-                scope_id: "direct".to_owned(),
-                capabilities: vec!["review".to_owned()],
-                workspaces: vec!["workspace".to_owned()],
-                access_mode: AccessMode::ReadOnly,
-                approval_rule: ApprovalRule::Automatic,
-                lifetime: Duration::from_secs(60),
-            },
-        )
-        .expect("access must sign");
-        let parsed = parse_grant_json(&grant_json(&grant).to_string())
-            .expect("grant must parse back");
+        let access = AccessInput {
+            issuer_agent_id: "node".to_owned(),
+            subject_agent_id: "friend".to_owned(),
+            subject_endpoint_id: "friend-endpoint".to_owned(),
+            scope_id: "direct".to_owned(),
+            capabilities: vec!["review".to_owned()],
+            workspaces: vec!["workspace".to_owned()],
+            access_mode: AccessMode::ReadOnly,
+            approval_rule: ApprovalRule::Automatic,
+            lifetime: Duration::from_secs(60),
+        };
+        let (claim, grant) = sign_access(&key, &access).expect("access must sign");
+        let authorization =
+            crate::transport::A2aAuthorization::for_access(&access, &claim);
+        let text = encode_grant(&grant).expect("grant must encode");
+        let parsed = decode_grant(&text).expect("grant must parse back");
         // `SystemTime` keeps sub-second precision; the policy form does not.
-        assert_eq!(grant_json(&parsed), grant_json(&grant));
+        assert_eq!(encode_grant(&parsed).expect("grant must encode"), text);
         assert_eq!(authorization.claim.subject_endpoint_id, "friend-endpoint");
         assert_eq!(authorization.claim.signing_key, hex::encode(grant.signing_key));
     }
@@ -1420,13 +1320,17 @@ mod tests {
         let (_, grant) =
             sign_access(&key, &friend_access(NODE_ISSUER)).expect("access must sign");
         service
-            .apply_stored_grant(&grant_json(&grant).to_string())
+            .apply_stored_grant(&encode_grant(&grant).expect("grant must encode"))
             .expect("a grant signed by the node key must apply");
         assert!(service.has_grant(&grant.id).expect("grants must read"));
         let stranger = SigningKey::from_bytes(&[8; 32]);
         let (_, forged) = sign_access(&stranger, &friend_access(NODE_ISSUER))
             .expect("access must sign");
-        assert!(service.apply_stored_grant(&grant_json(&forged).to_string()).is_err());
+        assert!(
+            service
+                .apply_stored_grant(&encode_grant(&forged).expect("grant must encode"))
+                .is_err()
+        );
     }
 
     #[test]
@@ -1442,7 +1346,7 @@ mod tests {
                 .expect("policy must decode");
         policy["trustedIssuers"] =
             json!({ "issuer": hex::encode(outside.verifying_key().to_bytes()) });
-        policy["grants"] = json!([grant_json(&file_grant)]);
+        policy["grants"] = json!([GrantRecord::from(&file_grant)]);
         fs::write(&path, policy.to_string()).expect("policy must write");
 
         let service = std::sync::Arc::new(
@@ -1464,7 +1368,7 @@ mod tests {
         ));
         let change = crate::admin::ChangeRequest::Grant {
             id: ui_grant.id.as_str().to_owned(),
-            grant: grant_json(&ui_grant).to_string(),
+            grant: encode_grant(&ui_grant).expect("grant must encode"),
         }
         .into_change()
         .expect("change must parse");
@@ -1553,8 +1457,10 @@ mod tests {
             {"id": "direct", "kind": "direct"},
             {"id": "directory", "kind": "directory"},
         ]);
-        policy["grants"] =
-            json!([grant_json(&direct_grant), grant_json(&directory_grant),]);
+        policy["grants"] = json!([
+            GrantRecord::from(&direct_grant),
+            GrantRecord::from(&directory_grant),
+        ]);
         let path = root.join("policy.json");
         fs::write(&path, serde_json::to_vec(&policy).expect("policy must encode"))
             .expect("policy must write");
@@ -1638,7 +1544,7 @@ mod tests {
             .apply_change(
                 aether_store::ChangeKind::Grant,
                 "restored",
-                &grant_json(&restored_grant).to_string(),
+                &encode_grant(&restored_grant).expect("grant must encode"),
             )
             .expect("grant must store");
         drop(store);
@@ -1937,7 +1843,7 @@ mod tests {
         json!({
             "scope": {"id": "direct", "kind": "direct"},
             "trustedIssuers": {"issuer": hex::encode(trusted_key)},
-            "grants": [grant_json(grant)],
+            "grants": [GrantRecord::from(grant)],
             "workspace": workspace,
             "maxContextTokens": 32,
             "maxSeconds": 1,

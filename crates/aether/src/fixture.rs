@@ -126,7 +126,7 @@ fn policy_json(
     json!({
         "scope": {"id": scope_id, "kind": scope_kind.as_str()},
         "trustedIssuers": {"fixture-issuer": hex::encode(trusted_key)},
-        "grants": [crate::node_config::grant_json(grant)],
+        "grants": [crate::identity::GrantRecord::from(grant)],
         "workspace": workspace,
         "maxContextTokens": 128,
         "maxSeconds": 10,

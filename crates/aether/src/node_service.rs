@@ -207,7 +207,7 @@ where
     }
 
     pub fn apply_stored_grant(&self, grant_json: &str) -> Result<(), ProofError> {
-        let grant = crate::node_config::parse_grant_json(grant_json)
+        let grant = crate::identity::decode_grant(grant_json)
             .map_err(|_| ProofError::Denied(aether_core::Denial::GrantDenied))?;
         self.node.apply_stored_grant(grant)
     }
