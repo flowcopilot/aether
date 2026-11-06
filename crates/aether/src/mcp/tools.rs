@@ -2071,12 +2071,7 @@ mod tests {
             dry_run: true,
         };
         let validated = server.settings_update_policy(Parameters(request)).await;
-        assert_eq!(
-            validated.is_error,
-            Some(false),
-            "{}",
-            decode_text(&validated)
-        );
+        assert_eq!(validated.is_error, Some(false), "{}", decode_text(&validated));
         assert_eq!(
             crate::policy::policy_settings(&data_dir)
                 .expect("policy must read")
