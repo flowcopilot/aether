@@ -31,19 +31,6 @@ pub enum AdminError {
     Stale,
 }
 
-impl schemars::JsonSchema for ChangeRequest {
-    fn schema_name() -> std::borrow::Cow<'static, str> {
-        "ChangeRequest".into()
-    }
-
-    fn json_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        schemars::json_schema!({
-            "type": "object",
-            "description": "A typed administration change."
-        })
-    }
-}
-
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum ChangeRequest {
@@ -54,36 +41,77 @@ pub enum ChangeRequest {
     Limit { id: aether_core::limits::QueueLimitId, limit: u32 },
 }
 
+// The wire form of a `ChangeRequest`, as MCP and the admin socket send it:
+// the grant travels encoded, and the limit id as its name. The MCP schema of
+// `aether.change` is this type's schema (a doc comment would enter it).
+#[derive(Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[schemars(rename = "ChangeRequest")]
+enum ChangeRequestWire {
+    Workspace { id: String, path: String },
+    Grant { id: String, grant: String },
+    Directory { id: String, url: String },
+    Capability { id: String, capability: String },
+    Limit { id: String, limit: u32 },
+}
+
+impl TryFrom<ChangeRequestWire> for ChangeRequest {
+    type Error = String;
+
+    fn try_from(wire: ChangeRequestWire) -> Result<Self, Self::Error> {
+        Ok(match wire {
+            ChangeRequestWire::Workspace { id, path } => Self::Workspace { id, path },
+            ChangeRequestWire::Grant { id, grant } => Self::Grant {
+                id,
+                grant: crate::identity::decode_grant(&grant)
+                    .map_err(|error| error.to_string())?,
+            },
+            ChangeRequestWire::Directory { id, url } => Self::Directory { id, url },
+            ChangeRequestWire::Capability { id, capability } => {
+                Self::Capability { id, capability }
+            }
+            ChangeRequestWire::Limit { id, limit } => Self::Limit {
+                id: aether_core::limits::QueueLimitId::parse(&id)
+                    .ok_or_else(|| "unknown limit id".to_owned())?,
+                limit,
+            },
+        })
+    }
+}
+
+impl TryFrom<&ChangeRequest> for ChangeRequestWire {
+    type Error = String;
+
+    fn try_from(request: &ChangeRequest) -> Result<Self, Self::Error> {
+        Ok(match request {
+            ChangeRequest::Workspace { id, path } => {
+                Self::Workspace { id: id.clone(), path: path.clone() }
+            }
+            ChangeRequest::Grant { id, grant } => Self::Grant {
+                id: id.clone(),
+                grant: crate::identity::encode_grant(grant)
+                    .map_err(|error| error.to_string())?,
+            },
+            ChangeRequest::Directory { id, url } => {
+                Self::Directory { id: id.clone(), url: url.clone() }
+            }
+            ChangeRequest::Capability { id, capability } => {
+                Self::Capability { id: id.clone(), capability: capability.clone() }
+            }
+            ChangeRequest::Limit { id, limit } => {
+                Self::Limit { id: id.as_str().to_owned(), limit: *limit }
+            }
+        })
+    }
+}
+
 impl<'de> Deserialize<'de> for ChangeRequest {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
     ) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-        enum Raw {
-            Workspace { id: String, path: String },
-            Grant { id: String, grant: String },
-            Directory { id: String, url: String },
-            Capability { id: String, capability: String },
-            Limit { id: String, limit: u32 },
-        }
-        match Raw::deserialize(deserializer)? {
-            Raw::Workspace { id, path } => Ok(Self::Workspace { id, path }),
-            Raw::Grant { id, grant } => {
-                let grant = crate::identity::decode_grant(&grant)
-                    .map_err(serde::de::Error::custom)?;
-                Ok(Self::Grant { id, grant })
-            }
-            Raw::Directory { id, url } => Ok(Self::Directory { id, url }),
-            Raw::Capability { id, capability } => {
-                Ok(Self::Capability { id, capability })
-            }
-            Raw::Limit { id, limit } => {
-                let id = aether_core::limits::QueueLimitId::parse(&id)
-                    .ok_or_else(|| serde::de::Error::custom("unknown limit id"))?;
-                Ok(Self::Limit { id, limit })
-            }
-        }
+        ChangeRequestWire::deserialize(deserializer)?
+            .try_into()
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -92,34 +120,19 @@ impl Serialize for ChangeRequest {
         &self,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
-        #[derive(Serialize)]
-        #[serde(tag = "type", rename_all = "snake_case")]
-        enum Raw<'a> {
-            Workspace { id: &'a str, path: &'a str },
-            Grant { id: &'a str, grant: String },
-            Directory { id: &'a str, url: &'a str },
-            Capability { id: &'a str, capability: &'a str },
-            Limit { id: &'a str, limit: u32 },
-        }
-        match self {
-            Self::Workspace { id, path } => {
-                Raw::Workspace { id, path }.serialize(serializer)
-            }
-            Self::Grant { id, grant } => {
-                let grant = crate::identity::encode_grant(grant)
-                    .map_err(serde::ser::Error::custom)?;
-                Raw::Grant { id, grant }.serialize(serializer)
-            }
-            Self::Directory { id, url } => {
-                Raw::Directory { id, url }.serialize(serializer)
-            }
-            Self::Capability { id, capability } => {
-                Raw::Capability { id, capability }.serialize(serializer)
-            }
-            Self::Limit { id, limit } => {
-                Raw::Limit { id: id.as_str(), limit: *limit }.serialize(serializer)
-            }
-        }
+        ChangeRequestWire::try_from(self)
+            .map_err(serde::ser::Error::custom)?
+            .serialize(serializer)
+    }
+}
+
+impl schemars::JsonSchema for ChangeRequest {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        ChangeRequestWire::schema_name()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        ChangeRequestWire::json_schema(generator)
     }
 }
 
