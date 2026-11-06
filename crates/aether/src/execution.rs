@@ -166,8 +166,7 @@ impl<P: Agent> Executor<P> {
             return Err(ExecutionError::Path);
         }
         let workspace = self.workspace.path()?;
-        let workspace =
-            workspace.canonicalize().map_err(|_| ExecutionError::Path)?;
+        let workspace = workspace.canonicalize().map_err(|_| ExecutionError::Path)?;
         let root = self.workspace_root()?;
         if !workspace.starts_with(&root) {
             return Err(ExecutionError::Path);
@@ -195,8 +194,7 @@ impl<P: Agent> Executor<P> {
 
     pub fn set_workspace(&mut self, workspace: &Path) -> Result<(), ExecutionError> {
         let subpath = workspace.starts_with(&self.allowed_root);
-        let canonical =
-            workspace.canonicalize().map_err(|_| ExecutionError::Path)?;
+        let canonical = workspace.canonicalize().map_err(|_| ExecutionError::Path)?;
         let root = self.workspace_root()?;
         if subpath && !canonical.starts_with(&root) {
             return Err(ExecutionError::Path);
