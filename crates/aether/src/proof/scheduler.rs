@@ -577,24 +577,31 @@ where
 
     fn maintain(&self) {
         let now = timestamp_after(Duration::ZERO);
-        let recovered =
-            self.store.call(move |store| store.recover_expired_leases(now)).ok();
-        if let Some(recovered) = recovered
-            && !recovered.is_empty()
-        {
-            let active = self.active_task.lock().ok().and_then(|active| active.clone());
-            if let Some(active_id) = active
-                && recovered.contains(&active_id)
-            {
-                // The active worker's lease was just reclaimed as
-                // `UnknownResult`; stop it promptly instead of letting it
-                // keep running unsupervised past its recovered deadline.
-                self.canceller.cancel(&active_id);
-            }
-            for task_id in recovered {
-                let _ = self.event_sender.send(task_id);
+        match self.store.call(move |store| store.recover_expired_leases(now)) {
+            Ok(recovered) => self.stop_recovered(&recovered),
+            Err(error) => {
+                eprintln!("aether: scheduler recover expired leases: {error:?}");
             }
         }
-        let _ = self.store.call(move |store| store.clear_expired_content(now));
+        if let Err(error) =
+            self.store.call(move |store| store.clear_expired_content(now))
+        {
+            eprintln!("aether: scheduler clear expired content: {error:?}");
+        }
+    }
+
+    fn stop_recovered(&self, recovered: &[String]) {
+        let active = self.active_task.lock().ok().and_then(|active| active.clone());
+        if let Some(active_id) = active
+            && recovered.contains(&active_id)
+        {
+            // The active worker's lease was just reclaimed as
+            // `UnknownResult`; stop it promptly instead of letting it
+            // keep running unsupervised past its recovered deadline.
+            self.canceller.cancel(&active_id);
+        }
+        for task_id in recovered {
+            self.notify_task(task_id);
+        }
     }
 }

@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use aether_core::{limits::QueueLimitId, Scope, ScopeId, ScopeKind};
+use aether_core::{Scope, ScopeId, ScopeKind, limits::QueueLimitId};
 use aether_store::{NodeStore, QueueLimits, StoreError};
 use hex::FromHex;
 use serde::{Deserialize, Serialize};
