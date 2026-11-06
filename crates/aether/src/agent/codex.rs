@@ -155,12 +155,6 @@ pub struct CodexAppServer {
     source: Option<PathBuf>,
     arguments: Vec<String>,
     limits: CodexLimits,
-    // Held separately from `limits` (and behind an `Arc` so every clone —
-    // including the one `Executor::cancellation_handle` hands out —
-    // shares it) because it is the one field a live workspace change must
-    // update after construction; the rest of `limits` stays fixed for this
-    // process's lifetime.
-    workspace: Arc<Mutex<PathBuf>>,
     active_turns: Arc<Mutex<BTreeMap<String, ActiveTurn>>>,
 }
 
@@ -209,13 +203,12 @@ fn app_server_arguments() -> Vec<String> {
 
 impl CodexAppServer {
     #[must_use]
-    pub fn new(binary: PathBuf, workspace: PathBuf, limits: CodexLimits) -> Self {
+    pub fn new(binary: PathBuf, _workspace: PathBuf, limits: CodexLimits) -> Self {
         Self {
             source: resolve_binary(&binary).ok(),
             binary,
             arguments: app_server_arguments(),
             limits,
-            workspace: Arc::new(Mutex::new(workspace)),
             active_turns: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
@@ -534,26 +527,13 @@ impl Agent for CodexAppServer {
             let _ = write_json(&active.input, &request);
         }
     }
-
-    fn set_workspace(&self, workspace: &Path) {
-        if self.limits.sandbox == TASK_FOLDER {
-            return;
-        }
-        if let Ok(mut current) = self.workspace.lock() {
-            *current = workspace.to_path_buf();
-        }
-    }
-
-    fn supports_workspace_change(&self) -> bool {
-        self.limits.sandbox != TASK_FOLDER
-    }
 }
 
 #[cfg(test)]
 impl CodexAppServer {
     fn with_arguments(
         binary: PathBuf,
-        workspace: PathBuf,
+        _workspace: PathBuf,
         arguments: Vec<String>,
         limits: CodexLimits,
     ) -> Self {
@@ -562,7 +542,6 @@ impl CodexAppServer {
             binary,
             arguments,
             limits,
-            workspace: Arc::new(Mutex::new(workspace)),
             active_turns: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }

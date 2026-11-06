@@ -495,7 +495,7 @@ pub async fn run(options: NodeServeOptions) -> Result<(), NodeRunError> {
     });
     let service_for_shutdown = Arc::clone(&service);
     let router = transport::router(endpoint.clone(), move |peer, frames| {
-        service.handle(peer, frames)
+        service.a2a().handle(peer, frames)
     });
     let mut result = match tokio::signal::ctrl_c().await {
         Ok(()) => router

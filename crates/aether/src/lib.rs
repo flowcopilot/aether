@@ -3,6 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod a2a_transport;
 mod access_groups;
 pub mod access_requests;
 pub mod admin;

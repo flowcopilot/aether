@@ -29,6 +29,14 @@ identifier!(EndpointId);
 identifier!(ScopeId);
 identifier!(CapabilityId);
 identifier!(WorkspaceId);
+
+impl WorkspaceId {
+    #[must_use]
+    pub fn allows_path_token(value: &str) -> bool {
+        !value.contains("..") && !value.starts_with('/')
+    }
+}
+
 identifier!(GrantId);
 identifier!(ClaimId);
 identifier!(TaskId);

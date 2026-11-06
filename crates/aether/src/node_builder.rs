@@ -136,8 +136,16 @@ fn build(
         signed_claims.verify_grant(grant, scope).map_err(|_| PolicyError::Invalid)?;
     }
     let queue_limits = QueueLimits {
-        global: stored_limit(&store, "queue_global", policy.queue_global)?,
-        per_peer: stored_limit(&store, "queue_per_peer", policy.queue_per_peer)?,
+        global: stored_limit(
+            &store,
+            aether_core::limits::QueueLimitId::Global,
+            policy.queue_global,
+        )?,
+        per_peer: stored_limit(
+            &store,
+            aether_core::limits::QueueLimitId::PerPeer,
+            policy.queue_per_peer,
+        )?,
     };
     let stored_workspace =
         store.current_workspace().map_err(|_| PolicyError::Invalid)?;
@@ -384,7 +392,11 @@ mod tests {
         assert!(load_service(&path, &root, "codex".into()).is_ok());
         let mut store = NodeStore::in_dir(&root).expect("store must open");
         store
-            .apply_change(aether_store::ChangeKind::Limit, "queue_global", "2")
+            .apply_change(
+                aether_store::ChangeKind::Limit,
+                aether_core::limits::QueueLimitId::Global.as_str(),
+                "2",
+            )
             .expect("queue limit must store");
         drop(store);
         let service = load_service(&path, &root, "codex".into())
