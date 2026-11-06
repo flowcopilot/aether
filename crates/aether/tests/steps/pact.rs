@@ -4,7 +4,7 @@
 
 use std::{
     fmt,
-    io::{BufRead, BufReader},
+    io::BufReader,
     process::{ChildStdout, Stdio},
     time::{Duration, SystemTime},
 };
@@ -24,7 +24,7 @@ use tempfile::TempDir;
 use aether::fixture::{PolicyLimits, policy_json};
 
 use crate::common::{
-    FakeCodex, ServerProcess, TestNodeDir, aether_command, read_event,
+    FakeCodex, ServerProcess, TestNodeDir, aether_command, read_events,
 };
 
 /// The scope that the code review offer grants.
@@ -366,10 +366,9 @@ impl Node {
                 .stdout(Stdio::piped()),
         );
         let mut output = process.stdout();
-        if !pact_listening(&mut output) {
-            return None;
-        }
-        let admin = read_event(&mut output, Some("admin_listening"))["url"]
+        // The node stops before `pact_listening` when the PACT port is taken.
+        let events = read_events(&mut output, &["pact_listening", "admin_listening"])?;
+        let admin = events["admin_listening"]["url"]
             .as_str()
             .expect("admin URL")
             .trim_end_matches('/')
@@ -382,23 +381,6 @@ impl Node {
             admin,
             _directory: node_dir.temp,
         })
-    }
-}
-
-/// Reads events until `pact_listening`. False when the node stops first, as
-/// it does when the PACT port is already in use.
-fn pact_listening(output: &mut impl BufRead) -> bool {
-    let mut line = String::new();
-    loop {
-        line.clear();
-        if output.read_line(&mut line).expect("event line must read") == 0 {
-            return false;
-        }
-        let event: Value =
-            serde_json::from_str(&line).expect("event line must be JSON");
-        if event["event"] == "pact_listening" {
-            return true;
-        }
     }
 }
 
