@@ -1,9 +1,10 @@
-//! Starts the PACT gateway next to a running node.
-//!
-//! The listener speaks plain HTTP: a TLS proxy (Coolify, Caddy, Traefik)
-//! in front of it serves `pact.publicUrl` over HTTPS.
-
-use std::{future::Future, io, path::Path, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    io,
+    path::Path,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use axum::{
     extract::DefaultBodyLimit, http::StatusCode, middleware, response::IntoResponse,
@@ -12,17 +13,14 @@ use tower::{ServiceBuilder, limit::ConcurrencyLimitLayer, load_shed::LoadShedLay
 
 use super::{
     config::PactConfig,
-    consent::{ConsentLink, PactConsent},
+    consent::{ConsentLink, PactConsent, SharedPactStore},
     gateway::{Gateway, PactNode, router},
     jwks::{HttpJwksSource, PaVerifier, UrlPolicy},
     keys::ProviderKey,
 };
 
-/// The largest request body the gateway reads.
 const MAX_BODY_BYTES: usize = 64 * 1024;
-/// The most requests the gateway serves at once; more get `503`.
 const MAX_CONCURRENT_REQUESTS: usize = 128;
-/// How often idle contexts close.
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, thiserror::Error)]
@@ -35,7 +33,6 @@ pub enum StartError {
     Client,
 }
 
-/// The gateway and the consent page's half of it, sharing one database.
 pub struct Started {
     pub gateway: Arc<Gateway>,
     pub consent: Arc<PactConsent>,
@@ -49,16 +46,20 @@ pub fn start(
 ) -> Result<Started, StartError> {
     let key =
         Arc::new(ProviderKey::load_or_create(data_dir).map_err(|_| StartError::Key)?);
-    let store = aether_store::pact::PactStore::open(data_dir.join("pact.sqlite"))
-        .map_err(|_| StartError::Store)?;
-    let consent = Arc::new(
-        PactConsent::open(config.clone(), data_dir).map_err(|_| StartError::Store)?,
-    );
+    let store: SharedPactStore = Arc::new(Mutex::new(
+        aether_store::pact::PactStore::in_dir(data_dir)
+            .map_err(|_| StartError::Store)?,
+    ));
+    let consent = Arc::new(PactConsent::new(
+        config.clone(),
+        Arc::clone(&store),
+        data_dir.to_owned(),
+    ));
     let policy =
         UrlPolicy { allow_insecure_local: config.allow_insecure_local_issuers };
     let source = HttpJwksSource::new(policy).map_err(|_| StartError::Client)?;
     let verifier = PaVerifier::new(config.audience.clone(), policy, Arc::new(source));
-    let link = Arc::new(ConsentLink::new());
+    let link = Arc::new(ConsentLink::default());
     let gateway = Arc::new(Gateway::new(
         config.clone(),
         verifier,
@@ -70,15 +71,12 @@ pub fn start(
     Ok(Started { gateway, consent, link })
 }
 
-/// Serves the gateway on `listener` until `shutdown` completes.
 pub async fn serve(
     listener: tokio::net::TcpListener,
     gateway: Arc<Gateway>,
     max_seconds: u64,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> io::Result<()> {
-    // A turn may wait for Codex up to the policy's limit, plus a margin
-    // for the queue; nothing else takes long.
     let request_limit = Duration::from_secs(max_seconds.saturating_add(60));
     let maintenance = tokio::spawn({
         let gateway = Arc::clone(&gateway);
@@ -87,7 +85,12 @@ pub async fn serve(
             loop {
                 interval.tick().await;
                 let gateway = Arc::clone(&gateway);
-                let _ = tokio::task::spawn_blocking(move || gateway.maintain()).await;
+                if tokio::task::spawn_blocking(move || gateway.maintain())
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!("pact maintenance task failed");
+                }
             }
         }
     });

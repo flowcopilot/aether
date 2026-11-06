@@ -4,50 +4,29 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use aether_core::{EndpointId, ScopeKind, TrustProvider};
-use aether_store::StoreError;
+use aether_core::{ScopeKind, TrustProvider};
+
+use crate::policy::AgentAdapter;
 
 use crate::{
+    a2a_transport::A2aTransport,
     admin::{AdminError, LiveNode},
     directory_publication::{DirectoryPublication, PublicationError},
     execution::{Agent, Task},
-    proof::{Identity, ProofError, ProofNode, SubmissionInput},
-    transport::{
-        A2aCancel, A2aPartContent, A2aRequest, A2aTaskStatus, Frame, FrameKind,
-        MAX_EXCHANGE_BYTES, MAX_FRAMES, TransportError, event_payload_with_sequence,
-        text_result_payload, text_result_payload_with_progress,
-    },
+    proof::{Identity, ProofError, ProofHandle, ProofNode, SubmissionInput},
 };
 
-/// Reserves room below `MAX_EXCHANGE_BYTES` for the final snapshot frame (and
-/// its framing overhead) when bounding an event page by encoded size.
-const EVENT_PAGE_BYTE_BUDGET: usize = MAX_EXCHANGE_BYTES - 65_536;
-
 pub struct NodeService<T, P> {
-    node: ProofNode<T, P>,
+    proof: ProofNode<T, P>,
     // Empty unless the policy file names approved workspaces — see
     // `set_approved_workspaces`'s own doc comment. Immutable after
     // construction: the approved set itself is not something a live admin
     // change can extend, only pick from.
     approved_workspaces: BTreeMap<String, PathBuf>,
     task_folder_mode: bool,
-    /// The name of the agent adapter, for the owner's own startup notes. It
-    /// never reaches a caller.
-    agent_adapter: &'static str,
+    agent_adapter: AgentAdapter,
     /// The `pact` section of the policy file, when the node offers PACT.
     pact: Option<crate::pact::config::PactConfig>,
-}
-
-/// The skill that a task runs as. A direct grant from before the general
-/// skill names `review`; it runs as the general skill. The grant and the
-/// request keep their capability, so the policy check does not change.
-fn task_skill(kind: Option<ScopeKind>, capability: &str) -> String {
-    if kind == Some(ScopeKind::Direct) && capability == "review" {
-        crate::execution::GENERAL_SKILL
-    } else {
-        capability
-    }
-    .to_owned()
 }
 
 impl<T, P> NodeService<T, P>
@@ -58,10 +37,10 @@ where
     #[must_use]
     pub const fn new(node: ProofNode<T, P>) -> Self {
         Self {
-            node,
+            proof: node,
             approved_workspaces: BTreeMap::new(),
             task_folder_mode: false,
-            agent_adapter: "",
+            agent_adapter: AgentAdapter::Codex,
             pact: None,
         }
     }
@@ -90,9 +69,9 @@ where
             idempotency_key,
             task,
         };
-        match self.node.admit(input, Identity::Verified, None)? {
-            aether_store::Admission::Accepted(task_id)
-            | aether_store::Admission::Existing(task_id) => Ok(task_id),
+        match self.proof().admit(input, Identity::Verified, None)? {
+            aether_store::TaskAdmission::Accepted(task_id)
+            | aether_store::TaskAdmission::Existing(task_id) => Ok(task_id),
         }
     }
 
@@ -101,7 +80,12 @@ where
         &self,
         task_id: &str,
     ) -> Result<(aether_store::TaskState, Option<String>), ProofError> {
-        self.node.task_snapshot(task_id)
+        self.proof().task_snapshot(task_id)
+    }
+
+    #[must_use]
+    pub const fn proof(&self) -> ProofHandle<'_, T, P> {
+        ProofHandle::new(&self.proof)
     }
 
     /// Names the workspace paths a live `Change::Workspace` may switch to
@@ -122,12 +106,12 @@ where
         self.task_folder_mode
     }
 
-    pub const fn set_agent_adapter(&mut self, adapter: &'static str) {
+    pub const fn set_agent_adapter(&mut self, adapter: AgentAdapter) {
         self.agent_adapter = adapter;
     }
 
     #[must_use]
-    pub const fn agent_adapter(&self) -> &'static str {
+    pub const fn agent_adapter(&self) -> AgentAdapter {
         self.agent_adapter
     }
 
@@ -162,62 +146,52 @@ where
     }
 
     pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<String> {
-        self.node.subscribe_events()
+        self.proof().subscribe_events()
     }
 
     #[must_use]
     pub fn scope_id(&self) -> &str {
-        self.node.scope_id()
-    }
-
-    #[must_use]
-    pub const fn scope_kind(&self) -> ScopeKind {
-        self.node.scope_kind()
+        self.proof.scope_id()
     }
 
     #[must_use]
     pub fn scope_kind_for(&self, scope_id: &str) -> Option<ScopeKind> {
-        self.node.scope_kind_for(scope_id)
+        self.proof.scope_kind_for(scope_id)
     }
 
     #[must_use]
     pub fn has_scope_kind(&self, kind: ScopeKind) -> bool {
-        self.node.has_scope_kind(kind)
+        self.proof.has_scope_kind(kind)
     }
 
     #[must_use]
     pub fn scope_id_for_kind(&self, kind: ScopeKind) -> Option<&str> {
-        self.node.scope_id_for_kind(kind)
+        self.proof.scope_id_for_kind(kind)
     }
 
-    /// The executor's live workspace path.
     pub fn current_workspace(&self) -> Result<PathBuf, ProofError> {
-        self.node.workspace()
+        self.proof().workspace()
     }
 
     pub fn apply_workspace(&self, path: &std::path::Path) -> Result<(), ProofError> {
         if self.task_folder_mode {
             return Err(ProofError::Execution(crate::execution::ExecutionError::Path));
         }
-        self.node.apply_workspace(path)
-    }
-
-    pub fn apply_grant(&self, grant: aether_core::Grant) -> Result<(), ProofError> {
-        self.node.apply_grant(grant)
+        self.proof().apply_workspace(path)
     }
 
     pub fn apply_stored_grant(&self, grant_json: &str) -> Result<(), ProofError> {
-        let grant = crate::node_config::parse_grant_json(grant_json)
+        let grant = crate::identity::decode_grant(grant_json)
             .map_err(|_| ProofError::Denied(aether_core::Denial::GrantDenied))?;
-        self.node.apply_stored_grant(grant)
+        self.proof().apply_stored_grant(grant)
     }
 
     pub fn has_grant(&self, id: &aether_core::GrantId) -> Result<bool, ProofError> {
-        self.node.has_grant(id)
+        self.proof().has_grant(id)
     }
 
     pub fn queue_limits(&self) -> Result<aether_store::QueueLimits, ProofError> {
-        self.node.queue_limits()
+        self.proof().queue_limits()
     }
 
     pub fn shutdown(&self)
@@ -225,242 +199,12 @@ where
         T: TrustProvider + 'static,
         P: Agent + Clone + Send + 'static,
     {
-        self.node.shutdown();
+        self.proof().shutdown();
     }
 
-    pub fn handle(
-        &self,
-        authenticated_endpoint: &str,
-        frames: Vec<Frame>,
-    ) -> Result<Vec<Frame>, TransportError> {
-        let Ok([mut frame]) = <[Frame; 1]>::try_from(frames) else {
-            return Err(TransportError::InvalidOrder);
-        };
-        if frame.kind == FrameKind::Cancel {
-            return self.cancel(authenticated_endpoint, frame);
-        }
-        if frame.kind != FrameKind::Request {
-            return Err(TransportError::BadFrame);
-        }
-        let payload: A2aRequest = serde_json::from_value(frame.payload.take())
-            .map_err(|_| TransportError::BadFrame)?;
-        let (request, claim) = payload.policy_data(&frame.scope_id)?;
-        let endpoint = EndpointId::new(authenticated_endpoint);
-        if request.caller_endpoint_id != endpoint {
-            return Err(TransportError::EndpointMismatch);
-        }
-        let text = match payload.task.history.as_deref() {
-            Some([message]) if message.role == a2a::Role::User => {
-                match message.parts.as_slice() {
-                    [part] => match &part.content {
-                        A2aPartContent::Text(text) => text,
-                        _ => return Err(TransportError::BadFrame),
-                    },
-                    _ => return Err(TransportError::BadFrame),
-                }
-            }
-            _ => return Err(TransportError::BadFrame),
-        };
-        let task = Task {
-            id: payload.task.id,
-            skill: task_skill(
-                self.scope_kind_for(&frame.scope_id),
-                request.capability_id.as_str(),
-            ),
-            workspace_id: request.workspace_id.as_str().to_owned(),
-            remote_text: text.to_owned(),
-            context_tokens: 0,
-        };
-        let admission = self
-            .node
-            .admit(
-                SubmissionInput {
-                    request: &request,
-                    authenticated_endpoint: &endpoint,
-                    idempotency_key: &payload.idempotency_key,
-                    task: &task,
-                },
-                Identity::Claim(&claim),
-                Some(format!("{}:{}", frame.exchange_id, payload.request_nonce)),
-            )
-            .map_err(map_error)?;
-        let (aether_store::Admission::Accepted(task_id)
-        | aether_store::Admission::Existing(task_id)) = admission;
-        let last_sequence = i64::try_from(payload.last_event_sequence.unwrap_or(0))
-            .map_err(|_| TransportError::BadFrame)?;
-        // Bound the page in SQL first (by frame count), then trim further by
-        // encoded size, reserving room for the final snapshot frame. Either
-        // bound can leave events unread, so both feed `more_events` below.
-        // The snapshot and the page are read together so a concurrent store
-        // write cannot leave them describing two different instants.
-        let event_limit = MAX_FRAMES.saturating_sub(1);
-        let (state, result, events, mut more_events) = self
-            .node
-            .task_progress(&task_id, last_sequence, event_limit)
-            .map_err(map_error)?;
-        if matches!(
-            state,
-            aether_store::TaskState::UnknownResult
-                | aether_store::TaskState::OperatorReviewed
-        ) {
-            return Err(TransportError::OperatorReviewRequired(
-                state.as_str().to_owned(),
-            ));
-        }
-        if state == aether_store::TaskState::Succeeded
-            && self.node.content_is_expired(&task_id).map_err(map_error)?
-        {
-            return Err(TransportError::ResultExpired);
-        }
-        let status = task_state_status(state);
-        let result_text = if state == aether_store::TaskState::Succeeded {
-            result.unwrap_or_default()
-        } else {
-            String::new()
-        };
-        let mut response = Vec::with_capacity(events.len().saturating_add(1));
-        let mut exchange_bytes = 0usize;
-        let mut cursor = last_sequence;
-        for event in events {
-            let event_frame = Frame {
-                version: 0,
-                kind: FrameKind::Event,
-                exchange_id: frame.exchange_id.clone(),
-                scope_id: frame.scope_id.clone(),
-                task_id: Some(task_id.clone()),
-                payload: event_payload_with_sequence(
-                    &task_id,
-                    event_status(&event.event_type),
-                    Some(event.sequence),
-                ),
-            };
-            let frame_bytes =
-                serde_json::to_vec(&event_frame).map_or(0, |encoded| encoded.len());
-            if exchange_bytes.saturating_add(frame_bytes) > EVENT_PAGE_BYTE_BUDGET {
-                more_events = true;
-                break;
-            }
-            exchange_bytes = exchange_bytes.saturating_add(frame_bytes);
-            cursor = event.sequence;
-            response.push(event_frame);
-        }
-        response.push(Frame {
-            version: 0,
-            kind: FrameKind::Result,
-            exchange_id: frame.exchange_id.clone(),
-            scope_id: frame.scope_id.clone(),
-            task_id: Some(task_id.clone()),
-            payload: text_result_payload_with_progress(
-                &task_id,
-                status,
-                &result_text,
-                cursor,
-                more_events,
-            ),
-        });
-        Ok(response)
-    }
-}
-
-fn event_status(event_type: &str) -> A2aTaskStatus {
-    match event_type {
-        "queued" | "leased" => A2aTaskStatus::Submitted,
-        "cancelled" => A2aTaskStatus::Canceled,
-        "succeeded" => A2aTaskStatus::Completed,
-        "failed" => A2aTaskStatus::Failed,
-        "rejected" => A2aTaskStatus::Rejected,
-        // "running", and any event that does not end the task.
-        _ => A2aTaskStatus::Working,
-    }
-}
-
-const fn task_state_status(state: aether_store::TaskState) -> A2aTaskStatus {
-    match state {
-        aether_store::TaskState::PendingApproval => A2aTaskStatus::InputRequired,
-        aether_store::TaskState::Queued | aether_store::TaskState::Leased => {
-            A2aTaskStatus::Submitted
-        }
-        aether_store::TaskState::Running => A2aTaskStatus::Working,
-        aether_store::TaskState::Succeeded => A2aTaskStatus::Completed,
-        aether_store::TaskState::Failed
-        | aether_store::TaskState::UnknownResult
-        | aether_store::TaskState::OperatorReviewed => A2aTaskStatus::Failed,
-        aether_store::TaskState::Rejected => A2aTaskStatus::Rejected,
-        aether_store::TaskState::Cancelled => A2aTaskStatus::Canceled,
-    }
-}
-
-impl<T, P> NodeService<T, P>
-where
-    T: TrustProvider + 'static,
-    P: Agent + Clone + Send + 'static,
-{
-    fn cancel(
-        &self,
-        authenticated_endpoint: &str,
-        mut frame: Frame,
-    ) -> Result<Vec<Frame>, TransportError> {
-        let cancel: A2aCancel = serde_json::from_value(frame.payload.take())
-            .map_err(|_| TransportError::BadFrame)?;
-        let task_id = frame.task_id.as_deref().ok_or(TransportError::BadFrame)?;
-        if cancel.id != task_id {
-            return Err(TransportError::BadFrame);
-        }
-        self.node
-            .cancel_from(
-                task_id,
-                &EndpointId::new(authenticated_endpoint),
-                &frame.scope_id,
-            )
-            .map_err(map_error)?;
-        let event = self
-            .node
-            .events_after(task_id, 0)
-            .map_err(map_error)?
-            .into_iter()
-            .last()
-            .ok_or_else(|| TransportError::Network("task event missing".to_owned()))?;
-        Ok(vec![
-            Frame {
-                version: 0,
-                kind: FrameKind::Event,
-                exchange_id: frame.exchange_id.clone(),
-                scope_id: frame.scope_id.clone(),
-                task_id: frame.task_id.clone(),
-                payload: event_payload_with_sequence(
-                    task_id,
-                    event_status(&event.event_type),
-                    Some(event.sequence),
-                ),
-            },
-            Frame {
-                version: 0,
-                kind: FrameKind::Result,
-                exchange_id: frame.exchange_id.clone(),
-                scope_id: frame.scope_id.clone(),
-                task_id: frame.task_id.clone(),
-                payload: text_result_payload(task_id, A2aTaskStatus::Canceled, ""),
-            },
-        ])
-    }
-}
-
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "an adapter for `map_err`, which hands over the error by value"
-)]
-fn map_error(error: ProofError) -> TransportError {
-    match error {
-        ProofError::Denied(_) | ProofError::Store(StoreError::Unauthorized) => {
-            TransportError::PermissionDenied
-        }
-        ProofError::Store(StoreError::Overloaded) => TransportError::Overloaded,
-        ProofError::Store(StoreError::DuplicateConflict) => TransportError::Replay,
-        ProofError::Store(_)
-        | ProofError::Execution(_)
-        | ProofError::TaskMismatch
-        | ProofError::Queue
-        | ProofError::Shutdown => TransportError::Network("task failed".to_owned()),
+    #[must_use]
+    pub const fn a2a(&self) -> A2aTransport<'_, T, P> {
+        A2aTransport::new(self.proof())
     }
 }
 
@@ -550,19 +294,26 @@ where
     P: Agent + Clone + Send + Sync + 'static,
 {
     fn cancel_task(&self, task_id: &str) -> Result<(), AdminError> {
-        self.service.node.cancel(task_id).map_err(|_| AdminError::Task)
+        self.service.proof().cancel(task_id).map_err(|_| AdminError::Task)
     }
 
-    fn queue_limit(&self, id: &str) -> Result<u32, AdminError> {
+    fn queue_limit(
+        &self,
+        id: aether_core::limits::QueueLimitId,
+    ) -> Result<u32, AdminError> {
         self.service
-            .node
+            .proof()
             .current_queue_limit(id)
             .map_err(|_| AdminError::InvalidField("id"))
     }
 
-    fn set_queue_limit(&self, id: &str, limit: u32) -> Result<(), AdminError> {
+    fn set_queue_limit(
+        &self,
+        id: aether_core::limits::QueueLimitId,
+        limit: u32,
+    ) -> Result<(), AdminError> {
         self.service
-            .node
+            .proof()
             .set_queue_limit(id, limit)
             .map_err(|_| AdminError::InvalidField("id"))
     }
@@ -587,23 +338,26 @@ where
 
     fn revoke_grant(&self, id: &str) -> Result<(), AdminError> {
         self.service
-            .node
+            .proof()
             .revoke_grant(&aether_core::GrantId::new(id))
             .map(|_| ())
             .map_err(|_| AdminError::InvalidField("grant"))
     }
 
-    fn grants(&self) -> Vec<aether_core::Grant> {
-        self.service.node.grants().unwrap_or_default()
+    fn grants(&self) -> Result<Vec<aether_core::Grant>, AdminError> {
+        self.service.proof().grants().map_err(|_| AdminError::Store)
     }
 
     fn renew_directory(&self, url: &str) -> Result<(), AdminError> {
-        if self.directory.get().is_some_and(|publication| publication.directory != url)
+        if self
+            .directory
+            .get()
+            .is_some_and(|publication| publication.directory() != url)
         {
             return Err(AdminError::InvalidField("url"));
         }
         self.publish("directory", |publication, endpoint_id| async move {
-            publication.renew(&endpoint_id).await
+            publication.renew(&endpoint_id).await.map(|_| ())
         })?
         .map_err(|_| AdminError::InvalidField("url"))
     }
@@ -619,12 +373,13 @@ where
     fn set_relay(&self, relay: Option<String>) -> Result<(), AdminError> {
         let (endpoint, runtime) =
             self.endpoint.get().ok_or(AdminError::Unsupported("relay"))?;
-        let previous = crate::node_config::setting::<
-            crate::node_config::settings::ActiveRelay,
-        >(&self.data_dir)
-        .map_err(|_| AdminError::Store)?;
+        let previous =
+            crate::settings::setting::<crate::transport::relay::ActiveRelay>(
+                &self.data_dir,
+            )
+            .map_err(|_| AdminError::Store)?;
         runtime
-            .block_on(crate::node_config::apply_relay(
+            .block_on(crate::transport::relay::apply_relay(
                 &self.data_dir,
                 &relay,
                 crate::transport::switch_relay(
@@ -654,7 +409,6 @@ mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet},
         fs,
-        net::TcpListener,
         path::PathBuf,
         sync::{Arc, Mutex},
         time::{Duration, SystemTime},
@@ -669,9 +423,10 @@ mod tests {
 
     use super::NodeService;
     use crate::{
-        execution::{Agent, ExecutionError, Executor, Limits},
+        execution::{Agent, ExecutionError, Executor, Limits, TurnContext},
         identity::{ClaimInput, GrantInput, SignedClaims, signed_claim, signed_grant},
         proof::ProofNode,
+        test_support::Trusted,
         transport::{
             A2aAccessMode, A2aAuthorization, A2aCancel, A2aClaim, A2aRequest, Frame,
             FrameKind, bind_node, request_once, router, text_request_payload,
@@ -686,30 +441,11 @@ mod tests {
     struct Fake;
 
     impl Agent for Fake {
-        fn start_turn(
-            &mut self,
-            _task_id: &str,
-            instruction: &str,
-            text: &str,
-        ) -> Result<String, ExecutionError> {
-            Ok(format!("{instruction}:{text}"))
+        fn start_turn(&mut self, ctx: &TurnContext) -> Result<String, ExecutionError> {
+            Ok(format!("{}:{}", ctx.skill, ctx.text))
         }
 
         fn cancel(&self, _task_id: &str) {}
-    }
-
-    #[test]
-    fn a_pact_task_keeps_its_brand_capability() {
-        // A brand can name any capability, also `review`.
-        assert_eq!(super::task_skill(Some(ScopeKind::Pact), "review"), "review");
-        assert_eq!(
-            super::task_skill(Some(ScopeKind::Pact), "brand-copy"),
-            "brand-copy"
-        );
-        assert_eq!(
-            super::task_skill(Some(ScopeKind::Direct), "review"),
-            crate::execution::GENERAL_SKILL
-        );
     }
 
     #[tokio::test]
@@ -717,7 +453,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("directory must create");
         let root = directory.path().to_path_buf();
         let workspace = root.join("workspace");
-        let database = root.join("node.sqlite");
+        let database = root.join(aether_store::NODE_DATABASE);
         fs::create_dir_all(&workspace).expect("workspace must create");
         let endpoint = aether_core::EndpointId::new(
             iroh::SecretKey::from_bytes(&[4; 32]).public().to_string(),
@@ -800,6 +536,7 @@ mod tests {
         let mut answer = serde_json::Value::Null;
         for poll in 0..100_u32 {
             let response = service
+                .a2a()
                 .handle(
                     endpoint.as_str(),
                     vec![Frame {
@@ -829,7 +566,7 @@ mod tests {
             .task_execution_data(WIRE_TASK_ID)
             .expect("task must persist");
         assert_eq!(stored.skill, crate::execution::GENERAL_SKILL);
-        assert_eq!(stored.capability_id, "review");
+        assert_eq!(stored.request.capability_id.as_str(), "review");
     }
 
     #[tokio::test]
@@ -837,15 +574,18 @@ mod tests {
         let directory = tempfile::tempdir().expect("directory must create");
         let root = directory.path().to_path_buf();
         let workspace = root.join("workspace");
-        let database = root.join("node.sqlite");
+        let database = root.join(aether_store::NODE_DATABASE);
         let server_data = root.join("server");
         let client_data = root.join("client");
         fs::create_dir_all(&workspace).expect("workspace must create");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("port must bind");
-        let port = listener.local_addr().expect("port must resolve").port();
-        drop(listener);
-        let server = bind_node(&server_data, port).await.expect("server must bind");
-        let client = bind_node(&client_data, 0).await.expect("client must bind");
+        let server = bind_node(&server_data, 0, None).await.expect("server must bind");
+        let port = server
+            .bound_sockets()
+            .into_iter()
+            .find(std::net::SocketAddr::is_ipv4)
+            .expect("server must have an IPv4 socket")
+            .port();
+        let client = bind_node(&client_data, 0, None).await.expect("client must bind");
         let endpoint = aether_core::EndpointId::new(client.id().to_string());
         client.close().await;
         let key = SigningKey::from_bytes(&[8; 32]);
@@ -930,7 +670,7 @@ mod tests {
                         "service stopped".to_owned(),
                     )
                 })?;
-                service.handle(authenticated_endpoint, frames)
+                service.a2a().handle(authenticated_endpoint, frames)
             });
         let response = request_once(
             &client_data,
@@ -963,6 +703,7 @@ mod tests {
         let replay = service
             .lock()
             .expect("service must unlock")
+            .a2a()
             .handle(
                 endpoint.as_str(),
                 vec![Frame {
@@ -994,20 +735,13 @@ mod tests {
     struct ManyProgressEvents;
 
     impl Agent for ManyProgressEvents {
-        fn start_turn(
-            &mut self,
-            _task_id: &str,
-            instruction: &str,
-            text: &str,
-        ) -> Result<String, ExecutionError> {
-            Ok(format!("{instruction}:{text}"))
+        fn start_turn(&mut self, ctx: &TurnContext) -> Result<String, ExecutionError> {
+            Ok(format!("{}:{}", ctx.skill, ctx.text))
         }
 
         fn start_turn_with_events(
             &mut self,
-            _task_id: &str,
-            instruction: &str,
-            text: &str,
+            ctx: &TurnContext,
             events: &mut dyn FnMut(crate::execution::ExecutionEvent),
         ) -> Result<String, ExecutionError> {
             // More than `MAX_FRAMES - 1` progress events, so the durable
@@ -1017,7 +751,7 @@ mod tests {
                 events(crate::execution::ExecutionEvent::Progress);
             }
             events(crate::execution::ExecutionEvent::Completed);
-            Ok(format!("{instruction}:{text}"))
+            Ok(format!("{}:{}", ctx.skill, ctx.text))
         }
 
         fn cancel(&self, _task_id: &str) {}
@@ -1031,11 +765,14 @@ mod tests {
         let server_data = root.join("server");
         let client_data = root.join("client");
         fs::create_dir_all(&workspace).expect("workspace must create");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("port must bind");
-        let port = listener.local_addr().expect("port must resolve").port();
-        drop(listener);
-        let server = bind_node(&server_data, port).await.expect("server must bind");
-        let client = bind_node(&client_data, 0).await.expect("client must bind");
+        let server = bind_node(&server_data, 0, None).await.expect("server must bind");
+        let port = server
+            .bound_sockets()
+            .into_iter()
+            .find(std::net::SocketAddr::is_ipv4)
+            .expect("server must have an IPv4 socket")
+            .port();
+        let client = bind_node(&client_data, 0, None).await.expect("client must bind");
         let endpoint = aether_core::EndpointId::new(client.id().to_string());
         client.close().await;
         let key = SigningKey::from_bytes(&[9; 32]);
@@ -1119,7 +856,7 @@ mod tests {
                         "service stopped".to_owned(),
                     )
                 })?;
-                service.handle(authenticated_endpoint, frames)
+                service.a2a().handle(authenticated_endpoint, frames)
             });
         let response = request_once(
             &client_data,
@@ -1190,7 +927,7 @@ mod tests {
             WIRE_NONCE,
             "remote text",
         );
-        let result = service.handle(
+        let result = service.a2a().handle(
             "endpoint",
             vec![
                 Frame {
@@ -1232,20 +969,24 @@ mod tests {
         fs::create_dir_all(&workspace).expect("workspace must create");
         let scope = Scope { id: ScopeId::new("direct"), kind: ScopeKind::Direct };
         let mut store = NodeStore::in_dir(&root).expect("store must open");
-        store.put_scope("direct", "direct").expect("scope must store");
+        store
+            .put_scope("direct", aether_core::ScopeKind::Direct)
+            .expect("scope must store");
         store
             .admit(
                 &TaskInput {
-                    id: WIRE_TASK_ID.to_owned(),
-                    request_id: WIRE_REQUEST_ID.to_owned(),
+                    request: aether_core::Request {
+                        task_id: aether_core::TaskId::new(WIRE_TASK_ID),
+                        id: aether_core::RequestId::new(WIRE_REQUEST_ID),
+                        caller_agent_id: aether_core::AgentId::new("caller"),
+                        caller_endpoint_id: aether_core::EndpointId::new("endpoint"),
+                        scope_id: aether_core::ScopeId::new("direct"),
+                        capability_id: aether_core::CapabilityId::new("review"),
+                        workspace_id: aether_core::WorkspaceId::new("workspace"),
+                        access_mode: aether_core::AccessMode::ReadOnly,
+                    },
                     idempotency_key: "key".to_owned(),
-                    caller_agent_id: "caller".to_owned(),
-                    caller_endpoint_id: "endpoint".to_owned(),
                     request_fingerprint: "fingerprint".to_owned(),
-                    scope_id: "direct".to_owned(),
-                    capability_id: "review".to_owned(),
-                    workspace_id: "workspace".to_owned(),
-                    access_mode: "read_only".to_owned(),
                     skill: "review".to_owned(),
                     remote_text: "remote text".to_owned(),
                 },
@@ -1269,6 +1010,7 @@ mod tests {
         let service = NodeService::new(node);
         let mut event_wake = service.subscribe_events();
         let response = service
+            .a2a()
             .handle(
                 "endpoint",
                 vec![Frame {
@@ -1291,34 +1033,14 @@ mod tests {
             WIRE_TASK_ID
         );
         assert_eq!(
-            response[0].payload["statusUpdate"]["metadata"]["aetherEventSequence"],
+            response[0].payload["statusUpdate"]["metadata"]
+                [crate::transport::EVENT_SEQUENCE],
             2
         );
         assert_eq!(
             response[1].payload["task"]["status"]["state"],
             "TASK_STATE_CANCELED"
         );
-    }
-
-    struct Trusted;
-
-    impl aether_core::TrustProvider for Trusted {
-        fn verify(
-            &self,
-            _claim: &aether_core::Claim,
-            _authenticated_endpoint: &aether_core::EndpointId,
-            _scope: &Scope,
-        ) -> Result<(), aether_core::ProviderError> {
-            Ok(())
-        }
-
-        fn verify_grant(
-            &self,
-            _grant: &aether_core::Grant,
-            _scope: &Scope,
-        ) -> Result<(), aether_core::ProviderError> {
-            Ok(())
-        }
     }
 
     #[test]
@@ -1345,25 +1067,28 @@ mod tests {
             skill: "general".to_owned(),
             workspace_id: "workspace".to_owned(),
             remote_text: "remote text".to_owned(),
-            context_tokens: 0,
         };
         let mut store = NodeStore::in_dir(&root).expect("store must open");
-        store.put_scope("direct", "direct").expect("scope must store");
+        store
+            .put_scope("direct", aether_core::ScopeKind::Direct)
+            .expect("scope must store");
         store
             .admit(
                 &TaskInput {
-                    id: WIRE_TASK_ID.to_owned(),
-                    request_id: "request".to_owned(),
+                    request: aether_core::Request {
+                        task_id: aether_core::TaskId::new(WIRE_TASK_ID),
+                        id: aether_core::RequestId::new("request"),
+                        caller_agent_id: aether_core::AgentId::new("caller"),
+                        caller_endpoint_id: aether_core::EndpointId::new("endpoint"),
+                        scope_id: aether_core::ScopeId::new("direct"),
+                        capability_id: aether_core::CapabilityId::new("review"),
+                        workspace_id: aether_core::WorkspaceId::new("workspace"),
+                        access_mode: aether_core::AccessMode::ReadOnly,
+                    },
                     idempotency_key: "key".to_owned(),
-                    caller_agent_id: "caller".to_owned(),
-                    caller_endpoint_id: "endpoint".to_owned(),
                     request_fingerprint: crate::proof::request_fingerprint(
                         &request, &task,
                     ),
-                    scope_id: "direct".to_owned(),
-                    capability_id: "review".to_owned(),
-                    workspace_id: "workspace".to_owned(),
-                    access_mode: "read_only".to_owned(),
                     skill: "general".to_owned(),
                     remote_text: "remote text".to_owned(),
                 },
@@ -1435,7 +1160,7 @@ mod tests {
                 signature: hex::encode([0; 32]),
             },
         });
-        let result = service.handle(
+        let result = service.a2a().handle(
             "endpoint",
             vec![Frame {
                 version: 0,
@@ -1478,25 +1203,28 @@ mod tests {
             skill: "general".to_owned(),
             workspace_id: "workspace".to_owned(),
             remote_text: "remote text".to_owned(),
-            context_tokens: 0,
         };
         let mut store = NodeStore::in_dir(&root).expect("store must open");
-        store.put_scope("direct", "direct").expect("scope must store");
+        store
+            .put_scope("direct", aether_core::ScopeKind::Direct)
+            .expect("scope must store");
         store
             .admit(
                 &TaskInput {
-                    id: WIRE_TASK_ID.to_owned(),
-                    request_id: "request".to_owned(),
+                    request: aether_core::Request {
+                        task_id: aether_core::TaskId::new(WIRE_TASK_ID),
+                        id: aether_core::RequestId::new("request"),
+                        caller_agent_id: aether_core::AgentId::new("caller"),
+                        caller_endpoint_id: aether_core::EndpointId::new("endpoint"),
+                        scope_id: aether_core::ScopeId::new("direct"),
+                        capability_id: aether_core::CapabilityId::new("review"),
+                        workspace_id: aether_core::WorkspaceId::new("workspace"),
+                        access_mode: aether_core::AccessMode::ReadOnly,
+                    },
                     idempotency_key: "key".to_owned(),
-                    caller_agent_id: "caller".to_owned(),
-                    caller_endpoint_id: "endpoint".to_owned(),
                     request_fingerprint: crate::proof::request_fingerprint(
                         &request, &task,
                     ),
-                    scope_id: "direct".to_owned(),
-                    capability_id: "review".to_owned(),
-                    workspace_id: "workspace".to_owned(),
-                    access_mode: "read_only".to_owned(),
                     skill: "general".to_owned(),
                     remote_text: "remote text".to_owned(),
                 },
@@ -1571,7 +1299,7 @@ mod tests {
                 signature: hex::encode([0; 32]),
             },
         });
-        let result = service.handle(
+        let result = service.a2a().handle(
             "endpoint",
             vec![Frame {
                 version: 0,
@@ -1609,25 +1337,28 @@ mod tests {
             skill: "general".to_owned(),
             workspace_id: "workspace".to_owned(),
             remote_text: "remote text".to_owned(),
-            context_tokens: 0,
         };
         let mut store = NodeStore::in_dir(&root).expect("store must open");
-        store.put_scope("direct", "direct").expect("scope must store");
+        store
+            .put_scope("direct", aether_core::ScopeKind::Direct)
+            .expect("scope must store");
         store
             .admit(
                 &TaskInput {
-                    id: WIRE_TASK_ID.to_owned(),
-                    request_id: "request".to_owned(),
+                    request: aether_core::Request {
+                        task_id: aether_core::TaskId::new(WIRE_TASK_ID),
+                        id: aether_core::RequestId::new("request"),
+                        caller_agent_id: aether_core::AgentId::new("caller"),
+                        caller_endpoint_id: aether_core::EndpointId::new("endpoint"),
+                        scope_id: aether_core::ScopeId::new("direct"),
+                        capability_id: aether_core::CapabilityId::new("review"),
+                        workspace_id: aether_core::WorkspaceId::new("workspace"),
+                        access_mode: aether_core::AccessMode::ReadOnly,
+                    },
                     idempotency_key: "key".to_owned(),
-                    caller_agent_id: "caller".to_owned(),
-                    caller_endpoint_id: "endpoint".to_owned(),
                     request_fingerprint: crate::proof::request_fingerprint(
                         &request, &task,
                     ),
-                    scope_id: "direct".to_owned(),
-                    capability_id: "review".to_owned(),
-                    workspace_id: "workspace".to_owned(),
-                    access_mode: "read_only".to_owned(),
                     skill: "general".to_owned(),
                     remote_text: "remote text".to_owned(),
                 },
@@ -1694,6 +1425,7 @@ mod tests {
             },
         });
         let response = service
+            .a2a()
             .handle(
                 "endpoint",
                 vec![Frame {
@@ -1758,25 +1490,30 @@ mod tests {
                 skill: "general".to_owned(),
                 workspace_id: "workspace".to_owned(),
                 remote_text: "remote text".to_owned(),
-                context_tokens: 0,
             };
             let mut store = NodeStore::in_dir(&root).expect("store must open");
-            store.put_scope("direct", "direct").expect("scope must store");
+            store
+                .put_scope("direct", aether_core::ScopeKind::Direct)
+                .expect("scope must store");
             store
                 .admit(
                     &TaskInput {
-                        id: WIRE_TASK_ID.to_owned(),
-                        request_id: "request".to_owned(),
+                        request: aether_core::Request {
+                            task_id: aether_core::TaskId::new(WIRE_TASK_ID),
+                            id: aether_core::RequestId::new("request"),
+                            caller_agent_id: aether_core::AgentId::new("caller"),
+                            caller_endpoint_id: aether_core::EndpointId::new(
+                                "endpoint",
+                            ),
+                            scope_id: aether_core::ScopeId::new("direct"),
+                            capability_id: aether_core::CapabilityId::new("review"),
+                            workspace_id: aether_core::WorkspaceId::new("workspace"),
+                            access_mode: aether_core::AccessMode::ReadOnly,
+                        },
                         idempotency_key: "key".to_owned(),
-                        caller_agent_id: "caller".to_owned(),
-                        caller_endpoint_id: "endpoint".to_owned(),
                         request_fingerprint: crate::proof::request_fingerprint(
                             &request, &task,
                         ),
-                        scope_id: "direct".to_owned(),
-                        capability_id: "review".to_owned(),
-                        workspace_id: "workspace".to_owned(),
-                        access_mode: "read_only".to_owned(),
                         skill: "general".to_owned(),
                         remote_text: "remote text".to_owned(),
                     },
@@ -1845,6 +1582,7 @@ mod tests {
                 },
             });
             let response = service
+                .a2a()
                 .handle(
                     "endpoint",
                     vec![Frame {
@@ -1874,7 +1612,8 @@ mod tests {
             .iter()
             .filter(|frame| frame.kind == FrameKind::Event)
             .map(|frame| {
-                frame.payload["statusUpdate"]["metadata"]["aetherEventSequence"]
+                frame.payload["statusUpdate"]["metadata"]
+                    [crate::transport::EVENT_SEQUENCE]
                     .as_i64()
                     .expect("event sequence must exist")
             })

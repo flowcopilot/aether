@@ -4,10 +4,11 @@
 //! is `404` with no A2A body, whatever the token. Every other route but the
 //! Agent Card and the OAuth metadata needs a valid personal-agent JWT.
 
+use aether_core::time::now;
 use std::{
     num::NonZeroU32,
-    sync::{Arc, Mutex, PoisonError},
-    time::{Duration, SystemTime},
+    sync::{Arc, PoisonError},
+    time::Duration,
 };
 
 use aether_core::{
@@ -32,8 +33,9 @@ use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
 use super::{
-    config::{BRAND_USER, Brand, PactConfig, SCOPE_ID},
-    consent::ConsentLink,
+    config::{Brand, PactConfig, SCOPE_ID},
+    consent::{ConsentLink, SharedPactStore},
+    grant::{GrantBinding, caller_agent_id, caller_endpoint_id, grant_binds},
     jwks::{PaIdentity, PaVerifier},
     keys::ProviderKey,
     tokens::{
@@ -49,8 +51,6 @@ const A2A_CONTENT_TYPE: &str = "application/a2a+json";
 /// RFC 8628 §3.2: how long a device code lives, and how often to poll.
 const DEVICE_CODE_SECONDS: i64 = 600;
 const POLL_INTERVAL_SECONDS: i64 = 5;
-/// How long the owner's approval lasts before a new consent is needed.
-pub const GRANT_SECONDS: i64 = 30 * 24 * 60 * 60;
 /// A context with no message for this long closes (§4.2).
 pub const CONTEXT_IDLE_SECONDS: i64 = 24 * 60 * 60;
 /// The most earlier turns a transcript carries.
@@ -78,7 +78,7 @@ pub trait PactNode: Send + Sync {
 
     /// Whether the live policy still holds the Aether grant `grant_id`.
     /// Revoking it in the admin UI revokes the delegation.
-    fn has_grant(&self, grant_id: &str) -> bool;
+    fn has_grant(&self, grant_id: &str) -> Result<bool, NodeUnavailable>;
 
     /// The ids of tasks as they change.
     fn subscribe_events(&self) -> broadcast::Receiver<String>;
@@ -105,8 +105,9 @@ where
         self.task_snapshot(task_id)
     }
 
-    fn has_grant(&self, grant_id: &str) -> bool {
-        Self::has_grant(self, &aether_core::GrantId::new(grant_id)).unwrap_or(false)
+    fn has_grant(&self, grant_id: &str) -> Result<bool, NodeUnavailable> {
+        Self::has_grant(self, &aether_core::GrantId::new(grant_id))
+            .map_err(|_| NodeUnavailable)
     }
 
     fn subscribe_events(&self) -> broadcast::Receiver<String> {
@@ -118,13 +119,15 @@ pub struct Gateway {
     config: PactConfig,
     verifier: PaVerifier,
     key: Arc<ProviderKey>,
-    store: Mutex<PactStore>,
+    store: SharedPactStore,
     node: Arc<dyn PactNode>,
     consent: Arc<ConsentLink>,
     callers: DefaultKeyedRateLimiter<String>,
     /// How long a turn waits for news of its task before it reads the task
     /// again. Each change of the task ends the wait sooner.
     poll_interval: Duration,
+    #[cfg(test)]
+    task_wait_deadline: Option<Duration>,
 }
 
 /// The gateway's routes, relative to `pact.publicUrl`.
@@ -356,7 +359,7 @@ fn metadata(config: &PactConfig, brand: &Brand) -> Response {
 // -- Errors (§3.4, §5.5, §6) --
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum A2aError {
+pub(crate) enum A2aError {
     InvalidParams,
     ContentTypeNotSupported,
     UnsupportedOperation,
@@ -400,7 +403,7 @@ impl A2aError {
 /// RFC 8628 §3.5). Each code fixes its own HTTP status, so a code and a
 /// status cannot disagree.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum OAuthError {
+pub(crate) enum OAuthError {
     InvalidClient,
     InvalidScope,
     InvalidGrant,
@@ -413,22 +416,20 @@ enum OAuthError {
     ServerError,
 }
 
-impl OAuthError {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::InvalidClient => "invalid_client",
-            Self::InvalidScope => "invalid_scope",
-            Self::InvalidGrant => "invalid_grant",
-            Self::UnsupportedGrantType => "unsupported_grant_type",
-            Self::AuthorizationPending => "authorization_pending",
-            Self::SlowDown => "slow_down",
-            Self::AccessDenied => "access_denied",
-            Self::ExpiredToken => "expired_token",
-            Self::TemporarilyUnavailable => "temporarily_unavailable",
-            Self::ServerError => "server_error",
-        }
-    }
+aether_core::named!(OAuthError {
+    InvalidClient => "invalid_client",
+    InvalidScope => "invalid_scope",
+    InvalidGrant => "invalid_grant",
+    UnsupportedGrantType => "unsupported_grant_type",
+    AuthorizationPending => "authorization_pending",
+    SlowDown => "slow_down",
+    AccessDenied => "access_denied",
+    ExpiredToken => "expired_token",
+    TemporarilyUnavailable => "temporarily_unavailable",
+    ServerError => "server_error",
+});
 
+impl OAuthError {
     const fn status(self) -> StatusCode {
         match self {
             // RFC 6749 §5.2: a client that fails to authenticate gets 401.
@@ -453,20 +454,10 @@ enum GrantType {
     RefreshToken,
 }
 
-impl GrantType {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::DeviceCode => "urn:ietf:params:oauth:grant-type:device_code",
-            Self::RefreshToken => "refresh_token",
-        }
-    }
-
-    fn parse(value: &str) -> Option<Self> {
-        [Self::DeviceCode, Self::RefreshToken]
-            .into_iter()
-            .find(|grant_type| grant_type.as_str() == value)
-    }
-}
+aether_core::named!(GrantType {
+    DeviceCode => "urn:ietf:params:oauth:grant-type:device_code",
+    RefreshToken => "refresh_token",
+});
 
 fn a2a_json(status: StatusCode, body: &Value) -> Response {
     let mut response = (status, body.to_string()).into_response();
@@ -516,7 +507,7 @@ fn challenge(value: &'static str) -> Response {
 /// A reply that ends a request early. Small, unlike a `Response`, so the
 /// helpers can return it; the route turns it into the response.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum Failure {
+pub(crate) enum Failure {
     A2a(A2aError, &'static str),
     /// `429`: the node's queue is full.
     Overloaded,
@@ -547,6 +538,14 @@ const fn internal(message: &'static str) -> Failure {
     Failure::A2a(A2aError::Internal, message)
 }
 
+/// The node could not read its own policy.
+#[derive(Debug)]
+pub struct NodeUnavailable;
+
+const fn oauth_store_error() -> Failure {
+    Failure::OAuth(OAuthError::ServerError, "The gateway store failed")
+}
+
 fn no_store(status: StatusCode, body: Value) -> Response {
     let mut response = (status, axum::Json(body)).into_response();
     let headers = response.headers_mut();
@@ -559,7 +558,7 @@ fn no_store(status: StatusCode, body: Value) -> Response {
 
 fn list_tasks(query: Option<&str>) -> Response {
     let mut page_size = 50_u32;
-    for (name, value) in form_pairs(query.unwrap_or_default()) {
+    for (name, value) in parse_form(query.unwrap_or_default()) {
         if name == "pageSize" {
             match value.parse::<u32>() {
                 Ok(size) if (1..=100).contains(&size) => page_size = size,
@@ -665,7 +664,7 @@ impl Gateway {
         config: PactConfig,
         verifier: PaVerifier,
         key: Arc<ProviderKey>,
-        store: PactStore,
+        store: SharedPactStore,
         node: Arc<dyn PactNode>,
         consent: Arc<ConsentLink>,
     ) -> Self {
@@ -676,21 +675,42 @@ impl Gateway {
             config,
             verifier,
             key,
-            store: Mutex::new(store),
+            store,
             node,
             consent,
             callers: RateLimiter::keyed(quota),
             poll_interval: Duration::from_secs(1),
+            #[cfg(test)]
+            task_wait_deadline: None,
         }
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::missing_const_for_fn)]
+    #[must_use]
+    pub fn with_poll_interval(mut self, interval: Duration) -> Self {
+        self.poll_interval = interval;
+        self
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::missing_const_for_fn)]
+    #[must_use]
+    pub fn with_task_wait_deadline(mut self, deadline: Duration) -> Self {
+        self.task_wait_deadline = Some(deadline);
+        self
     }
 
     /// Closes idle contexts and forgets idle rate-limit entries. The node
     /// calls this periodically.
     pub fn maintain(&self) {
         let now = now();
-        let _ = self
+        let closed = self
             .store()
             .close_idle_contexts(now.saturating_sub(CONTEXT_IDLE_SECONDS), now);
+        if let Err(error) = closed {
+            tracing::warn!(?error, "pact store idle context cleanup failed");
+        }
         self.callers.retain_recent();
     }
 
@@ -738,8 +758,9 @@ impl Gateway {
             None => None,
             Some(value) => {
                 match self.verify_delegation_header(&brand, &caller, value) {
-                    Some(delegation) => Some(delegation),
-                    None => return Begun::Answered(invalid_token()),
+                    Ok(Some(delegation)) => Some(delegation),
+                    Ok(None) => return Begun::Answered(invalid_token()),
+                    Err(failure) => return Begun::Answered(failure.into_response()),
                 }
             }
         };
@@ -794,16 +815,23 @@ impl Gateway {
                 Ok(context_id) => context_id,
                 Err(failure) => return Begun::Answered(failure.into_response()),
             };
-        if let Some(delegation) = &delegation
-            && self
-                .store()
-                .bind_context_user(&context_id, &delegation.claims.sub)
-                .is_err()
-        {
-            return Begun::Answered(a2a_error(
-                A2aError::InvalidParams,
-                "Unknown contextId",
-            ));
+        if let Some(delegation) = &delegation {
+            let bound =
+                self.store().bind_context_user(&context_id, &delegation.claims.sub);
+            match bound {
+                Ok(()) => {}
+                Err(StoreError::Unauthorized) => {
+                    return Begun::Answered(a2a_error(
+                        A2aError::InvalidParams,
+                        "Unknown contextId",
+                    ));
+                }
+                Err(_) => {
+                    return Begun::Answered(
+                        internal("The conversation cannot be stored").into_response(),
+                    );
+                }
+            }
         }
         let reservation = self.store().reserve_message(
             &context_id,
@@ -904,7 +932,14 @@ impl Gateway {
             }
             Err(failure) => {
                 // Nothing was answered: a retry with the same id runs again.
-                let _ = self.store().discard_message(turn.context_id, turn.message_id);
+                let discarded =
+                    self.store().discard_message(turn.context_id, turn.message_id);
+                if let Err(error) = discarded {
+                    tracing::warn!(
+                        ?error,
+                        "pact message discard failed after send error"
+                    );
+                }
                 failure.into_response()
             }
         }
@@ -917,27 +952,43 @@ impl Gateway {
         brand: &Brand,
         caller: &PaIdentity,
         value: &HeaderValue,
-    ) -> Option<Delegation> {
-        let token = value.to_str().ok()?;
-        let (scheme, token) = token.split_once(' ')?;
+    ) -> Result<Option<Delegation>, Failure> {
+        let token = value.to_str().ok();
+        let Some(token) = token else {
+            return Ok(None);
+        };
+        let Some((scheme, token)) = token.split_once(' ') else {
+            return Ok(None);
+        };
         if !scheme.eq_ignore_ascii_case("bearer") {
-            return None;
+            return Ok(None);
         }
-        let claims = verify_delegation(
+        let Some(claims) = verify_delegation(
             &self.key,
             token.trim(),
             &self.config.oauth_issuer(brand),
             &self.config.interface_url(brand),
-        )?;
-        let grant = self.store().grant(&claims.grant_id).ok()??;
-        let live = claims.client_id == caller.issuer
-            && grant.brand_id == brand.id
-            && grant.pa_issuer == caller.issuer
-            && grant.pa_subject == caller.subject
-            && grant.brand_user == claims.sub
-            && grant.expires_at > now()
-            && self.node.has_grant(&grant.grant_id);
-        live.then_some(Delegation { claims })
+        ) else {
+            return Ok(None);
+        };
+        if claims.client_id != caller.issuer {
+            return Ok(None);
+        }
+        let grant =
+            self.store().grant(&claims.grant_id).map_err(|_| oauth_store_error())?;
+        let Some(grant) = grant else {
+            return Ok(None);
+        };
+        let at = now();
+        let live = grant_binds(
+            &grant,
+            &brand.id,
+            caller,
+            at,
+            GrantBinding::Delegation { brand_user: &claims.sub },
+            self.node.has_grant(&grant.grant_id).map_err(|_| oauth_store_error())?,
+        );
+        Ok(live.then_some(Delegation { claims }))
     }
 
     /// The context to answer in: a new one, or the caller's own open one.
@@ -965,8 +1016,7 @@ impl Gateway {
         let context = self
             .store()
             .context(context_id)
-            .ok()
-            .flatten()
+            .map_err(|_| internal("The conversation cannot be read"))?
             .filter(|context| {
                 context.brand_id == brand.id
                     && context.pa_issuer == caller.issuer
@@ -1059,7 +1109,6 @@ impl Gateway {
             skill: turn.brand.capability.clone(),
             workspace_id: turn.brand.workspace.clone(),
             remote_text,
-            context_tokens: 0,
         };
         Ok((request, key, task, args_hash))
     }
@@ -1112,9 +1161,17 @@ impl Gateway {
     /// margin pass. Each change of the task, or else each poll interval,
     /// reads the task again.
     async fn wait_for_result(&self, task_id: &str) -> Result<String, Failure> {
-        let deadline = tokio::time::Instant::now().checked_add(Duration::from_secs(
-            self.config.max_seconds.saturating_add(30),
-        ));
+        let wait_budget = {
+            #[cfg(test)]
+            if let Some(deadline) = self.task_wait_deadline {
+                deadline
+            } else {
+                Duration::from_secs(self.config.max_seconds.saturating_add(30))
+            }
+            #[cfg(not(test))]
+            Duration::from_secs(self.config.max_seconds.saturating_add(30))
+        };
+        let deadline = tokio::time::Instant::now().checked_add(wait_budget);
         // Subscribe before the first read, so no change is lost between them.
         let mut events = Some(self.node.subscribe_events());
         loop {
@@ -1177,11 +1234,16 @@ impl Gateway {
         };
         let receipt = sign_receipt(&self.key, &claims)
             .map_err(|_| internal("The receipt cannot be signed"))?;
-        let jws = receipt.get("jws").and_then(Value::as_str).unwrap_or_default();
         self.store()
-            .put_receipt(turn.context_id, turn.message_id, &claims.grant_id, jws, now())
+            .put_receipt(
+                turn.context_id,
+                turn.message_id,
+                &claims.grant_id,
+                &receipt.jws,
+                now(),
+            )
             .map_err(|_| internal("The receipt cannot be stored"))?;
-        Ok(receipt)
+        Ok(json!(receipt))
     }
 
     // -- Device authorization (§5.3, RFC 8628) --
@@ -1212,7 +1274,7 @@ impl Gateway {
                 created_at: now,
                 expires_at: now.saturating_add(DEVICE_CODE_SECONDS),
             })
-            .map_err(|_| unavailable)?;
+            .map_err(|_| oauth_store_error())?;
         let verification_uri = format!("{base}/pact/consent");
         let verification_uri_complete =
             format!("{verification_uri}?user_code={user_code}");
@@ -1230,7 +1292,7 @@ impl Gateway {
         caller: &PaIdentity,
         body: &[u8],
     ) -> Response {
-        let form = form_pairs(&String::from_utf8_lossy(body));
+        let form = parse_form(&String::from_utf8_lossy(body));
         let authorization = check_client(&form, caller)
             .and_then(|()| {
                 let scopes = scope_list(field(&form, "scope").unwrap_or_default());
@@ -1264,7 +1326,7 @@ impl Gateway {
     }
 
     fn token(&self, brand: &Brand, caller: &PaIdentity, body: &[u8]) -> Response {
-        let form = form_pairs(&String::from_utf8_lossy(body));
+        let form = parse_form(&String::from_utf8_lossy(body));
         let now = now();
         check_client(&form, caller)
             .and_then(|()| self.redeem(&form, brand, caller, now))
@@ -1298,20 +1360,24 @@ impl Gateway {
             }
             GrantType::RefreshToken => {
                 let refresh_token = field(form, "refresh_token").unwrap_or_default();
-                let used =
-                    self.store().use_refresh_token(&digest_hex(refresh_token), now);
-                used.ok().flatten().ok_or(Failure::OAuth(
+                let used = self
+                    .store()
+                    .use_refresh_token(&digest_hex(refresh_token), now)
+                    .map_err(|_| oauth_store_error())?;
+                used.ok_or(Failure::OAuth(
                     OAuthError::InvalidGrant,
                     "Unknown, used or expired refresh_token",
                 ))?
             }
         };
-        let bound = grant.brand_id == brand.id
-            && grant.pa_issuer == caller.issuer
-            && grant.pa_subject == caller.subject
-            && grant.expires_at > now
-            && self.node.has_grant(&grant.grant_id);
-        if bound {
+        if grant_binds(
+            &grant,
+            &brand.id,
+            caller,
+            now,
+            GrantBinding::Redeem,
+            self.node.has_grant(&grant.grant_id).map_err(|_| oauth_store_error())?,
+        ) {
             Ok(grant)
         } else {
             Err(Failure::OAuth(
@@ -1377,7 +1443,9 @@ fn check_client(form: &[(String, String)], caller: &PaIdentity) -> Result<(), Fa
 }
 
 /// The token-endpoint answer to one device-code poll (RFC 8628 §3.5).
-fn approved_grant(poll: Result<DevicePoll, StoreError>) -> Result<PactGrant, Failure> {
+pub(crate) fn approved_grant(
+    poll: Result<DevicePoll, StoreError>,
+) -> Result<PactGrant, Failure> {
     match poll {
         Ok(DevicePoll::Approved(grant)) => Ok(grant),
         Ok(DevicePoll::Pending { slow_down: true }) => {
@@ -1394,9 +1462,10 @@ fn approved_grant(poll: Result<DevicePoll, StoreError>) -> Result<PactGrant, Fai
         Ok(DevicePoll::Expired) => {
             Err(Failure::OAuth(OAuthError::ExpiredToken, "The device code expired"))
         }
-        Ok(DevicePoll::Unknown | DevicePoll::Consumed) | Err(_) => {
+        Ok(DevicePoll::Unknown | DevicePoll::Consumed) => {
             Err(Failure::OAuth(OAuthError::InvalidGrant, "Unknown or used device_code"))
         }
+        Err(_) => Err(oauth_store_error()),
     }
 }
 
@@ -1457,86 +1526,10 @@ fn turn_key(turn: &Turn<'_>) -> String {
     hasher.finalize().to_hex().get(..32).unwrap_or_default().to_owned()
 }
 
-/// The Aether agent id of a personal agent.
-#[must_use]
-pub fn caller_agent_id(issuer: &str) -> String {
-    format!("pact:{issuer}")
+fn parse_form(source: &str) -> Vec<(String, String)> {
+    form_urlencoded::parse(source.as_bytes()).into_owned().collect()
 }
 
-/// The Aether endpoint id of one personal agent's user. The `sub` is
-/// hashed so the id stays short and holds no caller-chosen text but the
-/// issuer.
-#[must_use]
-pub fn caller_endpoint_id(caller: &PaIdentity) -> String {
-    let digest = blake3::hash(caller.subject.as_bytes()).to_hex();
-    format!("pact:{}#{}", caller.issuer, digest.get(..32).unwrap_or_default())
-}
-
-/// Builds the PACT grant record for an owner approval.
-#[must_use]
-pub fn new_grant(
-    grant_id: String,
-    brand_id: &str,
-    pa_issuer: &str,
-    pa_subject: &str,
-    scopes: &str,
-    now: i64,
-) -> PactGrant {
-    PactGrant {
-        grant_id,
-        brand_id: brand_id.to_owned(),
-        pa_issuer: pa_issuer.to_owned(),
-        pa_subject: pa_subject.to_owned(),
-        brand_user: BRAND_USER.to_owned(),
-        scopes: scopes.to_owned(),
-        created_at: now,
-        expires_at: now.saturating_add(GRANT_SECONDS),
-    }
-}
-
-// -- Small helpers --
-
-/// Decoded `application/x-www-form-urlencoded` pairs.
-fn form_pairs(source: &str) -> Vec<(String, String)> {
-    source
-        .split('&')
-        .filter(|pair| !pair.is_empty())
-        .map(|pair| {
-            let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
-            (form_decode(name), form_decode(value))
-        })
-        .collect()
-}
-
-fn form_decode(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while let Some(&byte) = bytes.get(index) {
-        match byte {
-            b'+' => decoded.push(b' '),
-            b'%' => {
-                let hex = bytes.get(index.saturating_add(1)..index.saturating_add(3));
-                match hex
-                    .and_then(|hex| std::str::from_utf8(hex).ok())
-                    .and_then(|hex| u8::from_str_radix(hex, 16).ok())
-                {
-                    Some(value) => {
-                        decoded.push(value);
-                        index = index.saturating_add(2);
-                    }
-                    None => decoded.push(b'%'),
-                }
-            }
-            other => decoded.push(other),
-        }
-        index = index.saturating_add(1);
-    }
-    String::from_utf8_lossy(&decoded).into_owned()
-}
-
-/// The value of the only `name` field. A repeated field is refused, as
-/// RFC 6749 §3.1 asks.
 fn field<'a>(form: &'a [(String, String)], name: &str) -> Option<&'a str> {
     let mut values = form.iter().filter(|(field, _)| field == name);
     let value = values.next()?;
@@ -1580,48 +1573,14 @@ fn sha256(value: &str) -> String {
     URL_SAFE_NO_PAD.encode(digest::digest(&digest::SHA256, value.as_bytes()))
 }
 
-fn now() -> i64 {
-    aether_core::time::unix_timestamp(SystemTime::now()).unwrap_or(0)
-}
-
-/// `seconds` since the Unix epoch as an RFC 3339 UTC time.
 #[must_use]
 pub fn rfc3339(seconds: i64) -> String {
-    // Howard Hinnant's `civil_from_days`.
-    let days = seconds.div_euclid(86_400);
-    let time = seconds.rem_euclid(86_400);
-    let z = days.saturating_add(719_468);
-    let era = z.div_euclid(146_097);
-    let day_of_era = z.rem_euclid(146_097);
-    let year_of_era = day_of_era
-        .saturating_sub(day_of_era / 1_460)
-        .saturating_add(day_of_era / 36_524)
-        .saturating_sub(day_of_era / 146_096)
-        / 365;
-    let day_of_year = day_of_era.saturating_sub(
-        year_of_era
-            .saturating_mul(365)
-            .saturating_add(year_of_era / 4)
-            .saturating_sub(year_of_era / 100),
-    );
-    let month_index = day_of_year.saturating_mul(5).saturating_add(2) / 153;
-    let day = day_of_year
-        .saturating_sub(month_index.saturating_mul(153).saturating_add(2) / 5)
-        .saturating_add(1);
-    let month = if month_index < 10 {
-        month_index.saturating_add(3)
-    } else {
-        month_index.saturating_sub(9)
-    };
-    let year = year_of_era
-        .saturating_add(era.saturating_mul(400))
-        .saturating_add(i64::from(month <= 2));
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-        time / 3_600,
-        (time / 60) % 60,
-        time % 60,
-    )
+    time::OffsetDateTime::from_unix_timestamp(seconds)
+        .ok()
+        .and_then(|instant| {
+            instant.format(&time::format_description::well_known::Rfc3339).ok()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

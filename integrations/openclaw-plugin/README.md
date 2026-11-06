@@ -108,17 +108,12 @@ visibility is `all`. These warnings are part of OpenClaw's security checks.
 
 ## Caller tools and the `mcp.servers.aether` override
 
-The plugin manifest starts `aether mcp serve --caller-only` and lists only
-the seven caller tools:
-
-- `aether.agents.list`, `aether.agents.find`, `aether.people.find`
-- `aether.task.send`, `aether.task.cancel`
-- `aether.inbox.list`, `aether.inbox.read`
+The plugin manifest starts `aether mcp serve --caller-only`. That server
+lists and accepts only the caller tools, which send tasks and read answers,
+and OpenClaw takes the tool list from it.
 
 If you set `mcp.servers.aether` in your config, your entry replaces the
-plugin entry. The manifest `toolFilter` is then lost. Keep
-`--caller-only` in `args`, and copy the seven names into an `include`
-list:
+plugin entry. Keep `--caller-only` in `args`:
 
 ```json5
 {
@@ -128,13 +123,6 @@ list:
         transport: "stdio",
         command: "aether",
         args: ["mcp", "serve", "--caller-only", "--data-dir", "/path/to/host"],
-        toolFilter: {
-          include: [
-            "aether.agents.list", "aether.agents.find", "aether.people.find",
-            "aether.task.send", "aether.task.cancel",
-            "aether.inbox.list", "aether.inbox.read",
-          ],
-        },
       },
     },
   },
@@ -147,10 +135,10 @@ when your data directory is not the default.
 ## Cancel
 
 - When a caller cancels, or the time limit ends, the node sends `cancel`.
-  The plugin sends `cancelled` to the node at once. It drops the late reply.
-- OpenClaw has no plugin API that stops a running agent turn. The turn can
-  keep running until it ends. The sandbox and the tool list limit what it
-  can do during that time.
+  The plugin stops the agent turn through the dispatch `abortSignal`,
+  sends `cancelled` to the node at once and drops the late reply.
+- When the node connection closes, the node fails the open tasks. The
+  plugin stops their turns too.
 
 ## Sessions
 

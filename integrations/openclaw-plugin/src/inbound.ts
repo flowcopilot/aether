@@ -10,6 +10,7 @@ import type { PluginRuntime } from "openclaw/plugin-sdk/runtime-store";
 import type { Dispatch } from "./task-runner.ts";
 
 export const CHANNEL_ID = "aether";
+export const DESCRIPTION = "Send and receive Aether agent tasks through the local Aether node.";
 
 // The node checks the grant before it sends a task. The plugin admits every
 // task as this one fixed sender, so the sender is never a caller name. It is
@@ -107,6 +108,7 @@ export function createDispatch(options: DispatchOptions): Dispatch {
       },
       replyOptions: {
         sourceReplyDeliveryMode: "automatic",
+        abortSignal: task.signal,
         // "completed" is not used here. It arrives before the final reply is
         // delivered, so it would send an empty result. The dispatch result below
         // ends a completed task after its reply is delivered.

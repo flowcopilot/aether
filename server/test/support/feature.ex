@@ -18,7 +18,11 @@ defmodule AetherHub.Feature do
   rows of a data table as maps from the header) and `:doc_string`. The
   third argument matches the scenario state, which starts as the ExUnit
   context. A step that returns `{:ok, map}` merges the map into the state;
-  any other value leaves the state as it was.
+  a step that returns `{:error, reason}` fails; any other value leaves the
+  state as it was.
+
+  Every feature also has the shared steps of `AetherHub.HubSteps`. A module
+  of shared steps uses `AetherHub.Feature.Steps`.
 
   Scenario tags become ExUnit tags, so `mix test --only slow` selects the
   scenarios tagged `@slow`.
@@ -39,10 +43,31 @@ defmodule AetherHub.Feature do
       @before_compile AetherHub.Feature
       use ExUnit.Case, async: unquote(async)
       import AetherHub.Feature, only: [defstep: 4]
+      import AetherHub.TestClient
+      import AetherHub.HubSteps
 
       Module.register_attribute(__MODULE__, :feature_steps, accumulate: true)
       @feature_file Path.join(AetherHub.Feature.features_dir(), unquote(file))
       @external_resource @feature_file
+    end
+  end
+
+  defmodule Steps do
+    @moduledoc "A module of step definitions that every feature shares."
+
+    defmacro __using__(_opts) do
+      quote do
+        import AetherHub.Feature, only: [defstep: 4]
+        Module.register_attribute(__MODULE__, :feature_steps, accumulate: true)
+        @before_compile AetherHub.Feature.Steps
+      end
+    end
+
+    defmacro __before_compile__(_env) do
+      quote do
+        @doc false
+        def __feature_steps__, do: @feature_steps
+      end
     end
   end
 
@@ -54,7 +79,7 @@ defmodule AetherHub.Feature do
     location = "#{Path.relative_to_cwd(__CALLER__.file)}:#{__CALLER__.line}"
 
     quote do
-      @feature_steps {unquote(name), unquote(Regex.source(compiled)),
+      @feature_steps {__MODULE__, unquote(name), unquote(Regex.source(compiled)),
                       unquote(Regex.opts(compiled)), unquote(location)}
       def unquote(name)(unquote(vars), unquote(state)), do: unquote(block)
     end
@@ -62,7 +87,10 @@ defmodule AetherHub.Feature do
 
   defmacro __before_compile__(env) do
     file = Module.get_attribute(env.module, :feature_file)
-    steps = Module.get_attribute(env.module, :feature_steps) |> Enum.reverse()
+
+    steps =
+      Enum.reverse(Module.get_attribute(env.module, :feature_steps)) ++
+        AetherHub.HubSteps.__feature_steps__()
 
     for scenario <- file |> File.read!() |> parse(file) do
       tags = Enum.map(scenario.tags, &String.to_atom/1)
@@ -72,7 +100,6 @@ defmodule AetherHub.Feature do
         @tag unquote(tags |> Enum.map(&{&1, true}))
         test unquote(scenario.name), context do
           AetherHub.Feature.run(
-            __MODULE__,
             unquote(Macro.escape(steps)),
             unquote(steps_ast),
             Map.new(context)
@@ -83,20 +110,27 @@ defmodule AetherHub.Feature do
   end
 
   @doc false
-  def run(module, definitions, steps, state) do
+  def run(definitions, steps, state) do
     Enum.reduce(steps, state, fn step, state ->
-      {name, vars} = find(definitions, step)
+      {module, name, vars} = find(definitions, step)
 
       case apply(module, name, [vars, state]) do
-        {:ok, %{} = changes} -> Map.merge(state, changes)
-        _ -> state
+        {:ok, %{} = changes} ->
+          Map.merge(state, changes)
+
+        {:error, reason} ->
+          raise ExUnit.AssertionError,
+            message: "line #{step.line} failed with #{inspect(reason)}: #{step.text}"
+
+        _ ->
+          state
       end
     end)
   end
 
   defp find(definitions, step) do
     matches =
-      for {name, source, opts, location} <- definitions,
+      for {module, name, source, opts, location} <- definitions,
           regex = Regex.compile!(source, opts),
           captures = Regex.named_captures(regex, step.text),
           captures != nil do
@@ -105,12 +139,12 @@ defmodule AetherHub.Feature do
           |> Map.new(fn {key, value} -> {String.to_atom(key), value} end)
           |> Map.merge(%{table: table(step.table), doc_string: step.doc_string})
 
-        {name, vars, location}
+        {module, name, vars, location}
       end
 
     case matches do
-      [{name, vars, _}] ->
-        {name, vars}
+      [{module, name, vars, _}] ->
+        {module, name, vars}
 
       [] ->
         raise ExUnit.AssertionError,
@@ -120,7 +154,7 @@ defmodule AetherHub.Feature do
         raise ExUnit.AssertionError,
           message:
             "more than one step definition matches line #{step.line}: #{step.text}\n" <>
-              Enum.map_join(many, "\n", fn {_, _, location} -> "  " <> location end)
+              Enum.map_join(many, "\n", fn {_, _, _, location} -> "  " <> location end)
     end
   end
 

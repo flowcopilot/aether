@@ -1,0 +1,91 @@
+{
+  "cases": [
+    {
+      "name": "a task gets progress and then its result",
+      "steps": [
+        { "agent": { "type": "ready", "protocol": 1 } },
+        { "node": { "type": "task", "id": "task-1", "instructions": "Do the task.", "text": "hello" } },
+        { "agent": { "type": "progress", "id": "task-1" } },
+        { "agent": { "type": "result", "id": "task-1", "text": "the answer" } }
+      ],
+      "outcomes": { "task-1": "answered" }
+    },
+    {
+      "name": "a failed turn fails the task without text",
+      "steps": [
+        { "agent": { "type": "ready", "protocol": 1 } },
+        { "node": { "type": "task", "id": "task-2", "instructions": "Do the task.", "text": "fail" } },
+        { "agent": { "type": "failed", "id": "task-2" } }
+      ],
+      "outcomes": { "task-2": "failed" }
+    },
+    {
+      "name": "a cancel stops the turn, and its late answer is dropped",
+      "steps": [
+        { "agent": { "type": "ready", "protocol": 1 } },
+        { "node": { "type": "task", "id": "task-3", "instructions": "Do the task.", "text": "wait" } },
+        { "node": { "type": "cancel", "id": "task-3" } },
+        { "agent": { "type": "cancelled", "id": "task-3" } },
+        { "agent": { "type": "result", "id": "task-3", "text": "late" }, "ignored": true }
+      ],
+      "outcomes": { "task-3": "cancelled" }
+    },
+    {
+      "name": "unknown and bad lines are skipped in both directions",
+      "steps": [
+        { "agent": { "type": "ready", "protocol": 1 } },
+        { "agent_line": "" },
+        { "agent_line": "not json" },
+        { "agent_line": "[]" },
+        { "agent_line": "{\"type\":\"hello\",\"id\":\"task-4\"}" },
+        { "agent_line": "{\"type\":\"result\",\"id\":\"nobody\",\"text\":\"no such task\"}" },
+        { "agent_line_bytes": 4194304 },
+        { "node_line": "" },
+        { "node_line": "not json" },
+        { "node_line": "[]" },
+        { "node_line": "{\"type\":\"ping\",\"id\":\"task-4\"}" },
+        { "node_line": "{\"type\":\"task\",\"instructions\":\"Do the task.\",\"text\":\"no id\"}" },
+        { "node_line": "{\"type\":\"cancel\",\"id\":7}" },
+        { "node_line": "{\"type\":\"cancel\",\"id\":\"nobody\"}" },
+        { "node_line_bytes": 4194304 },
+        { "node": { "type": "task", "id": "task-4", "instructions": "Do the task.", "text": "hello" } },
+        { "agent": { "type": "result", "id": "task-4", "text": "still connected" } }
+      ],
+      "outcomes": { "task-4": "answered" }
+    },
+    {
+      "name": "a second task with an open ID is ignored",
+      "steps": [
+        { "agent": { "type": "ready", "protocol": 1 } },
+        { "node": { "type": "task", "id": "task-5", "instructions": "Do the task.", "text": "first" } },
+        { "node": { "type": "task", "id": "task-5", "instructions": "Do the task.", "text": "again" }, "ignored": true },
+        { "agent": { "type": "result", "id": "task-5", "text": "the first answer" } }
+      ],
+      "outcomes": { "task-5": "answered" }
+    },
+    {
+      "name": "a line over the limit from the agent closes the connection, and its tasks are lost",
+      "steps": [
+        { "agent": { "type": "ready", "protocol": 1 } },
+        { "node": { "type": "task", "id": "task-6", "instructions": "Do the task.", "text": "hello" } },
+        { "agent_line_bytes": 4194305 },
+        { "closes": "node" },
+        { "agent": { "type": "ready", "protocol": 1 } },
+        { "agent": { "type": "result", "id": "task-6", "text": "late" }, "ignored": true }
+      ],
+      "outcomes": { "task-6": "lost" }
+    },
+    {
+      "name": "a line over the limit from the node closes the connection, and its tasks are lost",
+      "steps": [
+        { "agent": { "type": "ready", "protocol": 1 } },
+        { "node": { "type": "task", "id": "task-7", "instructions": "Do the task.", "text": "hello" } },
+        { "node_line_bytes": 4194305 },
+        { "closes": "agent" },
+        { "agent": { "type": "ready", "protocol": 1 } },
+        { "agent": { "type": "result", "id": "task-7", "text": "late" }, "ignored": true }
+      ],
+      "outcomes": { "task-7": "lost" }
+    }
+  ]
+}

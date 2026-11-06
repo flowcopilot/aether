@@ -13,7 +13,10 @@ pub mod connected;
 
 use std::path::Path;
 
-use crate::execution::{Agent, ExecutionError, ExecutionEvent};
+use crate::{
+    execution::{Agent, ExecutionError, ExecutionEvent, TurnContext},
+    policy::AgentAdapter,
+};
 
 /// The agent of one node, chosen in the policy file.
 #[derive(Clone)]
@@ -23,43 +26,31 @@ pub enum NodeAgent {
 }
 
 impl NodeAgent {
-    /// The adapter's name, for the owner's own logs only.
     #[must_use]
-    pub const fn kind(&self) -> &'static str {
+    pub const fn kind(&self) -> AgentAdapter {
         match self {
-            Self::Codex(_) => "codex",
-            Self::Connected(_) => "connected",
+            Self::Codex(_) => AgentAdapter::Codex,
+            Self::Connected(_) => AgentAdapter::Connected,
         }
     }
 }
 
 impl Agent for NodeAgent {
-    fn start_turn(
-        &mut self,
-        task_id: &str,
-        skill: &str,
-        remote_text: &str,
-    ) -> Result<String, ExecutionError> {
+    fn start_turn(&mut self, ctx: &TurnContext) -> Result<String, ExecutionError> {
         match self {
-            Self::Codex(agent) => agent.start_turn(task_id, skill, remote_text),
-            Self::Connected(agent) => agent.start_turn(task_id, skill, remote_text),
+            Self::Codex(agent) => agent.start_turn(ctx),
+            Self::Connected(agent) => agent.start_turn(ctx),
         }
     }
 
     fn start_turn_with_events(
         &mut self,
-        task_id: &str,
-        skill: &str,
-        remote_text: &str,
+        ctx: &TurnContext,
         events: &mut dyn FnMut(ExecutionEvent),
     ) -> Result<String, ExecutionError> {
         match self {
-            Self::Codex(agent) => {
-                agent.start_turn_with_events(task_id, skill, remote_text, events)
-            }
-            Self::Connected(agent) => {
-                agent.start_turn_with_events(task_id, skill, remote_text, events)
-            }
+            Self::Codex(agent) => agent.start_turn_with_events(ctx, events),
+            Self::Connected(agent) => agent.start_turn_with_events(ctx, events),
         }
     }
 
@@ -74,6 +65,13 @@ impl Agent for NodeAgent {
         match self {
             Self::Codex(agent) => agent.set_workspace(workspace),
             Self::Connected(agent) => agent.set_workspace(workspace),
+        }
+    }
+
+    fn supports_workspace_change(&self) -> bool {
+        match self {
+            Self::Codex(agent) => agent.supports_workspace_change(),
+            Self::Connected(agent) => agent.supports_workspace_change(),
         }
     }
 }

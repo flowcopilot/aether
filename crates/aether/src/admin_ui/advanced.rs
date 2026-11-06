@@ -6,7 +6,6 @@
 use std::{
     path::PathBuf,
     sync::{Arc, PoisonError},
-    time::SystemTime,
 };
 
 use serde::Deserialize;
@@ -22,19 +21,21 @@ use topcoat::{
 };
 
 use super::{
-    AdminConfirmations, Caller, Host, Managed, Tab, ensure_admin_session, node_header,
+    AdminConfirmations, Managed, Page, ensure_admin_session,
+    layout::{Tab, node_header, page_data_dir},
 };
 use crate::{
-    admin::SharedAdministration,
+    admin::{AdminStoreAccess, SharedAdministration},
     admin_components::page_title,
     components::{
+        alert::{AlertVariant, alert, alert_description, alert_title},
         button::{ButtonSize, ButtonVariant, button, button_variants},
         input::input,
         label::label,
     },
-    node_config::{PolicySettings, policy_settings, save_policy_settings},
+    policy::{PolicySettings, policy_settings},
 };
-use aether_store::ManagedMember;
+use aether_store::{ChangeKind, ManagedMember};
 
 #[page("/advanced")]
 pub(super) async fn advanced() -> TopcoatResult<impl View> {
@@ -49,36 +50,47 @@ pub(super) async fn dashboard(
     #[default] policy_saved: bool,
 ) -> TopcoatResult<impl View> {
     ensure_admin_session(cx).await?;
-    let Host(host) = app_context::<Host>(cx);
-    let Caller(caller) = app_context::<Caller>(cx);
-    let data_dir = host
-        .as_ref()
-        .map(|host| &host.data_dir)
-        .or_else(|| caller.as_ref().map(|caller| &caller.data_dir));
+    let Page(page) = app_context::<Page>(cx);
+    let data_dir = page_data_dir(cx);
     let policy = data_dir
-        .map(|path| policy_settings(path))
+        .map(|path| policy_settings(&path))
         .transpose()
         .map_err(internal_server_error)?
         .flatten();
 
     let administration = app_context::<SharedAdministration>(cx);
-    let (pending, configured, summary, members) = {
+    let (store_access, pending, configured, summary, members) = {
         let administration =
             administration.lock().unwrap_or_else(PoisonError::into_inner);
         (
+            administration.store_access(),
             administration.pending(),
             administration.configured_change_counts(),
             administration.node_summary(),
             administration.managed_members(),
         )
     };
-    let tokens = app_context::<Arc<AdminConfirmations>>(cx).reset(pending)?;
+    let store_unavailable = matches!(store_access, AdminStoreAccess::Unavailable)
+        || pending.is_err()
+        || configured.is_err()
+        || summary.is_err()
+        || members.is_err();
+    let pending = pending.unwrap_or_default();
+    let configured = configured.unwrap_or_default();
+    let summary = summary.unwrap_or_default();
+    let members = members.unwrap_or_default();
+    let tokens = if store_unavailable {
+        Vec::new()
+    } else {
+        app_context::<Arc<AdminConfirmations>>(cx).reset(pending)?
+    };
     let Managed(managed) = *app_context::<Managed>(cx);
 
-    let capabilities = configured.get("capability").copied().unwrap_or(0);
-    let directories = configured.get("directory").copied().unwrap_or(0);
-    let grants = configured.get("grant").copied().unwrap_or(0);
-    let workspaces = configured.get("workspace").copied().unwrap_or(0);
+    let applied = |kind| configured.get(&kind).copied().unwrap_or(0);
+    let capabilities = applied(ChangeKind::Capability);
+    let directories = applied(ChangeKind::Directory);
+    let grants = applied(ChangeKind::Grant);
+    let workspaces = applied(ChangeKind::Workspace);
 
     Ok(view! {
         node_header(current: Tab::Advanced)
@@ -100,9 +112,18 @@ pub(super) async fn dashboard(
                 "Review local permissions, tasks and pending changes."
             )
 
+            if store_unavailable {
+                alert(variant: AlertVariant::Destructive, attrs: attributes! { role="alert" },
+                    alert_title("Administration store is unavailable")
+                    alert_description("This node cannot read its local administration database. Fix the data directory and reload.")
+                )
+            }
+
             <section id="pending" class="flex scroll-mt-6 flex-col gap-3">
                 <h2 class="text-xl font-semibold tracking-tight">"Pending changes"</h2>
-                if tokens.is_empty() {
+                if store_unavailable {
+                    <p class="text-muted-foreground">"Pending changes cannot be loaded."</p>
+                } else if tokens.is_empty() {
                     <p class="text-muted-foreground">"No changes need confirmation."</p>
                 } else {
                     <ul class="flex flex-col gap-2">
@@ -128,19 +149,23 @@ pub(super) async fn dashboard(
 
             <section id="overview" class="flex scroll-mt-6 flex-col gap-3">
             <h2 class="text-xl font-semibold tracking-tight">"Overview"</h2>
-            <dl class="grid grid-cols-2 gap-px overflow-hidden rounded-xl border border-border bg-border sm:grid-cols-3">
-                count(id: "agents", name: "Agents", value: summary.agents, unit: "known agents")
-                count(id: "capabilities", name: "Capabilities", value: capabilities, unit: "configured capabilities")
-                count(id: "directories", name: "Directories", value: directories, unit: "configured directories")
-                count(id: "connections", name: "Connections", value: summary.active_connections, unit: "active connections")
-                count(id: "grant-count", name: "Permissions", value: grants, unit: "configured grants")
-                count(id: "workspaces", name: "Workspaces", value: workspaces, unit: "configured workspaces")
-            </dl>
+            if store_unavailable {
+                <p class="text-muted-foreground">"Overview counts cannot be loaded."</p>
+            } else {
+                <dl class="grid grid-cols-2 gap-px overflow-hidden rounded-xl border border-border bg-border sm:grid-cols-3">
+                    count(id: "agents", name: "Agents", value: summary.agents, unit: "known agents")
+                    count(id: "capabilities", name: "Capabilities", value: capabilities, unit: "configured capabilities")
+                    count(id: "directories", name: "Directories", value: directories, unit: "configured directories")
+                    count(id: "connections", name: "Connections", value: summary.active_connections, unit: "active connections")
+                    count(id: "grant-count", name: "Permissions", value: grants, unit: "configured grants")
+                    count(id: "workspaces", name: "Workspaces", value: workspaces, unit: "configured workspaces")
+                </dl>
+            }
             </section>
 
             <section id="permissions" class="flex scroll-mt-6 flex-col gap-3">
                 <h2 class="text-xl font-semibold tracking-tight">"Permissions"</h2>
-                if host.is_some() {
+                if page.as_ref().is_some_and(|page| page.host_ui) {
                     <p class="text-muted-foreground">"Invite a person to send tasks to your agent. Access groups control who can send tasks."</p>
                     <div class="flex flex-wrap gap-2">
                         <a href="/#invite" class=(class!(button_variants(ButtonVariant::Primary, ButtonSize::Md), "no-underline"))>"Invite someone"</a>
@@ -175,11 +200,11 @@ pub(super) async fn dashboard(
                             </div>
                             <div class="flex flex-col gap-1.5">
                                 label(attrs: attributes! { for="queue_global" }, "Max waiting tasks")
-                                input(attrs: attributes! { id="queue_global" name="queue_global" type="number" min="1" required="" value=(policy.queue_global.to_string()) })
+                                input(attrs: attributes! { id="queue_global" name="queue_global" type="number" min="1" required="" value=(policy.queue.get(aether_core::limits::QueueLimitId::Global).to_string()) })
                             </div>
                             <div class="flex flex-col gap-1.5">
                                 label(attrs: attributes! { for="queue_per_peer" }, "Max waiting tasks per person")
-                                input(attrs: attributes! { id="queue_per_peer" name="queue_per_peer" type="number" min="1" required="" value=(policy.queue_per_peer.to_string()) })
+                                input(attrs: attributes! { id="queue_per_peer" name="queue_per_peer" type="number" min="1" required="" value=(policy.queue.get(aether_core::limits::QueueLimitId::PerPeer).to_string()) })
                             </div>
                         </div>
                         button(variant: ButtonVariant::Primary, attrs: attributes! { type="submit" class="w-fit" }, "Save task policy")
@@ -191,9 +216,13 @@ pub(super) async fn dashboard(
 
             <section id="tasks" class="flex scroll-mt-6 flex-col gap-3">
                 <h2 class="text-xl font-semibold tracking-tight">"Tasks"</h2>
-                <p class="text-muted-foreground">
-                    (summary.tasks) " stored tasks. " (summary.queued_tasks) " tasks are waiting."
-                </p>
+                if store_unavailable {
+                    <p class="text-muted-foreground">"Task counts cannot be loaded."</p>
+                } else {
+                    <p class="text-muted-foreground">
+                        (summary.tasks) " stored tasks. " (summary.queued_tasks) " tasks are waiting."
+                    </p>
+                }
                 <form method="post" action="/cancel" class="flex flex-wrap items-end gap-2">
                     <div class="flex min-w-64 flex-1 flex-col gap-1.5">
                         label(attrs: attributes! { for="task_id" }, "Task ID")
@@ -213,7 +242,9 @@ pub(super) async fn dashboard(
             if managed {
                 <section id="members" class="flex flex-col gap-2">
                     <h2 class="text-xl font-semibold tracking-tight">"Members"</h2>
-                    if members.is_empty() {
+                    if store_unavailable {
+                        <p class="text-muted-foreground">"Members cannot be loaded."</p>
+                    } else if members.is_empty() {
                         <p class="text-muted-foreground">"No members are listed."</p>
                     } else {
                         <ul class="flex flex-col gap-2">
@@ -264,7 +295,7 @@ fn managed_member_state(member: &ManagedMember) -> &'static str {
     if member.revoked_at.is_some() {
         return "revoked";
     }
-    let now = aether_core::time::unix_timestamp(SystemTime::now()).unwrap_or(i64::MAX);
+    let now = aether_core::time::now();
     if member.expires_at <= now { "expired" } else { "active" }
 }
 
@@ -331,22 +362,22 @@ pub(super) async fn save_policy(
     Form(form): Form<PolicyForm>,
 ) -> TopcoatResult<impl View> {
     super::require_admin_session(cx).await?;
-    let Host(host) = app_context::<Host>(cx);
-    let Caller(caller) = app_context::<Caller>(cx);
-    let data_dir = host
-        .as_ref()
-        .map(|host| &host.data_dir)
-        .or_else(|| caller.as_ref().map(|caller| &caller.data_dir))
-        .ok_or_else(|| bad_request("this page has no node data"))?;
+    page_data_dir(cx).ok_or_else(|| bad_request("this page has no node data"))?;
     let settings = PolicySettings {
         workspace: PathBuf::from(form.workspace),
         max_context_tokens: form.max_context_tokens,
         max_seconds: form.max_seconds,
-        queue_global: form.queue_global,
-        queue_per_peer: form.queue_per_peer,
+        queue: crate::policy::QueuePolicyLimits::new(
+            form.queue_global,
+            form.queue_per_peer,
+        ),
     };
-    save_policy_settings(data_dir, &settings).map_err(|_| {
-        bad_request("use an existing absolute folder and limits above zero")
-    })?;
+    app_context::<SharedAdministration>(cx)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .save_policy_settings(&settings, aether_store::AuditActor::Ui)
+        .map_err(|_| {
+            bad_request("use an existing absolute folder and limits above zero")
+        })?;
     Ok(view! { dashboard(policy_saved: true) })
 }

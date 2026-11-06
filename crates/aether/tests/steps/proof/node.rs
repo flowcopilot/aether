@@ -11,7 +11,7 @@ use std::{
 };
 
 use aether::{
-    execution::{Agent, ExecutionError, Executor, Limits, Task},
+    execution::{Agent, ExecutionError, Executor, Limits, Task, TurnContext},
     identity::SignedClaims,
     proof::{Identity, ProofError, ProofNode, SubmissionInput},
 };
@@ -19,7 +19,7 @@ use aether_core::{
     Claim, Denial, EndpointId, PolicyEngine, Request, RequestId, TaskId,
 };
 use aether_store::{
-    Admission as StoreAdmission, NodeStore, QueueLimits, StoreError, TaskState,
+    NodeStore, QueueLimits, StoreError, TaskAdmission as StoreAdmission, TaskState,
 };
 use cucumber::{given, then, when};
 use tempfile::TempDir;
@@ -65,16 +65,11 @@ impl TestAgent {
 }
 
 impl Agent for TestAgent {
-    fn start_turn(
-        &mut self,
-        _task_id: &str,
-        instruction: &str,
-        remote_text: &str,
-    ) -> Result<String, ExecutionError> {
+    fn start_turn(&mut self, ctx: &TurnContext) -> Result<String, ExecutionError> {
         self.turns.fetch_add(1, Ordering::Relaxed);
         self.started.store(true, Ordering::Release);
         let Behaviour::WaitsForCancel { late_result } = self.behaviour else {
-            return Ok(format!("{instruction}:{remote_text}"));
+            return Ok(format!("{}:{}", ctx.skill, ctx.text));
         };
         let deadline = Instant::now() + Duration::from_secs(5);
         while !self.cancelled.load(Ordering::Acquire) {
@@ -111,7 +106,9 @@ impl Seed {
         match self {
             Self::Nothing => {}
             Self::LostResult => {
-                store.put_scope("direct", "direct").expect("scope must store");
+                store
+                    .put_scope("direct", aether_core::ScopeKind::Direct)
+                    .expect("scope must store");
                 store
                     .admit(&task_input("task", "request", "key"), limits)
                     .expect("task must queue");
@@ -120,13 +117,15 @@ impl Seed {
                 store.recover_expired_leases(1).expect("task must recover");
             }
             Self::FullQueue => {
-                store.put_scope("direct", "direct").expect("scope must store");
-                let other = aether_store::TaskInput {
-                    caller_agent_id: "other-caller".to_owned(),
-                    caller_endpoint_id: "other-endpoint".to_owned(),
-                    request_fingerprint: "other-fingerprint".to_owned(),
-                    ..task_input("other-task", "other-request", "other-key")
-                };
+                store
+                    .put_scope("direct", aether_core::ScopeKind::Direct)
+                    .expect("scope must store");
+                let mut other = task_input("other-task", "other-request", "other-key");
+                other.request.caller_agent_id =
+                    aether_core::AgentId::new("other-caller");
+                other.request.caller_endpoint_id =
+                    aether_core::EndpointId::new("other-endpoint");
+                "other-fingerprint".clone_into(&mut other.request_fingerprint);
                 store.admit(&other, limits).expect("task must queue");
             }
         }
@@ -186,7 +185,6 @@ impl State {
         self.agent.as_ref().expect("a proof node must run")
     }
 
-    /// Runs blocking work with the node, off the scenario task.
     async fn with_node<R, F>(&self, work: F) -> R
     where
         R: Send + 'static,
@@ -203,8 +201,9 @@ impl State {
             let root = tempfile::tempdir().expect("temporary directory must create");
             let workspace = root.path().join("workspace");
             fs::create_dir_all(&workspace).expect("workspace must exist");
-            let mut store = NodeStore::open(root.path().join("node.sqlite"))
-                .expect("store must open");
+            let mut store =
+                NodeStore::open(root.path().join(aether_store::NODE_DATABASE))
+                    .expect("store must open");
             seed.apply(&mut store);
             let scope = scope("direct");
             let grants = if grants { vec![grant(&scope)] } else { Vec::new() };
@@ -246,7 +245,6 @@ fn admit_task(
 }
 
 /// Admits a task as an Iroh caller and polls its state until the task ends.
-/// Returns the final state and, for a success, the result.
 fn submit_and_wait(
     node: &Node,
     request: &Request,
@@ -265,7 +263,7 @@ fn submit_and_wait(
             | TaskState::Running => {
                 // A task that never ends fails the scenario with this error.
                 if Instant::now() >= deadline {
-                    return Err(ProofError::Queue);
+                    return Err(ProofError::Internal);
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
@@ -274,13 +272,12 @@ fn submit_and_wait(
     }
 }
 
-/// The caller's review task `task`, sent with key `key`.
 fn submit_review(node: &Node, claim: &Claim) -> Outcome {
     submit_and_wait(node, &request(&scope("direct")), claim, "key", &task("task"))
 }
 
 fn event_types(events: Vec<aether_store::TaskEvent>) -> Vec<String> {
-    events.into_iter().map(|event| event.event_type).collect()
+    events.into_iter().map(|event| event.event_type.as_str().to_owned()).collect()
 }
 
 #[given("a proof node that grants review to the caller")]
@@ -451,7 +448,7 @@ fn agent_turns(world: &mut World, turns: usize) {
 
 #[then(expr = "the task is {word}")]
 async fn task_is(world: &mut World, state: String) {
-    let expected = state.parse::<TaskState>().expect("a known task state");
+    let expected = TaskState::parse(&state).expect("a known task state");
     let actual = world.proof.node.with_node(|node| node.state("task")).await;
     assert_eq!(actual.expect("task state must load"), expected);
 }

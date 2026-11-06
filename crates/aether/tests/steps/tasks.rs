@@ -7,10 +7,9 @@
 //! or a raw transport frame.
 
 use std::{
-    collections::BTreeSet,
     fmt, fs,
     io::{BufRead, BufReader, Write},
-    os::unix::{fs::PermissionsExt, net::UnixStream},
+    os::unix::net::UnixStream,
     path::{Path, PathBuf},
     process::{Child, ChildStdout, Command, Output, Stdio},
     sync::Arc,
@@ -21,30 +20,25 @@ use std::{
 use aether::{
     admin::ChangeRequest,
     admin_socket::{
-        Request as AdminRequest, Response as AdminResponse, path as admin_socket_path,
-        send as send_admin,
+        Request as AdminRequest, Response as AdminResponse, send as send_admin,
     },
-    control_service::WireRecord,
     direct::InvitationBundle,
-    fixture::FAKE_CODEX_SCRIPT,
-    identity::{ClaimInput, GrantInput, signed_claim, signed_grant},
-    node_config::grant_json,
+    discovery::wire::WireRecord,
     transport::{
         A2aAccessMode, A2aAuthorization, A2aRequest, Frame, FrameKind, bind_node,
         request_once, text_request_payload,
     },
 };
-use aether_core::{
-    AccessMode, AgentId, ApprovalRule, CapabilityId, Claim, ClaimId, EndpointId,
-    GrantId, ScopeId, WorkspaceId,
-};
+use aether_core::{Claim, EndpointId};
 use aether_store::{NodeStore, SentState, SentTask, TaskState};
 use cucumber::{given, then, when};
-use ed25519_dalek::SigningKey;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-use crate::common::{ServerProcess, aether_command, read_event};
+use crate::common::{
+    FakeCodex, PolicyLimits, ServerProcess, aether_command, host_signing_key,
+    policy_for_grants, read_event, read_node_listening, review_claim, review_grant,
+};
 
 type World = super::World;
 
@@ -56,44 +50,7 @@ const FOLLOWED_TASK_ID: &str = "00000000-0000-4000-8000-0000000000c1";
 /// The agent id under which a caller imports the host's invitation.
 const HOST_AGENT_ID: &str = "server";
 /// The roster cursor of the managed scope.
-const ROSTER_CURSOR: &str = "managed.cursor";
-
-/// Holds the turn open for a second after it starts, so a scenario can act
-/// on a task that is surely `running`.
-const SLOW_CODEX_SCRIPT: &str = "#!/bin/sh\nwhile IFS= read -r request; do\n  case \"$request\" in\n    *'\"id\":1'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}' ;;\n    *'\"id\":2'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"thread\":{\"id\":\"thread\"}}}' ;;\n    *'\"id\":3'*)\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"turn\":{\"id\":\"turn\"}}}'\n      sleep 1\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"thread\",\"turnId\":\"turn\",\"delta\":\"fake Codex result\"}}'\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thread\",\"turn\":{\"id\":\"turn\",\"status\":\"completed\",\"items\":[]}}}'\n      ;;\n  esac\ndone\n";
-
-/// Shell builtins only: the node gives Codex no PATH. The fake answers with
-/// the MCP server names in its `CODEX_HOME` and refuses a thread whose
-/// approval policy is not "never".
-const MCP_PROBE_CODEX_SCRIPT: &str = r#"#!/bin/sh
-names=''
-while IFS= read -r line; do
-  case "$line" in
-    '[mcp_servers.'*']')
-      name=${line#'[mcp_servers.'}
-      name=${name%']'}
-      names="$names$name "
-      ;;
-  esac
-done < "$CODEX_HOME/config.toml"
-while IFS= read -r request; do
-  case "$request" in
-    *'"id":1'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}' ;;
-    *'"id":2'*)
-      case "$request" in
-        *'"approvalPolicy":"never"'*) ;;
-        *) exit 1 ;;
-      esac
-      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread"}}}'
-      ;;
-    *'"id":3'*)
-      printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn"}}}'
-      printf '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thread","turnId":"turn","delta":"mcp: %s"}}\n' "$names"
-      printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread","turn":{"id":"turn","status":"completed","items":[]}}}'
-      ;;
-  esac
-done
-"#;
+const ROSTER_CONTROL: &str = "https://control.test";
 
 /// The agent that answers the tasks of the host node.
 #[derive(Debug, Default, Clone, Copy)]
@@ -248,7 +205,6 @@ impl fmt::Debug for State {
     }
 }
 
-/// Runs blocking work off the cucumber task, and passes its panic on.
 async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
     match tokio::task::spawn_blocking(work).await {
         Ok(value) => value,
@@ -256,7 +212,6 @@ async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) 
     }
 }
 
-/// Runs a command to completion off the cucumber task.
 async fn run(mut command: Command) -> Output {
     blocking(move || command.output().expect("aether must start")).await
 }
@@ -267,31 +222,6 @@ fn utf8(path: &Path) -> &str {
 
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
-fn signing_key() -> SigningKey {
-    SigningKey::from_bytes(&[7; 32])
-}
-
-fn write_executable(path: &Path, script: &str) {
-    fs::write(path, script).expect("fake agent must write");
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-        .expect("fake agent must be executable");
-}
-
-/// Reads the startup event of `node serve` and returns the server's
-/// endpoint id and bound port.
-fn read_node_listening(output: &mut impl BufRead) -> (String, u16) {
-    let startup = read_event(output, None);
-    assert_eq!(startup["event"], "node_listening");
-    let endpoint_id =
-        startup["endpoint_id"].as_str().expect("server endpoint must be logged");
-    let port = startup["port"]
-        .as_u64()
-        .and_then(|port| u16::try_from(port).ok())
-        .filter(|port| *port != 0)
-        .expect("server must report its bound port");
-    (endpoint_id.to_owned(), port)
 }
 
 /// Polls the server's store instead of sleeping a fixed time: on a loaded
@@ -315,24 +245,6 @@ fn wait_for_state(server_data: &Path, task_id: &str, wanted: TaskState) {
 
 fn overload_task_id(index: usize) -> String {
     format!("00000000-0000-4000-8000-0000000000b{index}")
-}
-
-fn policy_json(
-    workspace: &Path,
-    grants: &[aether_core::Grant],
-    trusted_key: [u8; 32],
-) -> Value {
-    json!({
-        "trustedIssuers": {"issuer": hex::encode(trusted_key)},
-        "grants": grants.iter().map(grant_json).collect::<Vec<_>>(),
-        "workspace": workspace,
-        "maxContextTokens": 32,
-        // The whole fake Codex session (spawn, handshake, turn) must fit in
-        // this; one second timed out on a loaded runner as `unknown_result`.
-        "maxSeconds": 10,
-        "queueGlobal": 1,
-        "queuePerPeer": 1,
-    })
 }
 
 fn signed_request(claim: &Claim, endpoint: &EndpointId) -> Frame {
@@ -438,7 +350,7 @@ impl State {
     async fn add_caller(&mut self) -> usize {
         let index = self.callers.len();
         let data = self.root().join(format!("client-{index}"));
-        let client = bind_node(&data, 0).await.expect("client must bind");
+        let client = bind_node(&data, 0, None).await.expect("client must bind");
         let endpoint = EndpointId::new(client.id().to_string());
         client.close().await;
         self.callers.push(Caller {
@@ -456,18 +368,16 @@ impl State {
         let nonce = self.next_nonce();
         let root = self.root();
         let caller = &mut self.callers[caller];
-        let claim = signed_claim(
-            &signing_key(),
-            ClaimInput {
-                id: ClaimId::new(format!("{scope}-claim-{}", caller.endpoint.as_str())),
-                issuer_agent_id: AgentId::new("issuer"),
-                subject_agent_id: AgentId::new("caller"),
-                subject_endpoint_id: caller.endpoint.clone(),
-                scope_id: ScopeId::new(scope),
-                issued_at: now - Duration::from_secs(1),
-                expires_at: now + Duration::from_secs(60),
-                nonce,
-            },
+        let claim = review_claim(
+            &host_signing_key(),
+            &format!("{scope}-claim-{}", caller.endpoint.as_str()),
+            "issuer",
+            "caller",
+            &caller.endpoint,
+            scope,
+            now - Duration::from_secs(1),
+            now + Duration::from_secs(60),
+            nonce,
         );
         let path = root
             .join(format!("{scope}-{}-authorization.json", caller.endpoint.as_str()));
@@ -500,38 +410,37 @@ impl State {
         let mut scopes: Vec<String> = Vec::new();
         for (endpoint, scope) in entries {
             let nonce = self.next_nonce();
-            grants.push(signed_grant(
-                &signing_key(),
-                GrantInput {
-                    id: GrantId::new(format!("{scope}-grant-{}", endpoint.as_str())),
-                    issuer_agent_id: AgentId::new("issuer"),
-                    subject_agent_id: AgentId::new("caller"),
-                    subject_endpoint_id: endpoint,
-                    scope_id: ScopeId::new(scope.as_str()),
-                    capabilities: BTreeSet::from([CapabilityId::new("review")]),
-                    workspaces: BTreeSet::from([WorkspaceId::new("workspace")]),
-                    access_mode: AccessMode::ReadOnly,
-                    approval_rule: ApprovalRule::Automatic,
-                    issued_at: now - Duration::from_secs(1),
-                    expires_at: now + Duration::from_secs(60),
-                    nonce,
-                },
+            grants.push(review_grant(
+                &host_signing_key(),
+                &format!("{scope}-grant-{}", endpoint.as_str()),
+                "issuer",
+                "caller",
+                &endpoint,
+                scope.as_str(),
+                now - Duration::from_secs(1),
+                now + Duration::from_secs(60),
+                nonce,
             ));
             if !scopes.contains(&scope) {
                 scopes.push(scope);
             }
         }
-        let mut policy =
-            policy_json(&workspace, &grants, signing_key().verifying_key().to_bytes());
+        let mut limits = PolicyLimits::default();
+        if let Some(tokens) = self.max_context_tokens {
+            limits.max_context_tokens = tokens;
+        }
+        let mut policy = policy_for_grants(
+            &workspace,
+            &grants,
+            host_signing_key().verifying_key().to_bytes(),
+            limits,
+        );
         let scope_entries: Vec<Value> =
             scopes.iter().map(|scope| json!({"id": scope, "kind": scope})).collect();
         if let [scope] = scope_entries.as_slice() {
             policy["scope"] = scope.clone();
         } else {
             policy["scopes"] = Value::Array(scope_entries);
-        }
-        if let Some(tokens) = self.max_context_tokens {
-            policy["maxContextTokens"] = json!(tokens);
         }
         if matches!(self.agent, Agent::Connected) {
             policy["adapter"] = json!("connected");
@@ -546,15 +455,16 @@ impl State {
         let root = self.root();
         let server_data = self.server_data();
         let policy = self.write_policy();
-        let codex = match self.agent {
-            Agent::Codex => Some(FAKE_CODEX_SCRIPT),
-            Agent::SlowCodex => Some(SLOW_CODEX_SCRIPT),
-            Agent::McpProbe => Some(MCP_PROBE_CODEX_SCRIPT),
+        let codex_kind = match self.agent {
+            Agent::Codex => Some(FakeCodex::Standard),
+            Agent::SlowCodex => Some(FakeCodex::Slow),
+            Agent::McpProbe => Some(FakeCodex::McpProbe),
             Agent::Connected => None,
         };
         let codex_bin = root.join("fake-codex");
-        if let Some(script) = codex {
-            write_executable(&codex_bin, script);
+        if let Some(kind) = codex_kind {
+            aether::fixture::write_executable(&codex_bin, kind.script())
+                .expect("fake Codex must write");
         }
         let mut command = aether_command();
         command
@@ -569,7 +479,11 @@ impl State {
             .args(["--port", "0", "--admin-port", "0"])
             .env(
                 "AETHER_CODEX_BIN",
-                if codex.is_some() { codex_bin } else { root.join("no-codex-here") },
+                if codex_kind.is_some() {
+                    codex_bin
+                } else {
+                    root.join("no-codex-here")
+                },
             )
             .stdout(Stdio::piped());
         if let Some(home) = &self.owner_codex_home {
@@ -766,15 +680,15 @@ impl State {
     }
 
     async fn change_directory(&mut self, url: String) {
-        let socket = admin_socket_path(&self.server_data());
+        let socket = aether::data_dir::DataDir::new(self.server_data()).admin_socket();
         let response = blocking(move || {
             send_admin(
                 &socket,
                 &AdminRequest::Change {
-                    change: ChangeRequest::Directory {
+                    change: Box::new(ChangeRequest::Directory {
                         id: "directory".to_owned(),
                         url,
-                    },
+                    }),
                     dry_run: false,
                 },
             )
@@ -814,7 +728,7 @@ const fn connected_agent(world: &mut World) {
 /// The agent's MCP servers live in the node's own Codex home.
 #[given(expr = "the agent of the node has the MCP server {string}")]
 fn node_mcp_server(world: &mut World, name: String) {
-    let home = world.tasks.server_data().join("codex-home");
+    let home = aether::data_dir::DataDir::new(world.tasks.server_data()).codex_home();
     fs::create_dir_all(&home).expect("node Codex home must create");
     fs::write(
         home.join("config.toml"),
@@ -1079,7 +993,8 @@ async fn other_endpoint_request(world: &mut World, text: String) {
 
 #[given("the connected agent is ready")]
 async fn connected_agent_ready(world: &mut World) {
-    let socket = world.tasks.server_data().join("agent.sock");
+    let socket =
+        aether::data_dir::DataDir::new(world.tasks.server_data()).agent_socket();
     let agent = blocking(move || {
         let mut agent =
             UnixStream::connect(socket).expect("the agent must connect to the node");
@@ -1197,7 +1112,7 @@ fn courier(
 async fn outbox_attempts(world: &mut World, count: usize) {
     let state = &mut world.tasks;
     let data = state.callers[0].data.clone();
-    let endpoint = bind_node(&data, 0).await.expect("client must bind");
+    let endpoint = bind_node(&data, 0, None).await.expect("client must bind");
     let courier = courier(state, &endpoint);
     let tasks = state.outbox().tasks.clone();
     assert_eq!(tasks.len(), count);
@@ -1320,7 +1235,8 @@ async fn caller_task_running(world: &mut World) {
 
 #[when("the owner cancels the caller's task")]
 async fn owner_cancels(world: &mut World) {
-    let socket = admin_socket_path(&world.tasks.server_data());
+    let socket =
+        aether::data_dir::DataDir::new(world.tasks.server_data()).admin_socket();
     let task_id = world
         .tasks
         .request
@@ -1405,7 +1321,7 @@ async fn roster_member(world: &mut World) {
         .tasks
         .store(move |store| {
             store
-                .apply_managed_member(ROSTER_CURSOR, 1, &member)
+                .apply_managed_member(ROSTER_CONTROL, 1, &member)
                 .expect("managed membership must apply");
         })
         .await;
@@ -1417,7 +1333,7 @@ async fn roster_revokes(world: &mut World) {
         .tasks
         .store(|store| {
             store
-                .revoke_managed_member(ROSTER_CURSOR, 2, "managed", "caller")
+                .revoke_managed_member(ROSTER_CONTROL, 2, "managed", "caller")
                 .expect("managed membership must revoke");
         })
         .await;
@@ -1451,7 +1367,8 @@ async fn directory_running(world: &mut World) {
     state.directory = Some(Directory {
         process: Some((process, output)),
         url,
-        certificate: control_data.join("control-cert.der"),
+        certificate: aether::data_dir::DataDir::new(&control_data)
+            .control_certificate(),
     });
 }
 

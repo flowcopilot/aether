@@ -3,7 +3,7 @@
 
 use std::{fs, path::PathBuf};
 
-use aether::control_service::{WireInvitation, WireRecord};
+use aether::discovery::wire::{WireInvitation, WireRecord};
 use cucumber::{given, then, when};
 
 use super::{assert_success, run, utf8};
@@ -11,11 +11,8 @@ use crate::{common::aether_command, steps::World};
 
 #[derive(Debug, Default)]
 pub struct State {
-    /// The direct invitation of the scenario, as it was made.
     invitation: Option<WireInvitation>,
-    /// The file that a node imports the invitation from.
     invitation_file: Option<PathBuf>,
-    /// The signed discovery records that the node made, in order.
     records: Vec<(serde_json::Value, WireRecord)>,
 }
 

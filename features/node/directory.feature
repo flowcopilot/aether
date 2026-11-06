@@ -31,5 +31,5 @@ Feature: Directory
     And the control service restarts on the same port
     And I revoke the test record in the directory
     And the node syncs from the directory
-    Then the node knows the record "test-scope:test-agent" as expired
+    Then the node knows the record of "test-agent" in "test-scope" as expired
     And the control service stops cleanly

@@ -1,6 +1,10 @@
-use std::{path::Path, time::SystemTime};
+use std::time::SystemTime;
 
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::SigningKey;
+
+use crate::signed::{SignedBytes, sign, verify};
+
+pub mod wire;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Record {
@@ -28,8 +32,9 @@ pub struct Invitation {
 pub enum DiscoveryError {
     Expired,
     Forged,
+    /// A wire form that names no valid time.
+    Malformed,
     NotFound,
-    Unavailable,
 }
 
 pub fn validate_record(record: &Record) -> Result<(), DiscoveryError> {
@@ -67,11 +72,7 @@ fn validate(
     if expires_at <= SystemTime::now() {
         return Err(DiscoveryError::Expired);
     }
-    let key =
-        VerifyingKey::from_bytes(signing_key).map_err(|_| DiscoveryError::Forged)?;
-    let signature =
-        Signature::try_from(signature).map_err(|_| DiscoveryError::Forged)?;
-    key.verify_strict(message, &signature).map_err(|_| DiscoveryError::Forged)
+    verify(signing_key, message, signature).map_err(|_| DiscoveryError::Forged)
 }
 
 #[must_use]
@@ -94,20 +95,8 @@ pub fn signed_record(
         signing_key: signing_key.verifying_key().to_bytes(),
         signature: Vec::new(),
     };
-    record.signature = signing_key.sign(&record_bytes(&record)).to_bytes().to_vec();
+    record.signature = sign(signing_key, &record_bytes(&record));
     record
-}
-
-pub fn load_or_create_signing_key(
-    path: impl AsRef<Path>,
-) -> Result<SigningKey, DiscoveryError> {
-    let bytes = crate::key_file::load_or_create(path.as_ref(), || {
-        let mut bytes = [0; 32];
-        getrandom::fill(&mut bytes).map_err(std::io::Error::other)?;
-        Ok(bytes)
-    })
-    .map_err(|_| DiscoveryError::Unavailable)?;
-    Ok(SigningKey::from_bytes(&bytes))
 }
 
 #[must_use]
@@ -126,8 +115,7 @@ pub fn signed_invitation(
         signing_key: signing_key.verifying_key().to_bytes(),
         signature: Vec::new(),
     };
-    invitation.signature =
-        signing_key.sign(&invitation_bytes(&invitation)).to_bytes().to_vec();
+    invitation.signature = sign(signing_key, &invitation_bytes(&invitation));
     invitation
 }
 
@@ -139,7 +127,7 @@ pub fn sign_agent_card(
     agent_id: &str,
     card: &[u8],
 ) -> Vec<u8> {
-    signing_key.sign(&agent_card_bytes(endpoint_id, agent_id, card)).to_bytes().to_vec()
+    sign(signing_key, &agent_card_bytes(endpoint_id, agent_id, card))
 }
 
 /// Checks that `signing_key` signed `card` for the agent `agent_id` at
@@ -151,69 +139,38 @@ pub fn verify_agent_card(
     card: &[u8],
     signature: &[u8],
 ) -> Result<(), DiscoveryError> {
-    let key =
-        VerifyingKey::from_bytes(signing_key).map_err(|_| DiscoveryError::Forged)?;
-    let signature =
-        Signature::try_from(signature).map_err(|_| DiscoveryError::Forged)?;
-    key.verify_strict(&agent_card_bytes(endpoint_id, agent_id, card), &signature)
+    verify(signing_key, &agent_card_bytes(endpoint_id, agent_id, card), signature)
         .map_err(|_| DiscoveryError::Forged)
 }
 
 fn agent_card_bytes(endpoint_id: &str, agent_id: &str, card: &[u8]) -> Vec<u8> {
-    let mut bytes = b"aether/agent-card/v1".to_vec();
-    append_string(&mut bytes, endpoint_id);
-    append_string(&mut bytes, agent_id);
-    append_length(&mut bytes, card.len());
-    bytes.extend_from_slice(card);
-    bytes
+    SignedBytes::new(b"aether/agent-card/v1")
+        .string(endpoint_id)
+        .string(agent_id)
+        .bytes(card)
+        .finish()
 }
 
 fn record_bytes(record: &Record) -> Vec<u8> {
-    let mut bytes = b"aether/discovery-record/v1".to_vec();
-    append_string(&mut bytes, &record.agent_id);
-    append_string(&mut bytes, &record.endpoint_id);
-    append_length(&mut bytes, record.addresses.len());
-    for address in &record.addresses {
-        append_string(&mut bytes, address);
-    }
-    append_string(&mut bytes, &record.scope_id);
-    append_length(&mut bytes, record.capabilities.len());
-    for capability in &record.capabilities {
-        append_string(&mut bytes, capability);
-    }
-    append_time(&mut bytes, record.expires_at);
-    bytes.extend_from_slice(&record.signing_key);
-    bytes
+    SignedBytes::new(b"aether/discovery-record/v1")
+        .string(&record.agent_id)
+        .string(&record.endpoint_id)
+        .strings(record.addresses.iter().map(String::as_str))
+        .string(&record.scope_id)
+        .strings(record.capabilities.iter().map(String::as_str))
+        .time(record.expires_at)
+        .raw(&record.signing_key)
+        .finish()
 }
 
 fn invitation_bytes(invitation: &Invitation) -> Vec<u8> {
-    let mut bytes = b"aether/direct-invitation/v1".to_vec();
-    append_string(&mut bytes, &invitation.scope_id);
-    append_string(&mut bytes, &invitation.agent_id);
-    append_string(&mut bytes, &invitation.endpoint_id);
-    append_time(&mut bytes, invitation.expires_at);
-    bytes.extend_from_slice(&invitation.signing_key);
-    bytes
-}
-
-fn append_string(bytes: &mut Vec<u8>, value: &str) {
-    append_length(bytes, value.len());
-    bytes.extend_from_slice(value.as_bytes());
-}
-
-/// A length as a `u64`, which holds every `usize` on the platforms Rust
-/// supports; the saturation only keeps the conversion total.
-fn append_length(bytes: &mut Vec<u8>, length: usize) {
-    append_u64(bytes, u64::try_from(length).unwrap_or(u64::MAX));
-}
-
-fn append_time(bytes: &mut Vec<u8>, value: SystemTime) {
-    let seconds = aether_core::time::unix_seconds(value).unwrap_or(0);
-    append_u64(bytes, seconds);
-}
-
-fn append_u64(bytes: &mut Vec<u8>, value: u64) {
-    bytes.extend_from_slice(&value.to_be_bytes());
+    SignedBytes::new(b"aether/direct-invitation/v1")
+        .string(&invitation.scope_id)
+        .string(&invitation.agent_id)
+        .string(&invitation.endpoint_id)
+        .time(invitation.expires_at)
+        .raw(&invitation.signing_key)
+        .finish()
 }
 
 #[cfg(test)]
@@ -223,9 +180,8 @@ fn append_u64(bytes: &mut Vec<u8>, value: u64) {
 )]
 mod tests {
     use super::{
-        DiscoveryError, Record, load_or_create_signing_key, sign_agent_card,
-        signed_invitation, signed_record, validate_invitation, validate_record,
-        verify_agent_card,
+        DiscoveryError, Record, sign_agent_card, signed_invitation, signed_record,
+        validate_invitation, validate_record, verify_agent_card,
     };
 
     #[test]
@@ -306,32 +262,5 @@ mod tests {
             validate_invitation(&changed_invitation),
             Err(DiscoveryError::Forged)
         );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn signing_key_persists_and_rejects_links() {
-        use std::os::unix::fs::{PermissionsExt, symlink};
-
-        let temporary = tempfile::tempdir().expect("directory must create");
-        let directory = temporary.path();
-        let key = directory.join("discovery.key");
-        let first = load_or_create_signing_key(&key).expect("key must create");
-        let second = load_or_create_signing_key(&key).expect("key must load");
-        assert_eq!(first.verifying_key(), second.verifying_key());
-        assert_eq!(
-            std::fs::metadata(&key)
-                .expect("key metadata must load")
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-        let link = directory.join("link");
-        symlink(&key, &link).expect("link must create");
-        assert!(matches!(
-            load_or_create_signing_key(&link),
-            Err(DiscoveryError::Unavailable)
-        ));
     }
 }

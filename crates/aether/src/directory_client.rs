@@ -1,9 +1,20 @@
-use reqwest::{Client, StatusCode, Url};
+pub mod cli;
+
+use std::path::Path;
+
+use hex::FromHex;
+use reqwest::StatusCode;
+
+use aether_store::DirectoryEventType;
 
 use crate::{
-    control_service::{WireDirectoryEvent, WireRecord},
-    discovery::validate_record,
-    pinned_https::{self, PinnedError},
+    discovery::{
+        validate_record,
+        wire::{self, WireDirectoryEvent, WireRecord},
+    },
+    pinned_https::PinnedError,
+    pinned_json::{self, HttpError, PinnedJsonClient},
+    transport::{self, Frame, TransportError},
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -22,10 +33,31 @@ pub enum DirectoryClientError {
     UntrustedRecord,
 }
 
+impl From<PinnedError> for DirectoryClientError {
+    fn from(error: PinnedError) -> Self {
+        match error {
+            PinnedError::Origin => Self::InvalidDirectory,
+            PinnedError::Certificate => Self::InvalidCertificate,
+            PinnedError::Client => Self::Request,
+        }
+    }
+}
+
+impl From<HttpError> for DirectoryClientError {
+    fn from(error: HttpError) -> Self {
+        match error {
+            HttpError::Origin => Self::InvalidDirectory,
+            HttpError::Certificate => Self::InvalidCertificate,
+            HttpError::Client | HttpError::Request => Self::Request,
+            HttpError::Status => Self::Status,
+            HttpError::Body => Self::InvalidRecord,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct DirectoryClient {
-    client: Client,
-    directory: Url,
+    http: PinnedJsonClient,
     trusted_signing_key: [u8; 32],
 }
 
@@ -35,31 +67,24 @@ impl DirectoryClient {
         certificate_der: &[u8],
         trusted_signing_key: [u8; 32],
     ) -> Result<Self, DirectoryClientError> {
-        let (client, directory) = pinned_https::client(directory, certificate_der)
-            .map_err(|error| match error {
-                PinnedError::Origin => DirectoryClientError::InvalidDirectory,
-                PinnedError::Certificate => DirectoryClientError::InvalidCertificate,
-                PinnedError::Client => DirectoryClientError::Request,
-            })?;
-        Ok(Self { client, directory, trusted_signing_key })
+        Ok(Self {
+            http: PinnedJsonClient::open(directory, certificate_der)?,
+            trusted_signing_key,
+        })
     }
 
     pub async fn publish(
         &self,
         record: &WireRecord,
     ) -> Result<WireRecord, DirectoryClientError> {
-        let response = self
-            .client
-            .post(self.records_url()?)
-            .json(record)
-            .send()
-            .await
-            .map_err(|_| DirectoryClientError::Request)?;
-        if !matches!(response.status(), StatusCode::CREATED | StatusCode::OK) {
-            return Err(DirectoryClientError::Status);
-        }
-        let record =
-            response.json().await.map_err(|_| DirectoryClientError::InvalidRecord)?;
+        let record = self
+            .http
+            .post_json_any(
+                self.records_url()?,
+                record,
+                &[StatusCode::CREATED, StatusCode::OK],
+            )
+            .await?;
         self.validate(&record)?;
         Ok(record)
     }
@@ -68,36 +93,9 @@ impl DirectoryClient {
         &self,
         agent_id: &str,
     ) -> Result<WireRecord, DirectoryClientError> {
-        let response = self
-            .client
-            .get(self.record_url(agent_id)?)
-            .send()
-            .await
-            .map_err(|_| DirectoryClientError::Request)?;
-        if response.status() != StatusCode::OK {
-            return Err(DirectoryClientError::Status);
-        }
-        let record =
-            response.json().await.map_err(|_| DirectoryClientError::InvalidRecord)?;
+        let record = self.http.get_json(self.record_url(agent_id)?).await?;
         self.validate(&record)?;
         Ok(record)
-    }
-
-    pub async fn resolve_record(
-        &self,
-        agent_id: &str,
-    ) -> Result<crate::discovery::Record, DirectoryClientError> {
-        self.resolve(agent_id)
-            .await?
-            .to_record()
-            .map_err(|_| DirectoryClientError::InvalidRecord)
-    }
-
-    pub async fn renew(
-        &self,
-        record: &WireRecord,
-    ) -> Result<WireRecord, DirectoryClientError> {
-        self.publish(record).await
     }
 
     pub async fn search(
@@ -107,18 +105,10 @@ impl DirectoryClient {
         if capability.is_empty() {
             return Err(DirectoryClientError::InvalidRecord);
         }
-        let response = self
-            .client
-            .get(self.records_url()?)
-            .query(&[("capability", capability)])
-            .send()
-            .await
-            .map_err(|_| DirectoryClientError::Request)?;
-        if response.status() != StatusCode::OK {
-            return Err(DirectoryClientError::Status);
-        }
-        let records: Vec<WireRecord> =
-            response.json().await.map_err(|_| DirectoryClientError::InvalidRecord)?;
+        let records: Vec<WireRecord> = self
+            .http
+            .get_json_query(self.records_url()?, &[("capability", capability)])
+            .await?;
         for record in &records {
             self.validate(record)?;
         }
@@ -129,16 +119,7 @@ impl DirectoryClient {
         &self,
         record: &WireRecord,
     ) -> Result<(), DirectoryClientError> {
-        let response = self
-            .client
-            .delete(self.record_url(&record.agent_id)?)
-            .json(record)
-            .send()
-            .await
-            .map_err(|_| DirectoryClientError::Request)?;
-        if response.status() != StatusCode::NO_CONTENT {
-            return Err(DirectoryClientError::Status);
-        }
+        self.http.delete_json(self.record_url(&record.agent_id)?, record).await?;
         Ok(())
     }
 
@@ -149,47 +130,35 @@ impl DirectoryClient {
         if cursor < 0 {
             return Err(DirectoryClientError::InvalidRecord);
         }
-        let response = self
-            .client
-            .get(self.events_url()?)
-            .query(&[("after", cursor)])
-            .send()
-            .await
-            .map_err(|_| DirectoryClientError::Request)?;
-        if response.status() != StatusCode::OK {
-            return Err(DirectoryClientError::Status);
+        let events: Vec<WireDirectoryEvent> = self
+            .http
+            .get_json_query(self.events_url()?, &[("after", &cursor.to_string())])
+            .await?;
+        if !pinned_json::monotonic_cursors(
+            cursor,
+            events.iter().map(|event| event.cursor),
+        ) {
+            return Err(DirectoryClientError::InvalidRecord);
         }
-        let events: Vec<WireDirectoryEvent> =
-            response.json().await.map_err(|_| DirectoryClientError::InvalidRecord)?;
-        let mut previous = cursor;
         for event in &events {
-            if event.cursor <= previous {
-                return Err(DirectoryClientError::InvalidRecord);
-            }
             self.validate_event(event)?;
-            previous = event.cursor;
         }
         Ok(events)
     }
 
-    fn records_url(&self) -> Result<Url, DirectoryClientError> {
-        self.url(&["v1", "records"])
+    fn records_url(&self) -> Result<reqwest::Url, DirectoryClientError> {
+        self.http.url(&wire::RECORDS).map_err(Into::into)
     }
 
-    fn record_url(&self, agent_id: &str) -> Result<Url, DirectoryClientError> {
-        if !pinned_https::valid_segment(agent_id) {
-            return Err(DirectoryClientError::InvalidRecord);
-        }
-        self.url(&["v1", "records", agent_id])
+    fn record_url(&self, agent_id: &str) -> Result<reqwest::Url, DirectoryClientError> {
+        PinnedJsonClient::require_segment(agent_id)?;
+        self.http
+            .url(&[wire::RECORDS[0], wire::RECORDS[1], agent_id])
+            .map_err(Into::into)
     }
 
-    fn events_url(&self) -> Result<Url, DirectoryClientError> {
-        self.url(&["v1", "events"])
-    }
-
-    fn url(&self, segments: &[&str]) -> Result<Url, DirectoryClientError> {
-        pinned_https::url(&self.directory, segments)
-            .ok_or(DirectoryClientError::InvalidDirectory)
+    fn events_url(&self) -> Result<reqwest::Url, DirectoryClientError> {
+        self.http.url(&wire::EVENTS).map_err(Into::into)
     }
 
     fn validate(&self, record: &WireRecord) -> Result<(), DirectoryClientError> {
@@ -209,8 +178,8 @@ impl DirectoryClient {
             return Err(DirectoryClientError::InvalidRecord);
         }
         self.record_url(&event.agent_id)?;
-        match event.event.as_str() {
-            "published" | "renewed" => {
+        match event.event {
+            DirectoryEventType::Published | DirectoryEventType::Renewed => {
                 let record =
                     event.record.as_ref().ok_or(DirectoryClientError::InvalidRecord)?;
                 if record.agent_id != event.agent_id
@@ -220,10 +189,143 @@ impl DirectoryClient {
                 }
                 self.validate(record)
             }
-            "revoked" if event.record.is_none() => Ok(()),
-            _ => Err(DirectoryClientError::InvalidRecord),
+            DirectoryEventType::Revoked if event.record.is_none() => Ok(()),
+            DirectoryEventType::Revoked => Err(DirectoryClientError::InvalidRecord),
         }
     }
+}
+
+#[allow(
+    clippy::result_unit_err,
+    clippy::ignored_unit_patterns,
+    clippy::match_same_arms
+)]
+pub fn read_authorization(path: &Path) -> Result<transport::A2aAuthorization, ()> {
+    let source = std::fs::read(path).map_err(|_| ())?;
+    serde_json::from_slice(&source).map_err(|_| ())
+}
+
+#[allow(clippy::result_unit_err)]
+pub fn read_verifying_key(path: &Path) -> Result<[u8; 32], ()> {
+    let source = std::fs::read_to_string(path).map_err(|_| ())?;
+    <[u8; 32]>::from_hex(source.trim()).map_err(|_| ())
+}
+
+#[allow(clippy::result_unit_err)]
+pub fn read_directory_record(path: &Path) -> Result<WireRecord, ()> {
+    serde_json::from_slice(&std::fs::read(path).map_err(|_| ())?).map_err(|_| ())
+}
+
+#[allow(clippy::result_unit_err)]
+pub fn cache_directory_record(
+    data_dir: &Path,
+    record: &crate::discovery::Record,
+) -> Result<(), ()> {
+    let store = aether_store::NodeStore::in_dir(data_dir).map_err(|_| ())?;
+    crate::roster_sync::cache_wire_directory_record(
+        &store,
+        &WireRecord::from_record(record),
+    )
+}
+
+pub use crate::roster_sync::cache_wire_directory_record;
+
+#[allow(clippy::result_unit_err)]
+pub async fn sync_directory(
+    data_dir: &Path,
+    directory: &str,
+    trusted_key: [u8; 32],
+    client: &DirectoryClient,
+) -> Result<(i64, usize), ()> {
+    std::fs::create_dir_all(data_dir).map_err(|_| ())?;
+    let store = aether_store::NodeStore::in_dir(data_dir).map_err(|_| ())?;
+    let mut cursor = store.directory_cursor(directory, &trusted_key).map_err(|_| ())?;
+    let mut records = 0usize;
+    let directory = directory.to_owned();
+    loop {
+        let changes = client.events_after(cursor).await.map_err(|_| ())?;
+        if changes.is_empty() {
+            return Ok((cursor, records));
+        }
+        for change in changes {
+            if change.cursor <= cursor {
+                return Err(());
+            }
+            if matches!(
+                change.event,
+                aether_store::DirectoryEventType::Published
+                    | aether_store::DirectoryEventType::Renewed
+            ) {
+                records = records.checked_add(1).ok_or(())?;
+            }
+            crate::roster_sync::apply_directory_change(&store, &change)?;
+            cursor = change.cursor;
+            store
+                .advance_directory_cursor(&directory, &trusted_key, cursor)
+                .map_err(|_| ())?;
+        }
+    }
+}
+
+#[allow(clippy::result_unit_err)]
+pub fn cached_directory_record(
+    data_dir: &Path,
+    scope_id: &str,
+    agent_id: &str,
+    trusted_key: [u8; 32],
+) -> Result<crate::discovery::Record, ()> {
+    let store = aether_store::NodeStore::in_dir(data_dir).map_err(|_| ())?;
+    let stored = store.directory_record(scope_id, agent_id).map_err(|_| ())?;
+    if stored.scope_id != scope_id || stored.agent_id != agent_id {
+        return Err(());
+    }
+    if stored.expires_at <= aether_core::time::now() {
+        return Err(());
+    }
+    let wire: WireRecord = serde_json::from_slice(&stored.record).map_err(|_| ())?;
+    let record = wire.to_record().map_err(|_| ())?;
+    if record.signing_key != trusted_key {
+        return Err(());
+    }
+    validate_record(&record).map_err(|_| ())?;
+    Ok(record)
+}
+
+#[allow(clippy::ignored_unit_patterns, clippy::match_same_arms)]
+pub async fn request_via_directory(
+    data_dir: &Path,
+    directory: &str,
+    certificate: &Path,
+    key: &Path,
+    agent_id: &str,
+    scope: &str,
+    request: Frame,
+) -> Result<Vec<Frame>, TransportError> {
+    let certificate =
+        std::fs::read(certificate).map_err(|_| TransportError::Address)?;
+    let trusted_key = read_verifying_key(key).map_err(|_| TransportError::Address)?;
+    let client =
+        DirectoryClient::with_pinned_certificate(directory, &certificate, trusted_key)
+            .map_err(|_| TransportError::Address)?;
+    let record = match client.resolve(agent_id).await.and_then(|wire| {
+        wire.to_record().map_err(|_| DirectoryClientError::InvalidRecord)
+    }) {
+        Ok(record) if record.scope_id == scope => {
+            if cache_directory_record(data_dir, &record).is_err() {
+                return Err(TransportError::Network(
+                    "local directory state is unavailable".to_owned(),
+                ));
+            }
+            record
+        }
+        Ok(_) => return Err(TransportError::Address),
+        Err(DirectoryClientError::Request) => {
+            cached_directory_record(data_dir, scope, agent_id, trusted_key)
+                .map_err(|_| TransportError::Address)?
+        }
+        Err(_) => return Err(TransportError::Address),
+    };
+    transport::request_once_record(data_dir, &record, request).await
 }
 
 #[cfg(test)]
@@ -233,7 +335,7 @@ mod tests {
     use axum_server::Handle;
 
     use super::{DirectoryClient, DirectoryClientError};
-    use crate::control_service::{WireRecord, serve};
+    use crate::{control_service::serve, discovery::wire::WireRecord};
     use ed25519_dalek::SigningKey;
 
     fn trusted_signing_key() -> [u8; 32] {
@@ -333,8 +435,9 @@ mod tests {
             .await
             .expect("server must listen")
             .expect("server address must exist");
-        let certificate = fs::read(data_dir.join("control-cert.der"))
-            .expect("certificate must exist");
+        let certificate =
+            fs::read(crate::data_dir::DataDir::new(&data_dir).control_certificate())
+                .expect("certificate must exist");
         let client = DirectoryClient::with_pinned_certificate(
             &format!("https://127.0.0.1:{}", address.port()),
             &certificate,
@@ -347,15 +450,7 @@ mod tests {
             client.resolve(&record.agent_id).await.expect("record must resolve"),
             record
         );
-        assert_eq!(
-            client
-                .resolve_record(&record.agent_id)
-                .await
-                .expect("record must resolve")
-                .endpoint_id,
-            record.endpoint_id
-        );
-        assert_eq!(client.renew(&record).await.expect("record must renew"), record);
+        assert_eq!(client.publish(&record).await.expect("record must renew"), record);
         assert_eq!(
             client.search("test").await.expect("record must search"),
             vec![record.clone()]
@@ -363,8 +458,12 @@ mod tests {
         client.revoke(&record).await.expect("record must revoke");
         let events = client.events_after(0).await.expect("events must load");
         assert_eq!(
-            events.iter().map(|event| event.event.as_str()).collect::<Vec<_>>(),
-            ["published", "renewed", "revoked"]
+            events.iter().map(|event| event.event).collect::<Vec<_>>(),
+            [
+                aether_store::DirectoryEventType::Published,
+                aether_store::DirectoryEventType::Renewed,
+                aether_store::DirectoryEventType::Revoked
+            ]
         );
         assert!(
             client

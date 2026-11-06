@@ -1,5 +1,6 @@
 use std::{collections::BTreeSet, fmt, time::SystemTime};
 
+pub mod limits;
 pub mod time;
 
 pub const PROTOCOL_FAMILY: &str = "aether";
@@ -28,6 +29,14 @@ identifier!(EndpointId);
 identifier!(ScopeId);
 identifier!(CapabilityId);
 identifier!(WorkspaceId);
+
+impl WorkspaceId {
+    #[must_use]
+    pub fn allows_path_token(value: &str) -> bool {
+        !value.contains("..") && !value.starts_with('/')
+    }
+}
+
 identifier!(GrantId);
 identifier!(ClaimId);
 identifier!(TaskId);
@@ -36,6 +45,7 @@ identifier!(RequestId);
 /// Gives an enum one table of names, read by `as_str` and `parse`. The
 /// names appear in policy files, wire data and database columns, so a
 /// changed name breaks all three.
+#[macro_export]
 macro_rules! named {
     ($name:ident { $($variant:ident => $text:literal),+ $(,)? }) => {
         impl $name {
@@ -59,10 +69,9 @@ macro_rules! named {
 
 /// Where a caller reaches the node from.
 ///
-/// `Pact` is the scope of PACT personal agents, which reach the node over
-/// HTTPS rather than Iroh. Their identity is a JWT the PACT gateway
-/// verifies, so they carry no `Claim`: `PolicyEngine::admit_verified`
-/// admits them, and `PolicyEngine::admit` refuses them.
+/// A `Pact` caller carries no `Claim`: its identity is verified outside
+/// this crate, so `PolicyEngine::admit_verified` admits it and
+/// `PolicyEngine::admit` refuses it.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 pub enum ScopeKind {
     Direct,
@@ -101,12 +110,6 @@ pub enum ApprovalRule {
 named!(ApprovalRule { Automatic => "automatic", LocalUi => "local_ui" });
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct Capability {
-    pub id: CapabilityId,
-    pub name: String,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Claim {
     pub id: ClaimId,
     pub issuer_agent_id: AgentId,
@@ -139,16 +142,6 @@ pub struct Grant {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct DispatchRequest {
-    pub caller_agent_id: AgentId,
-    pub caller_endpoint_id: EndpointId,
-    pub scope_id: ScopeId,
-    pub capability_id: CapabilityId,
-    pub workspace_id: WorkspaceId,
-    pub access_mode: AccessMode,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Request {
     pub id: RequestId,
     pub task_id: TaskId,
@@ -161,26 +154,16 @@ pub struct Request {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct Task {
-    pub id: TaskId,
-    pub request_id: RequestId,
-    pub scope_id: ScopeId,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum ProviderError {
     Unavailable,
     Invalid(String),
-    Failed(String),
 }
 
 impl fmt::Display for ProviderError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unavailable => formatter.write_str("provider unavailable"),
-            Self::Invalid(message) | Self::Failed(message) => {
-                formatter.write_str(message)
-            }
+            Self::Invalid(message) => formatter.write_str(message),
         }
     }
 }
@@ -207,7 +190,6 @@ pub enum Denial {
     LocalGrantMissing,
     LocalGrantExpired,
     GrantDenied,
-    GroupDenied,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -235,13 +217,11 @@ where
         self.grants.iter().any(|grant| grant.id == *id)
     }
 
-    /// The grants this engine admits requests under.
     #[must_use]
     pub fn grants(&self) -> &[Grant] {
         &self.grants
     }
 
-    /// Removes the grant `id`. Returns whether it was present.
     pub fn remove_grant(&mut self, id: &GrantId) -> bool {
         let before = self.grants.len();
         self.grants.retain(|grant| grant.id != *id);
@@ -268,40 +248,17 @@ where
         Ok(())
     }
 
+    /// Whether a grant still covers `request`, which was admitted earlier
+    /// and is about to run.
     pub fn permits_dispatch(
         &self,
-        request: &DispatchRequest,
+        request: &Request,
         scope: &Scope,
     ) -> Result<(), Denial> {
         if request.scope_id != scope.id {
             return Err(Denial::ScopeMismatch);
         }
-        let grants = self.grants.iter().filter(|grant| {
-            grant.subject_agent_id == request.caller_agent_id
-                && grant.subject_endpoint_id == request.caller_endpoint_id
-                && grant.scope_id == request.scope_id
-                && grant.capabilities.contains(&request.capability_id)
-                && grant.workspaces.contains(&request.workspace_id)
-                && grant.access_mode == request.access_mode
-        });
-        let mut expired = false;
-        let mut denied = false;
-        for grant in grants {
-            if grant.expires_at <= SystemTime::now() {
-                expired = true;
-            } else if self.verify_grant(grant, scope).is_ok() {
-                return Ok(());
-            } else {
-                denied = true;
-            }
-        }
-        if denied {
-            Err(Denial::GrantDenied)
-        } else if expired {
-            Err(Denial::LocalGrantExpired)
-        } else {
-            Err(Denial::LocalGrantMissing)
-        }
+        self.match_grant(request, scope)
     }
 
     #[must_use]
@@ -315,8 +272,6 @@ where
         if &request.caller_endpoint_id != authenticated_endpoint {
             return Admission::Denied(Denial::EndpointMismatch);
         }
-        // A PACT caller has no claim; its scope is admitted only after the
-        // gateway verified its JWT, through `admit_verified`.
         if scope.kind == ScopeKind::Pact
             || request.scope_id != scope.id
             || claim.scope_id != scope.id
@@ -331,14 +286,13 @@ where
         if self.trust.verify(claim, authenticated_endpoint, scope).is_err() {
             return Admission::Denied(Denial::ClaimDenied);
         }
-        self.admit_authenticated(request, scope)
+        self.admission(request, scope)
     }
 
-    /// Admits a request from a caller in a `pact` scope, whose identity the
-    /// PACT gateway already verified: `authenticated_endpoint` is the
-    /// endpoint the gateway derived from the verified JWT. The local grant
-    /// still decides, exactly as for `admit`. Any other
-    /// scope kind is refused, because its callers must present a claim.
+    /// Admits a request in a `pact` scope from a caller whose identity was
+    /// verified outside this crate as `authenticated_endpoint`. The local
+    /// grant still decides, as for `admit`. Every other scope kind is
+    /// refused, because its callers must present a claim.
     #[must_use]
     pub fn admit_verified(
         &self,
@@ -352,12 +306,19 @@ where
         if scope.kind != ScopeKind::Pact || request.scope_id != scope.id {
             return Admission::Denied(Denial::ScopeMismatch);
         }
-        self.admit_authenticated(request, scope)
+        self.admission(request, scope)
     }
 
-    /// The grant step shared by both admission paths, run once the caller's
-    /// identity is established.
-    fn admit_authenticated(&self, request: &Request, scope: &Scope) -> Admission {
+    fn admission(&self, request: &Request, scope: &Scope) -> Admission {
+        match self.match_grant(request, scope) {
+            Ok(()) => Admission::Approved,
+            Err(denial) => Admission::Denied(denial),
+        }
+    }
+
+    /// The grant step of every admission, run once the caller's identity is
+    /// established.
+    fn match_grant(&self, request: &Request, scope: &Scope) -> Result<(), Denial> {
         let grants = self.grants.iter().filter(|grant| {
             grant.subject_agent_id == request.caller_agent_id
                 && grant.subject_endpoint_id == request.caller_endpoint_id
@@ -372,17 +333,17 @@ where
             if grant.expires_at <= SystemTime::now() {
                 expired = true;
             } else if self.trust.verify_grant(grant, scope).is_ok() {
-                return Admission::Approved;
+                return Ok(());
             } else {
                 denied = true;
             }
         }
         if denied {
-            Admission::Denied(Denial::GrantDenied)
+            Err(Denial::GrantDenied)
         } else if expired {
-            Admission::Denied(Denial::LocalGrantExpired)
+            Err(Denial::LocalGrantExpired)
         } else {
-            Admission::Denied(Denial::LocalGrantMissing)
+            Err(Denial::LocalGrantMissing)
         }
     }
 }
@@ -402,33 +363,6 @@ mod tests {
         collections::BTreeSet,
         time::{Duration, SystemTime},
     };
-
-    #[test]
-    fn names_stay_the_same_and_parse_back() {
-        for (kind, name) in [
-            (ScopeKind::Direct, "direct"),
-            (ScopeKind::Directory, "directory"),
-            (ScopeKind::Managed, "managed"),
-            (ScopeKind::Pact, "pact"),
-        ] {
-            assert_eq!(kind.as_str(), name);
-            assert_eq!(ScopeKind::parse(name), Some(kind));
-        }
-        for (mode, name) in
-            [(AccessMode::ReadOnly, "read_only"), (AccessMode::ReadWrite, "read_write")]
-        {
-            assert_eq!(mode.as_str(), name);
-            assert_eq!(AccessMode::parse(name), Some(mode));
-        }
-        for (rule, name) in [
-            (ApprovalRule::Automatic, "automatic"),
-            (ApprovalRule::LocalUi, "local_ui"),
-        ] {
-            assert_eq!(rule.as_str(), name);
-            assert_eq!(ApprovalRule::parse(name), Some(rule));
-        }
-        assert_eq!(ScopeKind::parse("Direct"), None);
-    }
 
     struct Trusted;
 
@@ -560,5 +494,32 @@ mod tests {
             ),
             Admission::Denied(Denial::EndpointMismatch),
         );
+    }
+
+    #[test]
+    fn names_stay_the_same_and_parse_back() {
+        for (kind, name) in [
+            (ScopeKind::Direct, "direct"),
+            (ScopeKind::Directory, "directory"),
+            (ScopeKind::Managed, "managed"),
+            (ScopeKind::Pact, "pact"),
+        ] {
+            assert_eq!(kind.as_str(), name);
+            assert_eq!(ScopeKind::parse(name), Some(kind));
+        }
+        for (mode, name) in
+            [(AccessMode::ReadOnly, "read_only"), (AccessMode::ReadWrite, "read_write")]
+        {
+            assert_eq!(mode.as_str(), name);
+            assert_eq!(AccessMode::parse(name), Some(mode));
+        }
+        for (rule, name) in [
+            (ApprovalRule::Automatic, "automatic"),
+            (ApprovalRule::LocalUi, "local_ui"),
+        ] {
+            assert_eq!(rule.as_str(), name);
+            assert_eq!(ApprovalRule::parse(name), Some(rule));
+        }
+        assert_eq!(ScopeKind::parse("Direct"), None);
     }
 }

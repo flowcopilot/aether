@@ -1,5 +1,5 @@
 //! The public listing of a service agent on the hub (`PUT /v1/listing` in
-//! `server/PROTOCOL.md`).
+//! `protocol/hub/contract.json`).
 //!
 //! The listing reuses the text of the Agent Card, so the owner writes it one
 //! time. It holds the full name, the description and the skill, and no
@@ -7,31 +7,27 @@
 //! bytes with its endpoint key, and the hub returns them exactly as sent, so
 //! a reader can check them against the endpoint that it gets later.
 
-use std::{collections::BTreeSet, str::FromStr, time::Duration};
+use std::time::Duration;
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sha2::{Digest, Sha256};
 
-use crate::{
-    agent_card::{
-        CardSettings, MAX_DESCRIPTION, MAX_SKILL_DESCRIPTION, MAX_SKILL_NAME, MAX_TAG,
-        MAX_TAGS,
-    },
-    untrusted,
+use crate::{agent_card::CardSettings, untrusted};
+
+pub use crate::hub_client::protocol::{
+    MAX_LISTING_BYTES, MAX_LISTING_DAYS, MAX_LISTING_DESCRIPTION as MAX_DESCRIPTION,
+    MAX_LISTING_SKILL_DESCRIPTION as MAX_SKILL_DESCRIPTION,
+    MAX_LISTING_SKILL_ID as MAX_SKILL_ID, MAX_LISTING_SKILL_NAME as MAX_SKILL_NAME,
+    MAX_LISTING_SKILLS as MAX_SKILLS, MAX_LISTING_TAG as MAX_TAG,
+    MAX_LISTING_TAGS as MAX_TAGS, OWNER_LINK_MAX_DAYS,
 };
 
 /// How long a new listing stays on the hub. The hub accepts 30 days at most.
-pub const LISTING_LIFETIME: Duration = Duration::from_hours(30 * 24);
+pub const LISTING_LIFETIME: Duration =
+    Duration::from_hours(MAX_LISTING_DAYS.saturating_mul(24));
 /// A listing with less time left than this is signed again.
 pub const RENEW_BEFORE: Duration = Duration::from_hours(7 * 24);
-/// The most bytes of the listing that the hub keeps.
-pub const MAX_LISTING_BYTES: usize = 8 * 1024;
-/// The most skills of a listing.
-pub const MAX_SKILLS: usize = 5;
-/// The most characters of a skill ID, from `[a-z0-9-]`.
-const MAX_SKILL_ID: usize = 64;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
 pub enum ListingError {
@@ -41,24 +37,6 @@ pub enum ListingError {
     Signature,
     #[error("the listing has expired")]
     Expired,
-}
-
-/// The listing bytes as JSON. A key two times is refused by the derive.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawListing {
-    name: String,
-    description: String,
-    skills: Vec<RawSkill>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawSkill {
-    id: String,
-    name: String,
-    description: String,
-    tags: Vec<String>,
 }
 
 /// A listing that passed the checks. Every text is from a stranger.
@@ -78,8 +56,8 @@ pub struct ListingSkill {
     pub tags: Vec<String>,
 }
 
-/// What this node last sent to the hub, kept under
-/// `node_config::settings::ListingState`.
+/// What this node last sent to the hub, kept under the setting
+/// [`settings::ListingState`].
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ListingState {
@@ -108,20 +86,23 @@ pub fn listing_bytes(settings: &CardSettings, full_name: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-/// The message that the endpoint key signs.
-fn message(endpoint: &str, expires_at: u64, bytes: &[u8]) -> String {
-    format!(
-        "aether-listing/v1\n{endpoint}\ntrue\n{expires_at}\n{}",
-        hex::encode(Sha256::digest(bytes))
-    )
+const fn wire_error(
+    error: crate::hub_client::protocol::ListingWireError,
+) -> ListingError {
+    match error {
+        crate::hub_client::protocol::ListingWireError::Invalid => ListingError::Invalid,
+        crate::hub_client::protocol::ListingWireError::Signature => {
+            ListingError::Signature
+        }
+        crate::hub_client::protocol::ListingWireError::Expired => ListingError::Expired,
+    }
 }
 
 /// The signature of `bytes` until `expires_at` by the endpoint `key`, as
 /// unpadded base64url.
 #[must_use]
 pub fn sign(key: &iroh::SecretKey, bytes: &[u8], expires_at: u64) -> String {
-    let message = message(&key.public().to_string(), expires_at, bytes);
-    URL_SAFE_NO_PAD.encode(key.sign(message.as_bytes()).to_bytes())
+    crate::hub_client::protocol::sign_listing(key, bytes, expires_at)
 }
 
 /// Checks that the endpoint `endpoint` signed the listing `text` until
@@ -133,44 +114,15 @@ pub fn verify(
     expires_at: u64,
     at: u64,
 ) -> Result<(), ListingError> {
-    if expires_at <= at {
-        return Err(ListingError::Expired);
-    }
-    let bytes = URL_SAFE_NO_PAD.decode(text).map_err(|_| ListingError::Invalid)?;
-    let signature: [u8; 64] = URL_SAFE_NO_PAD
-        .decode(signature)
-        .ok()
-        .and_then(|signature| signature.try_into().ok())
-        .ok_or(ListingError::Signature)?;
-    let key =
-        iroh::PublicKey::from_str(endpoint).map_err(|_| ListingError::Signature)?;
-    key.verify(
-        message(endpoint, expires_at, &bytes).as_bytes(),
-        &iroh::Signature::from_bytes(&signature),
+    crate::hub_client::protocol::verify_listing(
+        text, signature, endpoint, expires_at, at,
     )
-    .map_err(|_| ListingError::Signature)
+    .map_err(wire_error)
 }
 
 /// How long an owner link lasts. The hub accepts 365 days at most.
-pub const OWNER_LINK_LIFETIME: Duration = Duration::from_hours(365 * 24);
-
-/// The message that the personal agent `personal` signs to claim the service
-/// agent `service_handle` as its own until `expires_at`.
-#[must_use]
-pub fn owner_claim_message(
-    personal: &str,
-    service_handle: &str,
-    expires_at: u64,
-) -> String {
-    format!("aether-owner/v1\nclaim\n{personal}\n{service_handle}\n{expires_at}")
-}
-
-/// The message that the service agent `service` signs to confirm the claim
-/// of the personal agent `personal` until `expires_at`.
-#[must_use]
-pub fn owner_confirm_message(service: &str, personal: &str, expires_at: u64) -> String {
-    format!("aether-owner/v1\nconfirm\n{service}\n{personal}\n{expires_at}")
-}
+pub const OWNER_LINK_LIFETIME: Duration =
+    Duration::from_hours(OWNER_LINK_MAX_DAYS.saturating_mul(24));
 
 /// The claim of the personal agent with the endpoint `key` for the service
 /// agent `service_handle`, as unpadded base64url.
@@ -180,8 +132,11 @@ pub fn sign_owner_claim(
     service_handle: &str,
     expires_at: u64,
 ) -> String {
-    let message =
-        owner_claim_message(&key.public().to_string(), service_handle, expires_at);
+    let message = crate::hub_client::protocol::owner_claim_message(
+        &key.public().to_string(),
+        service_handle,
+        expires_at,
+    );
     URL_SAFE_NO_PAD.encode(key.sign(message.as_bytes()).to_bytes())
 }
 
@@ -193,8 +148,11 @@ pub fn sign_owner_confirm(
     personal: &str,
     expires_at: u64,
 ) -> String {
-    let message =
-        owner_confirm_message(&key.public().to_string(), personal, expires_at);
+    let message = crate::hub_client::protocol::owner_confirm_message(
+        &key.public().to_string(),
+        personal,
+        expires_at,
+    );
     URL_SAFE_NO_PAD.encode(key.sign(message.as_bytes()).to_bytes())
 }
 
@@ -202,20 +160,8 @@ pub fn sign_owner_confirm(
 /// names `handle`. Every text is cleaned for display.
 pub fn parse(text: &str, handle: &str) -> Result<Listing, ListingError> {
     let bytes = URL_SAFE_NO_PAD.decode(text).map_err(|_| ListingError::Invalid)?;
-    if bytes.len() > MAX_LISTING_BYTES {
-        return Err(ListingError::Invalid);
-    }
-    let raw: RawListing =
-        serde_json::from_slice(&bytes).map_err(|_| ListingError::Invalid)?;
-    let ids: BTreeSet<&String> = raw.skills.iter().map(|skill| &skill.id).collect();
-    let valid = raw.name == handle
-        && valid_text(&raw.description, MAX_DESCRIPTION)
-        && (1..=MAX_SKILLS).contains(&raw.skills.len())
-        && ids.len() == raw.skills.len()
-        && raw.skills.iter().all(valid_skill);
-    if !valid {
-        return Err(ListingError::Invalid);
-    }
+    let raw = crate::hub_client::protocol::parse_listing_bytes(&bytes, handle)
+        .map_err(wire_error)?;
     Ok(Listing {
         name: untrusted::single_line(&raw.name, raw.name.chars().count()),
         description: untrusted::single_line(&raw.description, MAX_DESCRIPTION),
@@ -239,32 +185,145 @@ pub fn parse(text: &str, handle: &str) -> Result<Listing, ListingError> {
     })
 }
 
-fn valid_skill(skill: &RawSkill) -> bool {
-    let tags: BTreeSet<&String> = skill.tags.iter().collect();
-    valid_word(&skill.id, MAX_SKILL_ID)
-        && valid_text(&skill.name, MAX_SKILL_NAME)
-        && valid_text(&skill.description, MAX_SKILL_DESCRIPTION)
-        && (1..=MAX_TAGS).contains(&skill.tags.len())
-        && tags.len() == skill.tags.len()
-        && skill.tags.iter().all(|tag| valid_word(tag, MAX_TAG))
+pub mod settings {
+    use aether_store::StoreError;
+
+    use crate::settings::Setting;
+
+    /// The listing that this node last sent to its hub as its public
+    /// listing, if any. `None` forgets it.
+    pub struct ListingState;
+
+    impl Setting for ListingState {
+        const KEY: &'static str = "node.listing_state";
+        type Value = Option<super::ListingState>;
+
+        fn absent() -> Result<Self::Value, StoreError> {
+            Ok(None)
+        }
+
+        fn decode(stored: String) -> Result<Self::Value, StoreError> {
+            Ok(serde_json::from_str(&stored).ok())
+        }
+
+        fn encode(value: &Self::Value) -> Result<Option<String>, StoreError> {
+            value
+                .as_ref()
+                .map(|state| {
+                    serde_json::to_string(state).map_err(|_| StoreError::InvalidState)
+                })
+                .transpose()
+        }
+    }
 }
 
-/// The hub's text rule: 1 to `max_chars` characters, not only white space,
-/// with no control, bidirectional or zero-width characters.
-fn valid_text(text: &str, max_chars: usize) -> bool {
-    !text.trim().is_empty()
-        && text.chars().count() <= max_chars
-        && !text
-            .chars()
-            .any(|character| character.is_control() || untrusted::hidden(character))
+const RENEW_INTERVAL: std::time::Duration = std::time::Duration::from_hours(6);
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum HubPublishError {
+    NoName,
+    Key,
+    Store,
+    Hub(crate::hub_client::HubError),
 }
 
-/// 1 to `max` characters of `[a-z0-9-]`.
-fn valid_word(word: &str, max: usize) -> bool {
-    (1..=max).contains(&word.len())
-        && word.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
-        })
+pub(crate) async fn publish_to_hub(
+    data_dir: &std::path::Path,
+    hub: &crate::hub_client::HubClient,
+    now: u64,
+) -> Result<ListingState, HubPublishError> {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    let name =
+        crate::settings::setting::<crate::hub_client::settings::HubName>(data_dir)
+            .ok()
+            .flatten()
+            .ok_or(HubPublishError::NoName)?;
+    let settings = crate::agent_card::settings(data_dir);
+    let bytes = listing_bytes(&settings, &name);
+    let key = crate::data_dir::DataDir::new(data_dir)
+        .endpoint_key()
+        .map_err(|_| HubPublishError::Key)?;
+    let expires_at = now.saturating_add(LISTING_LIFETIME.as_secs());
+    let signature = sign(&key, &bytes, expires_at);
+    let text = URL_SAFE_NO_PAD.encode(&bytes);
+    hub.put_listing(&text, &signature, expires_at)
+        .await
+        .map_err(HubPublishError::Hub)?;
+    let state = ListingState { listed: true, expires_at, listing: text };
+    crate::settings::store_setting::<settings::ListingState>(
+        data_dir,
+        &Some(state.clone()),
+    )
+    .map_err(|_| HubPublishError::Store)?;
+    Ok(state)
+}
+
+pub(crate) async fn stop_hub_listing(
+    data_dir: &std::path::Path,
+    hub: &crate::hub_client::HubClient,
+) -> Result<(), HubPublishError> {
+    hub.delete_listing().await.map_err(HubPublishError::Hub)?;
+    crate::settings::store_setting::<settings::ListingState>(data_dir, &None)
+        .map_err(|_| HubPublishError::Store)
+}
+
+pub(crate) const fn hub_publish_message(error: HubPublishError) -> &'static str {
+    match error {
+        HubPublishError::NoName => "Choose your name on Aether first.",
+        HubPublishError::Key | HubPublishError::Store => {
+            "The listing was not saved on this computer. Try again."
+        }
+        HubPublishError::Hub(crate::hub_client::HubError::Invalid) => {
+            "The hub refused the listing. Check the text of your agent's card."
+        }
+        HubPublishError::Hub(error) => crate::hub_membership::hub_message(error),
+    }
+}
+
+pub async fn listing_renewal_worker(
+    ctx: std::sync::Arc<crate::node_serve_context::NodeServeContext>,
+) {
+    loop {
+        renew_listing(&ctx).await;
+        tokio::time::sleep(RENEW_INTERVAL).await;
+    }
+}
+
+async fn renew_listing(ctx: &crate::node_serve_context::NodeServeContext) {
+    use crate::hub_client::{AgentKind, HubAccess};
+    use aether_core::time::now_seconds;
+
+    let now = now_seconds();
+    let due = crate::settings::setting::<settings::ListingState>(&ctx.data_dir)
+        .ok()
+        .flatten()
+        .is_some_and(|state| {
+            state.listed
+                && state.expires_at.saturating_sub(now) < RENEW_BEFORE.as_secs()
+        });
+    let service = crate::settings::setting::<crate::hub_client::settings::AgentKind>(
+        &ctx.data_dir,
+    )
+    .ok()
+    .flatten()
+        == Some(AgentKind::Service);
+    if !(due && service) {
+        return;
+    }
+    let hub = match ctx.hub.access() {
+        HubAccess::Ready(client) => *client,
+        HubAccess::Unavailable => {
+            println!("{}", serde_json::json!({ "event": "hub_access_unavailable" }));
+            return;
+        }
+        HubAccess::Off => return,
+    };
+    let event = match publish_to_hub(&ctx.data_dir, &hub, now).await {
+        Ok(_) => "listing_renewed",
+        Err(_) => "listing_renew_failed",
+    };
+    println!("{}", serde_json::json!({ "event": event }));
 }
 
 #[cfg(test)]
@@ -289,31 +348,6 @@ mod tests {
 
     fn encode(bytes: &[u8]) -> String {
         URL_SAFE_NO_PAD.encode(bytes)
-    }
-
-    #[test]
-    fn the_owner_claim_signs_the_service_full_name() {
-        let key = iroh::SecretKey::generate();
-        let personal = key.public().to_string();
-        let signature = super::sign_owner_claim(&key, "law#0042", NOW);
-        let bytes: [u8; 64] = URL_SAFE_NO_PAD
-            .decode(&signature)
-            .expect("base64url")
-            .try_into()
-            .expect("64 bytes");
-        let signature = iroh::Signature::from_bytes(&bytes);
-        let message = super::owner_claim_message(&personal, "law#0042", NOW);
-        assert_eq!(
-            message,
-            format!("aether-owner/v1\nclaim\n{personal}\nlaw#0042\n{NOW}")
-        );
-        assert!(key.public().verify(message.as_bytes(), &signature).is_ok());
-        let other = super::owner_claim_message(&personal, "law#0043", NOW);
-        assert!(key.public().verify(other.as_bytes(), &signature).is_err());
-        assert_eq!(
-            super::owner_confirm_message("s", "p", 7),
-            "aether-owner/v1\nconfirm\ns\np\n7"
-        );
     }
 
     #[test]

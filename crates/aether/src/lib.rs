@@ -3,6 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod a2a_transport;
 mod access_groups;
 pub mod access_requests;
 pub mod admin;
@@ -18,6 +19,7 @@ pub mod agent_card;
 #[allow(dead_code, clippy::pedantic, clippy::nursery)]
 mod components;
 pub mod control_service;
+pub mod data_dir;
 pub mod direct;
 pub mod directory_client;
 pub mod directory_publication;
@@ -27,18 +29,31 @@ pub mod fixture;
 mod https;
 pub mod hub_client;
 mod hub_membership;
+mod hub_store;
 mod hub_sync;
+mod hub_workers;
 pub mod identity;
+mod invites;
 mod key_file;
 pub mod listing;
 pub mod managed_client;
 pub mod mcp;
-pub mod node_config;
+pub mod node_builder;
+pub mod node_request;
+pub mod node_runtime;
+mod node_serve_context;
 pub mod node_service;
 pub mod outbox;
 pub mod pact;
 mod pinned_https;
+mod pinned_json;
+pub mod policy;
 pub mod proof;
+pub mod roster_sync;
+pub mod settings;
+mod signed;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod transport;
 pub mod untrusted;
 
@@ -86,9 +101,10 @@ impl std::fmt::Display for UserError {
 impl std::error::Error for UserError {}
 
 pub fn load_config(path: Option<&Path>, command: Command) -> Result<Config, UserError> {
-    let default_data_dir = PathBuf::from(format!("./.aether/{}", command.name()));
     let Some(path) = path else {
-        return Ok(Config { data_dir: default_data_dir });
+        return Ok(Config {
+            data_dir: data_dir::resolve_daemon_data_dir(None, command),
+        });
     };
 
     let source = fs::read_to_string(path).map_err(|_| UserError {
@@ -103,7 +119,7 @@ pub fn load_config(path: Option<&Path>, command: Command) -> Result<Config, User
         });
     }
 
-    Ok(Config { data_dir: PathBuf::from(file.data_dir) })
+    Ok(Config { data_dir: data_dir::expand_home(PathBuf::from(file.data_dir)) })
 }
 
 /// The configuration file. `data_dir` is its only setting.
@@ -120,7 +136,6 @@ pub fn startup_log(command: Command, _config: &Config) -> String {
         "event": "process_ready",
         "command": command.name(),
         "protocol": aether_core::PROTOCOL_FAMILY,
-        "store_protocol": aether_store::protocol_family(),
     })
     .to_string()
 }

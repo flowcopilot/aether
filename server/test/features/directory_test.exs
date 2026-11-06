@@ -1,31 +1,15 @@
 defmodule AetherHub.Features.DirectoryTest do
   use AetherHub.Feature, file: "directory.feature", async: true
 
-  import Plug.Test
-  import AetherHub.TestClient
-  import AetherHub.HubStepsSocial
+  alias AetherHub.{Clock, Contract}
 
-  @router_opts AetherHub.Router.init([])
-
-  defp public(path, ip \\ unique_ip()) do
-    :get |> conn(path) |> Map.put(:remote_ip, ip) |> AetherHub.Router.call(@router_opts)
-  end
+  defp public(path, ip \\ unique_ip()), do: public_request(:get, path, ip)
 
   defp directory, do: public("/directory.json")
 
   defp row(handle), do: Enum.find(json(directory())["agents"], &(&1["handle"] == handle))
 
   defp content_type(conn), do: Plug.Conn.get_resp_header(conn, "content-type")
-
-  defstep ~r/^(?<names>\w+(?:(?:, | and )\w+)*) (?:is an?|are) (?<kind>person|people|service agent|unlisted service agent|listed service agent)$/,
-          %{names: names, kind: kind},
-          state do
-    {:ok, new_actors(state, names, kind)}
-  end
-
-  defstep ~r/^the hub answers (?<status>\d+)$/, %{status: status}, state do
-    assert_status(state, status)
-  end
 
   # Public pages
 
@@ -100,8 +84,9 @@ defmodule AetherHub.Features.DirectoryTest do
   defstep ~r/^the row of (?<name>\w+) shows only the full name, the listing text, the skills, the owner and whether it is online$/,
           %{name: name},
           state do
-    keys = row(actor(state, name).handle) |> Map.keys() |> Enum.sort()
-    assert keys == ["description", "handle", "online", "owner", "skills"]
+    row = row(actor(state, name).handle)
+    assert Enum.sort(Map.keys(row)) == Contract.keys("directoryAgent")
+    assert Enum.all?(row["skills"], &(Enum.sort(Map.keys(&1)) == Contract.keys("directorySkill")))
   end
 
   defstep ~r/^the directory does not show the endpoint of (?<names>\w+(?: or \w+)*)$/,
@@ -138,12 +123,10 @@ defmodule AetherHub.Features.DirectoryTest do
 
   defstep ~r/^a visitor reads the directory as many times as the limit allows$/, _, _state do
     ip = unique_ip()
-    {limit, _seconds} = AetherHub.RateLimit.limit(:directory_ip)
-    {:ok, %{ip: ip, statuses: for(_ <- 1..limit, do: public("/directory.json", ip).status)}}
-  end
+    {limit, seconds} = AetherHub.RateLimit.limit(:directory_ip)
+    Clock.set(div(Clock.now(), seconds) * seconds)
 
-  defstep ~r/^the hub answers 200 each time$/, _, state do
-    assert Enum.uniq(state.statuses) == [200]
+    {:ok, %{ip: ip, statuses: for(_ <- 1..limit, do: public("/directory.json", ip).status)}}
   end
 
   defstep ~r/^the visitor reads the directory once more$/, _, state do
@@ -151,6 +134,7 @@ defmodule AetherHub.Features.DirectoryTest do
   end
 
   defstep ~r/^a visitor from another address reads the directory$/, _, _state do
+    Clock.set(nil)
     {:ok, %{conn: directory()}}
   end
 end

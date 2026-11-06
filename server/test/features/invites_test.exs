@@ -1,14 +1,15 @@
 defmodule AetherHub.Features.InvitesTest do
-  use AetherHub.Feature, file: "invites.feature", async: true
+  use AetherHub.Feature, file: "invites.feature", async: false
 
-  import AetherHub.TestClient
-  import AetherHub.HubStepsSocial
-  import Ecto.Query, only: [from: 2]
+  alias AetherHub.{Contract, Invite, Repo}
 
-  @bundle "aether-invite:signed-line"
+  @prefix Contract.get(["limits", "invitePrefix"])
+  @max_bundle Contract.get(["limits", "maxInviteBytes"])
+  @bundle @prefix <> "signed-line"
 
   defp list(node, query \\ "") do
-    conn = request(node, "GET", "/v1/invites" <> query)
+    path = if query == "", do: "/v1/invites", else: "/v1/invites" <> query
+    conn = http_get(node, path)
     assert conn.status == 200
     json(conn)
   end
@@ -69,29 +70,16 @@ defmodule AetherHub.Features.InvitesTest do
   defp bundle("a bundle without the invite prefix"), do: "not-an-invite"
 
   defp bundle("a bundle with 8 KiB of text after the prefix"),
-    do: "aether-invite:" <> String.duplicate("a", 8 * 1024)
+    do: @prefix <> String.duplicate("a", @max_bundle)
 
   defp bundle("no bundle"), do: nil
 
   defp bundle("a bundle of exactly 8 KiB with the prefix"),
-    do: "aether-invite:" <> String.duplicate("a", 8 * 1024 - 14)
+    do: @prefix <> String.duplicate("a", @max_bundle - byte_size(@prefix))
 
-  # Nodes
-
-  defstep ~r/^(?<names>\w+(?:(?:, | and )\w+)*) (?:is an?|are) (?<kind>person|people|service agent|node without a name)$/,
-          %{names: names, kind: kind},
-          state do
-    {:ok, new_actors(state, names, kind)}
-  end
-
-  defstep ~r/^the hub answers (?<status>\d+)$/, %{status: status}, state do
-    assert_status(state, status)
-  end
-
-  defstep ~r/^the hub answers (?<status>\d+) with the error "(?<error>\w+)"$/,
-          %{status: status, error: error},
-          state do
-    assert_error(state, status, error)
+  defp by_handle(state, handle) do
+    {name, _node} = Enum.find(state.actors, fn {_name, node} -> node[:handle] == handle end)
+    name
   end
 
   # Making and moving invites
@@ -118,10 +106,14 @@ defmodule AetherHub.Features.InvitesTest do
 
   defstep ~r/^the invite is (?<stage>pending|accepted|delivered)$/, %{stage: stage}, state do
     if stage in ["accepted", "delivered"] do
-      assert act(state, "bob", "accepts the invite").status == 200
+      receiver = by_handle(state, state.invite["to"])
+      assert act(state, receiver, "accepts the invite").status == 200
     end
 
-    if stage == "delivered", do: assert(act(state, "alice", "sends the bundle").status == 200)
+    if stage == "delivered" do
+      sender = by_handle(state, state.invite["from"])
+      assert act(state, sender, "sends the bundle").status == 200
+    end
   end
 
   defstep ~r/^(?<who>\w+) (?<action>accepts the invite|deletes the invite|sends the bundle)$/,
@@ -153,13 +145,6 @@ defmodule AetherHub.Features.InvitesTest do
           %{who: who, parameter: parameter},
           state do
     {:ok, %{conn: request(actor(state, who), "GET", "/v1/invites?" <> parameter)}}
-  end
-
-  defstep ~r/^(?<who>\w+) takes a new name$/, %{who: who}, state do
-    node = actor(state, who)
-    conn = request(node, "PUT", "/v1/account", %{"name" => unique_name()})
-    handle = if conn.status == 200, do: json(conn)["handle"], else: node.handle
-    {:ok, Map.put(put_actor(state, who, %{node | handle: handle}), :conn, conn)}
   end
 
   # What each side sees
@@ -253,22 +238,8 @@ defmodule AetherHub.Features.InvitesTest do
 
   # Expiry
 
-  defstep ~r/^the invite is 7 days old$/, _, state do
-    old = System.system_time(:second) - 7 * 24 * 60 * 60
-    id = id(state)
-
-    AetherHub.Repo.update_all(
-      from(i in AetherHub.Invite, where: i.id == ^id),
-      set: [created_at: old]
-    )
-  end
-
-  defstep ~r/^the hub sweeps expired invites$/, _, _state do
-    AetherHub.Hub.delete_expired()
-  end
-
   defstep ~r/^the hub keeps no record of the invite$/, _, state do
-    assert AetherHub.Repo.get(AetherHub.Invite, id(state)) == nil
+    assert Repo.get(Invite, id(state)) == nil
   end
 
   # Waiting for a change

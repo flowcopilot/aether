@@ -1,5 +1,6 @@
 //! The client of the Aether hub (`server/`), which matches two people by
-//! name so that neither copies a code. `server/PROTOCOL.md` is the contract.
+//! name so that neither copies a code. `protocol/hub/contract.json` is the
+//! contract.
 //!
 //! The node's endpoint key is its hub account: every request is signed with
 //! it, and the hub knows the node by its endpoint ID.
@@ -9,15 +10,25 @@ use std::time::{Duration, SystemTime};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use reqwest::{Client, Method, StatusCode, Url, redirect::Policy};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+pub mod full_name;
+pub mod node_hub;
+pub mod protocol;
+mod types;
 
-use crate::node_config::settings;
-
-/// The public hub that a node uses when nothing else is set.
-pub const DEFAULT_HUB_URL: &str = "https://aether-hub.tudorandrei.xyz";
-
-/// The setting value that turns the hub off.
-pub const HUB_OFF: &str = "off";
+pub use self::full_name::{
+    FullName, split_full_name, valid_full_name, valid_name_part,
+};
+pub use self::node_hub::{
+    HubAccess, NodeHub, hub_access, hub_client as configured_hub_client,
+};
+pub use self::protocol::{
+    DEFAULT_HUB_URL, HUB_OFF, INVITE_SECONDS, MAX_WAIT_SECONDS, PROTOCOL_HEADER,
+    PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
+};
+pub use self::types::{
+    Account, AgentKind, AgentRow, Block, Contact, HeldListing, HubError, Invite,
+    Invites, Origin, OwnerLink, PersonRow, Role, Status,
+};
 
 /// The hub a node uses: `flag` (`--hub-url` or `AETHER_HUB_URL`), else the
 /// one set on the page, else [`DEFAULT_HUB_URL`]. `None` when the chosen
@@ -27,9 +38,10 @@ pub fn resolve_url(flag: Option<&str>, stored: Option<String>) -> Option<String>
     let url = flag
         .map(str::to_owned)
         .or(stored)
-        .unwrap_or_else(|| DEFAULT_HUB_URL.to_owned());
+        .unwrap_or_else(|| protocol::DEFAULT_HUB_URL.to_owned());
     let url = url.trim();
-    (!url.is_empty() && url != HUB_OFF).then(|| url.trim_end_matches('/').to_owned())
+    (!url.is_empty() && url != protocol::HUB_OFF)
+        .then(|| url.trim_end_matches('/').to_owned())
 }
 
 /// The hub setting for a hub URL an owner typed: [`HUB_OFF`] when it is
@@ -42,10 +54,10 @@ pub fn resolve_url(flag: Option<&str>, stored: Option<String>) -> Option<String>
 pub fn hub_setting(url: &str) -> Result<Option<String>, HubError> {
     let url = url.trim().trim_end_matches('/');
     if url.is_empty() {
-        return Ok(Some(HUB_OFF.to_owned()));
+        return Ok(Some(protocol::HUB_OFF.to_owned()));
     }
     parse_origin(url)?;
-    Ok((url != DEFAULT_HUB_URL).then(|| url.to_owned()))
+    Ok((url != protocol::DEFAULT_HUB_URL).then(|| url.to_owned()))
 }
 
 /// Keeps `stored` as the hub of the node at `data_dir`. A name belongs to
@@ -58,364 +70,18 @@ pub fn set_hub_url(
     data_dir: &std::path::Path,
     stored: &Option<String>,
 ) -> Result<(), aether_store::StoreError> {
-    crate::node_config::store_setting::<settings::Hub>(data_dir, stored).and_then(
-        |()| crate::node_config::store_setting::<settings::HubName>(data_dir, &None),
-    )
+    crate::settings::store_setting::<crate::hub_client::settings::Hub>(data_dir, stored)
+        .and_then(|()| {
+            crate::settings::store_setting::<crate::hub_client::settings::HubName>(
+                data_dir, &None,
+            )
+        })
 }
 
-/// The longest long poll the hub accepts, in seconds.
-pub const MAX_WAIT_SECONDS: u64 = 30;
-
-/// The header that names the hub protocol of this node. It is not in the
-/// signed message: it only lets a hub refuse a node that is too old.
-pub const PROTOCOL_HEADER: &str = "x-aether-protocol";
-/// The hub protocol that this node speaks.
-pub const PROTOCOL_VERSION: &str = "2";
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
-pub enum HubError {
-    #[error("hub URL must be an HTTPS origin, or HTTP on a loopback address")]
-    InvalidUrl,
-    #[error("the hub cannot be reached")]
-    Unreachable,
-    #[error("the hub refused the signature")]
-    Unauthorized,
-    #[error("this node has no name on the hub")]
-    NoAccount,
-    #[error("the hub refused the request")]
-    Forbidden,
-    #[error("the hub does not know this name or invite")]
-    NotFound,
-    #[error("this name belongs to someone else")]
-    Taken,
-    #[error("the hub refused the request as invalid")]
-    Invalid,
-    #[error("too many requests to the hub")]
-    RateLimited,
-    #[error("the hub returned an unexpected answer")]
-    Unexpected,
-    #[error("this hub is older than this node")]
-    OldHub,
-    #[error("this node is older than the hub")]
-    OldNode,
-    #[error("a hub limit is reached")]
-    Limit,
-}
-
-/// The type of the agent of a hub account. It does not change.
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AgentKind {
-    /// Stands for one person; friends that the person invites send it tasks.
-    #[default]
-    Personal,
-    /// Offers a service; strangers ask for access, and the owner approves.
-    Service,
-}
-
-impl AgentKind {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Personal => "personal",
-            Self::Service => "service",
-        }
-    }
-
-    #[must_use]
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "personal" => Some(Self::Personal),
-            "service" => Some(Self::Service),
-            _ => None,
-        }
-    }
-}
-
-/// This node's name on the hub.
-#[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
-pub struct Account {
-    /// The full name, such as `ana#0042`.
-    pub handle: String,
-    pub endpoint: String,
-    /// A protocol 2 hub always sends it; the default only lets a reply parse.
-    #[serde(default)]
-    pub kind: AgentKind,
-    #[serde(default)]
-    pub searchable: bool,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Role {
-    Sender,
-    Receiver,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Status {
-    Pending,
-    /// A request that waits for the service agent's owner.
-    Requested,
-    Accepted,
-    Delivered,
-    /// A status from a newer hub. A page does not show it, and no worker
-    /// acts on it.
-    #[serde(other)]
-    Unknown,
-}
-
-/// How a hub row started.
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Origin {
-    /// A host offered access to a name.
-    #[default]
-    Invite,
-    /// A node asked a listed service agent for access. The service is the
-    /// sender, because it signs the line.
-    Request,
-    /// An origin from a newer hub. No worker acts on it.
-    #[serde(other)]
-    Unknown,
-}
-
-/// One open invite that this node sent or received. `from` and `to` are
-/// full names, such as `ana#0042`.
-#[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Invite {
-    pub id: String,
-    pub from: String,
-    pub to: String,
-    pub role: Role,
-    pub days: u64,
-    pub status: Status,
-    #[serde(default)]
-    pub origin: Origin,
-    #[serde(default)]
-    pub receiver_endpoint: Option<String>,
-    #[serde(default)]
-    pub bundle: Option<String>,
-    /// The endpoint that sent the line, for the receiver of a delivered
-    /// invite only.
-    #[serde(default)]
-    pub sender_endpoint: Option<String>,
-    pub created_at: u64,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
-pub struct Invites {
-    pub version: u64,
-    pub invites: Vec<Invite>,
-}
-
-/// A node this node is connected with, and whether it is online.
-#[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Contact {
-    /// The full name, such as `ana#0042`.
-    pub handle: String,
-    pub endpoint: String,
-    pub online: bool,
-}
-
-#[derive(Deserialize)]
-struct Contacts {
-    contacts: Vec<Contact>,
-}
-
-/// An endpoint that this node blocked, with its current full name, or
-/// `None` when it has no account now.
-#[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
-pub struct Block {
-    pub endpoint: String,
-    pub handle: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct Blocks {
-    blocks: Vec<Block>,
-}
-
-#[derive(Serialize)]
-struct ClaimBody<'a> {
-    name: &'a str,
-    /// Only on the first claim: the hub sets the type once.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    kind: Option<AgentKind>,
-}
-
-#[derive(Serialize)]
-struct SearchBody {
-    searchable: bool,
-}
-
-/// The public listing of this service agent, as the hub keeps it.
-#[derive(Debug, Clone, Eq, PartialEq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HeldListing {
-    pub listed: bool,
-    /// The base64url text of the listing bytes, exactly as the node sent it.
-    pub listing: String,
-    /// The unpadded base64url signature of the endpoint key.
-    pub signature: String,
-    /// Unix time.
-    pub expires_at: u64,
-}
-
-/// One listed service agent from a search or a lookup.
-#[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentRow {
-    /// The full name, such as `law#0042`.
-    pub handle: String,
-    /// The base64url listing text, exactly as the service node sent it.
-    pub listing: String,
-    pub signature: String,
-    pub expires_at: u64,
-    pub online: bool,
-    #[serde(default)]
-    pub contact: bool,
-    /// Only for a contact of this node.
-    #[serde(default)]
-    pub endpoint: Option<String>,
-    /// The full name of the owner's personal agent, when the two linked.
-    #[serde(default)]
-    pub owner: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct AgentRows {
-    agents: Vec<AgentRow>,
-}
-
-/// One personal agent from a lookup or a name search.
-#[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
-pub struct PersonRow {
-    /// The full name, such as `ana#0042`.
-    pub handle: String,
-    #[serde(default)]
-    pub contact: bool,
-    /// Only for a contact of this node.
-    #[serde(default)]
-    pub online: Option<bool>,
-    /// Only for a contact of this node.
-    #[serde(default)]
-    pub endpoint: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct PersonRows {
-    people: Vec<PersonRow>,
-}
-
-/// An owner link or claim between a service agent and the personal agent of
-/// its owner, as one side sees it.
-#[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OwnerLink {
-    pub id: String,
-    /// `personal` or `service`: the side of this node.
-    pub role: String,
-    /// The full name of the service agent.
-    pub service: String,
-    /// The full name of the personal agent.
-    pub personal: String,
-    pub expires_at: u64,
-    pub confirmed: bool,
-    /// For the service side only.
-    #[serde(default)]
-    pub personal_endpoint: Option<String>,
-    /// For the personal side, once the link is active.
-    #[serde(default)]
-    pub service_endpoint: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct OwnerLinks {
-    links: Vec<OwnerLink>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct OwnerClaimBody<'a> {
-    service: &'a str,
-    expires_at: u64,
-    signature: &'a str,
-}
-
-#[derive(Serialize)]
-struct SignatureBody<'a> {
-    signature: &'a str,
-}
-
-#[derive(Deserialize)]
-struct HubInfo {
-    protocol: u64,
-}
-
-#[derive(Serialize)]
-struct InviteBody<'a> {
-    to: &'a str,
-    days: u64,
-}
-
-#[derive(Serialize)]
-struct ApproveBody {
-    days: u64,
-}
-
-#[derive(Serialize)]
-struct BundleBody<'a> {
-    bundle: &'a str,
-}
-
-/// One hub client, kept while the resolved hub URL stays the same, so that
-/// each call does not build a new HTTP client.
-#[derive(Clone, Default)]
-pub struct HubCache(std::sync::Arc<std::sync::Mutex<Option<(String, HubClient)>>>);
-
-impl HubCache {
-    /// The client for the hub at `url` that signs with the key in
-    /// `data_dir`. A new URL builds a new client.
-    pub fn client(
-        &self,
-        url: &str,
-        data_dir: &std::path::Path,
-    ) -> Result<HubClient, HubError> {
-        let cached = self
-            .slot()
-            .as_ref()
-            .filter(|(cached, _)| cached == url)
-            .map(|(_, client)| client.clone());
-        if let Some(client) = cached {
-            return Ok(client);
-        }
-        let client = HubClient::for_data_dir(url, data_dir)?;
-        *self.slot() = Some((url.to_owned(), client.clone()));
-        Ok(client)
-    }
-
-    fn slot(&self) -> std::sync::MutexGuard<'_, Option<(String, HubClient)>> {
-        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// [`HubClient::configured`], from the cache.
-    #[must_use]
-    pub fn configured(
-        &self,
-        flag: Option<&str>,
-        data_dir: &std::path::Path,
-    ) -> Option<HubClient> {
-        let url = resolve_url(
-            flag,
-            crate::node_config::setting::<settings::Hub>(data_dir).ok().flatten(),
-        )?;
-        self.client(&url, data_dir).ok()
-    }
-}
+use types::{
+    AgentRows, ApproveBody, Blocks, BundleBody, ClaimBody, Contacts, HubInfo,
+    InviteBody, OwnerClaimBody, OwnerLinks, PersonRows, SearchBody, SignatureBody,
+};
 
 #[derive(Clone)]
 pub struct HubClient {
@@ -435,7 +101,7 @@ impl HubClient {
         let client = Client::builder()
             .redirect(Policy::none())
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(MAX_WAIT_SECONDS + 15))
+            .timeout(Duration::from_secs(protocol::MAX_WAIT_SECONDS + 15))
             .build()
             .map_err(|_| HubError::InvalidUrl)?;
         Ok(Self { client, origin, key, protocol: std::sync::Arc::default() })
@@ -447,41 +113,26 @@ impl HubClient {
         origin: &str,
         data_dir: &std::path::Path,
     ) -> Result<Self, HubError> {
-        std::fs::create_dir_all(data_dir).map_err(|_| HubError::Unexpected)?;
-        let key = crate::transport::load_or_create_key(data_dir.join("endpoint.key"))
+        let key = crate::data_dir::DataDir::new(data_dir)
+            .endpoint_key()
             .map_err(|_| HubError::Unexpected)?;
         Self::new(origin, key)
     }
 
-    /// The hub that a node at `data_dir` uses: `flag` (`--hub-url` or
-    /// `AETHER_HUB_URL`), else the one set on the page, else the public hub.
-    /// `None` when the hub is off.
-    #[must_use]
-    pub fn configured(flag: Option<&str>, data_dir: &std::path::Path) -> Option<Self> {
-        let url = resolve_url(
-            flag,
-            crate::node_config::setting::<settings::Hub>(data_dir).ok().flatten(),
-        )?;
-        Self::for_data_dir(&url, data_dir).ok()
-    }
-
-    /// Whether each contact is online, by endpoint ID. Empty when the hub
-    /// does not answer within `wait`.
     pub async fn presence(
         &self,
         wait: Duration,
-    ) -> std::collections::BTreeMap<String, bool> {
-        tokio::time::timeout(wait, self.contacts())
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|contact| (contact.endpoint, contact.online))
-            .collect()
+    ) -> Result<std::collections::BTreeMap<String, bool>, HubError> {
+        match tokio::time::timeout(wait, self.contacts()).await {
+            Ok(Ok(contacts)) => Ok(contacts
+                .into_iter()
+                .map(|contact| (contact.endpoint, contact.online))
+                .collect()),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(HubError::Unreachable),
+        }
     }
 
-    /// The hub's origin, without the final `/`.
     #[must_use]
     pub fn url(&self) -> String {
         self.origin.as_str().trim_end_matches('/').to_owned()
@@ -563,7 +214,6 @@ impl HubClient {
         parse(&self.send(Method::PUT, "/v1/listing", &[], Some(body)).await?)
     }
 
-    /// The listing of this node on the hub, or `None` when it has none.
     pub async fn listing(&self) -> Result<Option<HeldListing>, HubError> {
         self.require_protocol_2().await?;
         match self.send(Method::GET, "/v1/listing", &[], None).await {
@@ -573,13 +223,11 @@ impl HubClient {
         }
     }
 
-    /// Stops the listing of this node.
     pub async fn delete_listing(&self) -> Result<(), HubError> {
         self.require_protocol_2().await?;
         self.send(Method::DELETE, "/v1/listing", &[], None).await.map(drop)
     }
 
-    /// The listed service agents that match the words of `query`.
     pub async fn find_agents(
         &self,
         query: &str,
@@ -593,22 +241,18 @@ impl HubClient {
         parse::<AgentRows>(&body).map(|rows| rows.agents)
     }
 
-    /// The listed service agent with the full name `full_name`.
     pub async fn agent(&self, full_name: &str) -> Result<AgentRow, HubError> {
         let path = name_path("/v1/agents", full_name)?;
         self.require_protocol_2().await?;
         parse(&self.send(Method::GET, &path, &[], None).await?)
     }
 
-    /// The personal agent with the full name `full_name`.
     pub async fn person(&self, full_name: &str) -> Result<PersonRow, HubError> {
         let path = name_path("/v1/people", full_name)?;
         self.require_protocol_2().await?;
         parse(&self.send(Method::GET, &path, &[], None).await?)
     }
 
-    /// The personal agents that opted in to name search and whose name
-    /// starts with `prefix`.
     pub async fn find_people(&self, prefix: &str) -> Result<Vec<PersonRow>, HubError> {
         self.require_protocol_2().await?;
         let body = self.send(Method::GET, "/v1/people", &[("q", prefix)], None).await?;
@@ -630,7 +274,7 @@ impl HubClient {
         wait: Duration,
     ) -> Result<Invites, HubError> {
         let after = after.map(|version| version.to_string());
-        let wait = wait.as_secs().min(MAX_WAIT_SECONDS).to_string();
+        let wait = wait.as_secs().min(protocol::MAX_WAIT_SECONDS).to_string();
         let query = match &after {
             Some(after) => vec![("after", after.as_str()), ("wait", wait.as_str())],
             None => Vec::new(),
@@ -656,7 +300,6 @@ impl HubClient {
         parse(&self.send(Method::POST, "/v1/owner-links", &[], Some(body)).await?)
     }
 
-    /// The owner links and claims of this node, on either side.
     pub async fn owner_links(&self) -> Result<Vec<OwnerLink>, HubError> {
         self.require_protocol_2().await?;
         let body = self.send(Method::GET, "/v1/owner-links", &[], None).await?;
@@ -675,7 +318,6 @@ impl HubClient {
         parse(&self.send(Method::POST, &path, &[], Some(body)).await?)
     }
 
-    /// Removes the owner link or claim `id`.
     pub async fn delete_owner_link(&self, id: &str) -> Result<(), HubError> {
         let path = format!("/v1/owner-links/{}", segment(id)?);
         self.require_protocol_2().await?;
@@ -693,7 +335,6 @@ impl HubClient {
         parse(&self.send(Method::POST, "/v1/requests", &[], Some(body)).await?)
     }
 
-    /// The service agent approves the request `id` for `days` days.
     pub async fn approve(&self, id: &str, days: u64) -> Result<Invite, HubError> {
         let path = format!("/v1/invites/{}/approve", segment(id)?);
         self.require_protocol_2().await?;
@@ -718,7 +359,6 @@ impl HubClient {
         parse(&self.send(Method::POST, &path, &[], Some(body)).await?)
     }
 
-    /// The nodes this node is connected with through the hub.
     pub async fn contacts(&self) -> Result<Vec<Contact>, HubError> {
         let body = self.send(Method::GET, "/v1/contacts", &[], None).await?;
         parse::<Contacts>(&body).map(|contacts| contacts.contacts)
@@ -732,14 +372,12 @@ impl HubClient {
         self.send(Method::POST, &path, &[], None).await.map(drop)
     }
 
-    /// The endpoints that this node blocked.
     pub async fn blocks(&self) -> Result<Vec<Block>, HubError> {
         self.require_protocol_2().await?;
         let body = self.send(Method::GET, "/v1/blocks", &[], None).await?;
         parse::<Blocks>(&body).map(|blocks| blocks.blocks)
     }
 
-    /// Removes the block of `endpoint`.
     pub async fn unblock(&self, endpoint: &str) -> Result<(), HubError> {
         let endpoint =
             endpoint.parse::<iroh::EndpointId>().map_err(|_| HubError::Invalid)?;
@@ -748,7 +386,6 @@ impl HubClient {
         self.send(Method::DELETE, &path, &[], None).await.map(drop)
     }
 
-    /// Removes an invite: a decline, a cancel, or the end of a delivery.
     pub async fn remove(&self, id: &str) -> Result<(), HubError> {
         let path = format!("/v1/invites/{}", segment(id)?);
         self.send(Method::DELETE, &path, &[], None).await.map(drop)
@@ -769,16 +406,24 @@ impl HubClient {
             .ok_or(HubError::Unexpected)?
             .to_string();
         let signature = self.key.sign(
-            signed_message(method.as_str(), &signed_target(&url), &time, &body)
-                .as_bytes(),
+            protocol::hub_request_message(
+                method.as_str(),
+                &protocol::hub_sign_target(url.path(), url.query()),
+                &time,
+                &body,
+            )
+            .as_bytes(),
         );
         let mut request = self
             .client
             .request(method, url)
-            .header(PROTOCOL_HEADER, PROTOCOL_VERSION)
-            .header("x-aether-endpoint", self.endpoint_id())
-            .header("x-aether-time", time)
-            .header("x-aether-signature", URL_SAFE_NO_PAD.encode(signature.to_bytes()));
+            .header(protocol::PROTOCOL_HEADER, protocol::PROTOCOL_VERSION_HEADER)
+            .header(protocol::ENDPOINT_HEADER, self.endpoint_id())
+            .header(protocol::TIME_HEADER, time)
+            .header(
+                protocol::SIGNATURE_HEADER,
+                URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+            );
         if !body.is_empty() {
             request = request.header("content-type", "application/json").body(body);
         }
@@ -807,48 +452,23 @@ fn request_url(
     Ok(url)
 }
 
-/// The path and query that the node signs, as the hub reads them: the path,
-/// and `?` with the query only when the query is not empty
-/// (`path_and_query/1` in `server/lib/aether_hub/verify.ex`).
-fn signed_target(url: &Url) -> String {
-    match url.query() {
-        Some(query) if !query.is_empty() => format!("{}?{query}", url.path()),
-        _ => url.path().to_owned(),
-    }
-}
-
-/// The text that the hub verifies the signature against.
-fn signed_message(
-    method: &str,
-    path_and_query: &str,
-    time: &str,
-    body: &[u8],
-) -> String {
-    format!(
-        "aether-hub/v1\n{method}\n{path_and_query}\n{time}\n{}",
-        hex::encode(Sha256::digest(body))
-    )
-}
-
 fn status_error(status: StatusCode, body: &[u8]) -> HubError {
     #[derive(Deserialize)]
     struct ErrorBody {
         error: String,
     }
     let code = serde_json::from_slice::<ErrorBody>(body).map(|body| body.error).ok();
-    match (status, code.as_deref()) {
-        (StatusCode::UNAUTHORIZED, _) => HubError::Unauthorized,
-        (StatusCode::FORBIDDEN, Some("no_account")) => HubError::NoAccount,
-        (StatusCode::FORBIDDEN, _) => HubError::Forbidden,
-        (StatusCode::NOT_FOUND, _) => HubError::NotFound,
-        (StatusCode::CONFLICT, Some("limit")) => HubError::Limit,
-        (StatusCode::CONFLICT, _) => HubError::Taken,
-        (StatusCode::BAD_REQUEST | StatusCode::PAYLOAD_TOO_LARGE, _) => {
-            HubError::Invalid
-        }
-        (StatusCode::TOO_MANY_REQUESTS, _) => HubError::RateLimited,
-        (StatusCode::UPGRADE_REQUIRED, _) => HubError::OldNode,
-        _ => HubError::Unexpected,
+    match protocol::wire_error(status.as_u16(), code.as_deref()) {
+        protocol::HubWireError::Invalid => HubError::Invalid,
+        protocol::HubWireError::Unauthorized => HubError::Unauthorized,
+        protocol::HubWireError::NoAccount => HubError::NoAccount,
+        protocol::HubWireError::Forbidden => HubError::Forbidden,
+        protocol::HubWireError::NotFound => HubError::NotFound,
+        protocol::HubWireError::Taken => HubError::Taken,
+        protocol::HubWireError::Limit => HubError::Limit,
+        protocol::HubWireError::RateLimited => HubError::RateLimited,
+        protocol::HubWireError::OldNode => HubError::OldNode,
+        protocol::HubWireError::Unexpected => HubError::Unexpected,
     }
 }
 
@@ -905,42 +525,10 @@ fn parse_origin(origin: &str) -> Result<Url, HubError> {
     Ok(url)
 }
 
-/// Whether `name` can be the name part of a hub name:
-/// `^[a-z0-9][a-z0-9._-]{0,31}$`.
-#[must_use]
-pub fn valid_name_part(name: &str) -> bool {
-    let bytes = name.as_bytes();
-    (1..=32).contains(&bytes.len())
-        && bytes
-            .first()
-            .is_some_and(|first| first.is_ascii_lowercase() || first.is_ascii_digit())
-        && bytes.iter().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(byte)
-        })
-}
-
-/// The name and the number of a full hub name such as `ana#0042`. The hub
-/// never gives `0000`.
-#[must_use]
-pub fn split_full_name(full_name: &str) -> Option<(&str, u16)> {
-    let (name, number) = full_name.split_once('#')?;
-    (valid_name_part(name)
-        && number.len() == 4
-        && number.bytes().all(|byte| byte.is_ascii_digit()))
-    .then(|| number.parse::<u16>().ok())
-    .flatten()
-    .filter(|number| *number != 0)
-    .map(|number| (name, number))
-}
-
-/// Whether `full_name` is a full hub name such as `ana#0042`.
-#[must_use]
-pub fn valid_full_name(full_name: &str) -> bool {
-    split_full_name(full_name).is_some()
-}
-
 #[cfg(test)]
 pub(crate) mod test_hub;
+
+pub mod settings;
 
 #[cfg(test)]
 mod tests {
@@ -949,21 +537,22 @@ mod tests {
     use reqwest::StatusCode;
 
     use super::{
-        DEFAULT_HUB_URL, HubError, Invites, Origin, PROTOCOL_HEADER, PROTOCOL_VERSION,
-        Status, parse_origin, request_url, resolve_url, signed_message, signed_target,
-        split_full_name, status_error, test_hub::TestHub, valid_full_name,
-        valid_name_part,
+        DEFAULT_HUB_URL, HubError, Invites, NodeHub, Origin, PROTOCOL_HEADER,
+        PROTOCOL_VERSION_HEADER, Status, parse_origin, protocol, request_url,
+        resolve_url, status_error, test_hub::TestHub,
     };
 
     #[test]
-    fn the_hub_cache_follows_a_changed_url() {
+    fn the_node_hub_cache_follows_a_changed_url() {
+        use crate::hub_client::settings::Hub;
+        use crate::settings::store_setting;
+
         let directory = tempfile::tempdir().expect("directory must create");
-        let cache = super::HubCache::default();
-        for url in ["https://one.example", "https://one.example", "https://two.example"]
-        {
-            let client =
-                cache.client(url, directory.path()).expect("client must build");
-            assert_eq!(client.url(), url);
+        let hub = NodeHub::new(directory.path().to_path_buf(), None);
+        for url in ["https://one.example", "https://two.example"] {
+            store_setting::<Hub>(directory.path(), &Some(url.to_owned()))
+                .expect("store");
+            assert_eq!(hub.client().expect("hub").expect("url").url(), url);
         }
     }
 
@@ -976,7 +565,10 @@ mod tests {
             url.as_str(),
             "https://hub.example/v1/agents?q=review+go%231+%C3%BC%26x"
         );
-        assert_eq!(signed_target(&url), "/v1/agents?q=review+go%231+%C3%BC%26x");
+        assert_eq!(
+            protocol::hub_sign_target(url.path(), url.query()),
+            "/v1/agents?q=review+go%231+%C3%BC%26x"
+        );
     }
 
     #[tokio::test]
@@ -1011,7 +603,7 @@ mod tests {
         let origin = parse_origin("https://hub.example").expect("origin must parse");
         let url = request_url(&origin, "/v1/account", &[]).expect("url must build");
         assert_eq!(url.as_str(), "https://hub.example/v1/account");
-        assert_eq!(signed_target(&url), "/v1/account");
+        assert_eq!(protocol::hub_sign_target(url.path(), url.query()), "/v1/account");
 
         let hub = TestHub::start().await;
         let directory = tempfile::tempdir().expect("directory must create");
@@ -1058,7 +650,7 @@ mod tests {
         for request in &requests {
             assert_eq!(
                 request.headers.get(PROTOCOL_HEADER).map(String::as_str),
-                Some(PROTOCOL_VERSION),
+                Some(PROTOCOL_VERSION_HEADER),
                 "{}",
                 request.target
             );
@@ -1095,7 +687,12 @@ mod tests {
     #[test]
     fn the_signed_message_names_the_request_and_hashes_the_body() {
         assert_eq!(
-            signed_message("GET", "/v1/invites?after=3&wait=25", "1760000000", b""),
+            protocol::hub_request_message(
+                "GET",
+                "/v1/invites?after=3&wait=25",
+                "1760000000",
+                b"",
+            ),
             "aether-hub/v1\nGET\n/v1/invites?after=3&wait=25\n1760000000\n\
              e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
@@ -1118,15 +715,6 @@ mod tests {
                 Some(HubError::InvalidUrl),
                 "{origin}"
             );
-        }
-    }
-
-    #[test]
-    fn a_name_part_is_short_lowercase_and_starts_with_a_letter_or_digit() {
-        assert!(valid_name_part("bob"));
-        assert!(valid_name_part("0x.b_o-b"));
-        for name in ["", "Bob", "-bob", "bob smith", "bob#0042", &"b".repeat(33)] {
-            assert!(!valid_name_part(name), "{name}");
         }
     }
 
@@ -1157,18 +745,6 @@ mod tests {
     }
 
     #[test]
-    fn a_full_name_splits_into_name_and_number() {
-        assert_eq!(split_full_name("ana#0042"), Some(("ana", 42)));
-        assert_eq!(split_full_name("a.b-c#9999"), Some(("a.b-c", 9999)));
-        for bad in
-            ["ana", "ana#42", "ana#00042", "ana#0000", "Ana#0042", "ana#00a2", "#0042"]
-        {
-            assert_eq!(split_full_name(bad), None, "{bad}");
-            assert!(!valid_full_name(bad));
-        }
-    }
-
-    #[test]
     fn status_error_maps_limit_apart_from_taken() {
         assert_eq!(
             status_error(StatusCode::CONFLICT, br#"{"error":"limit"}"#),
@@ -1188,10 +764,6 @@ mod tests {
                 br#"{"error":"upgrade_required"}"#
             ),
             HubError::OldNode
-        );
-        assert_eq!(
-            status_error(StatusCode::CONFLICT, br#"{"error":"taken"}"#),
-            HubError::Taken
         );
     }
 }

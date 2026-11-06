@@ -6,7 +6,8 @@ use std::{
 };
 
 use aether_store::{
-    Admission, NodeStore, QueueLimits, StoreError, TaskInput, TaskState,
+    NodeStore, QueueLimits, StoreError, TaskAdmission as Admission, TaskInput,
+    TaskState,
 };
 use cucumber::{given, then, when};
 use tempfile::TempDir;
@@ -32,7 +33,6 @@ impl fmt::Debug for State {
 }
 
 impl State {
-    /// Runs blocking work with the store, off the scenario task.
     async fn with_store<R, F>(&self, work: F) -> R
     where
         R: Send + 'static,
@@ -53,9 +53,11 @@ fn input(id: &str) -> TaskInput {
 async fn open_store(world: &mut World) {
     let opened = blocking(|| {
         let root = tempfile::tempdir().expect("temporary directory must create");
-        let store =
-            NodeStore::open(root.path().join("node.sqlite")).expect("store must open");
-        store.put_scope("direct", "direct").expect("scope must store");
+        let store = NodeStore::open(root.path().join(aether_store::NODE_DATABASE))
+            .expect("store must open");
+        store
+            .put_scope("direct", aether_core::ScopeKind::Direct)
+            .expect("scope must store");
         (root, Arc::new(Mutex::new(store)))
     })
     .await;
@@ -87,8 +89,8 @@ async fn conflicting_request(world: &mut World, id: String) {
         .proof
         .queue
         .with_store(move |store| {
-            let conflicting =
-                TaskInput { request_id: "different-request".to_owned(), ..input(&id) };
+            let mut conflicting = input(&id);
+            conflicting.request.id = aether_core::RequestId::new("different-request");
             store.admit(&conflicting, LIMITS)
         })
         .await;
@@ -128,7 +130,7 @@ async fn cancels(world: &mut World, id: String) {
 
 #[then(expr = "task {string} is {word}")]
 async fn task_is(world: &mut World, id: String, state: String) {
-    let expected = state.parse::<TaskState>().expect("a known task state");
+    let expected = TaskState::parse(&state).expect("a known task state");
     let actual = world.proof.queue.with_store(move |store| store.state(&id)).await;
     assert_eq!(actual, Ok(expected));
 }
@@ -190,6 +192,9 @@ async fn events_after(world: &mut World, id: String, sequence: i64, expected: St
         .with_store(move |store| store.events_after(&id, sequence))
         .await
         .expect("events must reconnect");
-    let types = events.into_iter().map(|event| event.event_type).collect::<Vec<_>>();
+    let types = events
+        .into_iter()
+        .map(|event| event.event_type.as_str().to_owned())
+        .collect::<Vec<_>>();
     assert_eq!(types, names(&expected));
 }

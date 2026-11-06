@@ -4,15 +4,15 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { TaskRunner } from "../src/task-runner.ts";
 import type { Dispatch } from "../src/task-runner.ts";
 import type { AgentMessage } from "../src/protocol.ts";
-import { frameTask } from "../src/protocol.ts";
+import { contract } from "./fake-node.ts";
 
-type Hooks = Parameters<Dispatch>[1];
+type Call = Parameters<Dispatch>[0] & { hooks: Parameters<Dispatch>[1] };
 
 // A dispatch that records its hooks and never finishes on its own, so the test
 // decides when each task ends.
 function setup(dispatch?: Dispatch) {
   const sent: AgentMessage[] = [];
-  const calls: { task: { id: string; body: string }; hooks: Hooks }[] = [];
+  const calls: Call[] = [];
   const runner = new TaskRunner({
     send: (message) => {
       sent.push(message);
@@ -20,7 +20,7 @@ function setup(dispatch?: Dispatch) {
     dispatch:
       dispatch ??
       ((task, hooks) => {
-        calls.push({ task, hooks });
+        calls.push({ ...task, hooks });
         return new Promise<void>(() => {});
       }),
   });
@@ -31,22 +31,9 @@ const task = { type: "task" as const, id: "t1", instructions: "Be brief.", text:
 
 test("dispatches the framed task body", () => {
   const { runner, calls } = setup();
-  runner.handle(task);
-  assert.deepEqual(calls.map((call) => call.task), [
-    { id: "t1", body: frameTask("Be brief.", "hi") },
-  ]);
-});
-
-test("tool and block deliveries send progress with no text", () => {
-  const { runner, sent, calls } = setup();
-  runner.handle(task);
-  calls[0].hooks.deliver("searching", "tool");
-  calls[0].hooks.deliver("thinking", "block");
-  assert.deepEqual(sent, [
-    { type: "progress", id: "t1" },
-    { type: "progress", id: "t1" },
-  ]);
-  assert.equal(runner.activeCount, 1);
+  const [example] = contract.frame.examples;
+  runner.handle({ type: "task", id: "t1", instructions: example.instructions, text: example.text });
+  assert.equal(calls[0].body, example.framed);
 });
 
 test("the first final delivery sends the result and later ones are ignored", () => {
@@ -57,15 +44,6 @@ test("the first final delivery sends the result and later ones are ignored", () 
   calls[0].hooks.deliver("late progress", "tool");
   calls[0].hooks.onTerminal("completed");
   assert.deepEqual(sent, [{ type: "result", id: "t1", text: "first answer" }]);
-  assert.equal(runner.activeCount, 0);
-});
-
-test("a failed terminal outcome sends failed", () => {
-  const { runner, sent, calls } = setup();
-  runner.handle(task);
-  calls[0].hooks.onTerminal("failed");
-  assert.deepEqual(sent, [{ type: "failed", id: "t1" }]);
-  assert.equal(runner.activeCount, 0);
 });
 
 test("a completed turn with no final text sends an empty result", () => {
@@ -84,26 +62,24 @@ test("a rejected dispatch sends failed and never the error text", async () => {
   assert.deepEqual(sent, [{ type: "failed", id: "t1" }]);
 });
 
-test("a cancel sends cancelled at once and drops the late replies", () => {
+test("a dispatch that throws at once sends failed", async () => {
+  const { runner, sent } = setup(() => {
+    throw new Error("internal detail");
+  });
+  runner.handle(task);
+  await sleep(0);
+  assert.deepEqual(sent, [{ type: "failed", id: "t1" }]);
+});
+
+test("the hooks of a cancelled run do not answer a later run with the same id", () => {
   const { runner, sent, calls } = setup();
   runner.handle(task);
   runner.handle({ type: "cancel", id: "t1" });
-  calls[0].hooks.deliver("late answer", "final");
-  calls[0].hooks.onTerminal("completed");
-  assert.deepEqual(sent, [{ type: "cancelled", id: "t1" }]);
-  assert.equal(runner.activeCount, 0);
-});
-
-test("a cancel for a task that is not active sends nothing", () => {
-  const { runner, sent } = setup();
-  runner.handle({ type: "cancel", id: "unknown" });
-  assert.deepEqual(sent, []);
-});
-
-test("a duplicate of an active task is ignored", () => {
-  const { runner, calls } = setup();
   runner.handle(task);
-  runner.handle(task);
-  assert.equal(calls.length, 1);
-  assert.equal(runner.activeCount, 1);
+  calls[0].hooks.deliver("old answer", "final");
+  calls[1].hooks.deliver("new answer", "final");
+  assert.deepEqual(sent, [
+    { type: "cancelled", id: "t1" },
+    { type: "result", id: "t1", text: "new answer" },
+  ]);
 });

@@ -35,18 +35,19 @@ use topcoat::{
 use tower::util::MapResponse;
 
 mod advanced;
+mod audit;
 mod caller;
 mod host;
 pub(crate) mod hub;
-mod listing;
+mod layout;
+pub(crate) mod listing;
 mod pact;
+mod shared;
 
 use crate::admin::SharedAdministration;
-use crate::admin_components::status_dot;
-use crate::node_config::settings;
 use advanced::dashboard;
 use caller::caller_screen;
-use host::host_screen;
+use host::{Notice, host_screen};
 
 const UI_SESSION_LIFETIME: Duration = Duration::from_secs(3_600);
 /// Matches the `DefaultBodyLimit` of `UI_HARDENING`: both cap the same
@@ -62,9 +63,8 @@ const UI_HARDENING: crate::https::Hardening = crate::https::Hardening {
 /// Copies a `data-copy-text` value on click and says so in the button's
 /// `data-copy-label`. Only the Advanced page, which has `#activity-status`,
 /// opens the activity stream.
-const ADMIN_JAVASCRIPT: &str = "document.addEventListener('click',async event=>{const button=event.target.closest('[data-copy-text]');if(!button)return;const label=button.querySelector('[data-copy-label]')||button;const text=label.textContent;try{await navigator.clipboard.writeText(button.dataset.copyText);label.textContent='Copied'}catch{label.textContent='Select and copy'}setTimeout(()=>{label.textContent=text},1600)});const status=document.getElementById('activity-status');if(status){const events=new EventSource('/events');events.addEventListener('ready',()=>{status.textContent='Activity updates are connected.'});events.addEventListener('audit',event=>{status.textContent=JSON.parse(event.data).entry});events.addEventListener('task',event=>{const task=JSON.parse(event.data);status.textContent=`Task ${task.taskId}: ${task.event}`});events.onerror=()=>{status.textContent='Activity updates will retry.'}}if(document.querySelector('[data-hub-waiting]')){const reload=()=>{const active=document.activeElement;if(active&&active.matches('input,select,textarea')&&active.value){setTimeout(reload,4000);return}location.assign('/')};setTimeout(reload,4000)}const dots=document.querySelectorAll('[data-presence]');if(dots.length){const update=async()=>{try{const answer=await fetch('/hub/presence');if(!answer.ok)return;const presence=await answer.json();for(const dot of dots){const online=presence[dot.dataset.presence];dot.dataset.state=online===undefined?'unknown':online?'online':'offline';dot.querySelector('[data-presence-label]').textContent=online===undefined?'':online?'Online':'Offline'}}catch{}};update();setInterval(update,15000)}";
+const ADMIN_JAVASCRIPT: &str = "document.addEventListener('click',async event=>{const button=event.target.closest('[data-copy-text]');if(!button)return;const label=button.querySelector('[data-copy-label]')||button;const text=label.textContent;try{await navigator.clipboard.writeText(button.dataset.copyText);label.textContent='Copied'}catch{label.textContent='Select and copy'}setTimeout(()=>{label.textContent=text},1600)});const status=document.getElementById('activity-status');if(status){const events=new EventSource('/events');events.addEventListener('ready',()=>{status.textContent='Activity updates are connected.'});events.addEventListener('audit',event=>{status.textContent=JSON.parse(event.data).entry});events.addEventListener('task',event=>{const task=JSON.parse(event.data);status.textContent=`Task ${task.taskId}: ${task.event}`});events.addEventListener('unavailable',()=>{status.textContent='Activity updates cannot read the administration store.'});events.onerror=()=>{status.textContent='Activity updates will retry.'}}if(document.querySelector('[data-hub-waiting]')){const reload=()=>{const active=document.activeElement;if(active&&active.matches('input,select,textarea')&&active.value){setTimeout(reload,4000);return}location.assign('/')};setTimeout(reload,4000)}const dots=document.querySelectorAll('[data-presence]');if(dots.length){const update=async()=>{try{const answer=await fetch('/hub/presence');if(!answer.ok)return;const presence=await answer.json();for(const dot of dots){const online=presence[dot.dataset.presence];dot.dataset.state=online===undefined?'unknown':online?'online':'offline';dot.querySelector('[data-presence-label]').textContent=online===undefined?'':online?'Online':'Offline'}}catch{}};update();setInterval(update,15000)}";
 
-// -- Bridging a topcoat `Router` into the existing axum + TLS server --
 //
 // topcoat has no TLS of its own; its docs point at fronting it with a
 // reverse proxy. Here the "reverse proxy" is the axum server this module
@@ -87,9 +87,7 @@ fn ui_service(router: TopcoatRouter) -> UiService {
 /// headers every response carries, success or error alike. topcoat's
 /// `Router::handle` already turns a handler `Err` into a concrete
 /// `Response` (its own status-code mapping), so by the time a response
-/// reaches this function there is no error case left to special-case: this
-/// single conversion point is what `into_axum` was in the hand-rolled
-/// version.
+/// reaches this function there is no error case left to special-case.
 fn into_axum_response(response: topcoat::router::response::Response) -> AxumResponse {
     let mut response = response.map(axum::body::Body::new);
     let headers = response.headers_mut();
@@ -105,8 +103,6 @@ fn into_axum_response(response: topcoat::router::response::Response) -> AxumResp
     response
 }
 
-// -- App context: the values every topcoat handler reaches for --
-
 /// The loopback port this admin UI is bound to, so the host-check layer can
 /// reject a request that names a different port (or host) even though it
 /// physically arrived on the loopback interface.
@@ -118,9 +114,8 @@ struct Managed(bool);
 /// The single admin session this process trusts, recorded the way
 /// topcoat's session docs ask: topcoat carries the token, the application
 /// owns the record. This admin UI has no login step and no user account —
-/// whichever browser first loads the page is trusted, the same way the
-/// hand-rolled version minted one session at process start — so there is
-/// exactly one slot rather than a table keyed by token hash.
+/// whichever browser first loads the page is trusted, so there is exactly
+/// one slot rather than a table keyed by token hash.
 struct AdminSession {
     hash: TokenHash,
     expires_at: SystemTime,
@@ -160,8 +155,7 @@ impl AdminSessionSlot {
 
 /// Maps a one-time opaque token to the real (possibly sensitive) pending
 /// change id, so the rendered page never carries the real id — see
-/// `pending_changes_show_no_secret_value`. Rebuilt on every home-page
-/// render, exactly as the hand-rolled `LocalUi::confirmations` was.
+/// `pending_changes_show_no_secret_value`. Rebuilt on every home-page render.
 struct AdminConfirmations(Mutex<BTreeMap<String, String>>);
 
 impl AdminConfirmations {
@@ -195,9 +189,6 @@ fn confirmation_token() -> TopcoatResult<String> {
     Ok(hex::encode(bytes))
 }
 
-// -- Layers: the transport-level concerns topcoat's own docs say belong
-// here rather than in a page or route function --
-
 /// Rejects a request whose `Host` header does not name this exact loopback
 /// address. This is independent of topcoat's own `OriginPolicy` (which the
 /// router applies to every request before any layer runs, and which only
@@ -224,8 +215,7 @@ async fn enforce_loopback_host(
 
 /// Requires a valid admin session. Combined with topcoat's default
 /// `OriginPolicy` (same-origin only for anything but `GET`/`HEAD`/
-/// `OPTIONS`), this replaces the hand-rolled hidden `csrf` field entirely:
-/// there is no longer a second secret to compare, because the origin check
+/// `OPTIONS`), so there is no separate CSRF token: the origin check
 /// and the session cookie (`HttpOnly`, so no script on any origin can read
 /// it to forge the header) already establish both "this request came from
 /// our own page" and "this browser holds our session".
@@ -248,8 +238,7 @@ async fn require_admin_session(cx: &Cx) -> TopcoatResult<()> {
 
 /// Establishes (or slides the expiry of) the one admin session this process
 /// trusts. There is no login form: whichever browser first loads the page
-/// is the operator, exactly as the hand-rolled version minted its one
-/// session at process start rather than on a credential check.
+/// is the operator.
 async fn ensure_admin_session(cx: &Cx) -> TopcoatResult<()> {
     let sessions = app_context::<Arc<AdminSessionSlot>>(cx);
     if let Some(hash) = session::token_hash(cx).await?
@@ -264,8 +253,6 @@ async fn ensure_admin_session(cx: &Cx) -> TopcoatResult<()> {
     sessions.store(session);
     Ok(())
 }
-
-// -- Layout and pages --
 
 #[layout("/")]
 async fn root_layout(slot: Slot<'_>) -> TopcoatResult<impl View> {
@@ -292,122 +279,20 @@ async fn root_layout(slot: Slot<'_>) -> TopcoatResult<impl View> {
     })
 }
 
-/// The page a [`node_header`] marks as the current one.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-pub(super) enum Tab {
-    /// The host screen: who can use the agent.
-    #[default]
-    Sharing,
-    /// The caller screen: the agents this computer can use.
-    Agents,
-    /// The Advanced page.
-    Advanced,
-}
-
-/// The bar on top of every page: the product, one tab for each screen that
-/// this mode has, with the count of what waits on it, and on the right how
-/// the node is reached and its name on Aether.
 #[component]
-pub(super) async fn node_header(cx: &Cx, current: Tab) -> TopcoatResult<impl View> {
-    let Host(host) = app_context::<Host>(cx);
-    let Caller(caller) = app_context::<Caller>(cx);
-    let data_dir = host
-        .as_ref()
-        .map(|host| host.data_dir.clone())
-        .or_else(|| caller.as_ref().map(|caller| caller.data_dir.clone()));
-    let drafts = caller.as_ref().map_or(0, |caller| {
-        let now = aether_core::time::unix_seconds(SystemTime::now()).unwrap_or(0);
-        caller::request_drafts_of(&caller.data_dir, now).len()
-    });
-    let pending = app_context::<SharedAdministration>(cx)
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .pending()
-        .len();
-    let relay_host = host.as_ref().map(|host| {
-        host.relay_url().map(|url| {
-            reqwest::Url::parse(&url)
-                .ok()
-                .and_then(|url| url.host_str().map(str::to_owned))
-                .unwrap_or(url)
-        })
-    });
-    let name = data_dir.as_deref().and_then(|dir| {
-        crate::node_config::setting::<settings::HubName>(dir).ok().flatten()
-    });
-    let tabs = host.is_some() || caller.is_some();
-    let agents_href = if host.is_some() { "/agents" } else { "/" };
-    Ok(view! {
-        <header class="border-b border-border">
-            <div class="mx-auto flex min-h-14 max-w-6xl flex-wrap items-center gap-x-6 gap-y-2 px-4 sm:px-8">
-                <a href="/" class="text-base font-semibold tracking-tight text-foreground no-underline">"Aether"</a>
-                if tabs {
-                    <nav aria-label="Pages" class="-mb-px flex self-stretch overflow-x-auto">
-                        if host.is_some() {
-                            node_tab(href: "/", current: current == Tab::Sharing, "Who can use your agent")
-                        }
-                        if caller.is_some() {
-                            node_tab(
-                                href: agents_href,
-                                current: current == Tab::Agents,
-                                "Agents you use"
-                                if drafts > 0 {
-                                    <span
-                                        class="flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-primary px-1.5 text-[11px] font-semibold text-primary-foreground"
-                                        aria-label=(format!("{drafts} requests wait"))
-                                    >(drafts)</span>
-                                }
-                            )
-                        }
-                        node_tab(
-                            href: "/advanced",
-                            current: current == Tab::Advanced,
-                            "Advanced"
-                            if pending > 0 {
-                                <span
-                                    class="flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-warning px-1.5 text-[11px] font-semibold text-primary-foreground"
-                                    aria-label=(format!("{pending} changes wait"))
-                                >(pending)</span>
-                            }
-                        )
-                    </nav>
-                }
-                <span class="flex-1"></span>
-                <div class="flex flex-wrap items-center gap-x-4 gap-y-1 py-2 text-sm">
-                    if let Some(relay_host) = &relay_host {
-                        match relay_host {
-                            Some(reached_through) => status_dot(ok: true, text: format!("Reachable through {reached_through}")),
-                            None => status_dot(ok: false, text: "No relay: only your network can reach it"),
-                        }
-                    }
-                    if let Some(name) = &name {
-                        <span class="rounded-md border border-border bg-background px-2.5 py-1 font-mono text-[13px] text-foreground">(name)</span>
-                    }
-                </div>
-            </div>
-        </header>
-    })
-}
-
-/// One tab of the [`node_header`]: a link that underlines the current page.
-#[component]
-async fn node_tab(
-    href: &'static str,
-    current: bool,
-    #[default] child: topcoat::view::Child<'_>,
+async fn hub_form_screen(
+    cx: &Cx,
+    #[default] error: String,
+    #[default] setting_error: String,
 ) -> TopcoatResult<impl View> {
+    let Page(page) = app_context::<Page>(cx);
+    let hosting = page.as_ref().is_some_and(|page| page.host_ui);
     Ok(view! {
-        <a
-            href=(href)
-            aria-current=(current.then_some("page"))
-            class=(if current {
-                "flex items-center gap-2 border-b-2 border-primary px-3 text-sm font-medium whitespace-nowrap text-foreground no-underline"
-            } else {
-                "flex items-center gap-2 border-b-2 border-transparent px-3 text-sm whitespace-nowrap text-muted-foreground no-underline hover:text-foreground"
-            })
-        >
-            (child)
-        </a>
+        if hosting {
+            host_screen(notice: Notice::hub(error.clone(), setting_error.clone()))
+        } else {
+            caller_screen(hub_error: error.clone(), hub_setting_error: setting_error.clone())
+        }
     })
 }
 
@@ -416,13 +301,11 @@ async fn node_tab(
 /// set.
 #[page("/")]
 async fn home(cx: &Cx) -> TopcoatResult<impl View> {
-    let Host(host) = app_context::<Host>(cx);
-    let Caller(caller) = app_context::<Caller>(cx);
-    let (hosting, calling) = (host.is_some(), caller.is_some());
+    let Page(page) = app_context::<Page>(cx);
     Ok(view! {
-        if hosting {
+        if page.as_ref().is_some_and(|page| page.host_ui) {
             host_screen()
-        } else if calling {
+        } else if page.as_ref().is_some_and(|page| page.caller) {
             caller_screen()
         } else {
             dashboard()
@@ -432,9 +315,12 @@ async fn home(cx: &Cx) -> TopcoatResult<impl View> {
 
 #[page("/agents")]
 async fn agents(cx: &Cx) -> TopcoatResult<impl View> {
-    let Caller(Some(_)) = app_context::<Caller>(cx) else {
+    let Page(Some(page)) = app_context::<Page>(cx) else {
         return Err(forbidden().into());
     };
+    if !page.caller {
+        return Err(forbidden().into());
+    }
     Ok(view! { caller_screen() })
 }
 
@@ -511,6 +397,8 @@ struct ActivityFeed {
     ready: VecDeque<Event>,
     audited: tokio::sync::watch::Receiver<()>,
     tasks: Option<tokio::sync::broadcast::Receiver<String>>,
+    /// Whether the last read failed, so the page hears it once per outage.
+    unavailable: bool,
 }
 
 impl ActivityFeed {
@@ -520,7 +408,14 @@ impl ActivityFeed {
                 administration.lock().unwrap_or_else(PoisonError::into_inner);
             (administration.watch_audit(), administration.subscribe_task_events())
         };
-        Self { administration, cursor, ready: VecDeque::new(), audited, tasks }
+        Self {
+            administration,
+            cursor,
+            ready: VecDeque::new(),
+            audited,
+            tasks,
+            unavailable: false,
+        }
     }
 
     async fn next(mut self) -> Option<(TopcoatResult<Event>, Self)> {
@@ -536,14 +431,26 @@ impl ActivityFeed {
 
     /// Queues the next batch of events. Returns `false` when there is none.
     fn read_batch(&mut self) -> bool {
-        let (audit, tasks) = {
+        let read = {
             let administration =
                 self.administration.lock().unwrap_or_else(PoisonError::into_inner);
-            (
-                administration.audit_page(self.cursor.audit, ACTIVITY_BATCH),
-                administration.task_activity_after(self.cursor.task, ACTIVITY_BATCH),
+            administration.audit_page(self.cursor.audit, ACTIVITY_BATCH).and_then(
+                |audit| {
+                    administration
+                        .task_activity_after(self.cursor.task, ACTIVITY_BATCH)
+                        .map(|tasks| (audit, tasks))
+                },
             )
         };
+        let Ok((audit, tasks)) = read else {
+            let first = !self.unavailable;
+            self.unavailable = true;
+            if first {
+                self.ready.push_back(Event::new().event("unavailable").data("{}"));
+            }
+            return first;
+        };
+        self.unavailable = false;
         let found = !audit.is_empty() || !tasks.is_empty();
         for entry in audit {
             self.cursor.audit = self.cursor.audit.saturating_add(1);
@@ -560,7 +467,7 @@ impl ActivityFeed {
                 Event::new().id(self.cursor.id()).event("task").data(
                     serde_json::json!({
                         "taskId": task.task_id,
-                        "event": task.event_type,
+                        "event": task.event_type.as_str(),
                     })
                     .to_string(),
                 ),
@@ -594,8 +501,6 @@ impl ActivityFeed {
     }
 }
 
-// -- Assembly --
-
 /// Everything the admin UI needs: the finished topcoat `Router` and the two
 /// handles tests use to reach into its app context (production code only
 /// needs the router itself).
@@ -614,68 +519,75 @@ pub type RelayFuture =
 pub type RelaySwitcher =
     Arc<dyn Fn(Option<String>, Option<String>) -> RelayFuture + Send + Sync>;
 
-/// What the host side of the UI needs from the running node.
-///
-/// Its data directory holds the issuer, endpoint and discovery keys, and the
-/// relay is the one it listens through. `node admin` has no running node and
-/// passes none.
-pub struct HostContext {
+pub use crate::hub_client::HubAccess;
+
+pub struct PageContext {
     pub data_dir: PathBuf,
     pub task_folder_mode: bool,
-    /// The `--invite-name` value: the agent name in invites while this
-    /// node has no name on the hub. It must pass
-    /// [`crate::direct::valid_name`].
+    pub host_ui: bool,
+    pub caller: bool,
     name: Option<String>,
     relay_url: Mutex<Option<String>>,
     switch_relay: RelaySwitcher,
-    /// The hub that matches people by name, when one is set.
-    hub: HubSlot,
-    /// Held while the hub worker checks, signs, and pins one row, and while
-    /// the owner blocks a requester, so that a block cannot land between
-    /// the worker's block check and its grant.
-    hub_sign: Mutex<()>,
+    hub: Arc<crate::hub_client::NodeHub>,
+    hub_sign: Arc<Mutex<()>>,
 }
 
-impl HostContext {
+impl PageContext {
     #[must_use]
-    pub fn new(
+    pub fn host(
         data_dir: PathBuf,
         name: Option<String>,
         relay_url: Option<String>,
         switch_relay: RelaySwitcher,
+        hub: Arc<crate::hub_client::NodeHub>,
+        hub_sign: Arc<Mutex<()>>,
     ) -> Self {
-        let hub = HubSlot::new(data_dir.clone());
         Self {
             data_dir,
             task_folder_mode: false,
+            host_ui: true,
+            caller: false,
             name,
             relay_url: Mutex::new(relay_url),
             switch_relay,
             hub,
-            hub_sign: Mutex::new(()),
+            hub_sign,
         }
     }
 
-    /// The name an invited person knows this node by: its name on the hub,
-    /// else the `--invite-name` value, else `agent-` and the start of the
-    /// endpoint ID. The hub name comes first, so invites carry the name that
-    /// people find this node by.
-    pub(super) fn agent_name(&self) -> String {
-        crate::node_config::setting::<settings::HubName>(&self.data_dir)
-            .ok()
-            .flatten()
-            .or_else(|| self.name.clone())
-            .unwrap_or_else(|| {
-                crate::direct::default_agent_name(
-                    &crate::direct::endpoint_id(&self.data_dir).unwrap_or_default(),
-                )
-            })
+    #[must_use]
+    pub fn admin_caller(data_dir: PathBuf) -> Self {
+        let hub = Arc::new(crate::hub_client::NodeHub::new(data_dir.clone(), None));
+        Self {
+            data_dir,
+            task_folder_mode: false,
+            host_ui: false,
+            caller: true,
+            name: None,
+            relay_url: Mutex::new(None),
+            switch_relay: Arc::new(|_, _| Box::pin(async { Ok(()) })),
+            hub,
+            hub_sign: Arc::new(Mutex::new(())),
+        }
     }
 
-    /// Lets people invite and connect by name through `hub`.
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn with_caller(mut self, enabled: bool) -> Self {
+        self.caller = enabled;
+        self
+    }
+
+    pub(crate) fn agent_name(&self) -> String {
+        crate::invites::invite_agent_name(&self.data_dir, self.name.as_deref())
+    }
+
     #[must_use]
     pub fn with_hub(self, hub: Option<crate::hub_client::HubClient>) -> Self {
-        self.hub.set(hub);
+        if let Some(client) = hub {
+            let _ = self.hub.as_ref().prime(client);
+        }
         self
     }
 
@@ -685,20 +597,51 @@ impl HostContext {
         self
     }
 
-    /// The relay the node listens through now.
-    fn relay_url(&self) -> Option<String> {
-        crate::node_config::setting::<settings::ActiveRelay>(&self.data_dir)
+    pub(super) fn hub_access(&self) -> HubAccess {
+        self.hub.access()
+    }
+
+    pub(crate) fn current_hub(&self) -> Option<crate::hub_client::HubClient> {
+        match self.hub_access() {
+            HubAccess::Ready(client) => Some(*client),
+            HubAccess::Off | HubAccess::Unavailable => None,
+        }
+    }
+
+    pub(super) fn set_hub(&self, hub: Option<crate::hub_client::HubClient>) {
+        if let Some(client) = hub {
+            let _ = self.hub.as_ref().prime(client);
+        }
+    }
+
+    pub(crate) const fn hub_sign(&self) -> &Arc<Mutex<()>> {
+        &self.hub_sign
+    }
+
+    #[cfg(test)]
+    pub(crate) fn worker_context(
+        &self,
+    ) -> Arc<crate::node_serve_context::NodeServeContext> {
+        Arc::new(crate::node_serve_context::NodeServeContext {
+            data_dir: self.data_dir.clone(),
+            hub: Arc::clone(&self.hub),
+            hub_sign: Arc::clone(&self.hub_sign),
+            caller: self.caller,
+        })
+    }
+
+    pub(super) fn relay_url(&self) -> Option<String> {
+        crate::settings::setting::<crate::transport::relay::ActiveRelay>(&self.data_dir)
             .unwrap_or_else(|_| {
                 self.relay_url.lock().unwrap_or_else(PoisonError::into_inner).clone()
             })
     }
 
-    /// Moves the running node to `relay` and keeps it for the next start.
-    async fn set_relay_url(
+    pub(super) async fn set_relay_url(
         &self,
         relay: Option<String>,
     ) -> Result<(), crate::transport::TransportError> {
-        crate::node_config::apply_relay(
+        crate::transport::relay::apply_relay(
             &self.data_dir,
             &relay,
             (self.switch_relay)(self.relay_url(), relay.clone()),
@@ -709,84 +652,10 @@ impl HostContext {
     }
 }
 
-/// The hub a page uses now. The settings form can change it while the page
-/// runs, so the workers read it again before each request.
-struct HubSlot {
-    data_dir: PathBuf,
-    state: Mutex<HubState>,
-}
-
-#[derive(Default)]
-struct HubState {
-    client: Option<crate::hub_client::HubClient>,
-    stored_url: Option<String>,
-}
-
-impl HubSlot {
-    fn new(data_dir: PathBuf) -> Self {
-        let stored_url =
-            crate::node_config::setting::<settings::Hub>(&data_dir).ok().flatten();
-        Self { data_dir, state: Mutex::new(HubState { client: None, stored_url }) }
-    }
-
-    fn get(&self) -> Option<crate::hub_client::HubClient> {
-        let stored_url =
-            crate::node_config::setting::<settings::Hub>(&self.data_dir).ok().flatten();
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if state.stored_url != stored_url {
-            state.client = crate::hub_client::resolve_url(None, stored_url.clone())
-                .and_then(|url| {
-                    crate::hub_client::HubClient::for_data_dir(&url, &self.data_dir)
-                        .ok()
-                });
-            state.stored_url = stored_url;
-        }
-        state.client.clone()
-    }
-
-    fn set(&self, hub: Option<crate::hub_client::HubClient>) {
-        let stored_url =
-            crate::node_config::setting::<settings::Hub>(&self.data_dir).ok().flatten();
-        *self.state.lock().unwrap_or_else(PoisonError::into_inner) =
-            HubState { client: hub, stored_url };
-    }
-}
-
-/// What the caller side of the UI needs: the caller's own data directory.
-///
-/// The directory holds its endpoint key and imported contacts. The page
-/// connects a caller to a host; sending tasks is the job of agents (MCP) and
-/// the CLI.
-pub struct CallerContext {
-    pub data_dir: PathBuf,
-    /// The hub that matches people by name, when one is set.
-    hub: HubSlot,
-}
-
-impl CallerContext {
-    #[must_use]
-    pub fn new(data_dir: PathBuf) -> Self {
-        Self { hub: HubSlot::new(data_dir.clone()), data_dir }
-    }
-
-    /// Lets this person accept invites by name through `hub`.
-    #[must_use]
-    pub fn with_hub(self, hub: Option<crate::hub_client::HubClient>) -> Self {
-        self.hub.set(hub);
-        self
-    }
-}
-
-/// How to serve the admin UI.
 #[derive(Default)]
 pub struct UiOptions {
-    /// Show the managed scope's members and invitations.
     pub managed: bool,
-    /// Show the host forms: invite a friend.
-    pub host: Option<HostContext>,
-    /// Show the caller forms: import an invitation.
-    pub caller: Option<CallerContext>,
-    /// Serve the PACT consent page, and publish its origin to the gateway.
+    pub page: Option<Arc<PageContext>>,
     pub pact: Option<PactUi>,
 }
 
@@ -798,31 +667,16 @@ pub struct PactUi {
     pub link: Arc<crate::pact::consent::ConsentLink>,
 }
 
-struct Host(Option<Arc<HostContext>>);
+pub(super) struct Page(pub Option<Arc<PageContext>>);
 
 struct Pact(Option<Arc<crate::pact::consent::PactConsent>>);
-
-struct Caller(Option<Arc<CallerContext>>);
 
 fn build_admin_ui(
     administration: SharedAdministration,
     options: UiOptions,
     port: u16,
 ) -> AdminUi {
-    let UiOptions { managed, host, caller, pact } = options;
-    let caller = caller.map(Arc::new);
-    let host = host.map(Arc::new);
-    // Each side follows its invites on the hub while the page runs. The
-    // hub can be set later on the page, so the workers start without one.
-    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-        if let Some(host) = &host {
-            runtime.spawn(hub::host_worker(administration.clone(), Arc::clone(host)));
-            runtime.spawn(listing::listing_worker(Arc::clone(host)));
-        }
-        if let Some(caller) = &caller {
-            runtime.spawn(hub::caller_worker(Arc::clone(caller)));
-        }
-    }
+    let UiOptions { managed, page, pact } = options;
     if let Some(pact) = &pact {
         pact.link.set(format!("https://127.0.0.1:{port}"));
     }
@@ -845,6 +699,7 @@ fn build_admin_ui(
         .page(home)
         .page(agents)
         .page(advanced::advanced)
+        .page(audit::audit)
         .page(advanced::confirm)
         .page(advanced::cancel)
         .page(advanced::save_policy)
@@ -854,7 +709,7 @@ fn build_admin_ui(
         .page(host::workspace)
         .page(host::relay)
         .page(host::save_card)
-        .page(listing::publish_listing)
+        .page(host::publish_listing)
         .page(caller::import)
         .page(caller::remove_contact)
         .page(caller::confirm_request)
@@ -862,7 +717,7 @@ fn build_admin_ui(
         .page(hub::claim_name)
         .page(hub::set_search)
         .page(hub::invite_by_name)
-        .page(hub::accept_invite)
+        .page(caller::accept_invite)
         .page(hub::remove_invite)
         .page(hub::block_invite)
         .page(hub::approve_request)
@@ -880,8 +735,7 @@ fn build_admin_ui(
         .route(stylesheet)
         .app_context(administration)
         .app_context(Managed(managed))
-        .app_context(Host(host))
-        .app_context(Caller(caller))
+        .app_context(Page(page))
         .app_context(Pact(pact.map(|pact| pact.consent)))
         .app_context(AdminPort(port))
         .app_context(Arc::clone(&sessions))
@@ -944,12 +798,7 @@ fn router(state: UiState) -> AxumRouter {
 }
 
 fn tls_config(data_dir: &Path) -> io::Result<Arc<ServerConfig>> {
-    let (certificate, key) = crate::key_file::self_signed_cert(
-        data_dir,
-        "admin-cert.der",
-        "admin-key.der",
-        &["localhost", "127.0.0.1"],
-    )?;
+    let (certificate, key) = crate::data_dir::DataDir::new(data_dir).admin_tls()?;
     let config = ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -970,7 +819,10 @@ fn tls_config(data_dir: &Path) -> io::Result<Arc<ServerConfig>> {
     reason = "test fixtures hold a lock only while they set up; nothing contends"
 )]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -980,38 +832,111 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{
-        AdminUi, CallerContext, HostContext, HubSlot, UiOptions, UiState,
-        build_admin_ui, router, tls_config, ui_service,
+        AdminUi, PageContext, UiOptions, UiState, build_admin_ui, router, tls_config,
+        ui_service,
     };
     use crate::admin::{
         ChangeRequest, SharedAdministration, shared_with_store,
         test_support::{FakeNode, shared_in},
     };
-    use crate::node_config::settings;
     use aether_store::{
         AuditActor, AuditResult, ManagedMember, NodeStore, QueueLimits, TaskInput,
     };
 
     const PORT: u16 = 3000;
 
+    fn test_node_hub(
+        data_dir: &std::path::Path,
+        hub_flag: Option<String>,
+    ) -> Arc<crate::hub_client::NodeHub> {
+        Arc::new(crate::hub_client::NodeHub::new(data_dir.to_path_buf(), hub_flag))
+    }
+
+    fn test_host_page(
+        data_dir: std::path::PathBuf,
+        name: Option<String>,
+        relay_url: Option<String>,
+        switch_relay: crate::admin_ui::RelaySwitcher,
+        hub_flag: Option<String>,
+    ) -> PageContext {
+        let hub = test_node_hub(&data_dir, hub_flag);
+        PageContext::host(
+            data_dir,
+            name,
+            relay_url,
+            switch_relay,
+            hub,
+            Arc::new(Mutex::new(())),
+        )
+    }
+
     #[test]
-    fn hub_slot_reads_a_saved_change_without_restarting_the_page() {
+    fn the_page_hub_reads_a_saved_change_without_restarting_the_page() {
         let directory = tempfile::tempdir().expect("directory must create");
-        let slot = HubSlot::new(directory.path().to_path_buf());
-        slot.set(Some(
+        let _ = crate::data_dir::DataDir::new(directory.path()).endpoint_key();
+        let page = test_host_page(
+            directory.path().to_path_buf(),
+            None,
+            None,
+            Arc::new(|_, _| Box::pin(async { Ok(()) })),
+            None,
+        )
+        .with_hub(Some(
             crate::hub_client::HubClient::for_data_dir(
                 crate::hub_client::DEFAULT_HUB_URL,
                 directory.path(),
             )
             .expect("hub client must create"),
         ));
-        assert!(slot.get().is_some());
-        crate::node_config::store_setting::<settings::Hub>(
+        assert!(page.current_hub().is_some());
+        crate::settings::store_setting::<crate::hub_client::settings::Hub>(
             directory.path(),
             &Some("off".to_owned()),
         )
         .expect("hub choice must save");
-        assert!(slot.get().is_none());
+        assert!(page.current_hub().is_none());
+    }
+
+    #[test]
+    fn a_store_read_error_is_not_treated_as_hub_off() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let _ = crate::data_dir::DataDir::new(directory.path()).endpoint_key();
+        crate::settings::store_setting::<crate::hub_client::settings::Hub>(
+            directory.path(),
+            &Some(crate::hub_client::DEFAULT_HUB_URL.to_owned()),
+        )
+        .expect("store");
+        std::fs::create_dir_all(directory.path()).expect("directory");
+        let _ = NodeStore::in_dir(directory.path()).expect("store");
+        std::fs::write(directory.path().join("node.sqlite"), b"not sqlite")
+            .expect("break store");
+        let page = test_host_page(
+            directory.path().to_path_buf(),
+            None,
+            None,
+            Arc::new(|_, _| Box::pin(async { Ok(()) })),
+            None,
+        );
+        assert!(matches!(page.hub_access(), super::HubAccess::Unavailable));
+    }
+
+    #[test]
+    fn the_page_hub_uses_the_serve_flag_over_the_saved_url() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let _ = crate::data_dir::DataDir::new(directory.path()).endpoint_key();
+        crate::settings::store_setting::<crate::hub_client::settings::Hub>(
+            directory.path(),
+            &Some("https://stored.example".to_owned()),
+        )
+        .expect("store");
+        let page = test_host_page(
+            directory.path().to_path_buf(),
+            None,
+            None,
+            Arc::new(|_, _| Box::pin(async { Ok(()) })),
+            Some("https://flag.example".to_owned()),
+        );
+        assert_eq!(page.current_hub().expect("hub").url(), "https://flag.example");
     }
 
     fn managed_options() -> UiOptions {
@@ -1048,14 +973,12 @@ mod tests {
         caller: bool,
     ) -> (AdminUi, Arc<FakeNode>) {
         let (administration, node) = test_administration(data_dir);
-        let options = UiOptions {
-            host: Some(
-                test_host(data_dir, Arc::new(std::sync::Mutex::new(Vec::new())))
-                    .with_task_folder_mode(task_folder_mode),
-            ),
-            caller: caller.then(|| CallerContext::new(data_dir.to_path_buf())),
-            ..UiOptions::default()
-        };
+        let mut page = test_host(data_dir, Arc::new(std::sync::Mutex::new(Vec::new())))
+            .with_task_folder_mode(task_folder_mode);
+        if caller {
+            page = page.with_caller(true);
+        }
+        let options = UiOptions { page: Some(Arc::new(page)), ..UiOptions::default() };
         (build_admin_ui(administration, options, PORT), node)
     }
 
@@ -1064,8 +987,8 @@ mod tests {
 
     /// A host on relay.test whose relay switches are recorded in `switches`
     /// instead of reaching a node. `https://down.test` never answers.
-    fn test_host(data_dir: &std::path::Path, switches: Switches) -> HostContext {
-        HostContext::new(
+    fn test_host(data_dir: &std::path::Path, switches: Switches) -> PageContext {
+        test_host_page(
             data_dir.to_path_buf(),
             Some("tudor".to_owned()),
             Some("https://relay.test".to_owned()),
@@ -1080,6 +1003,7 @@ mod tests {
                     }
                 })
             }),
+            None,
         )
     }
 
@@ -1087,11 +1011,12 @@ mod tests {
     fn the_agent_name_comes_from_the_hub_name_then_the_invite_name_then_the_endpoint() {
         let directory = tempfile::tempdir().expect("directory must create");
         let host = |name: Option<&str>| {
-            HostContext::new(
+            test_host_page(
                 directory.path().to_path_buf(),
                 name.map(str::to_owned),
                 None,
                 Arc::new(|_, _| Box::pin(async { Ok(()) })),
+                None,
             )
         };
         let endpoint =
@@ -1103,13 +1028,13 @@ mod tests {
         assert!(host(None).agent_name().starts_with("agent-"));
         assert_eq!(host(None).agent_name().len(), "agent-".len() + 8);
         assert_eq!(host(Some("server")).agent_name(), "server");
-        crate::node_config::store_setting::<settings::HubName>(
+        crate::settings::store_setting::<crate::hub_client::settings::HubName>(
             directory.path(),
-            &Some("tudor".to_owned()),
+            &Some("tudor#0042".to_owned()),
         )
         .expect("hub name must store");
-        assert_eq!(host(Some("server")).agent_name(), "tudor");
-        assert_eq!(host(None).agent_name(), "tudor");
+        assert_eq!(host(Some("server")).agent_name(), "tudor#0042");
+        assert_eq!(host(None).agent_name(), "tudor#0042");
     }
 
     /// Waits until the hub invite `id` is delivered, or fails the test.
@@ -1163,9 +1088,9 @@ mod tests {
         let host =
             test_host(directory.path(), Arc::new(std::sync::Mutex::new(Vec::new())))
                 .with_hub(Some(hub.client(directory.path())));
-        crate::node_config::store_setting::<settings::HubName>(
+        crate::settings::store_setting::<crate::hub_client::settings::HubName>(
             directory.path(),
-            &Some("tudor".to_owned()),
+            &Some("tudor#0042".to_owned()),
         )
         .expect("hub name must store");
         let own =
@@ -1173,24 +1098,26 @@ mod tests {
         let (ana, eve) = (peer_endpoint(5), peer_endpoint(6));
         let (unsent, sent) = {
             let mut state = hub.state();
-            state.add_account(&own, "tudor");
-            state.add_account(&ana, "ana");
-            state.add_account(&eve, "eve");
+            state.add_account(&own, "tudor#0042");
+            state.add_account(&ana, "ana#0007");
+            state.add_account(&eve, "eve#0008");
             (
                 state.add_invite(&own, &eve, "accepted"),
                 state.add_invite(&own, &ana, "accepted"),
             )
         };
-        approve(directory.path(), &sent, "ana");
-        let worker =
-            tokio::spawn(super::hub::host_worker(administration, Arc::new(host)));
+        approve(directory.path(), &sent, "ana#0007");
+        let worker = tokio::spawn(crate::hub_workers::host_worker(
+            administration,
+            host.worker_context(),
+        ));
         wait_for_delivery(&hub, &sent).await;
         worker.abort();
 
         let applied = node.granted();
         assert_eq!(applied.len(), 1);
-        let grant = crate::node_config::parse_grant_json(&applied[0])
-            .expect("grant must parse");
+        let grant =
+            crate::identity::decode_grant(&applied[0]).expect("grant must parse");
         assert_eq!(grant.subject_endpoint_id.as_str(), ana);
         let state = hub.state();
         let unsent = state.invites.iter().find(|invite| invite.id == unsent);
@@ -1200,21 +1127,24 @@ mod tests {
 
     /// A line that the host in `host_dir` signed as `agent` for `caller`.
     fn signed_line(host_dir: &std::path::Path, agent: &str, caller: &str) -> String {
-        let (authorization, _) = crate::identity::sign_access(
+        let access = crate::identity::AccessInput {
+            issuer_agent_id: "node".to_owned(),
+            subject_agent_id: "ana".to_owned(),
+            subject_endpoint_id: caller.to_owned(),
+            scope_id: crate::direct::SCOPE.to_owned(),
+            capabilities: vec![crate::execution::GENERAL_SKILL.to_owned()],
+            workspaces: vec!["workspace".to_owned()],
+            access_mode: aether_core::AccessMode::ReadOnly,
+            approval_rule: aether_core::ApprovalRule::Automatic,
+            lifetime: std::time::Duration::from_secs(60),
+        };
+        let (claim, _) = crate::identity::sign_access(
             &ed25519_dalek::SigningKey::from_bytes(&[9; 32]),
-            &crate::identity::AccessInput {
-                issuer_agent_id: "node".to_owned(),
-                subject_agent_id: "ana".to_owned(),
-                subject_endpoint_id: caller.to_owned(),
-                scope_id: crate::direct::SCOPE.to_owned(),
-                capabilities: vec![crate::execution::GENERAL_SKILL.to_owned()],
-                workspaces: vec!["workspace".to_owned()],
-                access_mode: aether_core::AccessMode::ReadOnly,
-                approval_rule: aether_core::ApprovalRule::Automatic,
-                lifetime: std::time::Duration::from_secs(60),
-            },
+            &access,
         )
         .expect("access must sign");
+        let authorization =
+            crate::transport::A2aAuthorization::for_access(&access, &claim);
         crate::direct::InvitationBundle {
             format: crate::direct::BUNDLE_FORMAT_V1.to_owned(),
 
@@ -1274,10 +1204,10 @@ mod tests {
                 });
             }
         }
-        let context = Arc::new(
-            CallerContext::new(caller_dir.path().to_path_buf()).with_hub(Some(client)),
-        );
-        let worker = tokio::spawn(super::hub::caller_worker(context));
+        let context = PageContext::admin_caller(caller_dir.path().to_path_buf())
+            .with_hub(Some(client));
+        let worker =
+            tokio::spawn(crate::hub_workers::caller_worker(context.worker_context()));
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             while !hub.state().invites.is_empty() {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -1287,8 +1217,10 @@ mod tests {
         .expect("the worker must handle both rows");
         worker.abort();
 
-        let contacts =
-            crate::direct::contact_bundles(caller_dir.path()).expect("contacts");
+        let contacts = crate::direct::contact_bundles(
+            &crate::direct::open_store(caller_dir.path()).expect("store must open"),
+        )
+        .expect("contacts");
         assert_eq!(contacts.len(), 1);
         assert_eq!(contacts[0].invitation.agent_id, "tudor");
         assert_eq!(contacts[0].invitation.endpoint_id, host);
@@ -1300,13 +1232,15 @@ mod tests {
         hub: &crate::hub_client::test_hub::TestHub,
     ) -> axum::Router {
         let (administration, _) = test_administration(data_dir);
-        let options = UiOptions {
-            host: Some(
-                test_host(data_dir, Arc::new(std::sync::Mutex::new(Vec::new())))
-                    .with_hub(Some(hub.client(data_dir))),
-            ),
-            ..UiOptions::default()
-        };
+        let page = Arc::new(
+            test_host(data_dir, Arc::new(std::sync::Mutex::new(Vec::new())))
+                .with_hub(Some(hub.client(data_dir))),
+        );
+        tokio::spawn(crate::hub_workers::host_worker(
+            administration.clone(),
+            page.worker_context(),
+        ));
+        let options = UiOptions { page: Some(page), ..UiOptions::default() };
         app(build_admin_ui(administration, options, PORT))
     }
 
@@ -1322,10 +1256,12 @@ mod tests {
         assert!(claimed.body.contains("tudor#0001"), "{}", claimed.body);
         assert!(claimed.body.contains("bob#0042"));
         assert_eq!(
-            crate::node_config::setting::<settings::HubName>(directory.path())
-                .ok()
-                .flatten()
-                .as_deref(),
+            crate::settings::setting::<crate::hub_client::settings::HubName>(
+                directory.path()
+            )
+            .ok()
+            .flatten()
+            .as_deref(),
             Some("tudor#0001")
         );
     }
@@ -1336,10 +1272,10 @@ mod tests {
         hub: &crate::hub_client::test_hub::TestHub,
     ) -> axum::Router {
         let options = UiOptions {
-            caller: Some(
-                CallerContext::new(data_dir.to_path_buf())
+            page: Some(Arc::new(
+                PageContext::admin_caller(data_dir.to_path_buf())
                     .with_hub(Some(hub.client(data_dir))),
-            ),
+            )),
             ..UiOptions::default()
         };
         app(build_admin_ui(shared_in(data_dir), options, PORT))
@@ -1360,15 +1296,17 @@ mod tests {
         assert!(claimed.body.contains("This is a service agent."), "{}", claimed.body);
         assert!(!claimed.body.contains("Their name on Aether"));
         assert_eq!(
-            crate::node_config::setting::<settings::AgentKind>(directory.path())
-                .ok()
-                .flatten(),
+            crate::settings::setting::<crate::hub_client::settings::AgentKind>(
+                directory.path()
+            )
+            .ok()
+            .flatten(),
             Some(crate::hub_client::AgentKind::Service)
         );
         let endpoint = crate::direct::endpoint_id(directory.path()).expect("endpoint");
         assert_eq!(
-            hub.state().kinds.get(&endpoint).map(String::as_str),
-            Some("service")
+            hub.state().kinds.get(&endpoint).copied(),
+            Some(crate::hub_client::AgentKind::Service)
         );
     }
 
@@ -1384,8 +1322,8 @@ mod tests {
         post(page.clone(), "/hub/name", Some(&cookie), "name=ana&kind=service").await;
         let endpoint = crate::direct::endpoint_id(directory.path()).expect("endpoint");
         assert_eq!(
-            hub.state().kinds.get(&endpoint).map(String::as_str),
-            Some("personal")
+            hub.state().kinds.get(&endpoint).copied(),
+            Some(crate::hub_client::AgentKind::Personal)
         );
     }
 
@@ -1428,10 +1366,11 @@ mod tests {
         hub: &crate::hub_client::test_hub::TestHub,
     ) -> (axum::Router, String, std::path::PathBuf) {
         let data_dir = directory.join("node");
-        crate::node_config::load_or_create_service(
+        crate::node_builder::load_or_create_service(
             &directory.join("missing-policy.json"),
             &data_dir,
             "codex".into(),
+            None,
         )
         .expect("first node policy must create");
         let page = hub_host_ui(&data_dir, hub);
@@ -1476,10 +1415,12 @@ mod tests {
             listing.description,
             crate::agent_card::settings(&data_dir).description
         );
-        let state = crate::node_config::setting::<settings::ListingState>(&data_dir)
-            .ok()
-            .flatten()
-            .expect("state");
+        let state = crate::settings::setting::<crate::listing::settings::ListingState>(
+            &data_dir,
+        )
+        .ok()
+        .flatten()
+        .expect("state");
         assert_eq!(state.listing, text);
 
         let stopped =
@@ -1487,9 +1428,11 @@ mod tests {
         assert!(stopped.body.contains("Not listed."), "{}", stopped.body);
         assert!(!hub.state().listings.contains_key(&endpoint));
         assert_eq!(
-            crate::node_config::setting::<settings::ListingState>(&data_dir)
-                .ok()
-                .flatten(),
+            crate::settings::setting::<crate::listing::settings::ListingState>(
+                &data_dir
+            )
+            .ok()
+            .flatten(),
             None
         );
     }
@@ -1501,7 +1444,7 @@ mod tests {
         let (page, cookie, data_dir) = service_page(directory.path(), &hub).await;
         NodeStore::in_dir(&data_dir)
             .expect("store must open")
-            .put_configuration("admin.limit.queue_global", "3")
+            .apply_change(aether_store::ChangeKind::Limit, "queue_global", "3")
             .expect("limit must store");
         let home = get_with(page, "/", &cookie).await;
         assert!(
@@ -2022,16 +1965,17 @@ mod tests {
         let directory = tempfile::tempdir().expect("directory must create");
         let hub = crate::hub_client::test_hub::TestHub::start().await;
         let (administration, node) = test_administration(directory.path());
-        let host = HostContext::new(
+        let host = test_host_page(
             directory.path().to_path_buf(),
             Some("server".to_owned()),
             None,
             Arc::new(|_, _| Box::pin(async { Ok(()) })),
+            None,
         )
         .with_hub(Some(hub.client(directory.path())));
-        crate::node_config::store_setting::<settings::HubName>(
+        crate::settings::store_setting::<crate::hub_client::settings::HubName>(
             directory.path(),
-            &Some("tudor".to_owned()),
+            &Some("tudor#0042".to_owned()),
         )
         .expect("hub name must store");
         let own =
@@ -2039,13 +1983,15 @@ mod tests {
         let ana = peer_endpoint(5);
         let id = {
             let mut state = hub.state();
-            state.add_account(&own, "tudor");
-            state.add_account(&ana, "ana");
+            state.add_account(&own, "tudor#0042");
+            state.add_account(&ana, "ana#0007");
             state.add_invite(&own, &ana, "accepted")
         };
-        approve(directory.path(), &id, "ana");
-        let worker =
-            tokio::spawn(super::hub::host_worker(administration, Arc::new(host)));
+        approve(directory.path(), &id, "ana#0007");
+        let worker = tokio::spawn(crate::hub_workers::host_worker(
+            administration,
+            host.worker_context(),
+        ));
         wait_for_delivery(&hub, &id).await;
         worker.abort();
 
@@ -2061,7 +2007,7 @@ mod tests {
             crate::direct::InvitationBundle::decode(&line).expect("bundle must decode");
         let invitation =
             bundle.invitation.to_invitation().expect("invitation must verify");
-        assert_eq!(invitation.agent_id, "tudor");
+        assert_eq!(invitation.agent_id, "tudor#0042");
         assert_eq!(bundle.authorization.claim.subject_endpoint_id, ana);
     }
 
@@ -2103,7 +2049,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("directory must create");
         let switches = Arc::new(std::sync::Mutex::new(Vec::new()));
         let options = UiOptions {
-            host: Some(test_host(directory.path(), Arc::clone(&switches))),
+            page: Some(Arc::new(test_host(directory.path(), Arc::clone(&switches)))),
             ..UiOptions::default()
         };
         let application =
@@ -2120,10 +2066,12 @@ mod tests {
         assert_eq!(response.status, StatusCode::OK, "{}", response.body);
         assert!(response.body.contains("Reachable through relay.example.com"));
         assert_eq!(
-            crate::node_config::setting::<settings::Relay>(directory.path())
-                .ok()
-                .flatten()
-                .as_deref(),
+            crate::settings::setting::<crate::transport::relay::Relay>(
+                directory.path()
+            )
+            .ok()
+            .flatten()
+            .as_deref(),
             Some("https://relay.example.com/")
         );
 
@@ -2142,9 +2090,11 @@ mod tests {
         assert_eq!(response.status, StatusCode::OK);
         assert!(response.body.contains("No relay yet"));
         assert_eq!(
-            crate::node_config::setting::<settings::Relay>(directory.path())
-                .ok()
-                .flatten(),
+            crate::settings::setting::<crate::transport::relay::Relay>(
+                directory.path()
+            )
+            .ok()
+            .flatten(),
             None
         );
 
@@ -2225,11 +2175,12 @@ mod tests {
         assert_eq!(bundle.authorization.caller_agent_id, "ana");
         assert_eq!(bundle.authorization.capability_id, crate::execution::GENERAL_SKILL);
         assert_eq!(bundle.authorization.claim.subject_endpoint_id, friend);
-        let issuer = crate::node_config::node_issuer_key(directory.path())
+        let issuer = crate::data_dir::DataDir::new(directory.path())
+            .issuer_key()
             .expect("issuer key must load");
         {
             let applied = node.granted();
-            let grant = crate::node_config::parse_grant_json(
+            let grant = crate::identity::decode_grant(
                 applied.first().expect("the grant must reach the node"),
             )
             .expect("grant must parse");
@@ -2244,23 +2195,30 @@ mod tests {
         }
         let mut store = NodeStore::in_dir(directory.path()).expect("store must open");
         assert_eq!(
-            store.configuration_values("admin.grant.").expect("grants must read").len(),
+            store
+                .applied_changes(aether_store::ChangeKind::Grant)
+                .expect("grants must read")
+                .len(),
             1
         );
-        store.put_scope(crate::direct::SCOPE, "direct").expect("scope must store");
+        store
+            .put_scope(crate::direct::SCOPE, aether_core::ScopeKind::Direct)
+            .expect("scope must store");
         store
             .admit(
                 &TaskInput {
-                    id: "greeting".to_owned(),
-                    request_id: "greeting-request".to_owned(),
+                    request: aether_core::Request {
+                        task_id: aether_core::TaskId::new("greeting"),
+                        id: aether_core::RequestId::new("greeting-request"),
+                        caller_agent_id: aether_core::AgentId::new("ana"),
+                        caller_endpoint_id: aether_core::EndpointId::new(friend),
+                        scope_id: aether_core::ScopeId::new(crate::direct::SCOPE),
+                        capability_id: aether_core::CapabilityId::new("review"),
+                        workspace_id: aether_core::WorkspaceId::new("workspace"),
+                        access_mode: aether_core::AccessMode::ReadOnly,
+                    },
                     idempotency_key: "greeting-key".to_owned(),
-                    caller_agent_id: "ana".to_owned(),
-                    caller_endpoint_id: friend,
                     request_fingerprint: "greeting-fingerprint".to_owned(),
-                    scope_id: crate::direct::SCOPE.to_owned(),
-                    capability_id: "review".to_owned(),
-                    workspace_id: "workspace".to_owned(),
-                    access_mode: "read_only".to_owned(),
                     skill: "review".to_owned(),
                     remote_text: "Greet Bob".to_owned(),
                 },
@@ -2302,7 +2260,7 @@ mod tests {
             "ana must be listed"
         );
         assert!(invited.body.contains("No tasks yet"));
-        let grant_id = crate::node_config::parse_grant_json(
+        let grant_id = crate::identity::decode_grant(
             node.granted().first().expect("grant must exist"),
         )
         .expect("grant must parse")
@@ -2318,11 +2276,7 @@ mod tests {
         .await;
         assert_eq!(asked.status, StatusCode::OK);
         assert!(asked.body.contains("Revoke ana's access?"), "{}", asked.body);
-        assert!(
-            store
-                .configuration(&crate::admin::revoked_grant_key(grant_id.as_str()))
-                .is_err()
-        );
+        assert_eq!(store.grant_revoked(grant_id.as_str()), Ok(false));
         let response = post(
             application,
             "/revoke",
@@ -2332,12 +2286,13 @@ mod tests {
         .await;
         assert_eq!(response.status, StatusCode::OK);
         assert!(response.body.contains("Nobody has access."));
+        assert_eq!(store.grant_revoked(grant_id.as_str()), Ok(true));
         assert!(
             store
-                .configuration(&crate::admin::revoked_grant_key(grant_id.as_str()))
-                .is_ok()
+                .applied_changes(aether_store::ChangeKind::Grant)
+                .expect("grants")
+                .is_empty()
         );
-        assert!(store.configuration_values("admin.grant.").expect("grants").is_empty());
     }
 
     #[tokio::test]
@@ -2530,7 +2485,7 @@ mod tests {
     /// A caller UI over `data_dir`.
     fn caller_ui(data_dir: &std::path::Path) -> AdminUi {
         let options = UiOptions {
-            caller: Some(super::CallerContext::new(data_dir.to_path_buf())),
+            page: Some(Arc::new(PageContext::admin_caller(data_dir.to_path_buf()))),
             ..UiOptions::default()
         };
         build_admin_ui(shared_in(data_dir), options, PORT)
@@ -2578,11 +2533,11 @@ mod tests {
             home.set_cookie.as_deref().expect("home must set a cookie"),
         )
         .to_owned();
-        let caller_id =
-            crate::transport::load_or_create_key(directory.path().join("endpoint.key"))
-                .expect("caller key must load")
-                .public()
-                .to_string();
+        let caller_id = crate::data_dir::DataDir::new(directory.path())
+            .endpoint_key()
+            .expect("caller key must load")
+            .public()
+            .to_string();
         assert!(home.body.contains("Connect to a friend's agent"));
         // Shown in groups of four; the copy button holds it whole.
         assert!(home.body.contains(&crate::admin_components::grouped(
@@ -2604,12 +2559,18 @@ mod tests {
             input_value(&response.body, "request-0"),
             "aether node request --scope direct --agent-id tudor --text 'Give me three ideas for a project name'"
         );
-        let kept = crate::direct::contact_bundle(directory.path(), "tudor")
-            .expect("the bundle must be kept");
+        let kept = crate::direct::contact_bundle(
+            &crate::direct::open_store(directory.path()).expect("store must open"),
+            "tudor",
+        )
+        .expect("the bundle must be kept");
         assert_eq!(kept.relay_url.as_deref(), Some("https://relay.test"));
         // The line was v2: its card is kept apart from the contact.
-        let card = crate::direct::contact_card(directory.path(), &kept)
-            .expect("the card must be kept");
+        let card = crate::direct::contact_card(
+            &crate::direct::open_store(directory.path()).expect("store must open"),
+            &kept,
+        )
+        .expect("the card must be kept");
         assert_eq!(card.name, "tudor");
         assert!(
             response
@@ -2624,15 +2585,16 @@ mod tests {
         let directory = tempfile::tempdir().expect("directory must create");
         let (administration, _) = test_administration(directory.path());
         let options = UiOptions {
-            host: Some(HostContext::new(
+            page: Some(Arc::new(test_host_page(
                 directory.path().to_path_buf(),
                 Some("server".to_owned()),
                 None,
                 Arc::new(|_, _| Box::pin(async { Ok(()) })),
-            )),
+                None,
+            ))),
             ..UiOptions::default()
         };
-        crate::node_config::store_setting::<settings::HubName>(
+        crate::settings::store_setting::<crate::hub_client::settings::HubName>(
             directory.path(),
             &Some("tudor#0042".to_owned()),
         )
@@ -2677,15 +2639,19 @@ mod tests {
         let (administration, _) = test_administration(directory.path());
         let host =
             test_host(directory.path(), Arc::new(std::sync::Mutex::new(Vec::new())));
-        let longest = format!("{}#0001", "a".repeat(64));
-        let (line, _) = super::host::sign_invite(
+        let longest = format!("{}#0001", "a".repeat(32));
+        let (line, _) = crate::invites::sign_direct_invite(
             &administration,
-            &host,
+            &crate::invites::DirectInviteSigning::for_data_dir_with_relay(
+                &host.data_dir,
+                host.relay_url(),
+            ),
             &longest,
             &longest,
             &iroh::SecretKey::generate().public().to_string(),
             30,
             "friends",
+            aether_store::AuditActor::Ui,
         )
         .expect("the invite must sign");
         assert!(line.len() + "bundle=".len() + 2 <= 8 * 1024, "{}", line.len());
@@ -2760,7 +2726,13 @@ mod tests {
                 .await;
         assert_eq!(removed.status, StatusCode::OK, "{}", removed.body);
         assert!(!removed.body.contains("Agents you can use"));
-        assert!(crate::direct::contact_bundle(directory.path(), "tudor").is_err());
+        assert!(
+            crate::direct::contact_bundle(
+                &crate::direct::open_store(directory.path()).expect("store must open"),
+                "tudor"
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -2790,9 +2762,11 @@ mod tests {
         assert_eq!(response.status, StatusCode::BAD_REQUEST);
         assert!(response.body.contains("This is not an Aether invite."));
         assert!(
-            crate::direct::contact_bundles(directory.path())
-                .expect("contacts must list")
-                .is_empty()
+            crate::direct::contact_bundles(
+                &crate::direct::open_store(directory.path()).expect("store must open")
+            )
+            .expect("contacts must list")
+            .is_empty()
         );
     }
 
@@ -2824,16 +2798,15 @@ mod tests {
         (directory, admin_ui, administration)
     }
 
-    /// Queues a low-risk `Directory` change directly against `administration`,
-    /// the same way `add_pending` on the old hand-rolled `LocalUi` did.
     fn add_pending(administration: &SharedAdministration, id: &str, url: &str) {
         administration
             .lock()
             .expect("administration must lock")
-            .change(
+            .submit(
                 &ChangeRequest::Directory { id: id.to_owned(), url: url.to_owned() }
                     .into_change()
                     .expect("change must parse"),
+                aether_store::AuditActor::Ui,
                 false,
             )
             .expect("change must apply");
@@ -3024,13 +2997,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn advanced_page_shows_a_store_error_instead_of_empty_counts() {
+        let (directory, admin_ui, _administration) = admin_ui_with_directory_applier();
+        let db_path = directory.path().join(aether_store::NODE_DATABASE);
+        rusqlite::Connection::open(&db_path)
+            .expect("database must open")
+            .execute(
+                "INSERT INTO audit_records(actor_type,action,result,created_at) VALUES('mcp','change','private-credential',0)",
+                [],
+            )
+            .expect("invalid audit row must insert");
+        let response = get(app(admin_ui), "/advanced").await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert!(response.body.contains("Administration store is unavailable"));
+        assert!(response.body.contains("Overview counts cannot be loaded"));
+        assert!(!response.body.contains("0 known agents"));
+    }
+
+    #[tokio::test]
+    async fn the_activity_feed_says_when_it_cannot_read_the_store() {
+        let (directory, admin_ui, _administration) = admin_ui_with_directory_applier();
+        rusqlite::Connection::open(directory.path().join(aether_store::NODE_DATABASE))
+            .expect("database must open")
+            .execute("DROP TABLE audit_records", [])
+            .expect("audit records must drop");
+        let response = app(admin_ui)
+            .oneshot(
+                Request::builder()
+                    .uri("/events")
+                    .header("host", format!("127.0.0.1:{PORT}"))
+                    .body(axum::body::Body::empty())
+                    .expect("request must build"),
+            )
+            .await
+            .expect("router must respond");
+        let mut stream = response.into_body().into_data_stream();
+        let _ = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("ready event must arrive");
+        let event = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("unavailable event must arrive")
+            .expect("stream must contain an event")
+            .expect("event must be valid bytes");
+        let event = std::str::from_utf8(&event).expect("event must be UTF-8");
+        assert!(event.contains("event: unavailable"), "{event}");
+    }
+
+    #[tokio::test]
+    async fn the_caller_page_says_when_sent_tasks_cannot_load() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let admin_ui = caller_ui(directory.path());
+        rusqlite::Connection::open(directory.path().join(aether_store::NODE_DATABASE))
+            .expect("database must open")
+            .execute("DROP TABLE sent_tasks", [])
+            .expect("sent tasks must drop");
+        let response = get(app(admin_ui), "/").await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert!(response.body.contains("Sent tasks cannot be loaded."));
+    }
+
+    #[tokio::test]
+    async fn audit_page_shows_a_store_error_instead_of_an_empty_list() {
+        let (directory, admin_ui, _administration) = admin_ui_with_directory_applier();
+        let db_path = directory.path().join(aether_store::NODE_DATABASE);
+        rusqlite::Connection::open(&db_path)
+            .expect("database must open")
+            .execute(
+                "INSERT INTO audit_records(actor_type,action,result,created_at) VALUES('mcp','change','private-credential',0)",
+                [],
+            )
+            .expect("invalid audit row must insert");
+        let response = get(app(admin_ui), "/audit").await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert!(response.body.contains("Administration store is unavailable"));
+        assert!(!response.body.contains("No audit records yet"));
+    }
+
+    #[tokio::test]
     async fn advanced_page_saves_task_policy_in_the_node_database() {
         let directory = tempfile::tempdir().expect("directory must create");
         let data_dir = directory.path().join("node");
-        crate::node_config::load_or_create_service(
+        crate::node_builder::load_or_create_service(
             &directory.path().join("missing-policy.json"),
             &data_dir,
             "codex".into(),
+            None,
         )
         .expect("first node policy must create");
         let (admin_ui, _) = host_ui(&data_dir);
@@ -3064,13 +3116,13 @@ mod tests {
         .await;
         assert_eq!(response.status, StatusCode::OK, "{}", response.body);
         assert!(response.body.contains("Policy saved"));
-        let settings = crate::node_config::policy_settings(&data_dir)
+        let settings = crate::policy::policy_settings(&data_dir)
             .expect("policy must read")
             .expect("policy must exist");
         assert_eq!(settings.max_context_tokens, 12_000);
         assert_eq!(settings.max_seconds, 90);
-        assert_eq!(settings.queue_global, 3);
-        assert_eq!(settings.queue_per_peer, 2);
+        assert_eq!(settings.queue.global, 3);
+        assert_eq!(settings.queue.per_peer, 2);
     }
 
     #[tokio::test]
@@ -3090,25 +3142,33 @@ mod tests {
         let directory = tempfile::tempdir().expect("directory must create");
         let mut store = NodeStore::in_dir(directory.path()).expect("store must open");
         store
-            .put_configuration("admin.capability.review", "private-credential")
+            .apply_change(
+                aether_store::ChangeKind::Capability,
+                "review",
+                "private-credential",
+            )
             .expect("change must apply");
         store
             .record_change(AuditActor::Mcp, AuditResult::Applied)
             .expect("change must record");
-        store.put_scope("scope", "direct").expect("scope must store");
+        store
+            .put_scope("scope", aether_core::ScopeKind::Direct)
+            .expect("scope must store");
         store
             .admit(
                 &TaskInput {
-                    id: "task".to_owned(),
-                    request_id: "request".to_owned(),
+                    request: aether_core::Request {
+                        task_id: aether_core::TaskId::new("task"),
+                        id: aether_core::RequestId::new("request"),
+                        caller_agent_id: aether_core::AgentId::new("agent"),
+                        caller_endpoint_id: aether_core::EndpointId::new("endpoint"),
+                        scope_id: aether_core::ScopeId::new("scope"),
+                        capability_id: aether_core::CapabilityId::new("review"),
+                        workspace_id: aether_core::WorkspaceId::new("workspace"),
+                        access_mode: aether_core::AccessMode::ReadOnly,
+                    },
                     idempotency_key: "key".to_owned(),
-                    caller_agent_id: "agent".to_owned(),
-                    caller_endpoint_id: "endpoint".to_owned(),
                     request_fingerprint: "fingerprint".to_owned(),
-                    scope_id: "scope".to_owned(),
-                    capability_id: "review".to_owned(),
-                    workspace_id: "workspace".to_owned(),
-                    access_mode: "read_only".to_owned(),
                     skill: "review".to_owned(),
                     remote_text: "private task data".to_owned(),
                 },
@@ -3149,7 +3209,7 @@ mod tests {
         ] {
             store
                 .apply_managed_member(
-                    "managed.cursor",
+                    "https://control.test",
                     cursor,
                     &ManagedMember {
                         scope_id: "managed".to_owned(),
@@ -3163,7 +3223,12 @@ mod tests {
                 .expect("member must store");
         }
         store
-            .revoke_managed_member("managed.cursor", 4, "managed", "revoked-agent")
+            .revoke_managed_member(
+                "https://control.test",
+                4,
+                "managed",
+                "revoked-agent",
+            )
             .expect("member must revoke");
         let admin_ui =
             build_admin_ui(shared_with_store(store), managed_options(), PORT);
@@ -3179,7 +3244,7 @@ mod tests {
         let mut store = NodeStore::in_dir(directory.path()).expect("store must open");
         store
             .apply_managed_member(
-                "managed.cursor",
+                "https://control.test",
                 1,
                 &ManagedMember {
                     scope_id: "managed".to_owned(),
@@ -3257,8 +3322,6 @@ mod tests {
 
     #[tokio::test]
     async fn cross_origin_post_cannot_confirm_a_change() {
-        // Exercises topcoat's default `OriginPolicy`, which now does the
-        // job the hand-rolled `Origin` header check used to do.
         let (_directory, admin_ui, _administration) = admin_ui_with_directory_applier();
         let application = app(admin_ui);
         let home = get(application.clone(), "/").await;
@@ -3465,20 +3528,24 @@ mod tests {
     async fn router_streams_durable_task_events_without_task_content() {
         let directory = tempfile::tempdir().expect("directory must create");
         let mut store = NodeStore::in_dir(directory.path()).expect("store must open");
-        store.put_scope("scope", "direct").expect("scope must store");
+        store
+            .put_scope("scope", aether_core::ScopeKind::Direct)
+            .expect("scope must store");
         store
             .admit(
                 &TaskInput {
-                    id: "task".to_owned(),
-                    request_id: "request".to_owned(),
+                    request: aether_core::Request {
+                        task_id: aether_core::TaskId::new("task"),
+                        id: aether_core::RequestId::new("request"),
+                        caller_agent_id: aether_core::AgentId::new("agent"),
+                        caller_endpoint_id: aether_core::EndpointId::new("endpoint"),
+                        scope_id: aether_core::ScopeId::new("scope"),
+                        capability_id: aether_core::CapabilityId::new("review"),
+                        workspace_id: aether_core::WorkspaceId::new("workspace"),
+                        access_mode: aether_core::AccessMode::ReadOnly,
+                    },
                     idempotency_key: "key".to_owned(),
-                    caller_agent_id: "agent".to_owned(),
-                    caller_endpoint_id: "endpoint".to_owned(),
                     request_fingerprint: "fingerprint".to_owned(),
-                    scope_id: "scope".to_owned(),
-                    capability_id: "review".to_owned(),
-                    workspace_id: "workspace".to_owned(),
-                    access_mode: "read_only".to_owned(),
                     skill: "review".to_owned(),
                     remote_text: "private task data".to_owned(),
                 },
@@ -3519,21 +3586,21 @@ mod tests {
         administration
             .lock()
             .expect("administration must lock")
-            .change(
-                &ChangeRequest::Grant {
-                    id: "private-key".to_owned(),
-                    grant: "credential".to_owned(),
+            .submit(
+                &{
+                    let grant = crate::admin::peer_grant();
+                    ChangeRequest::Grant { id: grant.id.as_str().to_owned(), grant }
                 }
                 .into_change()
                 .expect("change must parse"),
+                aether_store::AuditActor::Mcp,
                 false,
             )
             .expect("change must add");
         let application = app(admin_ui);
         let home = get(application.clone(), "/").await;
         assert!(home.body.contains("Confirm change"));
-        assert!(!home.body.contains("private-key"));
-        assert!(!home.body.contains("credential"));
+        assert!(!home.body.contains("08080808080808080808080808080808"));
         let token = extract_confirm_token(&home.body)
             .expect("a confirmation token must render");
         let cookie = session_cookie_pair(
@@ -3543,15 +3610,15 @@ mod tests {
             post(application, "/confirm", Some(cookie), &format!("id={token}")).await;
         assert!(response.body.contains("No changes need confirmation."));
         assert_eq!(
-            administration.lock().expect("administration must unlock").audit(),
+            administration
+                .lock()
+                .expect("administration must unlock")
+                .audit()
+                .expect("audit"),
             ["pending", "confirmed", "applied"]
         );
     }
 
-    /// A stand-in for the direct field access the hand-rolled `LocalUi`
-    /// gave tests. The confirmation map is now private application state
-    /// behind topcoat's app context, so a test recovers the live token the
-    /// same way a browser would: by parsing it out of the rendered page.
     fn extract_confirm_token(body: &str) -> Option<&str> {
         let (_, rest) = body.split_once("name=\"id\" value=\"")?;
         let (token, _) = rest.split_once('"')?;

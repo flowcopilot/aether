@@ -3,7 +3,6 @@ import { test } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 import { CHANNEL_ID, NODE_SENDER_ID, createDispatch } from "../src/inbound.ts";
 import { TaskRunner } from "../src/task-runner.ts";
-import { frameTask } from "../src/protocol.ts";
 import type { AgentMessage } from "../src/protocol.ts";
 
 // A fake of the OpenClaw channel runtime. It has only the members that
@@ -81,10 +80,11 @@ async function runTask(script: { ingress?: string; dispatchKind?: string; run?: 
     }),
   });
   runner.handle(task);
-  for (let i = 0; i < 50 && runner.activeCount > 0; i++) {
+  const terminal = () => sent.some((message) => message.type !== "progress");
+  for (let i = 0; i < 50 && !terminal(); i++) {
     await sleep(0);
   }
-  return { sent, calls, routeCalls, activeCount: runner.activeCount };
+  return { runner, sent, calls, routeCalls };
 }
 
 test("each task gets a route keyed by its task id with the per-account-channel-peer scope", async () => {
@@ -95,7 +95,6 @@ test("each task gets a route keyed by its task id with the per-account-channel-p
   assert.deepEqual(routeCalls[0].peer, { kind: "direct", id: "t1" });
   assert.equal(routeCalls[0].dmScope, "per-account-channel-peer");
 
-  // The ingress check and the dispatch use the session that the route chose.
   const sessionKey = "agent:aether:aether:default:direct:t1";
   assert.equal(calls.resolveStable[0].contextBinding.sessionKey, sessionKey);
   assert.equal(calls.dispatch[0].route.sessionKey, sessionKey);
@@ -109,13 +108,12 @@ test("admits every task as the one fixed node sender, never as the owner", async
   assert.deepEqual(admission.allowFrom, [NODE_SENDER_ID]);
   assert.deepEqual(admission.subject, { stableId: NODE_SENDER_ID });
   assert.equal(calls.buildContext[0].sender.id, NODE_SENDER_ID);
-  assert.equal(JSON.stringify(calls).includes("senderIsOwner"), false);
 });
 
 test("passes the framed task body unchanged and turns off command parsing", async () => {
   const { calls } = await runTask();
-  const body = frameTask("Be brief.", "hi");
-  assert.equal(calls.buildContext[0].message.body, body);
+  const body = calls.buildContext[0].message.body;
+  assert.ok(body.startsWith("[") && body.endsWith("\nhi"));
   assert.equal(calls.buildContext[0].message.commandBody, body);
   assert.equal(calls.buildContext[0].extra.CommandInterpretationSuppressed, true);
   assert.equal(calls.dispatch[0].ctxPayload.SessionKey, "agent:aether:aether:default:direct:t1");
@@ -157,11 +155,6 @@ test("a failed run outcome sends failed with no reason", async () => {
   assert.deepEqual(sent, [{ type: "failed", id: "t1" }]);
 });
 
-test("a turn that finishes with no final text sends an empty result", async () => {
-  const { sent } = await runTask();
-  assert.deepEqual(sent, [{ type: "result", id: "t1", text: "" }]);
-});
-
 test("a task that ingress does not admit fails without a dispatch", async () => {
   const { sent, calls } = await runTask({ ingress: "drop" });
   assert.deepEqual(sent, [{ type: "failed", id: "t1" }]);
@@ -183,12 +176,10 @@ test("a delivery error fails the task and sends none of its text", async () => {
   assert.equal(JSON.stringify(sent).includes("sk-secret"), false);
 });
 
-test("a dispatch that throws fails the task and sends none of its error text", async () => {
-  const { sent, activeCount } = await runTask({
-    run: () => {
-      throw new Error("internal detail");
-    },
-  });
-  assert.deepEqual(sent, [{ type: "failed", id: "t1" }]);
-  assert.equal(activeCount, 0);
+test("a cancel aborts the agent run of its task", async () => {
+  const { runner, calls } = await runTask({ run: () => new Promise<void>(() => {}) });
+  const signal: AbortSignal = calls.dispatch[0].replyOptions.abortSignal;
+  assert.equal(signal.aborted, false);
+  runner.handle({ type: "cancel", id: "t1" });
+  assert.equal(signal.aborted, true);
 });

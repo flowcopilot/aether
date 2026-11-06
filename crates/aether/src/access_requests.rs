@@ -17,14 +17,40 @@ pub const DRAFT_LIFETIME: Duration = Duration::from_hours(24);
 pub enum DraftError {
     #[error("{0}")]
     Invalid(&'static str),
-    #[error("5 requests already wait for confirmation on the Aether page")]
-    Limit,
+    #[error("{0} requests already wait for confirmation on the Aether page")]
+    Limit(u64),
     #[error(
         "a request to this agent already waits for confirmation on the Aether page"
     )]
     Duplicate,
     #[error("the requests are unavailable")]
     Store,
+}
+
+fn listing_matches_saved_contact(
+    data_dir: &Path,
+    row: &AgentRow,
+    now: i64,
+) -> Result<bool, DraftError> {
+    let now = u64::try_from(now).unwrap_or(u64::MAX);
+    let store = crate::direct::open_store(data_dir).map_err(|_| DraftError::Store)?;
+    let contacts =
+        crate::direct::contacts_by_endpoint(&store).map_err(|_| DraftError::Store)?;
+    if let Some(endpoint) = row.endpoint.as_deref()
+        && contacts.contains_key(endpoint)
+    {
+        return Ok(true);
+    }
+    Ok(contacts.keys().any(|endpoint| {
+        crate::listing::verify(
+            &row.listing,
+            &row.signature,
+            endpoint,
+            row.expires_at,
+            now,
+        )
+        .is_ok()
+    }))
 }
 
 /// Keeps a request to the listed agent `target_name` for `days` days, with
@@ -52,10 +78,13 @@ pub fn draft(
     if listing_expires_at <= now {
         return Err(DraftError::Invalid("the listing of this agent has expired"));
     }
-    if !(1..=30).contains(&days) {
+    if !(crate::hub_client::protocol::ACCESS_DAYS_MIN
+        ..=crate::hub_client::protocol::ACCESS_DAYS_MAX)
+        .contains(&days)
+    {
         return Err(DraftError::Invalid("days must be from 1 to 30"));
     }
-    if crate::direct::contact_by_name(data_dir, target_name).is_ok() {
+    if listing_matches_saved_contact(data_dir, row, now)? {
         return Err(DraftError::Invalid("this agent is a contact already"));
     }
     let lifetime = i64::try_from(DRAFT_LIFETIME.as_secs()).unwrap_or(i64::MAX);
@@ -74,7 +103,9 @@ pub fn draft(
     let mut store = NodeStore::in_dir(data_dir).map_err(|_| DraftError::Store)?;
     match store.add_access_request_draft(&draft) {
         Ok(()) => Ok(draft),
-        Err(StoreError::Overloaded) => Err(DraftError::Limit),
+        Err(StoreError::Overloaded) => {
+            Err(DraftError::Limit(crate::hub_client::protocol::MAX_OPEN_REQUESTS))
+        }
         Err(StoreError::DuplicateConflict) => Err(DraftError::Duplicate),
         Err(_) => Err(DraftError::Store),
     }
@@ -132,5 +163,41 @@ mod tests {
             draft(directory.path(), "law#0042", &good_row, 7),
             Err(DraftError::Duplicate)
         );
+    }
+
+    #[test]
+    fn a_contact_with_the_same_name_does_not_block_a_listed_agent() {
+        let host = tempfile::tempdir().expect("directory must create");
+        let caller = tempfile::tempdir().expect("directory must create");
+        let impostor = crate::direct::endpoint_id(caller.path()).expect("endpoint");
+        let service_key = iroh::SecretKey::generate();
+        crate::direct::import_bundle(
+            caller.path(),
+            &crate::direct::test_bundle_named(
+                host.path(),
+                &impostor,
+                "law#0042",
+                false,
+            ),
+        )
+        .expect("import");
+        let bytes = crate::listing::listing_bytes(&CardSettings::default(), "law#0042");
+        let expires_at = aether_core::time::unix_seconds(std::time::SystemTime::now())
+            .expect("clock")
+            .saturating_add(3600);
+        let listing = URL_SAFE_NO_PAD.encode(&bytes);
+        let signature = crate::listing::sign(&service_key, &bytes, expires_at);
+        let row = AgentRow {
+            handle: "law#0042".to_owned(),
+            listing,
+            signature,
+            expires_at,
+            online: true,
+            contact: false,
+            endpoint: None,
+            owner: None,
+        };
+        assert_ne!(service_key.public().to_string(), impostor);
+        draft(caller.path(), "law#0042", &row, 7).expect("draft must succeed");
     }
 }

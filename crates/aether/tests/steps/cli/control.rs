@@ -12,11 +12,8 @@ use crate::{common::aether_command, steps::World};
 
 #[derive(Debug, Default)]
 pub struct State {
-    /// The signed record to publish or to redeem a token with.
     record: Option<PathBuf>,
-    /// The verifying key of the agent that publishes to the directory.
     agent_key: Option<PathBuf>,
-    /// The file with a managed invitation token.
     token: Option<PathBuf>,
 }
 
@@ -160,13 +157,13 @@ async fn control_stops(world: &mut World) {
     assert!(control.process.interrupt().await.success());
 }
 
-#[then(expr = "the node knows the record {string} as expired")]
-async fn record_expired(world: &mut World, key: String) {
+#[then(expr = "the node knows the record of {string} in {string} as expired")]
+async fn record_expired(world: &mut World, agent: String, scope: String) {
     let client = world.cli.root().join("client");
     let expires_at = blocking(move || {
         aether_store::NodeStore::in_dir(&client)
             .expect("client store must open")
-            .signed_record(&key)
+            .directory_record(&scope, &agent)
             .expect("record must remain known")
             .expires_at
     })

@@ -3,6 +3,8 @@
 
 use std::{sync::PoisonError, time::SystemTime};
 
+use aether_core::time::now_seconds;
+
 use serde::Deserialize;
 use topcoat::{
     Result as TopcoatResult,
@@ -17,14 +19,15 @@ use topcoat::{
 };
 
 use super::{
-    Caller, Host, HostContext, Tab, ensure_admin_session,
+    Page, PageContext, ensure_admin_session,
     hub::{hub_section, hub_setting},
+    layout::{Tab, node_header},
     listing::listing_section,
-    node_header, require_admin_session,
+    require_admin_session, shared,
 };
 use crate::access_groups::{self, Action};
 use crate::hub_client::{HubClient, Role};
-use crate::node_config::settings;
+use crate::invites::{DirectInviteSigning, sign_direct_invite};
 use crate::{
     admin::SharedAdministration,
     admin_components::{
@@ -43,15 +46,6 @@ use crate::{
 use aether_store::{LastTask, TaskState};
 use topcoat::icon::icon;
 
-/// The lengths of access the invite form offers, in days.
-const ACCESS_DAYS: [u64; 3] = [1, 7, 30];
-const DEFAULT_ACCESS_DAYS: u64 = 7;
-const MAX_ACCESS_DAYS: u64 = 365;
-
-/// The workspace id that friends' grants name; the node has one workspace
-/// and the folder form changes its path.
-const WORKSPACE_ID: &str = "workspace";
-
 /// A new invite, shown once on the page that created it.
 #[derive(Clone, Default)]
 pub(super) struct NewInvitation {
@@ -62,34 +56,23 @@ pub(super) struct NewInvitation {
 /// What the last form on this screen asks the page to show.
 #[derive(Clone, Default)]
 pub(super) struct Notice {
-    /// The invite form refused its input, and why.
     invite_error: String,
-    /// The folder form refused its input, and why.
     workspace_error: String,
-    /// The relay form refused its input, and why.
     relay_error: String,
-    /// The grant whose revocation waits for a second click.
     confirm_revoke: String,
-    /// A hub form refused its input, and why.
     hub_error: String,
-    /// The hub setting form refused its input, and why.
     hub_setting_error: String,
     group_error: String,
-    /// The card form refused its input, and why.
     card_error: String,
-    /// The card was saved.
     card_saved: bool,
-    /// The listing form failed, and why.
     listing_error: String,
 }
 
 impl Notice {
-    /// The notice after a hub form, with its refusals if there are any.
     pub(super) fn hub(error: String, setting_error: String) -> Self {
         Self { hub_error: error, hub_setting_error: setting_error, ..Self::default() }
     }
 
-    /// The notice after the listing form, with its refusal if there is one.
     pub(super) fn listing(error: String) -> Self {
         Self { listing_error: error, ..Self::default() }
     }
@@ -111,22 +94,19 @@ pub(super) async fn host_screen(
     #[default] notice: Notice,
 ) -> TopcoatResult<impl View> {
     ensure_admin_session(cx).await?;
-    let Host(Some(host)) = app_context::<Host>(cx) else {
+    let Page(Some(page)) = app_context::<Page>(cx) else {
         return Err(internal_server_error(std::io::Error::other(
             "the host screen needs a node",
         ))
         .into());
     };
-    // The access requests that this person's own agent prepared, when the
-    // caller side uses the same data directory.
-    let drafts = match app_context::<Caller>(cx) {
-        Caller(Some(caller)) if caller.data_dir == host.data_dir => {
-            let now = aether_core::time::unix_seconds(SystemTime::now()).unwrap_or(0);
-            super::caller::request_drafts_of(&caller.data_dir, now).len()
-        }
-        _ => 0,
+    let drafts = if page.caller {
+        let now = aether_core::time::now_seconds();
+        super::shared::request_drafts_of(&page.data_dir, now).len()
+    } else {
+        0
     };
-    let relay_url = host.relay_url();
+    let relay_url = page.relay_url();
     let relay_host = relay_url.as_deref().map(|url| {
         reqwest::Url::parse(url)
             .ok()
@@ -138,14 +118,23 @@ pub(super) async fn host_screen(
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         (
-            administration.grants(),
-            administration.last_tasks(crate::direct::SCOPE),
+            administration.grants().map_err(|_| {
+                internal_server_error(std::io::Error::other("grants unavailable"))
+            })?,
+            administration.last_tasks(crate::direct::SCOPE).map_err(|_| {
+                internal_server_error(std::io::Error::other("tasks unavailable"))
+            })?,
             administration.current_workspace().unwrap_or_default(),
-            administration.pending().len(),
+            administration
+                .pending()
+                .map_err(|_| {
+                    internal_server_error(std::io::Error::other("pending unavailable"))
+                })?
+                .len(),
         )
     };
     let now = SystemTime::now();
-    let groups = access_groups::list(&host.data_dir)
+    let groups = access_groups::list(&page.data_dir)
         .map_err(|error| internal_server_error(std::io::Error::other(error)))?;
     let mut friends = grants
         .into_iter()
@@ -178,17 +167,20 @@ pub(super) async fn host_screen(
         || !notice.card_error.is_empty()
         || !notice.listing_error.is_empty();
     let command = format!("aether node direct import '{}'", invitation.line);
-    let hub = host.hub.get();
+    let hub_access = page.hub_access();
+    let hub = page.current_hub();
     let service = hub.is_some()
-        && crate::node_config::setting::<settings::AgentKind>(&host.data_dir)
-            .ok()
-            .flatten()
+        && crate::settings::setting::<crate::hub_client::settings::AgentKind>(
+            &page.data_dir,
+        )
+        .ok()
+        .flatten()
             == Some(crate::hub_client::AgentKind::Service);
     // The code form is the second way when a hub is set; it opens when it
     // is in use.
     let code_open = !invitation.line.is_empty() || !notice.invite_error.is_empty();
 
-    let agent_name = host.agent_name();
+    let agent_name = page.agent_name();
     Ok(view! {
         if refused {
             (StatusCode::BAD_REQUEST)
@@ -200,7 +192,7 @@ pub(super) async fn host_screen(
                     <div id="people">
                         page_title(
                             title: "Who can use your agent",
-                            workspace_line(path: folder, error: notice.workspace_error.clone(), task_folder_mode: host.task_folder_mode)
+                            workspace_line(path: folder, error: notice.workspace_error.clone(), task_folder_mode: page.task_folder_mode)
                         )
                     </div>
                     if drafts > 0 {
@@ -227,12 +219,18 @@ pub(super) async fn host_screen(
                     people(friends: friends, confirm_revoke: notice.confirm_revoke.clone())
                     if service {
                         listing_section(
-                            data_dir: host.data_dir.clone(),
+                            data_dir: page.data_dir.clone(),
                             error: notice.listing_error.clone(),
                         )
                     }
                 </section>
                 <aside aria-label="Invite and connection" class="flex flex-col gap-5">
+                    if matches!(hub_access, super::HubAccess::Unavailable) {
+                        alert(variant: AlertVariant::Destructive, attrs: attributes! { role="alert" },
+                            alert_title("Hub settings are unavailable")
+                            alert_description("This node cannot read its saved hub choice. Fix the data directory and reload.")
+                        )
+                    }
                     match &hub {
                         Some(hub) => {
                             hub_section(
@@ -261,7 +259,7 @@ pub(super) async fn host_screen(
                                     <p class="text-sm text-muted-foreground">"Ask them for the connect code on their Aether page. The invite works only on their computer."</p>
                                 </div>
                                 if relay_host.is_none() {
-                                    relay_notice()
+                                    shared::relay_notice()
                                 }
                                 invite_form(error: notice.invite_error.clone())
                                 if !invitation.line.is_empty() {
@@ -287,7 +285,7 @@ pub(super) async fn host_screen(
             </div>
             <div class="grid items-start gap-10 border-t border-border pt-10 lg:grid-cols-[minmax(0,1fr)_30rem]">
                 card_section(
-                    settings: crate::agent_card::settings(&host.data_dir),
+                    settings: crate::agent_card::settings(&page.data_dir),
                     error: notice.card_error.clone(),
                     saved: notice.card_saved,
                 )
@@ -297,20 +295,6 @@ pub(super) async fn host_screen(
     }
     // The page is deep: on the heap, its view does not fill the stack.
     .boxed())
-}
-
-/// The notice that only the local network can reach the agent.
-#[component]
-pub(super) async fn relay_notice() -> TopcoatResult<impl View> {
-    Ok(view! {
-        alert(
-            alert_description(
-                "Only your local network can reach this agent. "
-                <a href="#relay">"Set a relay"</a>
-                " before you invite someone elsewhere."
-            )
-        )
-    })
 }
 
 /// A new invite, shown once: the line for the friend's page and the command
@@ -377,7 +361,7 @@ async fn groups_section(
                 <div class="flex flex-col gap-2 rounded-xl border border-border bg-background px-5 py-4">
                     <div class="flex items-baseline justify-between gap-3">
                         <h3 class="text-[15px] font-semibold">(&group.name)</h3>
-                        if group.name != "friends" && group.name != crate::access_groups::REQUESTS_GROUP {
+                        if group.name != crate::access_groups::FRIENDS_GROUP && group.name != crate::access_groups::REQUESTS_GROUP {
                             <form method="post" action="/groups">
                                 <input type="hidden" name="action" value="delete" />
                                 <input type="hidden" name="group" value=(&group.name) />
@@ -437,7 +421,7 @@ pub(super) async fn change_group(
     Form(form): Form<GroupForm>,
 ) -> TopcoatResult<impl View> {
     require_admin_session(cx).await?;
-    let Host(Some(host)) = app_context::<Host>(cx) else {
+    let Page(Some(page)) = app_context::<Page>(cx) else {
         return Err(bad_request("this node has no groups").into());
     };
     let action = match form.action.as_str() {
@@ -451,6 +435,7 @@ pub(super) async fn change_group(
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .grants()
+        .map_err(|_| bad_request("grants are unavailable"))?
         .into_iter()
         .filter(|grant| {
             grant.scope_id.as_str() == crate::direct::SCOPE
@@ -464,7 +449,7 @@ pub(super) async fn change_group(
         })
         .collect::<Vec<_>>();
     let group_error = access_groups::change(
-        &host.data_dir,
+        &page.data_dir,
         action,
         &form.group,
         form.agent.as_deref(),
@@ -537,14 +522,14 @@ pub(super) async fn relay(
     Form(form): Form<RelayForm>,
 ) -> TopcoatResult<impl View> {
     require_admin_session(cx).await?;
-    let Host(Some(host)) = app_context::<Host>(cx) else {
+    let Page(Some(page)) = app_context::<Page>(cx) else {
         return Err(bad_request("this node has no relay to change").into());
     };
     let relay = form.relay_url.trim();
     let relay = (!relay.is_empty()).then(|| relay.to_owned());
-    let valid = relay.as_deref().is_none_or(crate::node_config::valid_relay_url);
+    let valid = relay.as_deref().is_none_or(crate::transport::relay::valid_relay_url);
     let relay_error = if valid {
-        match host.set_relay_url(relay).await {
+        match page.set_relay_url(relay).await {
             Ok(()) => String::new(),
             Err(crate::transport::TransportError::Timeout) => {
                 "The relay did not answer. The node keeps its current relay.".to_owned()
@@ -626,7 +611,7 @@ pub(super) async fn save_card(
     Form(form): Form<CardForm>,
 ) -> TopcoatResult<impl View> {
     require_admin_session(cx).await?;
-    let Host(Some(host)) = app_context::<Host>(cx) else {
+    let Page(Some(page)) = app_context::<Page>(cx) else {
         return Err(bad_request("this node has no agent card").into());
     };
     let card_input = crate::agent_card::CardInput {
@@ -641,7 +626,7 @@ pub(super) async fn save_card(
             .map(str::to_owned)
             .collect(),
     };
-    let notice = match crate::agent_card::save_settings(&host.data_dir, &card_input) {
+    let notice = match crate::agent_card::save_settings(&page.data_dir, &card_input) {
         Ok(_) => Notice { card_saved: true, ..Notice::default() },
         Err(crate::agent_card::CardError::Invalid(reason)) => Notice {
             card_error: format!("The card was not saved: {reason}."),
@@ -701,7 +686,7 @@ async fn people(
     friends: Vec<Friend>,
     confirm_revoke: String,
 ) -> TopcoatResult<impl View> {
-    let now = aether_core::time::unix_timestamp(SystemTime::now()).unwrap_or(i64::MAX);
+    let now = aether_core::time::now();
     Ok(view! {
         if friends.is_empty() {
             <div class="rounded-xl border border-dashed border-border p-6 text-muted-foreground">
@@ -884,8 +869,8 @@ async fn invite_form(error: String) -> TopcoatResult<impl View> {
                         name="days"
                         class="h-9 rounded-lg border border-border bg-background px-3 text-sm shadow-xs"
                     >
-                        for days in ACCESS_DAYS {
-                            <option value=(days) selected=((days == DEFAULT_ACCESS_DAYS).then_some(""))>
+                        for days in crate::direct::DIRECT_OFFER_DAYS {
+                            <option value=(days) selected=((days == crate::direct::DEFAULT_DIRECT_ACCESS_DAYS).then_some(""))>
                                 (if days == 1 { "1 day".to_owned() } else { format!("{days} days") })
                             </option>
                         }
@@ -916,7 +901,7 @@ pub(super) async fn invite(
     Form(form): Form<InviteForm>,
 ) -> TopcoatResult<impl View> {
     require_admin_session(cx).await?;
-    let Host(Some(host)) = app_context::<Host>(cx) else {
+    let Page(Some(page)) = app_context::<Page>(cx) else {
         return Err(bad_request("this node cannot invite").into());
     };
     // A code copied from the caller's page may keep its groups of four.
@@ -927,7 +912,7 @@ pub(super) async fn invite(
         )
     } else if !crate::direct::valid_name(&form.friend_name) {
         Some("Use letters, digits, dots, dashes or underscores for their name.")
-    } else if !(1..=MAX_ACCESS_DAYS).contains(&form.days) {
+    } else if !crate::direct::valid_direct_invite_days(form.days) {
         Some("Choose how long they can use your agent.")
     } else {
         None
@@ -938,7 +923,7 @@ pub(super) async fn invite(
             Notice { invite_error: refusal.to_owned(), ..Notice::default() },
         )
     } else {
-        let line = create_invite(cx, host, &form.friend_name, &endpoint_id, form.days)?;
+        let line = create_invite(cx, page, &form.friend_name, &endpoint_id, form.days)?;
         (NewInvitation { friend_name: form.friend_name, line }, Notice::default())
     };
     Ok(view! { host_screen(invitation: invitation, notice: notice) })
@@ -947,92 +932,30 @@ pub(super) async fn invite(
 /// Signs the access, applies the grant, and returns the one-line invite.
 fn create_invite(
     cx: &Cx,
-    host: &HostContext,
+    page: &PageContext,
     friend_name: &str,
     endpoint_id: &str,
     days: u64,
 ) -> TopcoatResult<String> {
-    sign_invite(
+    sign_direct_invite(
         app_context::<SharedAdministration>(cx),
-        host,
-        &host.agent_name(),
+        &DirectInviteSigning::for_data_dir_with_relay(&page.data_dir, page.relay_url()),
+        &page.agent_name(),
         friend_name,
         endpoint_id,
         days,
-        "friends",
+        crate::access_groups::FRIENDS_GROUP,
+        aether_store::AuditActor::Ui,
     )
     .map(|(line, _)| line)
     .map_err(|error| match error {
-        InviteError::Refused => bad_request("the node refused the new access").into(),
-        InviteError::Internal(error) => internal_server_error(error).into(),
+        crate::invites::InviteError::Refused => {
+            bad_request("the node refused the new access").into()
+        }
+        crate::invites::InviteError::Internal(error) => {
+            internal_server_error(error).into()
+        }
     })
-}
-
-#[derive(Debug)]
-pub(super) enum InviteError {
-    /// The running node did not take the grant.
-    Refused,
-    Internal(std::io::Error),
-}
-
-/// Gives `friend_name` at `endpoint_id` access for `days` days in the
-/// access group `access_group`, applies the grant to the running node, and
-/// returns the one-line invite that names this node `agent_name` and the ID
-/// of the grant.
-pub(super) fn sign_invite(
-    administration: &SharedAdministration,
-    host: &HostContext,
-    agent_name: &str,
-    friend_name: &str,
-    endpoint_id: &str,
-    days: u64,
-    access_group: &str,
-) -> Result<(String, String), InviteError> {
-    let internal = |error: &dyn std::fmt::Display| {
-        InviteError::Internal(std::io::Error::other(error.to_string()))
-    };
-    // The card comes first: when it fails, the node applies no grant.
-    let agent_card = crate::direct::create_card(&host.data_dir, agent_name)
-        .map_err(|error| internal(&error))?;
-    let (authorization, grant) = crate::direct::sign_invite_access(
-        &host.data_dir,
-        friend_name,
-        endpoint_id,
-        days,
-    )
-    .map_err(|error| internal(&error))?;
-    let change = crate::admin::ChangeRequest::Grant {
-        id: grant.id.as_str().to_owned(),
-        grant: crate::node_config::grant_json(&grant).to_string(),
-    }
-    .into_change()
-    .map_err(|error| internal(&error))?;
-    crate::access_groups::join_and_apply(
-        &host.data_dir,
-        access_group,
-        friend_name,
-        endpoint_id,
-        || {
-            administration
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .apply_ui(&change)
-        },
-    )
-    .map_err(|error| match error {
-        crate::access_groups::JoinError::Store(error) => internal(&error),
-        crate::access_groups::JoinError::Apply(_) => InviteError::Refused,
-    })?;
-    crate::direct::encode_invite_after_grant(
-        &host.data_dir,
-        agent_name,
-        days,
-        authorization,
-        host.relay_url(),
-        agent_card,
-    )
-    .map(|line| (line, grant.id.as_str().to_owned()))
-    .map_err(|error| internal(&error))
 }
 
 #[derive(Deserialize)]
@@ -1052,14 +975,14 @@ pub(super) async fn revoke(
     Form(form): Form<RevokeForm>,
 ) -> TopcoatResult<impl View> {
     require_admin_session(cx).await?;
-    let Host(Some(_)) = app_context::<Host>(cx) else {
+    let Page(Some(_page)) = app_context::<Page>(cx) else {
         return Err(bad_request("this node cannot revoke").into());
     };
     let notice = if form.confirm.as_deref() == Some("yes") {
         app_context::<SharedAdministration>(cx)
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .revoke_ui(&form.grant_id)
+            .revoke(&form.grant_id, aether_store::AuditActor::Ui)
             .map_err(|_| bad_request("the access cannot be revoked"))?;
         Notice::default()
     } else {
@@ -1083,14 +1006,14 @@ pub(super) async fn workspace(
     Form(form): Form<WorkspaceForm>,
 ) -> TopcoatResult<impl View> {
     require_admin_session(cx).await?;
-    let Host(Some(host)) = app_context::<Host>(cx) else {
+    let Page(Some(page)) = app_context::<Page>(cx) else {
         return Err(bad_request("this node has no workspace to change").into());
     };
-    if host.task_folder_mode {
+    if page.task_folder_mode {
         return Err(bad_request("task folders do not allow folder changes").into());
     }
     let applied = crate::admin::ChangeRequest::Workspace {
-        id: WORKSPACE_ID.to_owned(),
+        id: crate::direct::INVITE_WORKSPACE_ID.to_owned(),
         path: form.path.trim().to_owned(),
     }
     .into_change()
@@ -1098,7 +1021,8 @@ pub(super) async fn workspace(
         app_context::<SharedAdministration>(cx)
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .apply_ui(&change)
+            .apply(&change, aether_store::AuditActor::Ui)
+            .map(|_| ())
             .is_ok()
     });
     let notice = if applied {
@@ -1110,4 +1034,50 @@ pub(super) async fn workspace(
         }
     };
     Ok(view! { host_screen(notice: notice) })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ListingForm {
+    action: String,
+}
+
+#[page(POST "/listing/publish")]
+pub(super) async fn publish_listing(
+    cx: &Cx,
+    Form(form): Form<ListingForm>,
+) -> TopcoatResult<impl View> {
+    ensure_admin_session(cx).await?;
+    let Page(Some(page)) = app_context::<Page>(cx) else {
+        return Err(bad_request("this node has no listing").into());
+    };
+    if crate::settings::setting::<crate::hub_client::settings::AgentKind>(
+        &page.data_dir,
+    )
+    .ok()
+    .flatten()
+        != Some(crate::hub_client::AgentKind::Service)
+    {
+        return Err(bad_request("only a service agent has a public listing").into());
+    }
+    let result = match (form.action.as_str(), page.current_hub()) {
+        (_, None) => Err(crate::listing::HubPublishError::Hub(
+            crate::hub_client::HubError::Unreachable,
+        )),
+        ("list", Some(hub)) => {
+            crate::listing::publish_to_hub(&page.data_dir, &hub, now_seconds())
+                .await
+                .map(drop)
+        }
+        ("stop", Some(hub)) => {
+            crate::listing::stop_hub_listing(&page.data_dir, &hub).await
+        }
+        _ => return Err(bad_request("unknown listing action").into()),
+    };
+    let error = result
+        .err()
+        .map(crate::listing::hub_publish_message)
+        .unwrap_or_default()
+        .to_owned();
+    Ok(view! { host_screen(notice: Notice::listing(error)) })
 }

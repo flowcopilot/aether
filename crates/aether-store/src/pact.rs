@@ -10,7 +10,9 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
-use crate::{StoreError, open_connection};
+use crate::{StoreError, migrate::open_connection};
+
+pub const PACT_DATABASE: &str = "pact.sqlite";
 
 pub const PACT_MIGRATIONS: &[&str] =
     &[include_str!("../migrations/pact/001_initial.sql")];
@@ -114,6 +116,10 @@ impl PactStore {
         Ok(Self { connection: open_connection(path.as_ref(), PACT_MIGRATIONS)? })
     }
 
+    pub fn in_dir(dir: &Path) -> Result<Self, StoreError> {
+        Self::open(dir.join(PACT_DATABASE))
+    }
+
     // -- Contexts (§4.2) --
 
     pub fn create_context(
@@ -170,7 +176,7 @@ impl PactStore {
     /// deletes the messages of all closed contexts. Returns how many
     /// contexts it closed.
     pub fn close_idle_contexts(
-        &self,
+        &mut self,
         idle_before: i64,
         now: i64,
     ) -> Result<usize, StoreError> {
@@ -192,7 +198,7 @@ impl PactStore {
     /// Records `message_id` in an open context, or reports the stored
     /// reply of an earlier send with the same id.
     pub fn reserve_message(
-        &self,
+        &mut self,
         context_id: &str,
         message_id: &str,
         request_text: &str,
@@ -327,7 +333,7 @@ impl PactStore {
     /// Approves the pending authorization `user_code` and stores `grant`,
     /// in one transaction. `NotFound` when it is no longer pending.
     pub fn approve_device(
-        &self,
+        &mut self,
         user_code: &str,
         grant: &PactGrant,
         now: i64,
@@ -365,7 +371,7 @@ impl PactStore {
     /// can poll it; anyone else gets `Unknown` and changes nothing. An
     /// approved code is consumed by the first poll that sees it.
     pub fn poll_device(
-        &self,
+        &mut self,
         device_code_hash: &str,
         brand_id: &str,
         pa_issuer: &str,
@@ -399,7 +405,7 @@ impl PactStore {
         let poll = if expires_at <= now {
             DevicePoll::Expired
         } else {
-            match DeviceStatus::parse(&status)? {
+            match DeviceStatus::parse(&status).ok_or(StoreError::InvalidState)? {
                 DeviceStatus::Denied => DevicePoll::Denied,
                 DeviceStatus::Consumed => DevicePoll::Consumed,
                 DeviceStatus::Pending => {
@@ -450,7 +456,7 @@ impl PactStore {
     /// Spends an unused, unexpired refresh token and returns its grant.
     /// A second use of the same token returns `None`.
     pub fn use_refresh_token(
-        &self,
+        &mut self,
         token_hash: &str,
         now: i64,
     ) -> Result<Option<PactGrant>, StoreError> {
@@ -505,10 +511,7 @@ impl PactStore {
 
 /// The strings are the `pact_device_authorizations.status` column and its
 /// `CHECK` constraint. Changing one breaks every stored row that holds it.
-#[derive(
-    Debug, Clone, Copy, Eq, PartialEq, strum::IntoStaticStr, strum::EnumString,
-)]
-#[strum(serialize_all = "snake_case")]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum DeviceStatus {
     Pending,
     Approved,
@@ -516,15 +519,12 @@ enum DeviceStatus {
     Consumed,
 }
 
-impl DeviceStatus {
-    fn as_str(self) -> &'static str {
-        self.into()
-    }
-
-    fn parse(value: &str) -> Result<Self, StoreError> {
-        value.parse().map_err(|_| StoreError::InvalidState)
-    }
-}
+aether_core::named!(DeviceStatus {
+    Pending => "pending",
+    Approved => "approved",
+    Denied => "denied",
+    Consumed => "consumed",
+});
 
 /// The device-authorization columns `poll_device` decides on.
 struct DeviceRow {
@@ -573,10 +573,7 @@ mod tests {
     use crate::StoreError;
 
     fn store() -> (tempfile::TempDir, PactStore) {
-        let directory = tempfile::tempdir().expect("directory must create");
-        let store = PactStore::open(directory.path().join("pact.sqlite"))
-            .expect("store must open");
-        (directory, store)
+        crate::test_support::temp_pact_store()
     }
 
     fn device(user_code: &str, hash: &str) -> NewDeviceAuthorization {
@@ -607,23 +604,8 @@ mod tests {
     }
 
     #[test]
-    fn device_status_names_stay_the_same_and_parse_back() {
-        use super::DeviceStatus;
-        for (status, name) in [
-            (DeviceStatus::Pending, "pending"),
-            (DeviceStatus::Approved, "approved"),
-            (DeviceStatus::Denied, "denied"),
-            (DeviceStatus::Consumed, "consumed"),
-        ] {
-            assert_eq!(status.as_str(), name);
-            assert_eq!(DeviceStatus::parse(name), Ok(status));
-        }
-        assert_eq!(DeviceStatus::parse("Pending"), Err(StoreError::InvalidState));
-    }
-
-    #[test]
     fn a_retry_returns_the_stored_reply_and_a_running_turn_has_none() {
-        let (_directory, store) = store();
+        let (_directory, mut store) = store();
         store.create_context("c", "review", "https://pa.example", "user-1", 1).unwrap();
         assert_eq!(
             store.reserve_message("c", "m1", "hello", 2).unwrap(),
@@ -646,7 +628,7 @@ mod tests {
 
     #[test]
     fn a_discarded_turn_can_run_again() {
-        let (_directory, store) = store();
+        let (_directory, mut store) = store();
         store.create_context("c", "review", "https://pa.example", "user-1", 1).unwrap();
         store.reserve_message("c", "m1", "hello", 2).unwrap();
         store.discard_message("c", "m1").unwrap();
@@ -658,7 +640,7 @@ mod tests {
 
     #[test]
     fn the_transcript_holds_answered_turns_before_the_message_oldest_first() {
-        let (_directory, store) = store();
+        let (_directory, mut store) = store();
         store.create_context("c", "review", "https://pa.example", "user-1", 1).unwrap();
         for (id, text, reply) in
             [("m1", "one", Some("1")), ("m2", "two", None), ("m3", "three", Some("3"))]
@@ -679,7 +661,7 @@ mod tests {
 
     #[test]
     fn an_idle_context_closes_and_loses_its_messages() {
-        let (_directory, store) = store();
+        let (_directory, mut store) = store();
         store
             .create_context("old", "review", "https://pa.example", "user-1", 1)
             .unwrap();
@@ -715,25 +697,52 @@ mod tests {
 
     #[test]
     fn a_device_poll_waits_slows_down_and_consumes_the_approval_once() {
-        let (_directory, store) = store();
+        let (_directory, mut store) = store();
         store.create_device_authorization(&device("ABCD-EFGH", "hash")).unwrap();
-        let poll = |now| {
-            store.poll_device("hash", "review", "https://pa.example", "user-1", now)
-        };
-        assert_eq!(poll(200).unwrap(), DevicePoll::Pending { slow_down: false });
-        assert_eq!(poll(202).unwrap(), DevicePoll::Pending { slow_down: true });
-        assert_eq!(poll(210).unwrap(), DevicePoll::Pending { slow_down: false });
+        assert_eq!(
+            store
+                .poll_device("hash", "review", "https://pa.example", "user-1", 200)
+                .unwrap(),
+            DevicePoll::Pending { slow_down: false }
+        );
+        assert_eq!(
+            store
+                .poll_device("hash", "review", "https://pa.example", "user-1", 202)
+                .unwrap(),
+            DevicePoll::Pending { slow_down: true }
+        );
+        assert_eq!(
+            store
+                .poll_device("hash", "review", "https://pa.example", "user-1", 210)
+                .unwrap(),
+            DevicePoll::Pending { slow_down: false }
+        );
         assert!(store.pending_device("ABCD-EFGH", 210).unwrap().is_some());
         store.approve_device("ABCD-EFGH", &grant("g"), 220).unwrap();
         assert!(store.pending_device("ABCD-EFGH", 220).unwrap().is_none());
-        assert_eq!(poll(230).unwrap(), DevicePoll::Approved(grant("g")));
-        assert_eq!(poll(240).unwrap(), DevicePoll::Consumed);
-        assert_eq!(poll(800).unwrap(), DevicePoll::Expired);
+        assert_eq!(
+            store
+                .poll_device("hash", "review", "https://pa.example", "user-1", 230)
+                .unwrap(),
+            DevicePoll::Approved(grant("g"))
+        );
+        assert_eq!(
+            store
+                .poll_device("hash", "review", "https://pa.example", "user-1", 240)
+                .unwrap(),
+            DevicePoll::Consumed
+        );
+        assert_eq!(
+            store
+                .poll_device("hash", "review", "https://pa.example", "user-1", 800)
+                .unwrap(),
+            DevicePoll::Expired
+        );
     }
 
     #[test]
     fn only_the_starting_agent_user_and_brand_can_poll_a_device_code() {
-        let (_directory, store) = store();
+        let (_directory, mut store) = store();
         store.create_device_authorization(&device("ABCD-EFGH", "hash")).unwrap();
         store.approve_device("ABCD-EFGH", &grant("g"), 150).unwrap();
         for (brand, issuer, subject) in [
@@ -757,7 +766,7 @@ mod tests {
 
     #[test]
     fn a_denied_or_expired_authorization_cannot_be_approved() {
-        let (_directory, store) = store();
+        let (_directory, mut store) = store();
         store.create_device_authorization(&device("AAAA-AAAA", "one")).unwrap();
         store.create_device_authorization(&device("BBBB-BBBB", "two")).unwrap();
         store.deny_device("AAAA-AAAA").unwrap();
@@ -781,7 +790,7 @@ mod tests {
 
     #[test]
     fn a_refresh_token_works_once_and_not_after_it_expires() {
-        let (_directory, store) = store();
+        let (_directory, mut store) = store();
         store.create_device_authorization(&device("ABCD-EFGH", "hash")).unwrap();
         store.approve_device("ABCD-EFGH", &grant("g"), 200).unwrap();
         store.put_refresh_token("once", "g", 5_000).unwrap();
@@ -799,5 +808,20 @@ mod tests {
         store.put_receipt("c", "m2", "g", "d.e.f", 2).unwrap();
         store.put_receipt("c", "m3", "other", "g.h.i", 3).unwrap();
         assert_eq!(store.receipts("g").unwrap(), ["a.b.c", "d.e.f"]);
+    }
+
+    #[test]
+    fn device_status_names_stay_the_same_and_parse_back() {
+        use super::DeviceStatus;
+        for (status, name) in [
+            (DeviceStatus::Pending, "pending"),
+            (DeviceStatus::Approved, "approved"),
+            (DeviceStatus::Denied, "denied"),
+            (DeviceStatus::Consumed, "consumed"),
+        ] {
+            assert_eq!(status.as_str(), name);
+            assert_eq!(DeviceStatus::parse(name), Some(status));
+        }
+        assert_eq!(DeviceStatus::parse("Pending"), None);
     }
 }

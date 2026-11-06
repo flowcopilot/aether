@@ -3,8 +3,6 @@
 //! caller's own agent (MCP) or the CLI, so the page shows the commands that
 //! connect them instead of a task form.
 
-use std::time::SystemTime;
-
 use serde::Deserialize;
 use topcoat::{
     Result as TopcoatResult,
@@ -20,9 +18,10 @@ use topcoat::{
 };
 
 use super::{
-    Caller, Tab, ensure_admin_session,
+    Page, ensure_admin_session,
     hub::{error_line, hub_section, hub_setting},
-    node_header, require_admin_session,
+    layout::{Tab, node_header},
+    require_admin_session,
 };
 use crate::{
     admin_components::{
@@ -35,6 +34,7 @@ use crate::{
         input::input,
     },
     hub_client::{HubClient, Role},
+    hub_membership::{accept, hub_message},
 };
 
 /// An agent this computer can use, from its kept invite.
@@ -55,20 +55,28 @@ pub(super) async fn caller_screen(
     #[default] request_error: String,
 ) -> TopcoatResult<impl View> {
     ensure_admin_session(cx).await?;
-    let Caller(Some(caller)) = app_context::<Caller>(cx) else {
+    let Page(Some(page)) = app_context::<Page>(cx) else {
         return Err(internal_server_error(std::io::Error::other(
             "the caller screen needs a data directory",
         ))
         .into());
     };
+    if !page.caller {
+        return Err(internal_server_error(std::io::Error::other(
+            "the caller screen needs a data directory",
+        ))
+        .into());
+    }
     let endpoint_id =
-        crate::direct::endpoint_id(&caller.data_dir).map_err(internal_server_error)?;
-    let now = aether_core::time::unix_seconds(SystemTime::now()).unwrap_or(0);
-    let mut contacts = crate::direct::contact_bundles(&caller.data_dir)
+        crate::direct::endpoint_id(&page.data_dir).map_err(internal_server_error)?;
+    let now = aether_core::time::now_seconds();
+    let store =
+        crate::direct::open_store(&page.data_dir).map_err(internal_server_error)?;
+    let mut contacts = crate::direct::contact_bundles(&store)
         .map_err(internal_server_error)?
         .into_iter()
         .map(|bundle| Contact {
-            card: crate::direct::contact_card(&caller.data_dir, &bundle),
+            card: crate::direct::contact_card(&store, &bundle),
             days_left: bundle
                 .invitation
                 .expires_at
@@ -82,14 +90,13 @@ pub(super) async fn caller_screen(
     contacts.sort_by(|left, right| left.name.cmp(&right.name));
     let connected = !contacts.is_empty();
     // The newest tasks that this computer sent, from its outbox.
-    let sent = aether_store::NodeStore::in_dir(&caller.data_dir)
-        .and_then(|store| store.sent_tasks_page(None, 20, None, false))
-        .unwrap_or_default();
-    let drafts = request_drafts_of(&caller.data_dir, now);
-    let hub = caller.hub.get();
+    let sent = aether_store::NodeStore::in_dir(&page.data_dir)
+        .and_then(|store| store.sent_tasks_page(None, 20, None, false));
+    let drafts = super::shared::request_drafts_of(&page.data_dir, now);
+    let hub = page.current_hub();
     // The MCP server of this binary and this data directory, so the
     // person's own agent uses the same contacts as this page.
-    let mcp_command = mcp_command(&caller.data_dir);
+    let mcp_command = mcp_command(&page.data_dir);
 
     let code_open = !error.is_empty();
     Ok(view! {
@@ -209,8 +216,17 @@ pub(super) async fn caller_screen(
                     )
                 </section>
             }
-            if !sent.is_empty() {
-                sent_tasks(tasks: sent.clone(), now: now)
+            match &sent {
+                Ok(sent) if !sent.is_empty() => {
+                    sent_tasks(tasks: sent.clone(), now: now)
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    <section aria-labelledby="sent" class="flex flex-col gap-4">
+                        <h2 id="sent" class="text-xl font-semibold tracking-tight">"Sent tasks"</h2>
+                        <p role="alert" class="text-muted-foreground">"Sent tasks cannot be loaded."</p>
+                    </section>
+                }
             }
             if connected {
                 <section id="connect" aria-labelledby="connect-title" class="flex flex-col gap-4 rounded-xl border border-border px-5 py-4">
@@ -290,19 +306,6 @@ async fn connect_steps(endpoint_id: String, error: String) -> TopcoatResult<impl
     })
 }
 
-/// The access requests that wait for the person in `data_dir` at Unix time
-/// `now`.
-pub(super) fn request_drafts_of(
-    data_dir: &std::path::Path,
-    now: u64,
-) -> Vec<aether_store::AccessRequestDraft> {
-    aether_store::NodeStore::in_dir(data_dir)
-        .and_then(|store| {
-            store.access_request_drafts(i64::try_from(now).unwrap_or(i64::MAX))
-        })
-        .unwrap_or_default()
-}
-
 /// The access requests that the person's agent prepared. The node sends one
 /// only after **Confirm**.
 #[component]
@@ -335,7 +338,9 @@ async fn request_draft(
     draft: aether_store::AccessRequestDraft,
 ) -> TopcoatResult<impl View> {
     let listing = crate::listing::parse(&draft.listing.text, &draft.target_name).ok();
-    let mut choices = vec![1, 7, 30, u64::from(draft.days)];
+    let mut choices =
+        [crate::hub_client::protocol::OFFER_DAYS.as_slice(), &[u64::from(draft.days)]]
+            .concat();
     choices.sort_unstable();
     choices.dedup();
     Ok(view! {
@@ -385,6 +390,34 @@ async fn request_draft(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(super) struct InviteIdForm {
+    id: String,
+}
+
+#[page(POST "/hub/accept")]
+pub(super) async fn accept_invite(
+    cx: &Cx,
+    Form(form): Form<InviteIdForm>,
+) -> TopcoatResult<impl View> {
+    require_admin_session(cx).await?;
+    let Page(Some(page)) = app_context::<Page>(cx) else {
+        return Err(bad_request("this node cannot accept invites").into());
+    };
+    if !page.caller {
+        return Err(bad_request("this node cannot accept invites").into());
+    }
+    let Some(hub) = page.current_hub() else {
+        return Err(bad_request("this node has no hub").into());
+    };
+    let error = match accept(&hub, &page.data_dir, &form.id).await {
+        Ok(_) => "",
+        Err(error) => hub_message(error),
+    };
+    Ok(view! { caller_screen(hub_error: error.to_owned()) })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct ConfirmForm {
     id: String,
     days: u64,
@@ -397,15 +430,20 @@ pub(super) async fn confirm_request(
     Form(form): Form<ConfirmForm>,
 ) -> TopcoatResult<impl View> {
     require_admin_session(cx).await?;
-    let Caller(Some(caller)) = app_context::<Caller>(cx) else {
+    let Page(Some(page)) = app_context::<Page>(cx) else {
         return Err(bad_request("this node sends no access requests").into());
     };
-    let error = match caller.hub.get() {
-        Some(hub) => confirm(&hub, &caller.data_dir, &form.id, form.days)
-            .await
-            .err()
-            .unwrap_or_default(),
-        None => "Set a hub first: requests go through the hub.",
+    let error = match page.hub_access() {
+        super::HubAccess::Ready(hub) => {
+            confirm(&hub, &page.data_dir, &form.id, form.days)
+                .await
+                .err()
+                .unwrap_or_default()
+        }
+        super::HubAccess::Off => "Set a hub first: requests go through the hub.",
+        super::HubAccess::Unavailable => {
+            "This node cannot read its hub settings. Fix the data directory and try again."
+        }
     };
     Ok(view! { caller_screen(request_error: error.to_owned()) })
 }
@@ -419,16 +457,18 @@ async fn confirm(
     id: &str,
     days: u64,
 ) -> Result<(), &'static str> {
-    if !(1..=30).contains(&days) {
+    if !(crate::hub_client::protocol::ACCESS_DAYS_MIN
+        ..=crate::hub_client::protocol::ACCESS_DAYS_MAX)
+        .contains(&days)
+    {
         return Err("Choose 1 to 30 days.");
     }
-    let now = aether_core::time::unix_timestamp(SystemTime::now()).unwrap_or(0);
-    let store = aether_store::NodeStore::in_dir(data_dir)
+    let now = aether_core::time::now();
+    let store = crate::hub_store::HubStore::open(data_dir)
         .map_err(|_| "The requests are unavailable.")?;
     let draft = store
         .access_request_draft(id)
-        .ok()
-        .flatten()
+        .map_err(|_| "The requests are unavailable.")?
         .filter(|draft| draft.expires_at > now)
         .ok_or("This request is gone. Ask your agent again.")?;
     if draft.listing.expires_at <= now {
@@ -456,7 +496,7 @@ async fn confirm(
         expires_at: now.saturating_add(crate::hub_membership::APPROVAL_SECONDS),
         listing: Some(draft.listing),
     };
-    if store.put_hub_approval(&approval).is_err() {
+    if store.put_approval(&approval).is_err() {
         let _ = hub.remove(&invite.id).await;
         return Err("This node cannot keep the request. Try again.");
     }
@@ -470,18 +510,16 @@ pub(super) struct DiscardForm {
     id: String,
 }
 
-/// Removes an access request that the person's agent prepared. Nothing is
-/// sent.
 #[page(POST "/requests/discard")]
 pub(super) async fn discard_request(
     cx: &Cx,
     Form(form): Form<DiscardForm>,
 ) -> TopcoatResult<impl View> {
     require_admin_session(cx).await?;
-    let Caller(Some(caller)) = app_context::<Caller>(cx) else {
+    let Page(Some(page)) = app_context::<Page>(cx) else {
         return Err(bad_request("this node sends no access requests").into());
     };
-    aether_store::NodeStore::in_dir(&caller.data_dir)
+    aether_store::NodeStore::in_dir(&page.data_dir)
         .and_then(|store| store.remove_access_request_draft(&form.id))
         .map_err(internal_server_error)?;
     Ok(view! { caller_screen() })
@@ -594,12 +632,12 @@ pub(super) async fn import(
     Form(form): Form<ImportForm>,
 ) -> TopcoatResult<impl View> {
     require_admin_session(cx).await?;
-    let Caller(Some(caller)) = app_context::<Caller>(cx) else {
+    let Page(Some(page)) = app_context::<Page>(cx) else {
         return Err(bad_request("this page cannot import invitations").into());
     };
     let error = match crate::direct::InvitationBundle::decode(&form.bundle) {
         Err(_) => "This is not an Aether invite. Ask for it again and paste all of it.",
-        Ok(bundle) => match crate::direct::import_bundle(&caller.data_dir, &bundle) {
+        Ok(bundle) => match crate::direct::import_bundle(&page.data_dir, &bundle) {
             Ok(_) => "",
             Err(crate::direct::DirectError::OtherEndpoint) => {
                 "This invite is for another computer."
@@ -632,10 +670,10 @@ pub(super) async fn remove_contact(
     Form(form): Form<RemoveContactForm>,
 ) -> TopcoatResult<impl View> {
     require_admin_session(cx).await?;
-    let Caller(Some(caller)) = app_context::<Caller>(cx) else {
+    let Page(Some(page)) = app_context::<Page>(cx) else {
         return Err(bad_request("this page has no contacts").into());
     };
-    let error = match crate::direct::remove_contact(&caller.data_dir, &form.agent) {
+    let error = match crate::direct::remove_contact(&page.data_dir, &form.agent) {
         Ok(()) | Err(crate::direct::DirectError::UnknownContact) => "",
         Err(error) => return Err(internal_server_error(error).into()),
     };

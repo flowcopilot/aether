@@ -12,7 +12,6 @@ use crate::{
     hub_client::{Invite, Origin, Role, Status},
 };
 
-/// What the host does with one hub row.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum HostStep {
     /// Nothing now: the row is not ready, or this page never sent it.
@@ -27,7 +26,7 @@ pub enum HostStep {
 }
 
 /// The step for `invite` with the local `approval` of its id. `own_name` is
-/// this node's name on the hub (`node_config::stored_hub_name`), never a
+/// this node's name on the hub (the `HubName` setting), never a
 /// flag: without it the host makes no step. `blocked` is whether the owner
 /// blocked the endpoint that the row names: the host never signs for it.
 #[must_use]
@@ -47,7 +46,7 @@ pub fn host_step(
     };
     if blocked
         || endpoint.parse::<iroh::EndpointId>().is_err()
-        || !crate::direct::valid_name(&invite.to)
+        || !crate::hub_client::valid_full_name(&invite.to)
         || approval.side != ApprovalSide::Sender
         || invite.to != approval.peer_name
         || invite.days > u64::from(approval.days)
@@ -82,7 +81,6 @@ pub fn host_step(
     }
 }
 
-/// What the caller does with one hub row.
 #[derive(Debug, Clone)]
 pub enum CallerStep {
     /// Nothing: the row has no line for this node yet.
@@ -168,8 +166,8 @@ mod tests {
     fn accepted() -> Invite {
         Invite {
             id: "0123456789abcdef0123456789abcdef".to_owned(),
-            from: "tudor".to_owned(),
-            to: "ana".to_owned(),
+            from: "tudor#0042".to_owned(),
+            to: "ana#0007".to_owned(),
             role: Role::Sender,
             days: 7,
             status: Status::Accepted,
@@ -186,7 +184,7 @@ mod tests {
             invite_id: accepted().id,
             side: ApprovalSide::Sender,
             kind: ApprovalKind::Invite,
-            peer_name: "ana".to_owned(),
+            peer_name: "ana#0007".to_owned(),
             peer_endpoint: None,
             days: 7,
             access_group: "friends".to_owned(),
@@ -199,15 +197,18 @@ mod tests {
 
     #[test]
     fn the_host_signs_only_an_invite_it_sent() {
-        assert_eq!(host_step(&accepted(), None, Some("tudor"), false), HostStep::Skip);
+        assert_eq!(
+            host_step(&accepted(), None, Some("tudor#0042"), false),
+            HostStep::Skip
+        );
         assert_eq!(
             host_step(&accepted(), Some(&approval()), None, false),
             HostStep::Skip
         );
         assert_eq!(
-            host_step(&accepted(), Some(&approval()), Some("tudor"), false),
+            host_step(&accepted(), Some(&approval()), Some("tudor#0042"), false),
             HostStep::Sign {
-                friend_name: "ana".to_owned(),
+                friend_name: "ana#0007".to_owned(),
                 endpoint: endpoint(),
                 days: 7,
                 access_group: "friends".to_owned(),
@@ -215,12 +216,12 @@ mod tests {
         );
         let pending = Invite { status: Status::Pending, ..accepted() };
         assert_eq!(
-            host_step(&pending, Some(&approval()), Some("tudor"), false),
+            host_step(&pending, Some(&approval()), Some("tudor#0042"), false),
             HostStep::Skip
         );
         let received = Invite { role: Role::Receiver, ..accepted() };
         assert_eq!(
-            host_step(&received, Some(&approval()), Some("tudor"), false),
+            host_step(&received, Some(&approval()), Some("tudor#0042"), false),
             HostStep::Skip
         );
     }
@@ -228,8 +229,9 @@ mod tests {
     #[test]
     fn the_host_refuses_a_row_whose_name_days_or_endpoint_changed() {
         let approval = approval();
-        let refuse =
-            |invite: Invite| host_step(&invite, Some(&approval), Some("tudor"), false);
+        let refuse = |invite: Invite| {
+            host_step(&invite, Some(&approval), Some("tudor#0042"), false)
+        };
         assert_eq!(
             refuse(Invite { to: "eve".to_owned(), ..accepted() }),
             HostStep::Refuse
@@ -253,18 +255,18 @@ mod tests {
             ..approval.clone()
         };
         assert_eq!(
-            host_step(&accepted(), Some(&pinned), Some("tudor"), false),
+            host_step(&accepted(), Some(&pinned), Some("tudor#0042"), false),
             HostStep::Refuse
         );
         let received = HubApproval { side: ApprovalSide::Receiver, ..approval.clone() };
         assert_eq!(
-            host_step(&accepted(), Some(&received), Some("tudor"), false),
+            host_step(&accepted(), Some(&received), Some("tudor#0042"), false),
             HostStep::Refuse
         );
         assert_eq!(
             refuse(Invite { days: 1, ..accepted() }),
             HostStep::Sign {
-                friend_name: "ana".to_owned(),
+                friend_name: "ana#0007".to_owned(),
                 endpoint: endpoint(),
                 days: 1,
                 access_group: "friends".to_owned(),
@@ -275,21 +277,24 @@ mod tests {
     /// A delivered row for the caller, with a line that `host` signed as
     /// `agent` for the caller key `caller`.
     fn delivered(host: &std::path::Path, agent: &str, caller: &str) -> Invite {
-        let (authorization, _) = crate::identity::sign_access(
+        let access = crate::identity::AccessInput {
+            issuer_agent_id: "node".to_owned(),
+            subject_agent_id: "ana#0007".to_owned(),
+            subject_endpoint_id: caller.to_owned(),
+            scope_id: crate::direct::SCOPE.to_owned(),
+            capabilities: vec![crate::execution::GENERAL_SKILL.to_owned()],
+            workspaces: vec!["workspace".to_owned()],
+            access_mode: aether_core::AccessMode::ReadOnly,
+            approval_rule: aether_core::ApprovalRule::Automatic,
+            lifetime: std::time::Duration::from_secs(60),
+        };
+        let (claim, _) = crate::identity::sign_access(
             &ed25519_dalek::SigningKey::from_bytes(&[9; 32]),
-            &crate::identity::AccessInput {
-                issuer_agent_id: "node".to_owned(),
-                subject_agent_id: "ana".to_owned(),
-                subject_endpoint_id: caller.to_owned(),
-                scope_id: crate::direct::SCOPE.to_owned(),
-                capabilities: vec![crate::execution::GENERAL_SKILL.to_owned()],
-                workspaces: vec!["workspace".to_owned()],
-                access_mode: aether_core::AccessMode::ReadOnly,
-                approval_rule: aether_core::ApprovalRule::Automatic,
-                lifetime: std::time::Duration::from_secs(60),
-            },
+            &access,
         )
         .expect("access must sign");
+        let authorization =
+            crate::transport::A2aAuthorization::for_access(&access, &claim);
         let line = crate::direct::InvitationBundle {
             format: crate::direct::BUNDLE_FORMAT_V1.to_owned(),
 
@@ -308,8 +313,8 @@ mod tests {
         .encode()
         .expect("the line must encode");
         Invite {
-            from: "tudor".to_owned(),
-            to: "ana".to_owned(),
+            from: "tudor#0042".to_owned(),
+            to: "ana#0007".to_owned(),
             role: Role::Receiver,
             status: Status::Delivered,
             receiver_endpoint: None,
@@ -322,7 +327,7 @@ mod tests {
     fn accepted_by_caller() -> HubApproval {
         HubApproval {
             side: ApprovalSide::Receiver,
-            peer_name: "tudor".to_owned(),
+            peer_name: "tudor#0042".to_owned(),
             ..approval()
         }
     }
@@ -331,7 +336,7 @@ mod tests {
     fn the_caller_imports_only_a_bundle_from_the_named_sender_endpoint() {
         let host = tempfile::tempdir().expect("directory must create");
         let caller = endpoint();
-        let row = delivered(host.path(), "tudor", &caller);
+        let row = delivered(host.path(), "tudor#0042", &caller);
         let approval = accepted_by_caller();
         assert!(matches!(caller_step(&row, Some(&approval)), CallerStep::Import(_)));
 
@@ -439,7 +444,7 @@ mod tests {
             HostStep::Refuse
         );
         assert_eq!(
-            host_step(&accepted(), Some(&approval()), Some("tudor"), true),
+            host_step(&accepted(), Some(&approval()), Some("tudor#0042"), true),
             HostStep::Refuse
         );
         let signed = HubApproval {
@@ -448,7 +453,7 @@ mod tests {
             ..approval()
         };
         assert_eq!(
-            host_step(&accepted(), Some(&signed), Some("tudor"), true),
+            host_step(&accepted(), Some(&signed), Some("tudor#0042"), true),
             HostStep::Refuse
         );
     }
@@ -472,7 +477,8 @@ mod tests {
             &crate::agent_card::CardSettings::default(),
             "law#0042",
         );
-        let key = crate::transport::load_or_create_key(signer.join("endpoint.key"))
+        let key = crate::data_dir::DataDir::new(signer)
+            .endpoint_key()
             .expect("key must load");
         let expires = u64::try_from(listing_expires_at).expect("expiry");
         let approval = HubApproval {
@@ -532,7 +538,7 @@ mod tests {
             ..approval()
         };
         assert_eq!(
-            host_step(&accepted(), Some(&signed), Some("tudor"), false),
+            host_step(&accepted(), Some(&signed), Some("tudor#0042"), false),
             HostStep::Deliver("aether-invite:signed".to_owned())
         );
     }

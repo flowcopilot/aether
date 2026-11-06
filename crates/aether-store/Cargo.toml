@@ -8,13 +8,14 @@ repository.workspace = true
 
 [dependencies]
 aether-core = { path = "../aether-core" }
+blake3 = "1.8.7"
 rusqlite = { version = "0.40.2", features = ["backup", "bundled"] }
 rusqlite_migration = "2.6.0"
 serde = { version = "1.0.229", features = ["derive"] }
-strum = { version = "0.28.0", features = ["derive"] }
 thiserror = "2.0.18"
 
 [dev-dependencies]
+serde_json = "1.0.151"
 tempfile = "3.27.0"
 
 [lints]

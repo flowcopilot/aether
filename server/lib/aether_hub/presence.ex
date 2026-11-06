@@ -3,21 +3,23 @@ defmodule AetherHub.Presence do
   Whether a node is online. Kept in memory only, so it starts empty at boot.
 
   A node is online when it has an open long poll now, or when its last signed
-  request was at most 45 s ago. Presence never changes a version, so it
-  never wakes a long poll. Entries older than 7 days are deleted every hour.
+  request was recent. Presence never changes a version, so it never wakes a
+  long poll. The process owns the table; `AetherHub.Sweeper` removes old
+  entries.
   """
   use GenServer
 
+  alias AetherHub.Clock
+
   @table :aether_hub_presence
-  @window 45
-  @keep 7 * 86_400
-  @sweep_every :timer.hours(1)
+  @window AetherHub.Protocol.limit(:online_seconds)
+  @keep AetherHub.Protocol.limit(:presence_keep_seconds)
 
   def start_link(_opts), do: GenServer.start_link(__MODULE__, nil, name: __MODULE__)
 
-  @doc "Records a signed request from `endpoint` at Unix time `now`."
-  def seen(endpoint, now \\ System.system_time(:second)) do
-    :ets.insert(@table, {endpoint, now})
+  @doc "Records a signed request from `endpoint` now."
+  def seen(endpoint) do
+    :ets.insert(@table, {endpoint, Clock.now()})
     :ok
   end
 
@@ -29,19 +31,18 @@ defmodule AetherHub.Presence do
     end
   end
 
-  @doc "Whether `endpoint` counts as online at Unix time `now`."
-  def online?(endpoint, now \\ System.system_time(:second)) do
-    waiting?(endpoint) or recent?(last_seen(endpoint), now)
+  def online?(endpoint) do
+    waiting?(endpoint) or recent?(last_seen(endpoint))
   end
 
   defp waiting?(endpoint), do: Registry.lookup(AetherHub.Waiters, endpoint) != []
 
-  defp recent?(nil, _now), do: false
-  defp recent?(time, now), do: now - time <= @window
+  defp recent?(nil), do: false
+  defp recent?(time), do: Clock.now() - time <= @window
 
-  @doc "Deletes the entries of requests older than 7 days at Unix time `now`."
-  def sweep(now \\ System.system_time(:second)) do
-    cutoff = now - @keep
+  @doc "Forgets the requests that are older than the time the hub keeps them."
+  def sweep do
+    cutoff = Clock.now() - @keep
     :ets.select_delete(@table, [{{:_, :"$1"}, [{:<, :"$1", cutoff}], [true]}])
     :ok
   end
@@ -49,14 +50,6 @@ defmodule AetherHub.Presence do
   @impl true
   def init(nil) do
     :ets.new(@table, [:named_table, :public, :set, write_concurrency: true])
-    Process.send_after(self(), :sweep, @sweep_every)
     {:ok, nil}
-  end
-
-  @impl true
-  def handle_info(:sweep, state) do
-    sweep()
-    Process.send_after(self(), :sweep, @sweep_every)
-    {:noreply, state}
   end
 end

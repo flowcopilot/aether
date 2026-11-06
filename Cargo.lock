@@ -73,6 +73,7 @@ dependencies = [
  "bytes",
  "cucumber",
  "ed25519-dalek",
+ "form_urlencoded",
  "futures-util",
  "getrandom 0.4.3",
  "governor",
@@ -84,6 +85,7 @@ dependencies = [
  "predicates",
  "process-wrap",
  "rcgen",
+ "regex",
  "reqwest",
  "rmcp",
  "rusqlite",
@@ -96,6 +98,7 @@ dependencies = [
  "sha2 0.11.1",
  "tempfile",
  "thiserror 2.0.21",
+ "time",
  "tokio",
  "tokio-util",
  "toml",
@@ -115,10 +118,11 @@ name = "aether-store"
 version = "0.3.0"
 dependencies = [
  "aether-core",
+ "blake3",
  "rusqlite",
  "rusqlite_migration",
  "serde",
- "strum",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.21",
 ]

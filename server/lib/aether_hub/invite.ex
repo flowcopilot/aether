@@ -6,6 +6,10 @@ defmodule AetherHub.Invite do
   """
   use Ecto.Schema
 
+  alias AetherHub.Protocol
+
+  @default_origin Protocol.invite_origin(:invite)
+
   @primary_key {:id, :string, autogenerate: false}
   schema "invites" do
     field :sender_endpoint, :string
@@ -17,6 +21,6 @@ defmodule AetherHub.Invite do
     # The receiver when it blocked the sender: the row exists for the
     # sender only.
     field :hidden_from, :string
-    field :origin, :string, default: "invite"
+    field :origin, :string, default: @default_origin
   end
 end

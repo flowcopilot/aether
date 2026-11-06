@@ -9,8 +9,7 @@ use std::{
 };
 
 use aether::admin_socket::{
-    Request as AdminRequest, Response as AdminResponse, path as admin_socket_path,
-    send as send_admin,
+    Request as AdminRequest, Response as AdminResponse, send as send_admin,
 };
 use cucumber::{given, then, when};
 use serde_json::json;
@@ -22,13 +21,9 @@ const EXPIRED_TASK_ID: &str = "00000000-0000-4000-8000-000000000042";
 
 #[derive(Debug, Default)]
 pub struct State {
-    /// The `HOME` of the node.
     home: Option<PathBuf>,
-    /// The owner's Codex login file.
     owner_auth: Option<PathBuf>,
-    /// The port that the node reports for peers.
     port: Option<u16>,
-    /// The URL of the owner page.
     owner_page: Option<String>,
     /// An old `policy.json` and the node data directory that imports it.
     policy_file: Option<PathBuf>,
@@ -79,7 +74,7 @@ fn new_home(world: &mut World) {
 fn owner_logged_in(world: &mut World) {
     let codex_home = world.cli.node_files.home().join(".codex");
     fs::create_dir_all(&codex_home).expect("owner Codex home must create");
-    let auth = codex_home.join("auth.json");
+    let auth = aether::data_dir::codex_login(&codex_home);
     fs::write(&auth, "test credentials").expect("owner login must write");
     world.cli.node_files.owner_auth = Some(auth);
 }
@@ -151,7 +146,10 @@ async fn node_stops(world: &mut World) {
 
 #[when("the node is woken to send its outbox")]
 async fn wake_outbox(world: &mut World) {
-    let socket = admin_socket_path(&world.cli.node_files.home().join(".aether/host"));
+    let socket = aether::data_dir::DataDir::new(
+        world.cli.node_files.home().join(".aether/host"),
+    )
+    .admin_socket();
     blocking(move || {
         let started = Instant::now();
         while !matches!(
@@ -188,8 +186,10 @@ fn node_database_at(world: &mut World, path: String) {
 fn node_uses_owner_login(world: &mut World) {
     let home = world.cli.node_files.home();
     assert_eq!(
-        fs::read_link(home.join(".aether/host/codex-home/auth.json"))
-            .expect("node must link the owner's login"),
+        fs::read_link(aether::data_dir::codex_login(
+            &aether::data_dir::DataDir::new(home.join(".aether/host")).codex_home(),
+        ))
+        .expect("node must link the owner's login"),
         world.cli.node_files.owner_auth.clone().expect("owner must be logged in")
     );
 }
@@ -228,7 +228,7 @@ fn task_workspace_exists(world: &mut World, path: String) {
 async fn policy_uses_workspace(world: &mut World, tokens: u32) {
     let home = world.cli.node_files.home();
     let settings = blocking(move || {
-        aether::node_config::policy_settings(&home.join(".aether/host"))
+        aether::policy::policy_settings(&home.join(".aether/host"))
             .expect("policy must read")
             .expect("policy must exist")
     })
@@ -278,8 +278,13 @@ fn policy_paths(world: &mut World) -> (PathBuf, PathBuf) {
 async fn node_loads_policy(world: &mut World) {
     let (policy, data_dir) = policy_paths(world);
     blocking(move || {
-        aether::node_config::load_or_create_service(&policy, &data_dir, "codex".into())
-            .expect("the node must load its policy");
+        aether::node_builder::load_or_create_service(
+            &policy,
+            &data_dir,
+            "codex".into(),
+            None,
+        )
+        .expect("the node must load its policy");
     })
     .await;
 }
@@ -288,11 +293,11 @@ async fn node_loads_policy(world: &mut World) {
 async fn owner_changes_time_limit(world: &mut World, seconds: u64) {
     let (_, data_dir) = policy_paths(world);
     blocking(move || {
-        let mut settings = aether::node_config::policy_settings(&data_dir)
+        let mut settings = aether::policy::policy_settings(&data_dir)
             .expect("policy must read")
             .expect("policy must exist");
         settings.max_seconds = seconds;
-        aether::node_config::save_policy_settings(&data_dir, &settings)
+        aether::policy::save_policy_settings(&data_dir, &settings)
             .expect("policy must save");
     })
     .await;
@@ -308,7 +313,7 @@ fn policy_file_replaced(world: &mut World) {
 async fn policy_allows_seconds(world: &mut World, seconds: u64) {
     let (_, data_dir) = policy_paths(world);
     let settings = blocking(move || {
-        aether::node_config::policy_settings(&data_dir)
+        aether::policy::policy_settings(&data_dir)
             .expect("policy must read")
             .expect("policy must exist")
     })

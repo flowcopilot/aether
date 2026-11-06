@@ -1,12 +1,10 @@
 defmodule AetherHub.Features.ListingsTest do
-  use AetherHub.Feature, file: "listings.feature", async: true
+  use AetherHub.Feature, file: "listings.feature", async: false
 
-  import AetherHub.TestClient
-  import AetherHub.HubStepsSocial
+  alias AetherHub.{Clock, Listing, Repo}
 
-  alias AetherHub.{Listing, Listings, Repo}
-
-  defp search(asker, q), do: json(request(asker, "GET", "/v1/agents?q=#{q}"))["agents"]
+  defp search(asker, q),
+    do: AetherHub.HubRequests.field(asker, "/v1/agents", "agents", "q=#{q}", nil)
 
   defp search_rows(id),
     do: Repo.query!("SELECT COUNT(*) FROM listing_search WHERE rowid = ?1", [id]).rows
@@ -21,19 +19,19 @@ defmodule AetherHub.Features.ListingsTest do
       )
 
   defp bad_signature(service, bytes, "that expired a second ago"),
-    do: put_listing(service, bytes, expires_at: System.system_time(:second) - 1)
+    do: put_listing(service, bytes, expires_at: Clock.now() - 1)
 
   defp bad_signature(service, bytes, "that expires in 31 days"),
-    do: put_listing(service, bytes, expires_at: System.system_time(:second) + 31 * 86_400)
+    do: put_listing(service, bytes, expires_at: Clock.now() + 31 * 86_400)
 
   defp bad_signature(service, bytes, "that expires in 30 days"),
-    do: put_listing(service, bytes, expires_at: System.system_time(:second) + 30 * 86_400)
+    do: put_listing(service, bytes, expires_at: Clock.now() + 30 * 86_400)
 
   defp bad_signature(service, bytes, "marked as not listed"),
     do: put_listing(service, bytes, body: %{"listed" => false})
 
   defp bad_signature(service, bytes, "with the expiry as text"),
-    do: put_listing(service, bytes, body: %{"expiresAt" => "#{System.system_time(:second) + 60}"})
+    do: put_listing(service, bytes, body: %{"expiresAt" => "#{Clock.now() + 60}"})
 
   defp bad_signature(service, bytes, "with a malformed signature"),
     do: put_listing(service, bytes, body: %{"signature" => "AAAA"})
@@ -131,22 +129,6 @@ defmodule AetherHub.Features.ListingsTest do
     end
   end
 
-  defstep ~r/^(?<names>\w+(?:(?:, | and )\w+)*) (?:is an?|are) (?<kind>person|people|service agent|node without a name)$/,
-          %{names: names, kind: kind},
-          state do
-    {:ok, new_actors(state, names, kind)}
-  end
-
-  defstep ~r/^the hub answers (?<status>\d+)$/, %{status: status}, state do
-    assert_status(state, status)
-  end
-
-  defstep ~r/^the hub answers (?<status>\d+) with the error "(?<error>\w+)"$/,
-          %{status: status, error: error},
-          state do
-    assert_error(state, status, error)
-  end
-
   # The exact bytes
 
   defstep ~r/^(?<name>\w+) publishes this listing text:$/,
@@ -176,10 +158,10 @@ defmodule AetherHub.Features.ListingsTest do
   defstep ~r/^a person who looks up (?<name>\w+) gets the same text and signature$/,
           %{name: name},
           %{text: text, signature: signature} = state do
-    [path_name, path_number] = String.split(actor(state, name).handle, "#")
+    path = name_path("/v1/agents", actor(state, name))
 
     assert %{"listing" => ^text, "signature" => ^signature} =
-             json(request(claimed_node(), "GET", "/v1/agents/#{path_name}/#{path_number}"))
+             json(request(claimed_node(), "GET", path))
   end
 
   # Who may publish
@@ -232,23 +214,17 @@ defmodule AetherHub.Features.ListingsTest do
 
   defstep ~r/^(?<name>\w+) has a listing that a person can find$/, %{name: name}, state do
     service = actor(state, name)
-    marker = marker()
-    assert put_listing(service, listing(service, description: marker)).status == 200
-    id = Repo.get_by!(Listing, endpoint: service.endpoint).id
-    assert [_] = search(claimed_node(), marker)
-    {:ok, %{marker: marker, listing_id: id}}
-  end
+    marker = unique_name()
 
-  defstep ~r/^(?<name>\w+) takes a new name$/, %{name: name}, state do
-    {:ok, %{conn: request(actor(state, name), "PUT", "/v1/account", %{"name" => unique_name()})}}
+    assert put_listing(service, listing(service, description: marker)).status == 200
+    assert [_] = search(claimed_node(), marker)
+    id = Repo.get_by!(Listing, endpoint: service.endpoint).id
+
+    {:ok, %{marker: marker, listing_id: id}}
   end
 
   defstep ~r/^(?<name>\w+) deletes its listing$/, %{name: name}, state do
     {:ok, %{conn: request(actor(state, name), "DELETE", "/v1/listing")}}
-  end
-
-  defstep ~r/^(?<name>\w+) deletes its account$/, %{name: name}, state do
-    {:ok, %{conn: request(actor(state, name), "DELETE", "/v1/account")}}
   end
 
   # The marker is the one word of the listing; no other listing has it.
@@ -258,12 +234,6 @@ defmodule AetherHub.Features.ListingsTest do
 
   defstep ~r/^the search index has no entry for the listing$/, _, state do
     assert search_rows(state.listing_id) == [[0]]
-  end
-
-  defstep ~r/^the listing expires and the hub sweeps expired listings$/, _, state do
-    # Only this listing expires: other tests run at the same time.
-    Repo.query!("UPDATE listings SET expires_at = 1 WHERE id = ?1", [state.listing_id])
-    Listings.delete_expired()
   end
 
   defstep ~r/^the hub keeps no listing for (?<name>\w+)$/, %{name: name}, state do

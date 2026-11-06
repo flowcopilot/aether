@@ -8,7 +8,6 @@ defmodule AetherHub.Notify do
   @registry AetherHub.Waiters
   @message :aether_hub_changed
 
-  @doc "Registers the calling process as a waiter for `endpoint`."
   def subscribe(endpoint) do
     {:ok, _} = Registry.register(@registry, endpoint, nil)
     :ok

@@ -1,10 +1,7 @@
 defmodule AetherHub.Features.RateLimitsTest do
   use AetherHub.Feature, file: "rate-limits.feature", async: true
 
-  import AetherHub.TestClient
-  import AetherHub.HubStepsAccounts
-
-  alias AetherHub.{Presence, RateLimit}
+  alias AetherHub.{Clock, Presence}
 
   defp account(node), do: request(node, "GET", "/v1/account")
 
@@ -14,17 +11,17 @@ defmodule AetherHub.Features.RateLimitsTest do
 
   defp claims(count, ip), do: for(_ <- 1..count, do: claim(new_node(), ip).status)
 
-  defstep ~r/^(?<who>\w+) is a new node$/, %{who: who}, state do
-    {:ok, remember(state, who, new_node())}
-  end
+  defp search(node), do: request(node, "GET", "/v1/people?q=ab")
 
   # Requests a minute
 
   defstep ~r/^(?<who>\w+) (?:sends|sent) (?<count>\d+) requests in one minute$/,
           %{who: who, count: count},
           state do
-    start_early_in_window(60, 10)
-    node = who(state, who)
+    node = actor(state, who)
+    {_limit, seconds} = AetherHub.RateLimit.limit(:request)
+    Clock.set(div(Clock.now(), seconds) * seconds)
+
     {:ok, %{statuses: for(_ <- 1..String.to_integer(count), do: account(node).status)}}
   end
 
@@ -38,33 +35,24 @@ defmodule AetherHub.Features.RateLimitsTest do
   defstep ~r/^the next request of (?<who>\w+) gets the error "(?<error>\w+)"$/,
           %{who: who, error: error},
           state do
-    assert json(account(who(state, who))) == %{"error" => error}
+    assert json(account(actor(state, who))) == %{"error" => error}
   end
 
   defstep ~r/^the hub still answers another node$/, _, _ do
     assert account(new_node()).status == 404
   end
 
-  defstep ~r/^(?<who>\w+) was last seen long ago$/, %{who: who}, state do
-    Presence.seen(who(state, who).endpoint, 1)
-  end
-
   defstep ~r/^(?<who>\w+) sends one more request$/, %{who: who}, state do
-    {:ok, %{conn: account(who(state, who))}}
-  end
-
-  defstep ~r/^the hub answers (?<status>\d+)$/, %{status: status}, %{conn: conn} do
-    assert conn.status == String.to_integer(status)
+    {:ok, %{conn: account(actor(state, who))}}
   end
 
   defstep ~r/^(?<who>\w+) is still last seen long ago$/, %{who: who}, state do
-    assert Presence.last_seen(who(state, who).endpoint) == 1
+    assert Presence.last_seen(actor(state, who).endpoint) == state.seen_at
   end
 
   # New accounts an hour
 
   defstep ~r/^an address that made no accounts this hour$/, _, _ do
-    start_early_in_window(3_600, 10)
     {:ok, %{ip: unique_ip()}}
   end
 
@@ -72,6 +60,13 @@ defmodule AetherHub.Features.RateLimitsTest do
           %{count: count},
           %{ip: ip} do
     {:ok, %{statuses: claims(String.to_integer(count), ip)}}
+  end
+
+  defstep ~r/^(?<count>\d+) new nodes from that address claim a name that is not valid$/,
+          %{count: count},
+          %{ip: ip} do
+    for _ <- 1..String.to_integer(count),
+        do: assert(claim(new_node(), ip, "Not Valid").status == 400)
   end
 
   defstep ~r/^one new node claims the same name (?<count>\d+) times from that address$/,
@@ -103,20 +98,18 @@ defmodule AetherHub.Features.RateLimitsTest do
     assert claim(new_node(), unique_ip()).status == 200
   end
 
-  # Buckets
+  # Kinds of requests
 
-  defstep ~r/^a key that made 30 searches this minute$/, _, _ do
-    start_early_in_window(60, 5)
-    key = make_ref()
-    assert Enum.uniq(for _ <- 1..30, do: RateLimit.hit(:search, key)) == [:ok]
-    {:ok, %{key: key}}
+  defstep ~r/^(?<who>\w+) made 30 searches$/, %{who: who}, state do
+    node = actor(state, who)
+    assert Enum.uniq(for _ <- 1..30, do: search(node).status) == [200]
   end
 
-  defstep ~r/^a 31st search of the key is refused$/, _, %{key: key} do
-    assert RateLimit.hit(:search, key) == :rate_limited
+  defstep ~r/^(?<who>\w+) searches once more$/, %{who: who}, state do
+    {:ok, %{conn: search(actor(state, who))}}
   end
 
-  defstep ~r/^a request of another kind from the key is allowed$/, _, %{key: key} do
-    assert RateLimit.hit(:request, key) == :ok
+  defstep ~r/^(?<who>\w+) reads her account$/, %{who: who}, state do
+    {:ok, %{conn: account(actor(state, who))}}
   end
 end

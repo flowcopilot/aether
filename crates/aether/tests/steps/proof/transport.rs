@@ -18,12 +18,13 @@ use aether::{
         text_result_payload,
     },
 };
-use aether_store::NodeStore;
 use cucumber::{given, then, when};
 use tempfile::TempDir;
 
-use super::fixtures::{
-    DirectContacts, Directory, blocking, invitation, managed_member, record,
+use super::fixtures::{blocking, invitation, managed_member, record};
+use crate::common::{
+    discovery_signing_key, load_contact, load_directory_record, open_store,
+    store_contact_invitation, store_directory_record,
 };
 use crate::steps::World;
 
@@ -75,7 +76,7 @@ impl State {
         self.port = socket.local_addr().expect("port must resolve").port();
         drop(socket);
         let root = tempfile::tempdir().expect("temporary directory must create");
-        let server = bind_node(&root.path().join("server"), self.port)
+        let server = bind_node(&root.path().join("server"), self.port, None)
             .await
             .expect("server must bind");
         let endpoint_id = server.id().to_string();
@@ -107,7 +108,7 @@ fn answer(request: &[Frame]) -> Result<Vec<Frame>, TransportError> {
         payload,
     };
     Ok(vec![
-        frame(FrameKind::Event, event_payload(task_id, A2aTaskStatus::Submitted)),
+        frame(FrameKind::Event, event_payload(task_id, A2aTaskStatus::Submitted, None)),
         frame(
             FrameKind::Result,
             text_result_payload(task_id, A2aTaskStatus::Completed, "ok"),
@@ -130,45 +131,59 @@ fn review_request(exchange_id: &str, scope_id: &str, task_id: &str) -> Frame {
 async fn serving_node_in_scope(world: &mut World, scope_id: String) {
     let state = &mut world.proof.transport;
     let endpoint_id = state.bind().await;
+    let root = state.root();
     let route = match scope_id.as_str() {
         "direct" => {
-            let mut contacts = DirectContacts::default();
-            contacts
-                .import(invitation(&scope_id, "server", &endpoint_id))
-                .expect("direct invitation must import");
-            let invitation =
-                contacts.resolve("server").expect("direct invitation must resolve");
-            Route::Endpoint(invitation.endpoint_id.clone())
+            let signed = invitation(&scope_id, "server", &endpoint_id);
+            let endpoint = blocking({
+                let root = root.clone();
+                move || {
+                    let store = open_store(&root);
+                    store_contact_invitation(&store, &signed)
+                        .expect("direct invitation must store");
+                    load_contact(&store, "server")
+                        .expect("direct invitation must load")
+                        .endpoint_id
+                }
+            })
+            .await;
+            Route::Endpoint(endpoint)
         }
         "directory" => {
-            let mut directory = Directory::default();
-            directory
-                .publish(record(&scope_id, "server", &endpoint_id, &state.address()))
-                .expect("directory record must publish");
-            let record = directory
-                .resolve("server")
-                .expect("directory record must resolve")
-                .clone();
-            Route::Record(Box::new(record))
+            let signed = record(&scope_id, "server", &endpoint_id, &state.address());
+            let trusted = discovery_signing_key().verifying_key().to_bytes();
+            let loaded = blocking({
+                let root = root.clone();
+                move || {
+                    let store = open_store(&root);
+                    store_directory_record(&store, &signed)
+                        .expect("directory record must store");
+                    load_directory_record(&root, &scope_id, "server", trusted)
+                        .expect("directory record must load")
+                }
+            })
+            .await;
+            Route::Record(Box::new(loaded))
         }
         "managed" => {
-            let root = state.root();
-            let member = blocking(move || {
-                let mut store = NodeStore::open(root.join("roster.sqlite"))
-                    .expect("managed roster must open");
-                store
-                    .apply_managed_member(
-                        "managed.cursor",
-                        1,
-                        &managed_member("server", &endpoint_id, "managed"),
-                    )
-                    .expect("managed membership must apply");
-                store
-                    .managed_members("managed")
-                    .expect("managed roster must load")
-                    .into_iter()
-                    .next()
-                    .expect("managed roster must contain member")
+            let member = blocking({
+                let root = root.clone();
+                move || {
+                    let mut store = open_store(&root);
+                    store
+                        .apply_managed_member(
+                            "https://control.test",
+                            1,
+                            &managed_member("server", &endpoint_id, "managed"),
+                        )
+                        .expect("managed membership must apply");
+                    store
+                        .managed_members("managed")
+                        .expect("managed roster must load")
+                        .into_iter()
+                        .next()
+                        .expect("managed roster must contain member")
+                }
             })
             .await;
             Route::Endpoint(member.endpoint_id)

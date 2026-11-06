@@ -10,6 +10,14 @@ no mailbox. After the match, nodes talk over Iroh, directly or through the
 relay. A node that is offline gets its tasks again from the outbox of the
 sender, not from the hub.
 
+This document explains the protocol. The exact values are data in
+[`protocol/hub/`](../protocol/hub/): `contract.json` holds the protocol
+version, the header names, the signed message formats, the error codes with
+their statuses, the limits, the JSON keys of each object and the routes;
+`vectors.json` holds signing vectors that every implementation checks. A
+value in `code font` with a dotted path, such as `limits.accessDays`, is a
+key in `contract.json`.
+
 ## Accounts
 
 A node's account is its Iroh endpoint key. There is no password and no email.
@@ -17,10 +25,10 @@ One account is one agent. A node claims a name with a signed request. A node
 has at most one name.
 
 - **Full name.** A name has two parts: the name that the node chooses, and a
-  number from `0001` to `9999` that the hub picks at random, for example
-  `ana#4821`. The full name is unique; many nodes can use the name `ana`.
+  number (`names.numbers`, written with `names.numberDigits` digits) that
+  the hub picks at random, for example `ana#4821`. The full name is unique; many nodes can use the name `ana`.
   The JSON key `handle` holds the full name.
-- **Name rule.** The name part matches `^[a-z0-9][a-z0-9._-]{0,31}$`.
+- **Name rule.** The name part matches `names.name`.
 - **Paths.** A path that names an account uses two segments,
   `/{name}/{number}`, because `#` starts a URL fragment.
 - **Renames.** A rename keeps the current number when it is free for the new
@@ -29,10 +37,10 @@ has at most one name.
 - **Released names.** A name with its number that a node gives up stays with
   that node. The hub never gives it to another key, so a contact name cannot
   move to a stranger.
-- **Types.** `kind` is `personal` (an agent that stands for one person) or
-  `service` (an agent that offers a service). A node sets it at its first
+- **Types.** `kind` (`names.kinds`) is `personal` (an agent that stands
+  for one person) or `service` (an agent that offers a service). A node sets it at its first
   claim, and it never changes, also after an account deletion. Without
-  `kind`, an account is `personal`.
+  `kind`, an account is `names.defaultKind`.
 - **Search.** `searchable` (default `false`) is only for a personal agent.
 
 The host uses its full name as its agent ID, so a caller sends tasks with
@@ -40,31 +48,30 @@ The host uses its full name as its agent ID, so a caller sends tasks with
 
 ## Request signing
 
-A node sends `x-aether-protocol: 2` on every request. The hub refuses a
-`/v1` request without it with `426 upgrade_required`; only `GET /v1/hub` is
-accepted without the header. The header is not in the signed message, and
-the hub checks it before the signature.
+A node sends the protocol header (`headers.protocol`) with the version
+`protocol` on every request. The hub refuses a `/v1` request without it
+with `upgrade_required`; only `GET /v1/hub` is accepted without the header.
+The header is not in the signed message, and the hub checks it before the
+signature.
 
 Every `/v1` request also carries three signed headers:
 
 | Header | Value |
 | --- | --- |
-| `x-aether-endpoint` | The endpoint ID: 64 lowercase hex characters, the raw Ed25519 public key |
-| `x-aether-time` | Unix time in seconds, as a decimal string |
-| `x-aether-signature` | The Ed25519 signature of the message below, unpadded base64url |
+| `headers.endpoint` | The endpoint ID: the raw Ed25519 public key in lowercase hex (`signing.endpoint`) |
+| `headers.time` | Unix time in seconds, as a decimal string |
+| `headers.signature` | The Ed25519 signature of the message below, unpadded base64url |
 
-The signed message is these five lines joined with `\n` (no final newline):
+The signed message is `signing.messages.request`: its lines joined with
+`\n`, with no final newline. `method` is in upper case, `pathAndQuery` is
+the path and query exactly as sent (for example
+`/v1/invites?after=3&wait=25`), `time` is the time header value, and
+`bodySha256` is the SHA-256 of the request body in lowercase hex (the hash
+of the empty string for no body).
 
-```text
-aether-hub/v1
-<METHOD in upper case>
-<path and query, exactly as sent, e.g. /v1/invites?after=3&wait=25>
-<the x-aether-time value>
-<SHA-256 of the request body, lowercase hex; the hash of the empty string for no body>
-```
-
-The hub refuses a request with `401` when a header is missing, the signature
-does not verify, or the time differs from the hub clock by more than 300 s.
+The hub refuses a request with `unauthorized` when a header is missing, the
+signature does not verify, or the time differs from the hub clock by more
+than `signing.maxSkewSeconds`.
 
 A node percent-encodes free text in the query (UTF-8, as in
 `application/x-www-form-urlencoded`) before it signs, and sends the query
@@ -73,47 +80,54 @@ and query, then decodes the query.
 
 ## Errors
 
-An error response has a JSON body `{"error": "<code>"}`.
+An error response has a JSON body `{"error": "<code>"}`, with the status of
+its code in `errors`.
 
-| Status | Code | Meaning |
-| --- | --- | --- |
-| 400 | `invalid` | The body or a parameter is not valid |
-| 401 | `unauthorized` | The signature check failed |
-| 403 | `no_account` | The node has no name yet |
-| 403 | `forbidden` | The node is not the right side of this invite, or the invite is in the wrong state |
-| 404 | `not_found` | Unknown name or invite |
-| 409 | `taken` | No number is free for this name |
-| 409 | `limit` | The node is at a limit, such as 1,000 blocks |
-| 413 | `too_large` | The body is larger than 16 KiB |
-| 426 | `upgrade_required` | The request has no `x-aether-protocol: 2` header: the node is older than the hub |
-| 429 | `rate_limited` | A request is over one of the limits below |
+| Code | Meaning |
+| --- | --- |
+| `invalid` | The body, a header or a parameter is not valid |
+| `unauthorized` | The signature check failed |
+| `no_account` | The node has no name yet |
+| `forbidden` | The node is not the right side of this invite, or the invite is in the wrong state |
+| `not_found` | Unknown name or invite |
+| `taken` | No number is free for this name |
+| `limit` | The node is at a limit, such as `limits.maxBlocks` blocks |
+| `too_large` | The body is larger than `limits.maxBodyBytes` |
+| `upgrade_required` | The request has no protocol header: the node is older than the hub |
+| `rate_limited` | A request is over one of the rate limits below |
 
 ## Limits
 
-A rate limit counts in a fixed window, and a request over it gets `429
-rate_limited`. A size limit gets `409 limit`, `413 too_large` or `400
-invalid`, as the table says.
+A rate limit counts in a fixed window, and a request over it gets
+`rate_limited`. Only a name change, a new account or a new access request
+that succeeds counts against its limit. The rate limits are settings of the
+hub; these are the defaults of the public hub:
+
+| Rate limit | Counted for | Default |
+| --- | --- | --- |
+| Requests | one endpoint | 120 a minute |
+| Searches and lookups (`/v1/people`, `/v1/agents`) | one endpoint | 30 a minute |
+| Searches and lookups | one client address | 120 a minute |
+| Name changes | one endpoint | 5 a day |
+| New accounts | one client address | 20 an hour (`NEW_ACCOUNTS_PER_IP_HOUR`) |
+| New access requests | one endpoint | 10 a day |
+| Directory reads (`/directory.json`) | one client address | 60 a minute |
+
+The other limits are part of the protocol:
 
 | Limit | Counted for | Value | Error |
 | --- | --- | --- | --- |
-| Requests | one endpoint | 120 a minute | `429` |
-| Searches and lookups (`/v1/people`, `/v1/agents`) | one endpoint | 30 a minute | `429` |
-| Searches and lookups | one client address | 120 a minute | `429` |
-| Name changes | one endpoint | 5 a day | `429` |
-| New accounts | one client address | 20 an hour (`NEW_ACCOUNTS_PER_IP_HOUR`) | `429` |
-| New access requests | one endpoint | 10 a day | `429` |
-| Directory reads (`/directory.json`) | one client address | 60 a minute | `429` |
-| Open access requests | one requester | 5 | `409` |
-| Requests that a service sees | one service | 50, oldest requester accounts first | none |
-| Blocks | one endpoint | 1,000 | `409` |
-| Open owner claims | one personal agent | 5 | `409` |
-| Owner links | one personal agent | 20 | `409` |
-| Active owners | one service agent | 1 | `409` |
-| Request body | one request | 16 KiB | `413` |
-| Listing bytes | one listing | 8 KiB | `400` |
-| Invite line | one invite | 8 KiB | `400` |
-| Search words | one search | 1 to 8, at most 128 characters | `400` |
-| Search rows | one search | 1 to 20 | `400` |
+| Open access requests | one requester | `limits.maxOpenRequests` | `limit` |
+| Requests that a service sees | one service | `limits.maxListedRequests`, oldest requester accounts first | none |
+| Blocks | one endpoint | `limits.maxBlocks` | `limit` |
+| Open owner claims | one personal agent | `limits.ownerLinks.maxOpenClaims` | `limit` |
+| Owner links | one personal agent | `limits.ownerLinks.maxLinks` | `limit` |
+| Active owners | one service agent | 1 | `limit` |
+| Request body | one request | `limits.maxBodyBytes` | `too_large` |
+| Listing bytes | one listing | `limits.listing.maxBytes` | `invalid` |
+| Invite line | one invite | `limits.maxInviteBytes` | `invalid` |
+| Search words | one search | `limits.search.agents` | `invalid` |
+| Search rows | one search | `limits.search.limit` | `invalid` |
 
 The client address comes from `x-forwarded-for` only when the peer is a
 trusted proxy of the hub.
@@ -128,8 +142,8 @@ signature and no account.
 
 ### `GET /v1/hub`
 
-`200 {"protocol": 2}`. It needs a signature but no account and no protocol
-header. A hub of protocol 1 answers `404 not_found`.
+`200 {"protocol": <protocol>}`. It needs a signature but no account and no
+protocol header. A hub of protocol 1 answers `404 not_found`.
 
 ### `GET /v1/account`
 
@@ -145,8 +159,7 @@ Body keys: `name`, `kind` and `searchable`. Another key is `400 invalid`. A
 first claim needs `name`. A later request can leave out a field to keep it.
 `200` with the account. `400 invalid` for a different `kind` or for
 `searchable` on a service agent. `409 taken` when no number is free for the
-name. `429 rate_limited` after 5 renames in a day, or after 20 new accounts
-in an hour from one client address. Open invites keep working after a
+name. `429 rate_limited` over the name change or new account limit. Open invites keep working after a
 rename, because they refer to endpoints.
 
 ### `DELETE /v1/account`
@@ -160,7 +173,7 @@ stay.
 ### `POST /v1/invites`
 
 The host offers its agent. Body `{"to": "bob#0042", "days": 7}`; `to` is the
-full name of a personal agent, and `days` is 1 to 30. `201` with the invite.
+full name of a personal agent, and `days` is in `limits.accessDays`. `201` with the invite.
 `400 invalid` for a bare name or for the node's own name. `404 not_found` for
 an unknown name, and also for a service agent, so that an invite does not
 show that an unlisted service agent exists. `403 forbidden` when the sender
@@ -178,7 +191,7 @@ Lists every open invite that this node sent or received:
 `version` is a counter for this endpoint. It increases with each change to an
 invite that the endpoint is part of, and with each change of either side's
 name. `after` and `wait` are optional. When `after` equals the current
-version and `wait` is 1 to 30, the hub holds the request until a change or
+version and `wait` is 1 to `limits.maxWaitSeconds`, the hub holds the request until a change or
 until `wait` seconds pass, and then answers with the current list.
 
 ### `POST /v1/invites/{id}/accept`
@@ -189,7 +202,8 @@ The receiver accepts a `pending` invite. `200` with the invite, now
 ### `POST /v1/invites/{id}/bundle`
 
 The sender gives the signed invite line for an `accepted` invite. Body
-`{"bundle": "aether-invite:…"}`, at most 8 KiB and with that prefix. The hub
+`{"bundle": "aether-invite:…"}`, at most `limits.maxInviteBytes` and with
+the prefix `limits.invitePrefix`. The hub
 keeps the line as opaque text: it can read the Agent Card in it, but not
 change it. `200` with the invite, now `delivered`.
 
@@ -214,21 +228,24 @@ rows.
 
 - The service sees `receiverEndpoint` already while the row is
   `requested`, so that its owner approves one endpoint.
-- The service sees at most 50 `requested` rows, from the oldest requester
-  accounts first.
-- A node can have at most 5 open requests (`409 limit`), and it can make 10
-  new requests a day (`429 rate_limited`).
+- The service sees at most `limits.maxListedRequests` `requested` rows,
+  from the oldest requester accounts first.
+- A node can have at most `limits.maxOpenRequests` open requests
+  (`409 limit`), and its new requests count against a rate limit
+  (`429 rate_limited`).
 - When the service blocked the requester, the row exists for the requester
   alone, and the answers do not change.
 - After approval the flow is as for an invite: the service delivers the
   line, and the requester keeps it. The hub then adds only one contact: the
   requester sees whether the service is online; the service does not see
   the requester.
-- A request expires 7 days after `createdAt`, as an invite does.
+- A request expires `limits.inviteSeconds` after `createdAt`, as an invite
+  does.
 
 ### `POST /v1/requests`
 
-Body `{"to": "law#0042", "days": 7}`, with no other key; `days` is 1 to 30.
+Body `{"to": "law#0042", "days": 7}`, with no other key; `days` is in
+`limits.accessDays`.
 `201` with the row. When a row between the two nodes is open, `201` with
 that row and no change. `404 not_found` for an unknown name, a personal
 agent, or a service agent with no listing. `400 invalid` for a bare name or
@@ -237,7 +254,7 @@ the node's own name.
 ### `POST /v1/invites/{id}/approve`
 
 The service approves a `requested` row. The body is empty, or
-`{"days": 3}` to change the days (1 to 30). `200` with the row, now
+`{"days": 3}` to change the days (in `limits.accessDays`). `200` with the row, now
 `accepted`. `403 forbidden` for the requester, or for a row that is not
 `requested`.
 
@@ -257,10 +274,11 @@ The nodes this node is connected with, and whether they are online:
 - `handle` is the contact's current full name, and `kind` its type. A
   contact without a name is left out.
 - `online` is true when the contact has an open long poll now, or sent a
-  signed request in the last 45 s.
-- `lastSeen` is the start of the 15-minute period (a multiple of 900 s) of
-  the contact's last signed request. It is `null` when the hub has seen no
-  request from the contact for 7 days or since the hub started. A request
+  signed request in the last `limits.presence.onlineSeconds`.
+- `lastSeen` is the start of the period of `limits.presence.lastSeenStepSeconds`
+  that holds the contact's last signed request. It is `null` when the hub
+  has seen no request from the contact for `limits.presence.keepSeconds` or
+  since the hub started. A request
   that the hub refuses with 429 does not count.
 - Only contacts see each other's presence. A lookup or a search
   (see [People](#people)) gives it only for a contact.
@@ -276,7 +294,8 @@ before: an invite that it sends to the owner gets `201`, and the blocked node
 sees it in its own list. The owner never sees it, and the version of the
 owner does not change for it. A block removes the open invites and the
 contact pair between the two nodes. A block stays when either account is
-deleted. A node can have at most 1,000 blocks: one more is `409 limit`.
+deleted. A node can have at most `limits.maxBlocks` blocks: one more is
+`409 limit`.
 
 ### `PUT /v1/blocks/{endpoint}`
 
@@ -321,8 +340,8 @@ for an unknown name or a service agent. `400 invalid` for a bad segment.
 ### `GET /v1/people?q=<prefix>&limit=<n>`
 
 Lists the personal agents with `searchable` set to `true` whose name starts
-with `q`, ordered by name and number. `q` has 2 to 32 characters of the name
-alphabet `[a-z0-9._-]`. `limit` is 1 to 20 (default 10). `200
+with `q`, ordered by name and number. `q` matches
+`limits.search.people.query`. `limit` is in `limits.search.limit`. `200
 {"people": [<row>, ...]}`. `400 invalid` for a bad `q` or `limit`.
 
 ## Listings
@@ -337,32 +356,24 @@ The listing bytes are a JSON object with exactly these keys:
 {"name": "lawyer#0042", "description": "…", "skills": [{"id": "general", "name": "…", "description": "…", "tags": ["law"]}]}
 ```
 
-| Key | Rule |
+| Key | Rule (in `limits.listing`) |
 | --- | --- |
 | `name` | The current full name of the agent |
-| `description` | 1 to 500 characters |
-| `skills` | 1 to 5 objects with exactly `id`, `name`, `description` and `tags`; each `id` once |
-| `id` | 1 to 64 characters `[a-z0-9-]` |
-| skill `name` | 1 to 64 characters |
-| skill `description` | 1 to 300 characters |
-| `tags` | 1 to 5 different tags of 1 to 24 characters `[a-z0-9-]` |
+| `description` | 1 to `maxDescription` characters |
+| `skills` | 1 to `maxSkills` objects with exactly the keys of `objects.listingSkill`; each `id` once |
+| `id` | matches `skillId` |
+| skill `name` | 1 to `maxSkillName` characters |
+| skill `description` | 1 to `maxSkillDescription` characters |
+| `tags` | 1 to `maxTags` different tags that match `tag` |
 
-The text has no control characters, no characters that change the direction
-of the text (U+202A to U+202E, U+2066 to U+2069, U+200E, U+200F) and no
-zero-width characters (U+200B to U+200D, U+FEFF). An object with a key two
-times is refused. The bytes are at most 8 KiB. They hold no endpoint and no
-address.
+The text has none of the characters in `hiddenCodepoints`: control
+characters, characters that change the direction of the text and
+zero-width characters. An object with a key two times is refused. The bytes
+are at most `maxBytes`. They hold no endpoint and no address.
 
-The node signs this message with its endpoint key (lines joined with `\n`,
-no final newline):
-
-```text
-aether-listing/v1
-<endpoint ID>
-true
-<expiresAt>
-<SHA-256 of the listing bytes, lowercase hex>
-```
+The node signs `signing.messages.listing` with its endpoint key: `endpoint`
+is its endpoint ID, and `listingSha256` the SHA-256 of the listing bytes in
+lowercase hex.
 
 The hub keeps the listing text exactly as the node sent it, and returns it
 as sent. A rename and an account deletion remove the listing, because the
@@ -375,7 +386,7 @@ listing names the agent. The hub removes a listing when it expires.
 ```
 
 Body keys: exactly these four. `expiresAt` is a Unix time later than now and
-at most 30 days ahead. A new listing replaces the old one. `200` with the
+at most `limits.listing.maxDays` days ahead. A new listing replaces the old one. `200` with the
 listing object. `400 invalid` for a personal agent, a bad signature, a bad
 expiry, or bytes that do not pass the rules above.
 
@@ -413,12 +424,13 @@ A search row is:
 
 ### `GET /v1/agents?q=<words>&limit=<n>`
 
-Searches the listed service agents. `q` has at most 128 characters. The hub
-uses the runs of letters and digits with 2 or more characters in `q` as the
-words, and needs 1 to 8 of them. Every word must match the start of a word
+Searches the listed service agents. `q` has at most
+`limits.search.agents.maxQueryChars` characters. The hub uses the runs of
+letters and digits with at least `minWordChars` characters in `q` as the
+words, and needs 1 to `maxWords` of them. Every word must match the start of a word
 in the name, the description, a skill or a tag, without case and accents.
 Other characters in `q`, such as quotes, `*` or `AND`, have no special
-meaning. `limit` is 1 to 20 (default 10). There is no cursor.
+meaning. `limit` is in `limits.search.limit`. There is no cursor.
 
 The hub takes the best `limit` matches by rank, then by the latest update.
 Inside that page, the agents that are online come first.
@@ -440,7 +452,8 @@ no account, and it counts against the directory limit of the client address.
 {"agents": [{"handle": "lawyer#0042", "description": "…", "skills": [{"name": "Contracts", "tags": ["law"]}], "online": true, "owner": "ana#0007"}], "listed": 1, "online": 1, "people": 412}
 ```
 
-- `agents` holds the listed service agents, at most 100: the agents that
+- `agents` holds the listed service agents, at most
+  `limits.maxDirectoryAgents`: the agents that
   are online first, then the latest update first. A row has only the full
   name, the listing description, the name and the tags of each skill,
   `online` (as in [`GET /v1/contacts`](#get-v1contacts)), and `owner` (as
@@ -458,30 +471,12 @@ Both keys sign it, and the hub keeps both signatures. While the link is
 active, the listing rows of the service show the owner's full name. A
 service agent has at most one active owner.
 
-The personal node signs this claim (lines joined with `\n`, no final
-newline):
-
-```text
-aether-owner/v1
-claim
-<personal endpoint ID>
-<service full name>
-<expiresAt>
-```
-
-The service node signs this confirm:
-
-```text
-aether-owner/v1
-confirm
-<service endpoint ID>
-<personal endpoint ID>
-<expiresAt>
-```
-
-Signatures are unpadded base64url. `expiresAt` is a Unix time later than
-now and at most 365 days ahead. A claim that the service does not confirm
-goes after 7 days. A rename or an account deletion on either side removes
+The personal node signs `signing.messages.ownerClaim` for the full name of
+the service, and the service node signs `signing.messages.ownerConfirm`
+for the personal endpoint. Signatures are unpadded base64url. `expiresAt`
+is a Unix time later than now and at most `limits.ownerLinks.maxDays` days
+ahead. A claim that the service does not confirm goes after
+`limits.ownerLinks.claimSeconds`. A rename or an account deletion on either side removes
 the links, as does a block between the two. When the service blocked the
 personal node, a claim exists for the personal node alone.
 
@@ -502,8 +497,8 @@ A personal agent claims a service agent. Body
 no other key. `201` with the link. A new claim for the same service replaces
 the old link, which the service must confirm again. `403 forbidden` from a
 service agent. `404 not_found` for an unknown name or a personal agent.
-`400 invalid` for a bad signature or expiry. `409 limit` at 5 open claims
-or 20 links.
+`400 invalid` for a bad signature or expiry. `409 limit` at
+`limits.ownerLinks.maxOpenClaims` open claims or `maxLinks` links.
 
 ### `GET /v1/owner-links`
 
@@ -549,8 +544,8 @@ Either side removes the link. `204`, or `404 not_found`.
 - `senderEndpoint` is set only for the receiver, and only after `delivered`.
   The sender never gets it.
 
-An invite that is not removed expires 7 days after `createdAt` and disappears
-from the list.
+An invite that is not removed expires `limits.inviteSeconds` after
+`createdAt` and disappears from the list.
 
 ## The flow
 
@@ -608,7 +603,7 @@ Card and the listing hold only the text that the owner writes (see
 `references/aether-security-model.md`).
 
 The hub does not keep a list of used signatures. A person who copies a signed
-request can send it again during the 300 s window. TLS stops that copy on the
+request can send it again during the `signing.maxSkewSeconds` window. TLS stops that copy on the
 network, so the public hub must use HTTPS.
 
 ## Privacy
@@ -627,8 +622,8 @@ network, so the public hub must use HTTPS.
   whether the service is online.
 - **Blocks.** A block is hidden: the blocked node gets the same answers as
   before, and its rows exist for itself alone.
-- **Presence.** `lastSeen` is the start of a 15-minute period, and it is
-  `null` after 7 days. A request that the hub refuses with `429` does not
+- **Presence.** `lastSeen` is the start of a period, not the second, and it
+  is `null` after `limits.presence.keepSeconds`. A request that the hub refuses with `429` does not
   count. The hub keeps presence in memory only.
 - **Lookups.** A lookup and a search do not tell the person or the agent
   that someone looked.

@@ -3,9 +3,8 @@
 //! with a verified receipt, and revocation.
 
 use std::{
-    fmt, fs,
-    io::{BufRead, BufReader},
-    os::unix::fs::PermissionsExt,
+    fmt,
+    io::BufReader,
     process::{ChildStdout, Stdio},
     time::{Duration, SystemTime},
 };
@@ -22,7 +21,11 @@ use jsonwebtoken::{
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-use crate::common::{ServerProcess, aether_command, read_event};
+use aether::fixture::{PolicyLimits, policy_json};
+
+use crate::common::{
+    FakeCodex, ServerProcess, TestNodeDir, aether_command, read_events,
+};
 
 /// The scope that the code review offer grants.
 const SCOPE: &str = "review:read_only";
@@ -324,62 +327,48 @@ impl Node {
     }
 
     fn try_start(pact_port: u16) -> Option<Self> {
-        let directory = tempfile::tempdir().expect("directory must create");
-        let root = directory.path();
-        let workspace = root.join("workspace");
-        fs::create_dir_all(&workspace).expect("workspace must create");
-        let fake_codex = root.join("fake-codex");
-        fs::write(&fake_codex, aether::fixture::FAKE_CODEX_SCRIPT)
-            .expect("fake Codex must write");
-        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o700))
-            .expect("chmod");
-
+        let node_dir = TestNodeDir::new();
+        let fake_codex = node_dir.write_fake_codex(FakeCodex::Standard);
         let public = format!("http://127.0.0.1:{pact_port}");
         let brand = format!("{public}/a2a/review");
-        let policy = root.join("policy.json");
-        fs::write(
-            &policy,
-            serde_json::to_vec(&json!({
-                "scope": { "id": "direct", "kind": "direct" },
-                "workspace": workspace,
-                "maxContextTokens": 4000,
-                "maxSeconds": 10,
-                "queueGlobal": 4,
-                "queuePerPeer": 2,
-                "pact": {
-                    "publicUrl": public,
-                    "audience": public,
-                    "allowInsecureLocalIssuers": true,
-                    "brands": [{
-                        "id": "review",
-                        "name": "Code review",
-                        "description": "Reviews code in the owner's workspace.",
-                        "capability": "review",
-                        "workspace": "workspace",
-                        "accessMode": "read_only",
-                        "scope": { "id": SCOPE, "description": "Review code (read only)" },
-                    }],
-                },
-            }))
-            .expect("policy must encode"),
-        )
-        .expect("policy must write");
+        let limits = PolicyLimits {
+            max_context_tokens: 4000,
+            queue_global: 4,
+            queue_per_peer: 2,
+            ..PolicyLimits::default()
+        };
+        let mut policy = policy_json(&node_dir.workspace, &[], [0; 32], limits);
+        policy["scope"] = json!({ "id": "direct", "kind": "direct" });
+        policy["pact"] = json!({
+            "publicUrl": public,
+            "audience": public,
+            "allowInsecureLocalIssuers": true,
+            "brands": [{
+                "id": "review",
+                "name": "Code review",
+                "description": "Reviews code in the owner's workspace.",
+                "capability": "review",
+                "workspace": "workspace",
+                "accessMode": "read_only",
+                "scope": { "id": SCOPE, "description": "Review code (read only)" },
+            }],
+        });
+        let policy_path = node_dir.write_policy(&policy);
         let mut process = ServerProcess::spawn(
             aether_command()
                 .args(["node", "serve", "--policy"])
-                .arg(&policy)
+                .arg(&policy_path)
                 .arg("--data-dir")
-                .arg(root.join("node"))
+                .arg(&node_dir.data_dir)
                 .args(["--port", "0", "--admin-port", "0", "--pact-listen"])
                 .arg(format!("127.0.0.1:{pact_port}"))
                 .env("AETHER_CODEX_BIN", &fake_codex)
                 .stdout(Stdio::piped()),
         );
         let mut output = process.stdout();
-        if !pact_listening(&mut output) {
-            return None;
-        }
-        let admin = read_event(&mut output, Some("admin_listening"))["url"]
+        // The node stops before `pact_listening` when the PACT port is taken.
+        let events = read_events(&mut output, &["pact_listening", "admin_listening"])?;
+        let admin = events["admin_listening"]["url"]
             .as_str()
             .expect("admin URL")
             .trim_end_matches('/')
@@ -390,25 +379,8 @@ impl Node {
             public,
             brand,
             admin,
-            _directory: directory,
+            _directory: node_dir.temp,
         })
-    }
-}
-
-/// Reads events until `pact_listening`. False when the node stops first, as
-/// it does when the PACT port is already in use.
-fn pact_listening(output: &mut impl BufRead) -> bool {
-    let mut line = String::new();
-    loop {
-        line.clear();
-        if output.read_line(&mut line).expect("event line must read") == 0 {
-            return false;
-        }
-        let event: Value =
-            serde_json::from_str(&line).expect("event line must be JSON");
-        if event["event"] == "pact_listening" {
-            return true;
-        }
     }
 }
 

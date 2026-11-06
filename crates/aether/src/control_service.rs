@@ -1,11 +1,11 @@
 use std::{
     io,
     path::Path,
-    sync::{Arc, Mutex},
-    time::{Duration, SystemTime},
+    sync::{Arc, Mutex, MutexGuard},
+    time::Duration,
 };
 
-use aether_core::time::{from_unix_seconds, unix_seconds, unix_timestamp};
+use aether_core::time::{now, unix_timestamp};
 
 use axum::{
     Json, Router,
@@ -15,73 +15,23 @@ use axum::{
     routing::{get, post},
 };
 use axum_server::{Handle, tls_rustls::RustlsConfig};
-use ed25519_dalek::SigningKey;
 use hex::FromHex;
 use serde::{Deserialize, Serialize};
 
-use crate::discovery::{
-    DiscoveryError, Invitation, Record, signed_record, validate_invitation,
-    validate_record,
+use crate::{
+    data_dir::DataDir,
+    discovery::{
+        DiscoveryError, validate_record,
+        wire::{
+            self, EVENT_PAGE, WireDirectoryEvent, WireManagedEvent, WireManagedRedeem,
+            WireRecord, route,
+        },
+    },
 };
 
 #[derive(Clone)]
 pub struct ControlService {
     store: Arc<Mutex<aether_store::ControlStore>>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct WireRecord {
-    pub agent_id: String,
-    pub endpoint_id: String,
-    pub addresses: Vec<String>,
-    pub scope_id: String,
-    pub capabilities: Vec<String>,
-    pub expires_at: u64,
-    #[serde(with = "hex::serde")]
-    pub signing_key: [u8; 32],
-    #[serde(with = "hex::serde")]
-    pub signature: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct WireInvitation {
-    pub scope_id: String,
-    pub agent_id: String,
-    pub endpoint_id: String,
-    pub expires_at: u64,
-    #[serde(with = "hex::serde")]
-    pub signing_key: [u8; 32],
-    #[serde(with = "hex::serde")]
-    pub signature: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct WireDirectoryEvent {
-    pub cursor: i64,
-    pub event: String,
-    pub scope_id: String,
-    pub agent_id: String,
-    pub record: Option<WireRecord>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct WireManagedRedeem {
-    pub token: String,
-    pub record: WireRecord,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct WireManagedEvent {
-    pub cursor: i64,
-    pub event: String,
-    pub scope_id: String,
-    pub agent_id: String,
-    pub member: Option<aether_store::ManagedMember>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -103,6 +53,14 @@ pub enum ControlError {
 }
 
 impl ControlService {
+    fn store(
+        &self,
+    ) -> Result<MutexGuard<'_, aether_store::ControlStore>, ControlError> {
+        self.store
+            .lock()
+            .map_err(|_| ControlError::Server("control store lock failed".to_owned()))
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ControlError> {
         Ok(Self {
             store: Arc::new(Mutex::new(aether_store::ControlStore::open(path)?)),
@@ -111,11 +69,9 @@ impl ControlService {
 
     pub fn publish(&self, wire: &WireRecord) -> Result<bool, ControlError> {
         let record = wire.to_record()?;
-        validate_record(&record).map_err(map_discovery_error)?;
-        let timestamp = now()?;
-        let mut store = self.store.lock().map_err(|_| {
-            ControlError::Server("control store lock failed".to_owned())
-        })?;
+        validate_record(&record)?;
+        let timestamp = now();
+        let mut store = self.store()?;
         let is_renewal = match store.signed_record(&wire.agent_id) {
             Ok(stored) => {
                 let existing = decode_record(&stored.record)?;
@@ -128,16 +84,12 @@ impl ControlService {
             Err(error) => return Err(ControlError::Store(error)),
         };
         store.publish_signed_record(
-            &aether_store::SignedRecord {
-                id: wire.agent_id.clone(),
-                scope_id: wire.scope_id.clone(),
-                agent_id: wire.agent_id.clone(),
-                record: serde_json::to_vec(wire)
-                    .map_err(|_| ControlError::InvalidRecord)?,
-                expires_at: i64::try_from(wire.expires_at)
-                    .map_err(|_| ControlError::InvalidRecord)?,
+            &wire.signed_store_record().map_err(|_| ControlError::InvalidRecord)?,
+            if is_renewal {
+                aether_store::DirectoryEventType::Renewed
+            } else {
+                aether_store::DirectoryEventType::Published
             },
-            if is_renewal { "renewed" } else { "published" },
         )?;
         // Held from the read to the write, so two publishes cannot interleave.
         drop(store);
@@ -145,19 +97,14 @@ impl ControlService {
     }
 
     pub fn resolve(&self, agent_id: &str) -> Result<WireRecord, ControlError> {
-        let stored = self
-            .store
-            .lock()
-            .map_err(|_| ControlError::Server("control store lock failed".to_owned()))?
-            .signed_record(agent_id)
-            .map_err(map_store_error)?;
+        let stored = self.store()?.signed_record(agent_id).map_err(map_store_error)?;
         let wire = decode_record(&stored.record)?;
-        let now = u64::try_from(now()?)
+        let now = u64::try_from(now())
             .map_err(|_| ControlError::Server("the clock is before 1970".to_owned()))?;
         if wire.expires_at <= now {
             return Err(ControlError::Expired);
         }
-        validate_record(&wire.to_record()?).map_err(map_discovery_error)?;
+        validate_record(&wire.to_record()?)?;
         Ok(wire)
     }
 
@@ -165,16 +112,12 @@ impl ControlService {
         if capability.is_empty() {
             return Err(ControlError::InvalidRecord);
         }
-        let timestamp = now()?;
-        let records = self
-            .store
-            .lock()
-            .map_err(|_| ControlError::Server("control store lock failed".to_owned()))?
-            .active_signed_records(timestamp)?;
+        let timestamp = now();
+        let records = self.store()?.active_signed_records(timestamp)?;
         let mut matches = Vec::new();
         for stored in records {
             let wire = decode_record(&stored.record)?;
-            validate_record(&wire.to_record()?).map_err(map_discovery_error)?;
+            validate_record(&wire.to_record()?)?;
             if wire.capabilities.iter().any(|item| item == capability) {
                 matches.push(wire);
             }
@@ -190,10 +133,8 @@ impl ControlService {
         if wire.agent_id != agent_id {
             return Err(ControlError::InvalidRecord);
         }
-        validate_record(&wire.to_record()?).map_err(map_discovery_error)?;
-        let mut store = self.store.lock().map_err(|_| {
-            ControlError::Server("control store lock failed".to_owned())
-        })?;
+        validate_record(&wire.to_record()?)?;
+        let mut store = self.store()?;
         let existing = store.signed_record(agent_id).map_err(map_store_error)?;
         if decode_record(&existing.record)?.signing_key != wire.signing_key {
             return Err(ControlError::InvalidRecord);
@@ -211,10 +152,8 @@ impl ControlService {
         if cursor < 0 {
             return Err(ControlError::InvalidRecord);
         }
-        self.store
-            .lock()
-            .map_err(|_| ControlError::Server("control store lock failed".to_owned()))?
-            .directory_events_after(cursor, 128)?
+        self.store()?
+            .directory_events_after(cursor, EVENT_PAGE)?
             .into_iter()
             .map(|event| {
                 Ok(WireDirectoryEvent {
@@ -236,7 +175,7 @@ impl ControlService {
         if scope_id.is_empty() || expires_in.is_zero() {
             return Err(ControlError::InvalidRecord);
         }
-        let expires_at = now()?
+        let expires_at = now()
             .checked_add(
                 i64::try_from(expires_in.as_secs())
                     .map_err(|_| ControlError::InvalidRecord)?,
@@ -246,9 +185,7 @@ impl ControlService {
         getrandom::fill(&mut token).map_err(|_| {
             ControlError::Server("random source unavailable".to_owned())
         })?;
-        self.store
-            .lock()
-            .map_err(|_| ControlError::Server("control store lock failed".to_owned()))?
+        self.store()?
             .create_managed_invitation(
                 &uuid::Uuid::new_v4().to_string(),
                 scope_id,
@@ -266,19 +203,17 @@ impl ControlService {
         let token = <[u8; 32]>::from_hex(request.token)
             .map_err(|_| ControlError::InvalidRecord)?;
         let record = request.record.to_record()?;
-        validate_record(&record).map_err(map_discovery_error)?;
+        validate_record(&record)?;
         let member = aether_store::ManagedMember {
             scope_id: record.scope_id,
             agent_id: record.agent_id,
             endpoint_id: record.endpoint_id,
-            role: "member".to_owned(),
+            role: wire::MANAGED_MEMBER_ROLE.to_owned(),
             expires_at: unix_timestamp(record.expires_at)
                 .ok_or(ControlError::InvalidRecord)?,
             revoked_at: None,
         };
-        self.store
-            .lock()
-            .map_err(|_| ControlError::Server("control store lock failed".to_owned()))?
+        self.store()?
             .redeem_managed_invitation(blake3::hash(&token).as_bytes(), &member)
             .map_err(map_store_error)?;
         Ok(member)
@@ -288,11 +223,7 @@ impl ControlService {
         &self,
         scope_id: &str,
     ) -> Result<Vec<aether_store::ManagedMember>, ControlError> {
-        self.store
-            .lock()
-            .map_err(|_| ControlError::Server("control store lock failed".to_owned()))?
-            .managed_members(scope_id)
-            .map_err(map_store_error)
+        self.store()?.managed_members(scope_id).map_err(map_store_error)
     }
 
     pub fn revoke_managed_member(
@@ -300,9 +231,7 @@ impl ControlService {
         scope_id: &str,
         agent_id: &str,
     ) -> Result<(), ControlError> {
-        self.store
-            .lock()
-            .map_err(|_| ControlError::Server("control store lock failed".to_owned()))?
+        self.store()?
             .revoke_managed_member(scope_id, agent_id)
             .map_err(map_store_error)?;
         Ok(())
@@ -317,10 +246,8 @@ impl ControlService {
             return Err(ControlError::InvalidRecord);
         }
         let events = self
-            .store
-            .lock()
-            .map_err(|_| ControlError::Server("control store lock failed".to_owned()))?
-            .managed_events_after(scope_id, cursor, 128)
+            .store()?
+            .managed_events_after(scope_id, cursor, EVENT_PAGE)
             .map_err(map_store_error)?;
         Ok(events
             .into_iter()
@@ -332,82 +259,6 @@ impl ControlService {
                 member: event.member,
             })
             .collect())
-    }
-}
-
-impl WireRecord {
-    #[must_use]
-    pub fn test_record() -> Self {
-        let key = SigningKey::from_bytes(&[7; 32]);
-        Self::from_record(&signed_record(
-            &key,
-            "test-agent".to_owned(),
-            "https://127.0.0.1:9443".to_owned(),
-            vec!["127.0.0.1:9443".to_owned()],
-            "test-scope".to_owned(),
-            vec!["test".to_owned()],
-            // A clock an hour from its end cannot hold the expiry; the record
-            // then expires at once.
-            SystemTime::now()
-                .checked_add(Duration::from_secs(3_600))
-                .unwrap_or_else(SystemTime::now),
-        ))
-    }
-
-    #[must_use]
-    pub fn from_record(record: &Record) -> Self {
-        Self {
-            agent_id: record.agent_id.clone(),
-            endpoint_id: record.endpoint_id.clone(),
-            addresses: record.addresses.clone(),
-            scope_id: record.scope_id.clone(),
-            capabilities: record.capabilities.clone(),
-            expires_at: unix_seconds(record.expires_at).unwrap_or(0),
-            signing_key: record.signing_key,
-            signature: record.signature.clone(),
-        }
-    }
-
-    pub fn to_record(&self) -> Result<Record, ControlError> {
-        Ok(Record {
-            agent_id: self.agent_id.clone(),
-            endpoint_id: self.endpoint_id.clone(),
-            addresses: self.addresses.clone(),
-            scope_id: self.scope_id.clone(),
-            capabilities: self.capabilities.clone(),
-            expires_at: from_unix_seconds(self.expires_at)
-                .ok_or(ControlError::InvalidRecord)?,
-            signing_key: self.signing_key,
-            signature: self.signature.clone(),
-        })
-    }
-}
-
-impl WireInvitation {
-    #[must_use]
-    pub fn from_invitation(invitation: &Invitation) -> Self {
-        Self {
-            scope_id: invitation.scope_id.clone(),
-            agent_id: invitation.agent_id.clone(),
-            endpoint_id: invitation.endpoint_id.clone(),
-            expires_at: unix_seconds(invitation.expires_at).unwrap_or(0),
-            signing_key: invitation.signing_key,
-            signature: invitation.signature.clone(),
-        }
-    }
-
-    pub fn to_invitation(&self) -> Result<Invitation, ControlError> {
-        let invitation = Invitation {
-            scope_id: self.scope_id.clone(),
-            agent_id: self.agent_id.clone(),
-            endpoint_id: self.endpoint_id.clone(),
-            expires_at: from_unix_seconds(self.expires_at)
-                .ok_or(ControlError::InvalidRecord)?,
-            signing_key: self.signing_key,
-            signature: self.signature.clone(),
-        };
-        validate_invitation(&invitation).map_err(map_discovery_error)?;
-        Ok(invitation)
     }
 }
 
@@ -451,24 +302,16 @@ const CONTROL_HARDENING: crate::https::Hardening = crate::https::Hardening {
     body_limit: 64 * 1_024,
 };
 
-fn tls_material(data_dir: &Path) -> io::Result<(Vec<u8>, Vec<u8>)> {
-    crate::key_file::self_signed_cert(
-        data_dir,
-        "control-cert.der",
-        "control-key.der",
-        &["localhost", "127.0.0.1", "control"],
-    )
-}
-
 pub async fn serve(
     data_dir: &Path,
     port: u16,
     handle: Handle<std::net::SocketAddr>,
 ) -> Result<(), ControlError> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    std::fs::create_dir_all(data_dir)?;
-    let service = ControlService::open(data_dir.join("control.sqlite"))?;
-    let (certificate, key) = tls_material(data_dir)?;
+    let data_dir = DataDir::new(data_dir);
+    data_dir.create()?;
+    let service = ControlService::open(data_dir.control_store())?;
+    let (certificate, key) = data_dir.control_tls()?;
     let config = RustlsConfig::from_der(vec![certificate], key)
         .await
         .map_err(|error| ControlError::Server(error.to_string()))?;
@@ -490,12 +333,23 @@ pub async fn serve(
 
 fn router(service: ControlService) -> Router {
     Router::new()
-        .route("/v1/records", post(publish).get(search))
-        .route("/v1/records/{agent_id}", get(resolve).delete(revoke))
-        .route("/v1/events", get(events))
-        .route("/v1/managed/redeem", post(redeem_managed))
-        .route("/v1/managed/{scope_id}/events", get(managed_events))
-        .route("/v1/managed/{scope_id}/members", get(managed_members))
+        .route(&route(&wire::RECORDS), post(publish).get(search))
+        .route(
+            &route(&[&wire::RECORDS[..], &["{agent_id}"]].concat()),
+            get(resolve).delete(revoke),
+        )
+        .route(&route(&wire::EVENTS), get(events))
+        .route(&route(&wire::MANAGED_REDEEM), post(redeem_managed))
+        .route(
+            &route(
+                &[&wire::MANAGED[..], &["{scope_id}", wire::MANAGED_EVENTS]].concat(),
+            ),
+            get(managed_events),
+        )
+        .route(
+            &route(&[&wire::MANAGED[..], &["{scope_id}", wire::MEMBERS]].concat()),
+            get(managed_members),
+        )
         .with_state(service)
 }
 
@@ -565,12 +419,15 @@ fn decode_record(bytes: &[u8]) -> Result<WireRecord, ControlError> {
     serde_json::from_slice(bytes).map_err(|_| ControlError::InvalidRecord)
 }
 
-fn map_discovery_error(error: DiscoveryError) -> ControlError {
-    match error {
-        DiscoveryError::Expired => ControlError::Expired,
-        DiscoveryError::Forged => ControlError::Forged,
-        DiscoveryError::NotFound | DiscoveryError::Unavailable => {
-            ControlError::Server("unexpected discovery state".to_owned())
+impl From<DiscoveryError> for ControlError {
+    fn from(error: DiscoveryError) -> Self {
+        match error {
+            DiscoveryError::Expired => Self::Expired,
+            DiscoveryError::Forged => Self::Forged,
+            DiscoveryError::Malformed => Self::InvalidRecord,
+            DiscoveryError::NotFound => {
+                Self::Server("unexpected discovery state".to_owned())
+            }
         }
     }
 }
@@ -583,10 +440,6 @@ fn map_store_error(error: aether_store::StoreError) -> ControlError {
     }
 }
 
-fn now() -> Result<i64, ControlError> {
-    unix_timestamp(SystemTime::now()).ok_or(ControlError::InvalidRecord)
-}
-
 #[cfg(test)]
 #[expect(
     clippy::arithmetic_side_effects,
@@ -595,53 +448,20 @@ fn now() -> Result<i64, ControlError> {
 mod tests {
     use std::time::{Duration, SystemTime};
 
-    use super::{
-        ControlError, ControlService, WireManagedRedeem, WireRecord, tls_material,
-    };
+    use aether_store::{DirectoryEventType, ManagedEventType};
+
+    use super::{ControlError, ControlService, DataDir, WireManagedRedeem, WireRecord};
     use crate::discovery::signed_record;
     use ed25519_dalek::SigningKey;
-
-    #[test]
-    fn a_managed_member_keeps_its_wire_form() {
-        let member = aether_store::ManagedMember {
-            scope_id: "scope".to_owned(),
-            agent_id: "agent".to_owned(),
-            endpoint_id: "endpoint".to_owned(),
-            role: "member".to_owned(),
-            expires_at: 1_900_000_000,
-            revoked_at: None,
-        };
-        let wire = serde_json::json!({
-            "scopeId": "scope",
-            "agentId": "agent",
-            "endpointId": "endpoint",
-            "role": "member",
-            "expiresAt": 1_900_000_000,
-            "revokedAt": null,
-        });
-        assert_eq!(serde_json::to_value(&member).expect("member must encode"), wire);
-        let revoked =
-            aether_store::ManagedMember { revoked_at: Some(1_800_000_000), ..member };
-        let mut revoked_wire = wire;
-        revoked_wire["revokedAt"] = serde_json::json!(1_800_000_000);
-        assert_eq!(
-            serde_json::from_value::<aether_store::ManagedMember>(revoked_wire.clone())
-                .expect("member must decode"),
-            revoked
-        );
-        assert_eq!(
-            serde_json::to_value(&revoked).expect("member must encode"),
-            revoked_wire
-        );
-    }
 
     #[tokio::test]
     async fn a_record_with_bad_hex_is_rejected_before_the_handler() {
         use tower::ServiceExt;
 
         let directory = tempfile::tempdir().expect("directory must create");
-        let service = ControlService::open(directory.path().join("control.sqlite"))
-            .expect("service must open");
+        let service =
+            ControlService::open(DataDir::new(directory.path()).control_store())
+                .expect("service must open");
         let mut record = serde_json::to_value(WireRecord::test_record())
             .expect("record must serialize");
         record["signature"] = serde_json::Value::String("zz".to_owned());
@@ -655,32 +475,6 @@ mod tests {
             .await
             .expect("router must answer");
         assert_eq!(response.status(), axum::http::StatusCode::UNPROCESSABLE_ENTITY);
-    }
-
-    #[test]
-    fn tls_material_replaces_a_key_left_without_its_certificate() {
-        let directory = tempfile::tempdir().expect("directory must create");
-        let key_path = directory.path().join("control-key.der");
-        std::fs::write(&key_path, b"orphaned").expect("orphaned key must write");
-        let (certificate, key) =
-            tls_material(directory.path()).expect("TLS material must generate");
-        assert_ne!(key, b"orphaned");
-        assert_eq!(std::fs::read(&key_path).expect("key must read"), key);
-        assert_eq!(
-            std::fs::read(directory.path().join("control-cert.der"))
-                .expect("certificate must read"),
-            certificate
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            let mode = std::fs::metadata(&key_path)
-                .expect("key must exist")
-                .permissions()
-                .mode();
-            assert_eq!(mode & 0o777, 0o600);
-        }
     }
 
     fn record_for(key: &SigningKey) -> WireRecord {
@@ -699,14 +493,14 @@ mod tests {
     fn records_can_be_published_found_and_revoked() {
         let directory = tempfile::tempdir().expect("directory must create");
         let directory = directory.path();
-        let service = ControlService::open(directory.join("control.sqlite"))
+        let service = ControlService::open(DataDir::new(directory).control_store())
             .expect("service must open");
         let record = WireRecord::test_record();
 
         assert!(!service.publish(&record).expect("record must publish"));
         assert!(service.publish(&record).expect("record must renew"));
         drop(service);
-        let service = ControlService::open(directory.join("control.sqlite"))
+        let service = ControlService::open(DataDir::new(directory).control_store())
             .expect("service must reopen");
         assert_eq!(service.resolve("test-agent").expect("record must resolve"), record);
         assert_eq!(
@@ -717,10 +511,10 @@ mod tests {
         assert!(matches!(service.resolve("test-agent"), Err(ControlError::NotFound)));
         let changes = service.changes_after(0).expect("changes must load");
         assert_eq!(changes.len(), 3);
-        assert_eq!(changes[0].event, "published");
+        assert_eq!(changes[0].event, DirectoryEventType::Published);
         assert!(changes[0].record.is_some());
-        assert_eq!(changes[1].event, "renewed");
-        assert_eq!(changes[2].event, "revoked");
+        assert_eq!(changes[1].event, DirectoryEventType::Renewed);
+        assert_eq!(changes[2].event, DirectoryEventType::Revoked);
         assert!(changes[2].record.is_none());
         assert!(
             service
@@ -735,8 +529,9 @@ mod tests {
     #[test]
     fn forged_records_are_not_stored() {
         let directory = tempfile::tempdir().expect("directory must create");
-        let service = ControlService::open(directory.path().join("control.sqlite"))
-            .expect("service must open");
+        let service =
+            ControlService::open(DataDir::new(directory.path()).control_store())
+                .expect("service must open");
         let mut record = WireRecord::test_record();
         record.endpoint_id = "changed".to_owned();
 
@@ -747,8 +542,9 @@ mod tests {
     #[test]
     fn another_signer_cannot_replace_or_revoke_a_record() {
         let directory = tempfile::tempdir().expect("directory must create");
-        let service = ControlService::open(directory.path().join("control.sqlite"))
-            .expect("service must open");
+        let service =
+            ControlService::open(DataDir::new(directory.path()).control_store())
+                .expect("service must open");
         let record = WireRecord::test_record();
         let replacement = record_for(&SigningKey::from_bytes(&[8; 32]));
 
@@ -769,7 +565,7 @@ mod tests {
     fn invited_signed_member_is_durable_and_can_be_revoked() {
         let directory = tempfile::tempdir().expect("directory must create");
         let directory = directory.path();
-        let service = ControlService::open(directory.join("control.sqlite"))
+        let service = ControlService::open(DataDir::new(directory).control_store())
             .expect("service must open");
         let token = service
             .create_managed_invitation("managed", Duration::from_secs(60))
@@ -790,7 +586,7 @@ mod tests {
             .expect("invitation must redeem");
         assert_eq!(member.agent_id, "member-agent");
         drop(service);
-        let service = ControlService::open(directory.join("control.sqlite"))
+        let service = ControlService::open(DataDir::new(directory).control_store())
             .expect("service must reopen");
         assert_eq!(
             service.managed_members("managed").expect("members must load"),
@@ -811,8 +607,8 @@ mod tests {
         let events =
             service.managed_changes_after("managed", 0).expect("events must load");
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].event, "joined");
-        assert_eq!(events[1].event, "revoked");
+        assert_eq!(events[0].event, ManagedEventType::Joined);
+        assert_eq!(events[1].event, ManagedEventType::Revoked);
         assert!(events[0].member.is_some());
         assert!(events[1].member.is_none());
         assert!(
