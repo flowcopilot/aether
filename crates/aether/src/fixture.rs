@@ -13,9 +13,28 @@ use ed25519_dalek::SigningKey;
 use serde_json::json;
 
 use crate::{
-    identity::{ClaimInput, GrantInput, signed_claim, signed_grant},
+    identity::{ClaimInput, GrantInput, GrantRecord, signed_claim, signed_grant},
     transport::{A2aAccessMode, A2aAuthorization},
 };
+
+#[derive(Debug, Clone, Copy)]
+pub struct PolicyLimits {
+    pub max_context_tokens: u64,
+    pub max_seconds: u64,
+    pub queue_global: u64,
+    pub queue_per_peer: u64,
+}
+
+impl Default for PolicyLimits {
+    fn default() -> Self {
+        Self {
+            max_context_tokens: 32,
+            max_seconds: 10,
+            queue_global: 1,
+            queue_per_peer: 1,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct FixtureError;
@@ -82,17 +101,27 @@ pub async fn create_for_scope(
             nonce: [2; 32],
         },
     );
-    let policy = data_dir.join("policy.json");
+    let policy_path = data_dir.join("policy.json");
+    let limits = PolicyLimits { max_context_tokens: 128, ..PolicyLimits::default() };
+    let mut document = policy_json(
+        &workspace,
+        std::slice::from_ref(&grant),
+        key.verifying_key().to_bytes(),
+        limits,
+    );
+    let object = document.as_object_mut().ok_or(FixtureError)?;
+    object.insert(
+        "scope".to_owned(),
+        json!({"id": scope_id, "kind": scope_kind.as_str()}),
+    );
+    object.insert(
+        "trustedIssuers".to_owned(),
+        json!({"fixture-issuer": hex::encode(key.verifying_key().to_bytes())}),
+    );
+    object.insert("grants".to_owned(), json!([GrantRecord::from(&grant)]));
     fs::write(
-        &policy,
-        serde_json::to_vec(&policy_json(
-            &workspace,
-            &grant,
-            key.verifying_key().to_bytes(),
-            scope_id,
-            scope_kind,
-        ))
-        .map_err(|_| FixtureError)?,
+        &policy_path,
+        serde_json::to_vec(&document).map_err(|_| FixtureError)?,
     )
     .map_err(|_| FixtureError)?;
     let authorization = data_dir.join("authorization.json");
@@ -103,35 +132,34 @@ pub async fn create_for_scope(
     )
     .map_err(|_| FixtureError)?;
     let fake_codex = data_dir.join("fake-codex");
-    fs::write(&fake_codex, FAKE_CODEX_SCRIPT).map_err(|_| FixtureError)?;
-    set_executable(&fake_codex)?;
+    write_executable(&fake_codex, fake_codex_script(false, false))
+        .map_err(|_| FixtureError)?;
     serde_json::to_string(&json!({
         "serverDataDir": server_data,
         "clientDataDir": client_data,
         "workspace": workspace,
-        "policy": policy,
+        "policy": policy_path,
         "authorization": authorization,
         "codexBinary": fake_codex,
     }))
     .map_err(|_| FixtureError)
 }
 
-fn policy_json(
+#[must_use]
+pub fn policy_json(
     workspace: &Path,
-    grant: &aether_core::Grant,
+    grants: &[aether_core::Grant],
     trusted_key: [u8; 32],
-    scope_id: &str,
-    scope_kind: ScopeKind,
+    limits: PolicyLimits,
 ) -> serde_json::Value {
     json!({
-        "scope": {"id": scope_id, "kind": scope_kind.as_str()},
-        "trustedIssuers": {"fixture-issuer": hex::encode(trusted_key)},
-        "grants": [crate::identity::GrantRecord::from(grant)],
+        "trustedIssuers": {"issuer": hex::encode(trusted_key)},
+        "grants": grants.iter().map(GrantRecord::from).collect::<Vec<_>>(),
         "workspace": workspace,
-        "maxContextTokens": 128,
-        "maxSeconds": 10,
-        "queueGlobal": 1,
-        "queuePerPeer": 1,
+        "maxContextTokens": limits.max_context_tokens,
+        "maxSeconds": limits.max_seconds,
+        "queueGlobal": limits.queue_global,
+        "queuePerPeer": limits.queue_per_peer,
     })
 }
 
@@ -150,19 +178,57 @@ fn authorization_json(
     }
 }
 
-/// A fake `codex app-server`: it answers the handshake and the turn, and
-/// replies with the text `fake Codex result`.
-pub const FAKE_CODEX_SCRIPT: &str = "#!/bin/sh\nwhile IFS= read -r request; do\n  case \"$request\" in\n    *'\"id\":1'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}' ;;\n    *'\"id\":2'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"thread\":{\"id\":\"thread\"}}}' ;;\n    *'\"id\":3'*)\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"turn\":{\"id\":\"turn\"}}}'\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"thread\",\"turnId\":\"turn\",\"delta\":\"fake Codex result\"}}'\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thread\",\"turn\":{\"id\":\"turn\",\"status\":\"completed\",\"items\":[]}}}'\n      ;;\n  esac\ndone\n";
+pub const FAKE_CODEX_SCRIPT: &str = fake_codex_script(false, false);
+
+#[must_use]
+pub const fn fake_codex_script(slow_turn: bool, mcp_probe: bool) -> &'static str {
+    if mcp_probe {
+        r#"#!/bin/sh
+names=''
+while IFS= read -r line; do
+  case "$line" in
+    '[mcp_servers.'*']')
+      name=${line#'[mcp_servers.'}
+      name=${name%']'}
+      names="$names$name "
+      ;;
+  esac
+done < "$CODEX_HOME/config.toml"
+while IFS= read -r request; do
+  case "$request" in
+    *'"id":1'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}' ;;
+    *'"id":2'*)
+      case "$request" in
+        *'"approvalPolicy":"never"'*) ;;
+        *) exit 1 ;;
+      esac
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread"}}}'
+      ;;
+    *'"id":3'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn"}}}'
+      printf '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thread","turnId":"turn","delta":"mcp: %s"}}\n' "$names"
+      printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread","turn":{"id":"turn","status":"completed","items":[]}}}'
+      ;;
+  esac
+done
+"#
+    } else if slow_turn {
+        "#!/bin/sh\nwhile IFS= read -r request; do\n  case \"$request\" in\n    *'\"id\":1'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}' ;;\n    *'\"id\":2'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"thread\":{\"id\":\"thread\"}}}' ;;\n    *'\"id\":3'*)\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"turn\":{\"id\":\"turn\"}}}'\n      sleep 1\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"thread\",\"turnId\":\"turn\",\"delta\":\"fake Codex result\"}}'\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thread\",\"turn\":{\"id\":\"turn\",\"status\":\"completed\",\"items\":[]}}}'\n      ;;\n  esac\ndone\n"
+    } else {
+        "#!/bin/sh\nwhile IFS= read -r request; do\n  case \"$request\" in\n    *'\"id\":1'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}' ;;\n    *'\"id\":2'*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"thread\":{\"id\":\"thread\"}}}' ;;\n    *'\"id\":3'*)\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"turn\":{\"id\":\"turn\"}}}'\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"item/agentMessage/delta\",\"params\":{\"threadId\":\"thread\",\"turnId\":\"turn\",\"delta\":\"fake Codex result\"}}'\n      printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thread\",\"turn\":{\"id\":\"turn\",\"status\":\"completed\",\"items\":[]}}}'\n      ;;\n  esac\ndone\n"
+    }
+}
 
 #[cfg(unix)]
-fn set_executable(path: &Path) -> Result<(), FixtureError> {
+pub fn write_executable(path: &Path, script: &str) -> Result<(), FixtureError> {
     use std::os::unix::fs::PermissionsExt;
 
+    fs::write(path, script).map_err(|_| FixtureError)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
         .map_err(|_| FixtureError)
 }
 
 #[cfg(not(unix))]
-fn set_executable(_path: &Path) -> Result<(), FixtureError> {
+pub fn write_executable(_path: &Path, _script: &str) -> Result<(), FixtureError> {
     Err(FixtureError)
 }
