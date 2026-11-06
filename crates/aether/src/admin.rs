@@ -901,17 +901,17 @@ impl Administration {
     }
 
     /// At most `limit` audit results, after the first `skip`.
-    #[must_use]
-    pub fn audit_page(&self, skip: usize, limit: usize) -> Vec<String> {
-        self.store.audit_records_page(skip, limit).map_or_else(
-            |_| Vec::new(),
-            |records| {
-                records
-                    .into_iter()
-                    .map(|record| record.result.as_str().to_owned())
-                    .collect()
-            },
-        )
+    pub fn audit_page(
+        &self,
+        skip: usize,
+        limit: usize,
+    ) -> Result<Vec<String>, aether_store::StoreError> {
+        Ok(self
+            .store
+            .audit_records_page(skip, limit)?
+            .into_iter()
+            .map(|record| record.result.as_str().to_owned())
+            .collect())
     }
 
     pub fn task_activity_after(

@@ -63,7 +63,7 @@ const UI_HARDENING: crate::https::Hardening = crate::https::Hardening {
 /// Copies a `data-copy-text` value on click and says so in the button's
 /// `data-copy-label`. Only the Advanced page, which has `#activity-status`,
 /// opens the activity stream.
-const ADMIN_JAVASCRIPT: &str = "document.addEventListener('click',async event=>{const button=event.target.closest('[data-copy-text]');if(!button)return;const label=button.querySelector('[data-copy-label]')||button;const text=label.textContent;try{await navigator.clipboard.writeText(button.dataset.copyText);label.textContent='Copied'}catch{label.textContent='Select and copy'}setTimeout(()=>{label.textContent=text},1600)});const status=document.getElementById('activity-status');if(status){const events=new EventSource('/events');events.addEventListener('ready',()=>{status.textContent='Activity updates are connected.'});events.addEventListener('audit',event=>{status.textContent=JSON.parse(event.data).entry});events.addEventListener('task',event=>{const task=JSON.parse(event.data);status.textContent=`Task ${task.taskId}: ${task.event}`});events.onerror=()=>{status.textContent='Activity updates will retry.'}}if(document.querySelector('[data-hub-waiting]')){const reload=()=>{const active=document.activeElement;if(active&&active.matches('input,select,textarea')&&active.value){setTimeout(reload,4000);return}location.assign('/')};setTimeout(reload,4000)}const dots=document.querySelectorAll('[data-presence]');if(dots.length){const update=async()=>{try{const answer=await fetch('/hub/presence');if(!answer.ok)return;const presence=await answer.json();for(const dot of dots){const online=presence[dot.dataset.presence];dot.dataset.state=online===undefined?'unknown':online?'online':'offline';dot.querySelector('[data-presence-label]').textContent=online===undefined?'':online?'Online':'Offline'}}catch{}};update();setInterval(update,15000)}";
+const ADMIN_JAVASCRIPT: &str = "document.addEventListener('click',async event=>{const button=event.target.closest('[data-copy-text]');if(!button)return;const label=button.querySelector('[data-copy-label]')||button;const text=label.textContent;try{await navigator.clipboard.writeText(button.dataset.copyText);label.textContent='Copied'}catch{label.textContent='Select and copy'}setTimeout(()=>{label.textContent=text},1600)});const status=document.getElementById('activity-status');if(status){const events=new EventSource('/events');events.addEventListener('ready',()=>{status.textContent='Activity updates are connected.'});events.addEventListener('audit',event=>{status.textContent=JSON.parse(event.data).entry});events.addEventListener('task',event=>{const task=JSON.parse(event.data);status.textContent=`Task ${task.taskId}: ${task.event}`});events.addEventListener('unavailable',()=>{status.textContent='Activity updates cannot read the administration store.'});events.onerror=()=>{status.textContent='Activity updates will retry.'}}if(document.querySelector('[data-hub-waiting]')){const reload=()=>{const active=document.activeElement;if(active&&active.matches('input,select,textarea')&&active.value){setTimeout(reload,4000);return}location.assign('/')};setTimeout(reload,4000)}const dots=document.querySelectorAll('[data-presence]');if(dots.length){const update=async()=>{try{const answer=await fetch('/hub/presence');if(!answer.ok)return;const presence=await answer.json();for(const dot of dots){const online=presence[dot.dataset.presence];dot.dataset.state=online===undefined?'unknown':online?'online':'offline';dot.querySelector('[data-presence-label]').textContent=online===undefined?'':online?'Online':'Offline'}}catch{}};update();setInterval(update,15000)}";
 
 //
 // topcoat has no TLS of its own; its docs point at fronting it with a
@@ -397,6 +397,8 @@ struct ActivityFeed {
     ready: VecDeque<Event>,
     audited: tokio::sync::watch::Receiver<()>,
     tasks: Option<tokio::sync::broadcast::Receiver<String>>,
+    /// Whether the last read failed, so the page hears it once per outage.
+    unavailable: bool,
 }
 
 impl ActivityFeed {
@@ -406,7 +408,14 @@ impl ActivityFeed {
                 administration.lock().unwrap_or_else(PoisonError::into_inner);
             (administration.watch_audit(), administration.subscribe_task_events())
         };
-        Self { administration, cursor, ready: VecDeque::new(), audited, tasks }
+        Self {
+            administration,
+            cursor,
+            ready: VecDeque::new(),
+            audited,
+            tasks,
+            unavailable: false,
+        }
     }
 
     async fn next(mut self) -> Option<(TopcoatResult<Event>, Self)> {
@@ -422,16 +431,26 @@ impl ActivityFeed {
 
     /// Queues the next batch of events. Returns `false` when there is none.
     fn read_batch(&mut self) -> bool {
-        let (audit, tasks) = {
+        let read = {
             let administration =
                 self.administration.lock().unwrap_or_else(PoisonError::into_inner);
-            (
-                administration.audit_page(self.cursor.audit, ACTIVITY_BATCH),
-                administration
-                    .task_activity_after(self.cursor.task, ACTIVITY_BATCH)
-                    .unwrap_or_default(),
+            administration.audit_page(self.cursor.audit, ACTIVITY_BATCH).and_then(
+                |audit| {
+                    administration
+                        .task_activity_after(self.cursor.task, ACTIVITY_BATCH)
+                        .map(|tasks| (audit, tasks))
+                },
             )
         };
+        let Ok((audit, tasks)) = read else {
+            let first = !self.unavailable;
+            self.unavailable = true;
+            if first {
+                self.ready.push_back(Event::new().event("unavailable").data("{}"));
+            }
+            return first;
+        };
+        self.unavailable = false;
         let found = !audit.is_empty() || !tasks.is_empty();
         for entry in audit {
             self.cursor.audit = self.cursor.audit.saturating_add(1);
@@ -2993,6 +3012,49 @@ mod tests {
         assert!(response.body.contains("Administration store is unavailable"));
         assert!(response.body.contains("Overview counts cannot be loaded"));
         assert!(!response.body.contains("0 known agents"));
+    }
+
+    #[tokio::test]
+    async fn the_activity_feed_says_when_it_cannot_read_the_store() {
+        let (directory, admin_ui, _administration) = admin_ui_with_directory_applier();
+        rusqlite::Connection::open(directory.path().join(aether_store::NODE_DATABASE))
+            .expect("database must open")
+            .execute("DROP TABLE audit_records", [])
+            .expect("audit records must drop");
+        let response = app(admin_ui)
+            .oneshot(
+                Request::builder()
+                    .uri("/events")
+                    .header("host", format!("127.0.0.1:{PORT}"))
+                    .body(axum::body::Body::empty())
+                    .expect("request must build"),
+            )
+            .await
+            .expect("router must respond");
+        let mut stream = response.into_body().into_data_stream();
+        let _ = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("ready event must arrive");
+        let event = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("unavailable event must arrive")
+            .expect("stream must contain an event")
+            .expect("event must be valid bytes");
+        let event = std::str::from_utf8(&event).expect("event must be UTF-8");
+        assert!(event.contains("event: unavailable"), "{event}");
+    }
+
+    #[tokio::test]
+    async fn the_caller_page_says_when_sent_tasks_cannot_load() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let admin_ui = caller_ui(directory.path());
+        rusqlite::Connection::open(directory.path().join(aether_store::NODE_DATABASE))
+            .expect("database must open")
+            .execute("DROP TABLE sent_tasks", [])
+            .expect("sent tasks must drop");
+        let response = get(app(admin_ui), "/").await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert!(response.body.contains("Sent tasks cannot be loaded."));
     }
 
     #[tokio::test]
