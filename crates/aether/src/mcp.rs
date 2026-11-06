@@ -823,7 +823,9 @@ impl McpServer {
         Parameters(arguments): Parameters<InviteNameArguments>,
     ) -> CallToolResult {
         let to = arguments.to.trim();
-        if !valid_full_name(to) || ![1, 7, 30].contains(&arguments.days) {
+        if !valid_full_name(to)
+            || !crate::hub_client::protocol::OFFER_DAYS.contains(&arguments.days)
+        {
             return tool_error(
                 "use a full Aether name with its number, such as bob#0042, and 1, 7 or 30 days",
             );
@@ -1244,7 +1246,10 @@ impl McpServer {
             );
         }
         let days = arguments.days.unwrap_or(7);
-        if !(1..=u64::from(aether_core::limits::MAX_HUB_ACCESS_DAYS)).contains(&days) {
+        if !(crate::hub_client::protocol::ACCESS_DAYS_MIN
+            ..=crate::hub_client::protocol::ACCESS_DAYS_MAX)
+            .contains(&days)
+        {
             return tool_error("aether.access.request days must be from 1 to 30");
         }
         let Some(hub) = self.node_hub(data_dir).client().ok().flatten() else {

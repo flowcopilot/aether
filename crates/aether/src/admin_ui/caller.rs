@@ -341,7 +341,9 @@ async fn request_draft(
     draft: aether_store::AccessRequestDraft,
 ) -> TopcoatResult<impl View> {
     let listing = crate::listing::parse(&draft.listing.text, &draft.target_name).ok();
-    let mut choices = vec![1, 7, 30, u64::from(draft.days)];
+    let mut choices =
+        [crate::hub_client::protocol::OFFER_DAYS.as_slice(), &[u64::from(draft.days)]]
+            .concat();
     choices.sort_unstable();
     choices.dedup();
     Ok(view! {
@@ -425,7 +427,10 @@ async fn confirm(
     id: &str,
     days: u64,
 ) -> Result<(), &'static str> {
-    if !(1..=u64::from(aether_core::limits::MAX_HUB_ACCESS_DAYS)).contains(&days) {
+    if !(crate::hub_client::protocol::ACCESS_DAYS_MIN
+        ..=crate::hub_client::protocol::ACCESS_DAYS_MAX)
+        .contains(&days)
+    {
         return Err("Choose 1 to 30 days.");
     }
     let now = aether_core::time::now();

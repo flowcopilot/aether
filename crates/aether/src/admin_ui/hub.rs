@@ -33,6 +33,7 @@ use super::{
     host::{Notice, host_screen, sign_invite},
     page_data_dir, require_admin_session,
 };
+use crate::hub_client::protocol::{DEFAULT_ACCESS_DAYS, OFFER_DAYS};
 use aether_store::{ApprovalKind, ApprovalSide, HubApproval, NodeStore};
 
 use crate::{
@@ -56,11 +57,6 @@ const PAGE_WAIT: Duration = Duration::from_secs(4);
 const RETRY_WAIT: Duration = Duration::from_secs(5);
 /// How long a worker's long poll asks the hub to wait for a change.
 const POLL_WAIT: Duration = Duration::from_secs(25);
-
-/// The lengths of access the invite form offers, in days. The hub accepts
-/// 1 to 30.
-const ACCESS_DAYS: [u64; 3] = [1, 7, 30];
-const DEFAULT_ACCESS_DAYS: u64 = 7;
 
 /// The hub's answer for one page, or why there is none.
 enum HubState {
@@ -542,7 +538,7 @@ async fn invite_form(error: String) -> TopcoatResult<impl View> {
                         name="days"
                         class="h-9 rounded-lg border border-border bg-background px-3 text-sm shadow-xs"
                     >
-                        for days in ACCESS_DAYS {
+                        for days in OFFER_DAYS {
                             <option value=(days) selected=((days == DEFAULT_ACCESS_DAYS).then_some(""))>
                                 (if days == 1 { "1 day".to_owned() } else { format!("{days} days") })
                             </option>
@@ -563,7 +559,7 @@ async fn invite_form(error: String) -> TopcoatResult<impl View> {
 #[component]
 async fn request_row(invite: Invite) -> TopcoatResult<impl View> {
     let endpoint = invite.receiver_endpoint.clone().unwrap_or_default();
-    let selected = if ACCESS_DAYS.contains(&invite.days) {
+    let selected = if OFFER_DAYS.contains(&invite.days) {
         invite.days
     } else {
         DEFAULT_ACCESS_DAYS
@@ -585,7 +581,7 @@ async fn request_row(invite: Invite) -> TopcoatResult<impl View> {
                         aria-label=(format!("Access for {}", invite.to))
                         class="h-8 rounded-lg border border-border bg-background px-2 text-sm"
                     >
-                        for days in ACCESS_DAYS {
+                        for days in OFFER_DAYS {
                             <option value=(days) selected=((days == selected).then_some(""))>
                                 (if days == 1 { "1 day".to_owned() } else { format!("{days} days") })
                             </option>
@@ -817,7 +813,7 @@ pub(super) async fn invite_by_name(
     let to = form.to.trim();
     let error = if !valid_full_name(to) {
         "Use their full name on Aether, with the four digits, such as bob#0042."
-    } else if !ACCESS_DAYS.contains(&form.days) {
+    } else if !OFFER_DAYS.contains(&form.days) {
         "Choose how long they can use your agent."
     } else {
         offer(&hub, &page.data_dir, to, form.days).await.err().unwrap_or_default()
@@ -871,7 +867,7 @@ pub(super) async fn approve_request(
         return Err(bad_request("this node has no access requests").into());
     };
     let hub = page.current_hub().ok_or_else(|| bad_request("this node has no hub"))?;
-    let error = if ACCESS_DAYS.contains(&form.days) {
+    let error = if OFFER_DAYS.contains(&form.days) {
         approve(&hub, &page.data_dir, &form.id, form.days)
             .await
             .err()

@@ -732,10 +732,10 @@ impl HubClient {
             .client
             .request(method, url)
             .header(PROTOCOL_HEADER, PROTOCOL_VERSION)
-            .header(protocol::endpoint_header(), self.endpoint_id())
-            .header(protocol::time_header(), time)
+            .header(protocol::ENDPOINT_HEADER, self.endpoint_id())
+            .header(protocol::TIME_HEADER, time)
             .header(
-                protocol::signature_header(),
+                protocol::SIGNATURE_HEADER,
                 URL_SAFE_NO_PAD.encode(signature.to_bytes()),
             );
         if !body.is_empty() {

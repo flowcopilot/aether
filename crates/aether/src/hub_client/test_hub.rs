@@ -666,7 +666,8 @@ fn route(
             match body.get("days").map(Value::as_u64) {
                 None => {}
                 Some(Some(days))
-                    if (1..=u64::from(aether_core::limits::MAX_HUB_ACCESS_DAYS))
+                    if (crate::hub_client::protocol::ACCESS_DAYS_MIN
+                        ..=crate::hub_client::protocol::ACCESS_DAYS_MAX)
                         .contains(&days) =>
                 {
                     invite.days = days;

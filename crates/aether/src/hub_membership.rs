@@ -117,9 +117,11 @@ pub async fn accept(
                 kind: ApprovalKind::Invite,
                 peer_name: invite.from.clone(),
                 peer_endpoint: None,
-                days: u32::try_from(invite.days)
-                    .unwrap_or(u32::MAX)
-                    .clamp(1, aether_core::limits::MAX_HUB_ACCESS_DAYS),
+                days: u32::try_from(invite.days.clamp(
+                    crate::hub_client::protocol::ACCESS_DAYS_MIN,
+                    crate::hub_client::protocol::ACCESS_DAYS_MAX,
+                ))
+                .unwrap_or(u32::MAX),
                 access_group: crate::access_groups::FRIENDS_GROUP.to_owned(),
                 bundle: None,
                 created_at: now,

@@ -77,7 +77,10 @@ pub fn draft(
     if listing_expires_at <= now {
         return Err(DraftError::Invalid("the listing of this agent has expired"));
     }
-    if !(1..=u64::from(aether_core::limits::MAX_HUB_ACCESS_DAYS)).contains(&days) {
+    if !(crate::hub_client::protocol::ACCESS_DAYS_MIN
+        ..=crate::hub_client::protocol::ACCESS_DAYS_MAX)
+        .contains(&days)
+    {
         return Err(DraftError::Invalid("days must be from 1 to 30"));
     }
     if listing_matches_saved_contact(data_dir, row, now) {

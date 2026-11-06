@@ -1,6 +1,6 @@
 use std::fmt;
 
-use super::protocol::name_number_digits;
+use super::protocol::NAME_NUMBER_DIGITS;
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct FullName {
@@ -12,7 +12,7 @@ impl FullName {
     #[must_use]
     pub fn parse(full_name: &str) -> Option<Self> {
         let (name, number) = full_name.split_once('#')?;
-        if number.len() != name_number_digits()
+        if number.len() != NAME_NUMBER_DIGITS
             || !number.bytes().all(|byte| byte.is_ascii_digit())
         {
             return None;
@@ -66,7 +66,7 @@ pub fn valid_full_name(full_name: &str) -> bool {
 #[must_use]
 pub fn split_full_name(full_name: &str) -> Option<(&str, u16)> {
     let (name, number) = full_name.split_once('#')?;
-    if number.len() != name_number_digits()
+    if number.len() != NAME_NUMBER_DIGITS
         || !number.bytes().all(|byte| byte.is_ascii_digit())
     {
         return None;
