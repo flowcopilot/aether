@@ -5,7 +5,7 @@
 use aether_core::time::now;
 use std::time::Duration;
 
-use aether_store::{ApprovalKind, ApprovalSide, HubApproval, NodeStore, StoreError};
+use aether_store::{ApprovalKind, ApprovalSide, HubApproval, StoreError};
 
 use crate::hub_client::{HubClient, HubError, Invite, Role, Status};
 
@@ -74,7 +74,7 @@ fn approve_invite(
     days: u64,
 ) -> Result<(), StoreError> {
     let now = now();
-    NodeStore::in_dir(data_dir)?.put_hub_approval(&HubApproval {
+    crate::hub_store::HubStore::open(data_dir)?.put_approval(&HubApproval {
         invite_id: invite.id.clone(),
         side: ApprovalSide::Sender,
         kind: ApprovalKind::Invite,
@@ -109,9 +109,9 @@ pub async fn accept(
         })
         .ok_or(HubError::Forbidden)?;
     let now = now();
-    NodeStore::in_dir(data_dir)
+    crate::hub_store::HubStore::open(data_dir)
         .and_then(|store| {
-            store.put_hub_approval(&HubApproval {
+            store.put_approval(&HubApproval {
                 invite_id: invite.id.clone(),
                 side: ApprovalSide::Receiver,
                 kind: ApprovalKind::Invite,

@@ -64,9 +64,10 @@ impl NodeHub {
         self.client()
     }
 
-    pub fn prime(&self, client: HubClient) {
-        let stored = setting::<Hub>(&self.data_dir).ok().flatten();
+    pub fn prime(&self, client: HubClient) -> Result<(), StoreError> {
+        let stored = setting::<Hub>(&self.data_dir)?;
         *self.slot() = Some(HubState { stored, client: Some(client) });
+        Ok(())
     }
 
     fn slot(&self) -> MutexGuard<'_, Option<HubState>> {

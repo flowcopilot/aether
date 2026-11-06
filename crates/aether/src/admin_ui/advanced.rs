@@ -31,7 +31,7 @@ use crate::{
         input::input,
         label::label,
     },
-    policy::{PolicySettings, policy_settings, save_policy_settings},
+    policy::{PolicySettings, policy_settings},
 };
 use aether_store::{ChangeKind, ManagedMember};
 
@@ -327,7 +327,7 @@ pub(super) async fn save_policy(
     Form(form): Form<PolicyForm>,
 ) -> TopcoatResult<impl View> {
     super::require_admin_session(cx).await?;
-    let data_dir = super::page_data_dir(cx)
+    super::page_data_dir(cx)
         .ok_or_else(|| bad_request("this page has no node data"))?;
     let settings = PolicySettings {
         workspace: PathBuf::from(form.workspace),
@@ -336,8 +336,12 @@ pub(super) async fn save_policy(
         queue_global: form.queue_global,
         queue_per_peer: form.queue_per_peer,
     };
-    save_policy_settings(&data_dir, &settings).map_err(|_| {
-        bad_request("use an existing absolute folder and limits above zero")
-    })?;
+    app_context::<SharedAdministration>(cx)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .save_policy_settings(&settings, aether_store::AuditActor::Ui)
+        .map_err(|_| {
+            bad_request("use an existing absolute folder and limits above zero")
+        })?;
     Ok(view! { dashboard(policy_saved: true) })
 }

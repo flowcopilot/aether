@@ -22,6 +22,30 @@ use crate::{
 /// The scope id and kind of a direct connection.
 pub const SCOPE: &str = "direct";
 
+pub const INVITE_WORKSPACE_ID: &str = "workspace";
+
+pub const DIRECT_OFFER_DAYS: [u64; 3] = [1, 7, 30];
+pub const DEFAULT_DIRECT_ACCESS_DAYS: u64 = 7;
+
+#[must_use]
+pub fn valid_direct_invite_days(days: u64) -> bool {
+    DIRECT_OFFER_DAYS.contains(&days)
+}
+
+#[must_use]
+pub fn grant_is_low_risk_invite(grant: &aether_core::Grant) -> bool {
+    grant.scope_id.as_str() == SCOPE
+        && grant.approval_rule == aether_core::ApprovalRule::Automatic
+        && grant
+            .capabilities
+            .iter()
+            .any(|capability| capability.as_str() == crate::execution::GENERAL_SKILL)
+        && grant
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.as_str() == INVITE_WORKSPACE_ID)
+}
+
 /// The `format` value of an [`InvitationBundle`] without an Agent Card.
 pub const BUNDLE_FORMAT_V1: &str = "aether-invitation/v1";
 /// The `format` value of an [`InvitationBundle`] with a signed Agent Card.
@@ -162,7 +186,7 @@ pub fn sign_invite_access(
 ) -> Result<(A2aAuthorization, aether_core::Grant), DirectError> {
     if !valid_name(friend_name)
         || endpoint_id.parse::<iroh::EndpointId>().is_err()
-        || !(1..=u64::from(aether_core::limits::MAX_DIRECT_ACCESS_DAYS)).contains(&days)
+        || !valid_direct_invite_days(days)
     {
         return Err(DirectError::Invalid);
     }
@@ -174,7 +198,7 @@ pub fn sign_invite_access(
         subject_endpoint_id: endpoint_id.to_owned(),
         scope_id: SCOPE.to_owned(),
         capabilities: vec![crate::execution::GENERAL_SKILL.to_owned()],
-        workspaces: vec!["workspace".to_owned()],
+        workspaces: vec![INVITE_WORKSPACE_ID.to_owned()],
         access_mode: aether_core::AccessMode::ReadOnly,
         approval_rule: aether_core::ApprovalRule::Automatic,
         lifetime: Duration::from_secs(days.saturating_mul(24 * 60 * 60)),
@@ -195,9 +219,7 @@ pub fn encode_invite_after_grant(
     relay_url: Option<String>,
     agent_card: (String, String),
 ) -> Result<String, DirectError> {
-    if !valid_name(agent_name)
-        || !(1..=u64::from(aether_core::limits::MAX_DIRECT_ACCESS_DAYS)).contains(&days)
-    {
+    if !valid_name(agent_name) || !valid_direct_invite_days(days) {
         return Err(DirectError::Invalid);
     }
     let invitation = create_invitation(

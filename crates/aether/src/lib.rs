@@ -29,6 +29,7 @@ pub mod fixture;
 mod https;
 pub mod hub_client;
 mod hub_membership;
+mod hub_store;
 mod hub_sync;
 pub mod identity;
 mod invites;

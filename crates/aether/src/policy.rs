@@ -295,13 +295,12 @@ pub fn policy_settings(data_dir: &Path) -> Result<Option<PolicySettings>, Policy
 ///
 /// A [`PolicyError`] when the settings are invalid, no policy is stored, or
 /// the store fails.
-pub fn save_policy_settings(
-    data_dir: &Path,
+pub fn save_policy_settings_in_store(
+    store: &NodeStore,
     settings: &PolicySettings,
 ) -> Result<(), PolicyError> {
     validate_policy_settings(settings)?;
-    let store = NodeStore::in_dir(data_dir).map_err(|_| PolicyError::Read)?;
-    let policy = stored(&store)?.ok_or(PolicyError::Read)?;
+    let policy = stored(store)?.ok_or(PolicyError::Read)?;
     let policy = PolicyFile {
         workspace: settings.workspace.clone(),
         max_context_tokens: settings.max_context_tokens,
@@ -310,14 +309,21 @@ pub fn save_policy_settings(
         queue_per_peer: settings.queue_per_peer,
         ..policy
     };
-    keep(&store, &serde_json::to_string(&policy).map_err(|_| PolicyError::Invalid)?)?;
-    // Older live admin changes must not override the new saved limits.
+    keep(store, &serde_json::to_string(&policy).map_err(|_| PolicyError::Invalid)?)?;
     for id in [QueueLimitId::Global, QueueLimitId::PerPeer] {
         store
             .remove_applied_change(aether_store::ChangeKind::Limit, id.as_str())
             .map_err(|_| PolicyError::Read)?;
     }
     Ok(())
+}
+
+pub fn save_policy_settings(
+    data_dir: &Path,
+    settings: &PolicySettings,
+) -> Result<(), PolicyError> {
+    let store = NodeStore::in_dir(data_dir).map_err(|_| PolicyError::Read)?;
+    save_policy_settings_in_store(&store, settings)
 }
 
 pub fn validate_policy_settings(settings: &PolicySettings) -> Result<(), PolicyError> {

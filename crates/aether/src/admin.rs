@@ -721,7 +721,6 @@ impl Administration {
                     live.queue_limit(*id).is_ok_and(|current| *limit <= current)
                 })
             }
-            ChangeRequest::Grant { grant, .. } => !direct_invite_grant(grant),
             _ => change.is_high_risk(),
         }
     }
@@ -797,6 +796,24 @@ impl Administration {
         let live = self.live.clone().ok_or(AdminError::Unsupported("revoke"))?;
         self.store.revoke_applied_grant(id).map_err(|_| AdminError::Store)?;
         live.revoke_grant(id)?;
+        self.store
+            .record_change(actor, AuditResult::Applied)
+            .map_err(|_| AdminError::Store)
+    }
+
+    pub fn save_policy_settings(
+        &mut self,
+        settings: &crate::policy::PolicySettings,
+        actor: AuditActor,
+    ) -> Result<(), AdminError> {
+        crate::policy::save_policy_settings_in_store(&self.store, settings).map_err(
+            |error| match error {
+                crate::policy::PolicyError::InvalidField(_) => {
+                    AdminError::InvalidField("policy")
+                }
+                _ => AdminError::Store,
+            },
+        )?;
         self.store
             .record_change(actor, AuditResult::Applied)
             .map_err(|_| AdminError::Store)
@@ -896,13 +913,14 @@ impl Administration {
 
 impl Change {
     #[must_use]
-    pub const fn is_high_risk(&self) -> bool {
-        matches!(
-            self.request,
-            ChangeRequest::Workspace { .. }
-                | ChangeRequest::Grant { .. }
-                | ChangeRequest::Capability { .. }
-        )
+    pub fn is_high_risk(&self) -> bool {
+        match &self.request {
+            ChangeRequest::Grant { grant, .. } => {
+                !crate::direct::grant_is_low_risk_invite(grant)
+            }
+            ChangeRequest::Workspace { .. } | ChangeRequest::Capability { .. } => true,
+            _ => false,
+        }
     }
 
     #[must_use]
@@ -922,16 +940,6 @@ impl Change {
 
 fn expires_at(value: SystemTime) -> i64 {
     aether_core::time::unix_timestamp(value).unwrap_or(i64::MAX)
-}
-
-#[must_use]
-fn direct_invite_grant(grant: &aether_core::Grant) -> bool {
-    grant.scope_id.as_str() == crate::direct::SCOPE
-        && grant.approval_rule == aether_core::ApprovalRule::Automatic
-        && grant
-            .capabilities
-            .iter()
-            .any(|capability| capability.as_str() == crate::execution::GENERAL_SKILL)
 }
 
 /// Rebuilds a typed `Change` from a durably stored pending change so
