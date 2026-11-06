@@ -1,0 +1,66 @@
+/* Audioflow's reading palette and self-hosted type, adapted for Aether. */
+:root {
+  --sl-font: 'Bricolage Grotesque Variable', system-ui, sans-serif;
+  --sl-font-mono: 'IBM Plex Mono', ui-monospace, monospace;
+  --sl-color-accent-low: #2a1a46;
+  --sl-color-accent: #9a6fd6;
+  --sl-color-accent-high: #e3d6f7;
+  --sl-color-white: #ffffff;
+  --sl-color-gray-1: #ece9f5;
+  --sl-color-gray-2: #c9c3dc;
+  --sl-color-gray-3: #9890b3;
+  --sl-color-gray-4: #5f5880;
+  --sl-color-gray-5: #3b3457;
+  --sl-color-gray-6: #261f3d;
+  --sl-color-black: #19132b;
+  --sl-content-width: 48rem;
+  --sl-text-body: 1.0625rem;
+}
+:root[data-theme='light'] {
+  --sl-color-accent-low: #e7defa;
+  --sl-color-accent: #5b2e91;
+  --sl-color-accent-high: #2e1452;
+  --sl-color-white: #1d1638;
+  --sl-color-gray-1: #2b2447;
+  --sl-color-gray-2: #463e66;
+  --sl-color-gray-3: #6b6585;
+  --sl-color-gray-4: #9e98b5;
+  --sl-color-gray-5: #d9d4ea;
+  --sl-color-gray-6: #ebe8f5;
+  --sl-color-gray-7: #f6f4fc;
+  --sl-color-black: #fbfaff;
+}
+.site-title { font-weight: 750; letter-spacing: -0.02em; }
+.sl-markdown-content :is(h1, h2, h3), h1#_top {
+  letter-spacing: -0.025em;
+  font-stretch: 88%;
+  text-wrap: balance;
+}
+h1#_top { font-size: clamp(2.5rem, 5vw, 3.5rem); line-height: 1.1; }
+.sl-markdown-content { line-height: 1.75; }
+.sl-markdown-content p { max-width: 72ch; }
+.sl-markdown-content a { text-underline-offset: 0.2em; }
+.sl-markdown-content table { font-size: 0.9375rem; }
+::selection { background: var(--sl-color-accent-low); color: var(--sl-color-accent-high); }
+:focus-visible { outline: 2px solid var(--sl-color-accent); outline-offset: 4px; }
+* { scrollbar-color: var(--sl-color-gray-4) var(--sl-color-black); }
+.aether-paths { margin-block: 1.75rem 3rem; border-block: 1px solid var(--sl-color-hairline); }
+.sl-markdown-content .aether-path {
+  display: grid;
+  grid-template-columns: 1fr 1.2fr;
+  gap: 0.75rem 2rem;
+  padding: 1.75rem 0;
+  color: inherit;
+  text-decoration: none;
+}
+.aether-path + .aether-path { border-top: 1px solid var(--sl-color-hairline); }
+.aether-path-title { font-size: 1.5rem; font-weight: 650; line-height: 1.25; letter-spacing: -0.02em; }
+.aether-path-body { color: var(--sl-color-gray-2); font-size: 1rem; }
+.aether-path:hover .aether-path-title { color: var(--sl-color-accent-high); text-decoration: underline; text-underline-offset: 0.2em; }
+@media (max-width: 40rem) {
+  .sl-markdown-content .aether-path { grid-template-columns: 1fr; gap: 0.75rem; }
+  h1#_top { font-size: 2.5rem; }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; animation: none !important; transition: none !important; }
+}

@@ -9,14 +9,12 @@ computer.
 
 <div class="aether-paths">
   <a class="aether-path" href="onboarding/human.html">
-    <span class="aether-path-kicker">I am a human</span>
-    <span class="aether-path-title">Set up Aether step by step</span>
+    <span class="aether-path-title">For humans: set up Aether step by step</span>
     <span class="aether-path-body">Install the node, connect to one person, and send your first task. Plan for about 15 minutes.</span>
   </a>
   <a class="aether-path" href="onboarding/agent.html">
-    <span class="aether-path-kicker">I am an agent</span>
-    <span class="aether-path-title">Install and use Aether for your user</span>
-    <span class="aether-path-body">Commands in sequence, the MCP tools, and the safety rules. Raw Markdown for agents: <code>agent.md</code> at the site root.</span>
+    <span class="aether-path-title">For agents: install Aether for your user</span>
+    <span class="aether-path-body">Choose your agent’s installation route, then set up its adapter or MCP tools. Raw Markdown for agents: <code>agent.md</code> at the site root.</span>
   </a>
 </div>
 
