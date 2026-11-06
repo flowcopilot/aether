@@ -11,7 +11,7 @@ use std::{
 };
 
 use aether::{
-    execution::{Agent, ExecutionError, Executor, Limits, Task},
+    execution::{Agent, ExecutionError, Executor, Limits, Task, TurnContext},
     identity::SignedClaims,
     proof::{Identity, ProofError, ProofNode, SubmissionInput},
 };
@@ -65,16 +65,11 @@ impl TestAgent {
 }
 
 impl Agent for TestAgent {
-    fn start_turn(
-        &mut self,
-        _task_id: &str,
-        instruction: &str,
-        remote_text: &str,
-    ) -> Result<String, ExecutionError> {
+    fn start_turn(&mut self, ctx: &TurnContext) -> Result<String, ExecutionError> {
         self.turns.fetch_add(1, Ordering::Relaxed);
         self.started.store(true, Ordering::Release);
         let Behaviour::WaitsForCancel { late_result } = self.behaviour else {
-            return Ok(format!("{instruction}:{remote_text}"));
+            return Ok(format!("{}:{}", ctx.skill, ctx.text));
         };
         let deadline = Instant::now() + Duration::from_secs(5);
         while !self.cancelled.load(Ordering::Acquire) {
