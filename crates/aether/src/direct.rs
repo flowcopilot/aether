@@ -61,6 +61,9 @@ impl crate::settings::Setting for HostName {
     }
 
     fn encode(value: &Self::Value) -> Result<Option<String>, aether_store::StoreError> {
+        if !valid_name(value) {
+            return Err(aether_store::StoreError::InvalidState);
+        }
         Ok(Some(value.clone()))
     }
 }
@@ -140,17 +143,13 @@ impl InvitationBundle {
 /// that a hub gives, as in `ana#0042`.
 #[must_use]
 pub fn valid_name(name: &str) -> bool {
-    let (base, number) = match name.split_once('#') {
-        Some((base, number)) => (base, Some(number)),
-        None => (name, None),
-    };
-    (1..=64).contains(&base.len())
-        && base
+    if name.contains('#') {
+        return crate::hub_client::valid_full_name(name);
+    }
+    (1..=64).contains(&name.len())
+        && name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
-        && number.is_none_or(|number| {
-            number.len() == 4 && number.bytes().all(|byte| byte.is_ascii_digit())
-        })
 }
 
 /// Sign one person's direct access. The caller applies the grant to the
@@ -1021,7 +1020,7 @@ mod tests {
             "ana#0042",
             "a.b_c-d#9999",
             &"a".repeat(64),
-            &format!("{}#0001", "a".repeat(64)),
+            &format!("{}#0001", "a".repeat(32)),
         ] {
             assert!(super::valid_name(good), "{good}");
         }

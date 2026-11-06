@@ -2578,7 +2578,7 @@ mod tests {
             let mut state = hub.state();
             state.add_account(&"a".repeat(64), "ana#0042");
             state.add_account(&"b".repeat(64), "quiet#0001");
-            state.kinds.insert("b".repeat(64), "service".to_owned());
+            state.kinds.insert("b".repeat(64), crate::hub_client::AgentKind::Service);
         }
         let server = served(caller.path(), shared_in(caller.path()))
             .with_caller(caller.path().to_path_buf());

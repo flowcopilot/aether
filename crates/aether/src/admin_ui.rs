@@ -1330,8 +1330,8 @@ mod tests {
         );
         let endpoint = crate::direct::endpoint_id(directory.path()).expect("endpoint");
         assert_eq!(
-            hub.state().kinds.get(&endpoint).map(String::as_str),
-            Some("service")
+            hub.state().kinds.get(&endpoint).copied(),
+            Some(crate::hub_client::AgentKind::Service)
         );
     }
 
@@ -1347,8 +1347,8 @@ mod tests {
         post(page.clone(), "/hub/name", Some(&cookie), "name=ana&kind=service").await;
         let endpoint = crate::direct::endpoint_id(directory.path()).expect("endpoint");
         assert_eq!(
-            hub.state().kinds.get(&endpoint).map(String::as_str),
-            Some("personal")
+            hub.state().kinds.get(&endpoint).copied(),
+            Some(crate::hub_client::AgentKind::Personal)
         );
     }
 
@@ -2662,7 +2662,7 @@ mod tests {
         let (administration, _) = test_administration(directory.path());
         let host =
             test_host(directory.path(), Arc::new(std::sync::Mutex::new(Vec::new())));
-        let longest = format!("{}#0001", "a".repeat(64));
+        let longest = format!("{}#0001", "a".repeat(32));
         let (line, _) = super::host::sign_invite(
             &administration,
             &host,
