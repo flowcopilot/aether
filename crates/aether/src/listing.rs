@@ -104,7 +104,9 @@ pub fn listing_bytes(settings: &CardSettings, full_name: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-const fn wire_error(error: crate::hub_client::protocol::ListingWireError) -> ListingError {
+const fn wire_error(
+    error: crate::hub_client::protocol::ListingWireError,
+) -> ListingError {
     match error {
         crate::hub_client::protocol::ListingWireError::Invalid => ListingError::Invalid,
         crate::hub_client::protocol::ListingWireError::Signature => {
