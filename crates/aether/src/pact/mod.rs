@@ -8,6 +8,7 @@
 pub mod config;
 pub mod consent;
 pub mod gateway;
+pub mod grant;
 pub mod jwks;
 pub mod keys;
 pub mod server;

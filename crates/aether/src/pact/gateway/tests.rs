@@ -11,7 +11,7 @@ use std::{
 };
 
 use aether_core::Request;
-use aether_store::{TaskState, pact::PactStore};
+use aether_store::{StoreError, TaskState, pact::PactStore};
 use axum::{
     body::Body,
     http::{Method, Request as HttpRequest, StatusCode, header},
@@ -20,14 +20,15 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 use super::{
-    DELEGATION_HEADER, Gateway, GrantType, OAuthError, PactNode, Route,
-    caller_endpoint_id, form_decode, new_grant, rfc3339, route, router,
+    DELEGATION_HEADER, Failure, Gateway, GrantType, OAuthError, PactNode, Route,
+    approved_grant, caller_endpoint_id, rfc3339, route, router,
 };
 use crate::{
     execution::Task,
     pact::{
         config::{PactConfig, PactFile},
-        consent::ConsentLink,
+        consent::{ConsentLink, SharedPactStore},
+        grant::pact_grant_record,
         jwks::{
             PaIdentity, PaVerifier, UrlPolicy,
             tests::{AUDIENCE, ISSUER, StaticKeys, TestAgent},
@@ -86,9 +87,7 @@ struct Fixture {
     agent: TestAgent,
     node: Arc<FakeNode>,
     key: Arc<ProviderKey>,
-    /// A second connection to the gateway's database, to act as the
-    /// consent page would.
-    store: Mutex<PactStore>,
+    store: SharedPactStore,
 }
 
 fn config() -> PactConfig {
@@ -129,6 +128,8 @@ fn fixture() -> Fixture {
     let link = Arc::new(ConsentLink::default());
     link.set("https://127.0.0.1:3000".to_owned());
     let path = directory.path().join(aether_store::pact::PACT_DATABASE);
+    let store: SharedPactStore =
+        Arc::new(Mutex::new(PactStore::open(&path).expect("store must open")));
     let mut gateway = Gateway::new(
         config(),
         PaVerifier::new(
@@ -137,12 +138,11 @@ fn fixture() -> Fixture {
             StaticKeys::new(agent.jwks.clone()),
         ),
         Arc::clone(&key),
-        PactStore::open(&path).expect("store must open"),
+        Arc::clone(&store),
         node.clone(),
         link,
     );
     gateway.poll_interval = Duration::from_millis(1);
-    let store = Mutex::new(PactStore::open(&path).expect("store must open"));
     Fixture {
         app: router(Arc::new(gateway)),
         agent,
@@ -232,8 +232,8 @@ impl Fixture {
         self.store()
             .approve_device(
                 user_code,
-                &new_grant(
-                    grant_id.clone(),
+                &pact_grant_record(
+                    &grant_id,
                     "review",
                     ISSUER,
                     sub,
@@ -782,24 +782,33 @@ fn rfc3339_agrees_with_a_day_by_day_calendar_from_1600_to_2400() {
     }
 }
 
+fn decode_form_field(body: &str) -> String {
+    form_urlencoded::parse(body.as_bytes())
+        .find(|(name, _)| name == "x")
+        .map_or_else(String::new, |(_, value)| value.into_owned())
+}
+
 #[test]
 fn every_percent_escape_decodes_to_its_byte() {
     for byte in 0_u8..=0x7f {
         let expected = char::from(byte).to_string();
-        assert_eq!(form_decode(&format!("%{byte:02X}")), expected, "{byte:#04x}");
-        assert_eq!(form_decode(&format!("%{byte:02x}")), expected, "{byte:#04x}");
+        assert_eq!(
+            decode_form_field(&format!("x=%{byte:02X}")),
+            expected,
+            "{byte:#04x}"
+        );
+        assert_eq!(
+            decode_form_field(&format!("x=%{byte:02x}")),
+            expected,
+            "{byte:#04x}"
+        );
     }
-    for malformed in ["%", "%4", "%G1", "%%41"] {
-        let decoded = form_decode(malformed);
-        assert!(decoded.starts_with('%'), "{malformed} gave {decoded}");
-    }
-    // Every byte escaped reads back as the original text, in any script.
     for text in ["", "a b", "ok:read", "é", "日本語", "🦀+%&=", "\u{0}\u{7f}"] {
         let escaped = text.bytes().fold(String::new(), |mut escaped, byte| {
             let _ = write!(escaped, "%{byte:02X}");
             escaped
         });
-        assert_eq!(form_decode(&escaped), text);
+        assert_eq!(decode_form_field(&format!("x={escaped}")), text);
     }
 }
 
@@ -841,7 +850,9 @@ fn rfc3339_matches_known_instants() {
 }
 
 #[test]
-fn form_values_are_decoded() {
-    assert_eq!(form_decode("a%3Ab+c"), "a:b c");
-    assert_eq!(form_decode("100%"), "100%");
+fn a_store_failure_while_polling_a_device_code_is_a_server_error() {
+    assert_eq!(
+        approved_grant(Err(StoreError::InvalidState)),
+        Err(Failure::OAuth(OAuthError::ServerError, "The gateway store failed")),
+    );
 }

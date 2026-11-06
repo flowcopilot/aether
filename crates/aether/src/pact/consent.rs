@@ -1,39 +1,24 @@
-//! The owner's consent (spec §5.3).
-//!
-//! The node owner is the only Brand user, and the loopback admin UI is the
-//! Brand's login: it already holds the one owner session. Approval signs an
-//! ordinary Aether grant with the node's issuer key and applies it through
-//! the administration service, so the grant list, revocation, and the
-//! dispatch-time recheck cover PACT callers too.
-
-use aether_core::time::now;
 use std::{
-    collections::BTreeSet,
-    path::{Path, PathBuf},
-    sync::{Mutex, OnceLock, PoisonError},
-    time::{Duration, SystemTime},
+    path::PathBuf,
+    sync::OnceLock,
+    sync::{Arc, Mutex, PoisonError},
 };
 
-use aether_core::{
-    AgentId, ApprovalRule, CapabilityId, EndpointId, GrantId, ScopeId, WorkspaceId,
-};
 use aether_store::pact::{PactStore, PendingDevice};
 
 use super::{
-    config::{Brand, PactConfig, SCOPE_ID},
-    gateway::{GRANT_SECONDS, caller_agent_id, caller_endpoint_id, new_grant},
+    config::{Brand, PactConfig},
+    grant::{GrantSignError, pact_grant_record, sign_aether_grant},
     jwks::PaIdentity,
 };
 use crate::admin::SharedAdministration;
 
-/// The origin of the admin UI's consent page, set once the UI listens.
-/// Until then, the gateway cannot start a device flow.
+pub type SharedPactStore = Arc<Mutex<PactStore>>;
+
 #[derive(Default)]
 pub struct ConsentLink(OnceLock<String>);
 
 impl ConsentLink {
-    /// Sets the origin, such as `https://127.0.0.1:3000`. Only the first
-    /// call has an effect.
     pub fn set(&self, origin: String) {
         let _ = self.0.set(origin);
     }
@@ -56,44 +41,34 @@ pub enum ConsentError {
     Store,
 }
 
-/// What the consent page shows (§5.3): the personal agent's issuer
-/// origin, the Brand, and each requested scope.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ConsentRequest {
     pub user_code: String,
     pub brand_name: String,
     pub pa_issuer: String,
     pub pa_origin: String,
-    /// `(scope id, description shown verbatim)`.
     pub scopes: Vec<(String, String)>,
 }
 
 pub struct PactConsent {
     config: PactConfig,
-    store: Mutex<PactStore>,
+    store: SharedPactStore,
     data_dir: PathBuf,
 }
 
 impl PactConsent {
-    pub fn open(
-        config: PactConfig,
-        data_dir: &Path,
-    ) -> Result<Self, aether_store::StoreError> {
-        Ok(Self {
-            store: Mutex::new(PactStore::in_dir(data_dir)?),
-            config,
-            data_dir: data_dir.to_owned(),
-        })
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn new(config: PactConfig, store: SharedPactStore, data_dir: PathBuf) -> Self {
+        Self { config, store, data_dir }
     }
 
     fn store(&self) -> std::sync::MutexGuard<'_, PactStore> {
         self.store.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The pending request with `user_code`, ignoring case and spaces.
     #[must_use]
     pub fn pending(&self, user_code: &str) -> Option<ConsentRequest> {
-        let (device, brand) = self.pending_device(user_code)?;
+        let (device, brand) = self.pending_device(user_code).ok()??;
         let pa_origin = reqwest::Url::parse(&device.pa_issuer).ok().map_or_else(
             || device.pa_issuer.clone(),
             |url| url.origin().ascii_serialization(),
@@ -113,15 +88,22 @@ impl PactConsent {
         })
     }
 
-    fn pending_device(&self, user_code: &str) -> Option<(PendingDevice, &Brand)> {
+    fn pending_device(
+        &self,
+        user_code: &str,
+    ) -> Result<Option<(PendingDevice, &Brand)>, ConsentError> {
         let user_code = normalize_user_code(user_code);
-        let device = self.store().pending_device(&user_code, now()).ok()??;
-        let brand = self.config.brand(&device.brand_id)?;
-        Some((device, brand))
+        let device = self
+            .store()
+            .pending_device(&user_code, aether_core::time::now())
+            .map_err(|_| ConsentError::Store)?;
+        let Some(device) = device else {
+            return Ok(None);
+        };
+        let brand = self.config.brand(&device.brand_id).ok_or(ConsentError::Store)?;
+        Ok(Some((device, brand)))
     }
 
-    /// Approves the scopes in `chosen` that were requested. An empty
-    /// choice denies. Returns the approved scope ids.
     pub fn approve(
         &self,
         user_code: &str,
@@ -129,7 +111,7 @@ impl PactConsent {
         administration: &SharedAdministration,
     ) -> Result<Vec<String>, ConsentError> {
         let (device, brand) =
-            self.pending_device(user_code).ok_or(ConsentError::NotPending)?;
+            self.pending_device(user_code)?.ok_or(ConsentError::NotPending)?;
         let granted = device
             .scopes
             .split(' ')
@@ -142,11 +124,17 @@ impl PactConsent {
             self.deny(user_code)?;
             return Ok(granted);
         }
+        let at = aether_core::time::now();
         let caller = PaIdentity {
             issuer: device.pa_issuer.clone(),
             subject: device.pa_subject.clone(),
         };
-        let grant = self.sign_grant(brand, &caller)?;
+        let grant =
+            sign_aether_grant(&self.data_dir, brand, &caller, at).map_err(|error| {
+                match error {
+                    GrantSignError::Sign => ConsentError::Sign,
+                }
+            })?;
         let grant_id = grant.id.as_str().to_owned();
         let change = crate::admin::ChangeRequest::Grant { id: grant_id.clone(), grant }
             .into_change()
@@ -156,17 +144,15 @@ impl PactConsent {
             .unwrap_or_else(PoisonError::into_inner)
             .apply(&change, aether_store::AuditActor::Ui)
             .map_err(|_| ConsentError::Refused)?;
-        let record = new_grant(
-            grant_id.clone(),
+        let record = pact_grant_record(
+            &grant_id,
             &brand.id,
             &device.pa_issuer,
             &device.pa_subject,
             &granted.join(" "),
-            now(),
+            at,
         );
-        if self.store().approve_device(&device.user_code, &record, now()).is_err() {
-            // The request expired between the page and the click: take the
-            // live grant back, so nothing is left that no token can use.
+        if self.store().approve_device(&device.user_code, &record, at).is_err() {
             let _ = administration
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -177,44 +163,15 @@ impl PactConsent {
     }
 
     pub fn deny(&self, user_code: &str) -> Result<(), ConsentError> {
-        self.store()
-            .deny_device(&normalize_user_code(user_code))
-            .map_err(|_| ConsentError::NotPending)
-    }
-
-    fn sign_grant(
-        &self,
-        brand: &Brand,
-        caller: &PaIdentity,
-    ) -> Result<aether_core::Grant, ConsentError> {
-        let issuer = crate::data_dir::DataDir::new(&self.data_dir)
-            .issuer_key()
-            .map_err(|_| ConsentError::Sign)?;
-        let now = SystemTime::now();
-        let lifetime = Duration::from_secs(GRANT_SECONDS.unsigned_abs());
-        let mut nonce = [0_u8; 32];
-        getrandom::fill(&mut nonce).map_err(|_| ConsentError::Sign)?;
-        Ok(crate::identity::signed_grant(
-            &issuer,
-            crate::identity::GrantInput {
-                id: GrantId::new(format!("pact_{}", uuid::Uuid::new_v4().simple())),
-                issuer_agent_id: AgentId::new(crate::identity::NODE_ISSUER),
-                subject_agent_id: AgentId::new(caller_agent_id(&caller.issuer)),
-                subject_endpoint_id: EndpointId::new(caller_endpoint_id(caller)),
-                scope_id: ScopeId::new(SCOPE_ID),
-                capabilities: BTreeSet::from([CapabilityId::new(&brand.capability)]),
-                workspaces: BTreeSet::from([WorkspaceId::new(&brand.workspace)]),
-                access_mode: brand.access_mode.clone(),
-                approval_rule: ApprovalRule::Automatic,
-                issued_at: now.checked_sub(Duration::from_secs(1)).unwrap_or(now),
-                expires_at: now.checked_add(lifetime).ok_or(ConsentError::Sign)?,
-                nonce,
-            },
-        ))
+        self.store().deny_device(&normalize_user_code(user_code)).map_err(|error| {
+            match error {
+                aether_store::StoreError::NotFound => ConsentError::NotPending,
+                _ => ConsentError::Store,
+            }
+        })
     }
 }
 
-/// `abcd efgh` and `ABCD-EFGH` name the same code.
 fn normalize_user_code(user_code: &str) -> String {
     let letters = user_code
         .chars()
