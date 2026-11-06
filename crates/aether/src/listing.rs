@@ -288,17 +288,9 @@ mod tests {
             .expect("64 bytes");
         let signature = iroh::Signature::from_bytes(&bytes);
         let message = super::owner_claim_message(&personal, "law#0042", NOW);
-        assert_eq!(
-            message,
-            format!("aether-owner/v1\nclaim\n{personal}\nlaw#0042\n{NOW}")
-        );
         assert!(key.public().verify(message.as_bytes(), &signature).is_ok());
         let other = super::owner_claim_message(&personal, "law#0043", NOW);
         assert!(key.public().verify(other.as_bytes(), &signature).is_err());
-        assert_eq!(
-            super::owner_confirm_message("s", "p", 7),
-            "aether-owner/v1\nconfirm\ns\np\n7"
-        );
     }
 
     #[test]

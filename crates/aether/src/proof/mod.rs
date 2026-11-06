@@ -626,33 +626,11 @@ mod tests {
 
     use aether_core::{
         AccessMode, AgentId, ApprovalRule, CapabilityId, Claim, ClaimId, EndpointId,
-        Grant, GrantId, ProviderError, Request, RequestId, ScopeId, TaskId,
-        WorkspaceId,
+        Grant, GrantId, Request, RequestId, ScopeId, TaskId, WorkspaceId,
     };
 
     use super::*;
-    use crate::execution::TurnContext;
-
-    struct Trusted;
-
-    impl TrustProvider for Trusted {
-        fn verify(
-            &self,
-            _claim: &Claim,
-            _authenticated_endpoint: &EndpointId,
-            _scope: &Scope,
-        ) -> Result<(), ProviderError> {
-            Ok(())
-        }
-
-        fn verify_grant(
-            &self,
-            _grant: &Grant,
-            _scope: &Scope,
-        ) -> Result<(), ProviderError> {
-            Ok(())
-        }
-    }
+    use crate::{execution::TurnContext, test_support::Trusted};
 
     #[derive(Clone)]
     struct Cancellable {

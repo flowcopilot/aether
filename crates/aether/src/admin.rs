@@ -975,34 +975,13 @@ fn change_from_pending(
 #[cfg(test)]
 #[allow(clippy::arithmetic_side_effects)]
 pub(crate) fn peer_grant() -> aether_core::Grant {
-    use crate::identity::{GrantInput, signed_grant};
-    use aether_core::{
-        AccessMode, AgentId, ApprovalRule, CapabilityId, EndpointId, GrantId, ScopeId,
-        WorkspaceId,
-    };
-    use std::{
-        collections::BTreeSet,
-        time::{Duration, SystemTime},
-    };
-    let key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
-    let now = SystemTime::now();
-    signed_grant(
-        &key,
-        GrantInput {
-            id: GrantId::new("peer"),
-            issuer_agent_id: AgentId::new("issuer"),
-            subject_agent_id: AgentId::new("caller"),
-            subject_endpoint_id: EndpointId::new("endpoint"),
-            scope_id: ScopeId::new("direct"),
-            capabilities: BTreeSet::from([CapabilityId::new("review")]),
-            workspaces: BTreeSet::from([WorkspaceId::new("workspace")]),
-            access_mode: AccessMode::ReadOnly,
-            approval_rule: ApprovalRule::Automatic,
-            issued_at: now - Duration::from_secs(1),
-            expires_at: now + Duration::from_secs(60),
-            nonce: [8; 32],
-        },
-    )
+    use crate::test_support::{signed_test_grant, test_signing_key};
+    use aether_core::{AgentId, GrantId};
+    signed_test_grant(&test_signing_key(), |input| {
+        input.id = GrantId::new("peer");
+        input.subject_agent_id = AgentId::new("caller");
+        input.nonce = [8; 32];
+    })
 }
 
 #[cfg(test)]
@@ -1031,8 +1010,8 @@ mod tests {
     #[test]
     fn caller_cannot_lower_workspace_change_risk() {
         let (_directory, mut admin) = in_temp_dir();
-        admin
-            .submit(
+        assert_eq!(
+            admin.submit(
                 &ChangeRequest::Workspace {
                     id: "workspace".to_owned(),
                     path: "project".to_owned(),
@@ -1041,8 +1020,9 @@ mod tests {
                 .expect("change must parse"),
                 aether_store::AuditActor::Mcp,
                 false,
-            )
-            .expect("change must be accepted");
+            ),
+            Ok(ChangeOutcome::Pending)
+        );
     }
 
     #[test]

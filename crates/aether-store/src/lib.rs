@@ -275,4 +275,19 @@ pub(crate) mod test_support {
         store.put_scope("scope", ScopeKind::Direct).expect("scope must store");
         (store, database)
     }
+
+    pub fn temp_node_store() -> (tempfile::TempDir, NodeStore) {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let store = NodeStore::in_dir(directory.path()).expect("store must open");
+        (directory, store)
+    }
+
+    pub fn temp_pact_store() -> (tempfile::TempDir, crate::pact::PactStore) {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let store = crate::pact::PactStore::open(
+            directory.path().join(crate::pact::PACT_DATABASE),
+        )
+        .expect("store must open");
+        (directory, store)
+    }
 }

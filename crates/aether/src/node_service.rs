@@ -423,6 +423,7 @@ mod tests {
         execution::{Agent, ExecutionError, Executor, Limits, TurnContext},
         identity::{ClaimInput, GrantInput, SignedClaims, signed_claim, signed_grant},
         proof::ProofNode,
+        test_support::Trusted,
         transport::{
             A2aAccessMode, A2aAuthorization, A2aCancel, A2aClaim, A2aRequest, Frame,
             FrameKind, bind_node, request_once, router, text_request_payload,
@@ -1033,27 +1034,6 @@ mod tests {
             response[1].payload["task"]["status"]["state"],
             "TASK_STATE_CANCELED"
         );
-    }
-
-    struct Trusted;
-
-    impl aether_core::TrustProvider for Trusted {
-        fn verify(
-            &self,
-            _claim: &aether_core::Claim,
-            _authenticated_endpoint: &aether_core::EndpointId,
-            _scope: &Scope,
-        ) -> Result<(), aether_core::ProviderError> {
-            Ok(())
-        }
-
-        fn verify_grant(
-            &self,
-            _grant: &aether_core::Grant,
-            _scope: &Scope,
-        ) -> Result<(), aether_core::ProviderError> {
-            Ok(())
-        }
     }
 
     #[test]

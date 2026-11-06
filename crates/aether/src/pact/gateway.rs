@@ -126,6 +126,8 @@ pub struct Gateway {
     /// How long a turn waits for news of its task before it reads the task
     /// again. Each change of the task ends the wait sooner.
     poll_interval: Duration,
+    #[cfg(test)]
+    task_wait_deadline: Option<Duration>,
 }
 
 /// The gateway's routes, relative to `pact.publicUrl`.
@@ -678,7 +680,25 @@ impl Gateway {
             consent,
             callers: RateLimiter::keyed(quota),
             poll_interval: Duration::from_secs(1),
+            #[cfg(test)]
+            task_wait_deadline: None,
         }
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::missing_const_for_fn)]
+    #[must_use]
+    pub fn with_poll_interval(mut self, interval: Duration) -> Self {
+        self.poll_interval = interval;
+        self
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::missing_const_for_fn)]
+    #[must_use]
+    pub fn with_task_wait_deadline(mut self, deadline: Duration) -> Self {
+        self.task_wait_deadline = Some(deadline);
+        self
     }
 
     /// Closes idle contexts and forgets idle rate-limit entries. The node
@@ -1131,9 +1151,17 @@ impl Gateway {
     /// margin pass. Each change of the task, or else each poll interval,
     /// reads the task again.
     async fn wait_for_result(&self, task_id: &str) -> Result<String, Failure> {
-        let deadline = tokio::time::Instant::now().checked_add(Duration::from_secs(
-            self.config.max_seconds.saturating_add(30),
-        ));
+        let wait_budget = {
+            #[cfg(test)]
+            if let Some(deadline) = self.task_wait_deadline {
+                deadline
+            } else {
+                Duration::from_secs(self.config.max_seconds.saturating_add(30))
+            }
+            #[cfg(not(test))]
+            Duration::from_secs(self.config.max_seconds.saturating_add(30))
+        };
+        let deadline = tokio::time::Instant::now().checked_add(wait_budget);
         // Subscribe before the first read, so no change is lost between them.
         let mut events = Some(self.node.subscribe_events());
         loop {

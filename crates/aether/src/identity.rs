@@ -478,40 +478,22 @@ fn grant_bytes(grant: &Grant) -> Vec<u8> {
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::arithmetic_side_effects,
-    reason = "test clocks move by seconds, far from overflow"
-)]
 mod tests {
-    use super::{
-        ClaimInput, GrantInput, RosterClaims, SignedClaims, signed_claim, signed_grant,
-    };
+    use super::{ClaimInput, RosterClaims, SignedClaims, signed_claim};
+    use crate::test_support::{signed_test_claim, signed_test_grant};
     use aether_core::{
-        AccessMode, AgentId, ApprovalRule, CapabilityId, ClaimId, EndpointId, GrantId,
-        Scope, ScopeId, ScopeKind, TrustProvider, WorkspaceId,
+        AccessMode, AgentId, ApprovalRule, ClaimId, EndpointId, Scope, ScopeId,
+        ScopeKind, TrustProvider,
     };
     use aether_store::ManagedMember;
     use ed25519_dalek::SigningKey;
     use std::{
-        collections::{BTreeMap, BTreeSet},
+        collections::BTreeMap,
         time::{Duration, SystemTime},
     };
 
     fn claim(key: &SigningKey) -> aether_core::Claim {
-        let now = SystemTime::now();
-        signed_claim(
-            key,
-            ClaimInput {
-                id: ClaimId::new("claim"),
-                issuer_agent_id: AgentId::new("issuer"),
-                subject_agent_id: AgentId::new("subject"),
-                subject_endpoint_id: EndpointId::new("endpoint"),
-                scope_id: ScopeId::new("direct"),
-                issued_at: now - Duration::from_secs(1),
-                expires_at: now + Duration::from_secs(60),
-                nonce: [1; 32],
-            },
-        )
+        signed_test_claim(key, |_| {})
     }
 
     fn provider(key: &SigningKey) -> SignedClaims {
@@ -522,24 +504,7 @@ mod tests {
     }
 
     fn grant(key: &SigningKey) -> aether_core::Grant {
-        let now = SystemTime::now();
-        signed_grant(
-            key,
-            GrantInput {
-                id: GrantId::new("grant"),
-                issuer_agent_id: AgentId::new("issuer"),
-                subject_agent_id: AgentId::new("subject"),
-                subject_endpoint_id: EndpointId::new("endpoint"),
-                scope_id: ScopeId::new("direct"),
-                capabilities: BTreeSet::from([CapabilityId::new("review")]),
-                workspaces: BTreeSet::from([WorkspaceId::new("workspace")]),
-                access_mode: AccessMode::ReadOnly,
-                approval_rule: ApprovalRule::Automatic,
-                issued_at: now - Duration::from_secs(1),
-                expires_at: now + Duration::from_secs(60),
-                nonce: [2; 32],
-            },
-        )
+        signed_test_grant(key, |_| {})
     }
 
     fn verify(provider: &SignedClaims, claim: &aether_core::Claim) -> bool {

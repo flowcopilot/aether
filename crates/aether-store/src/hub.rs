@@ -348,9 +348,7 @@ mod tests {
 
     #[test]
     fn access_request_drafts_stop_at_five() {
-        let directory = tempfile::tempdir().expect("directory must create");
-        let mut store =
-            NodeStore::open(directory.path().join("node.sqlite")).expect("store");
+        let (_directory, mut store) = crate::test_support::temp_node_store();
         for index in 0_i64..5 {
             store
                 .add_access_request_draft(&draft(

@@ -49,6 +49,8 @@ pub mod proof;
 pub mod roster_sync;
 pub mod settings;
 mod signed;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod transport;
 pub mod untrusted;
 
