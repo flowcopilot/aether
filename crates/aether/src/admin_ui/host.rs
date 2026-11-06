@@ -42,14 +42,6 @@ use crate::{
 use aether_store::{LastTask, TaskState};
 use topcoat::icon::icon;
 
-/// The lengths of access the invite form offers, in days.
-const ACCESS_DAYS: [u64; 3] = [1, 7, 30];
-const DEFAULT_ACCESS_DAYS: u64 = 7;
-
-/// The workspace id that friends' grants name; the node has one workspace
-/// and the folder form changes its path.
-const WORKSPACE_ID: &str = "workspace";
-
 /// A new invite, shown once on the page that created it.
 #[derive(Clone, Default)]
 pub(super) struct NewInvitation {
@@ -173,6 +165,7 @@ pub(super) async fn host_screen(
         || !notice.card_error.is_empty()
         || !notice.listing_error.is_empty();
     let command = format!("aether node direct import '{}'", invitation.line);
+    let hub_access = page.hub_access();
     let hub = page.current_hub();
     let service = hub.is_some()
         && crate::settings::setting::<crate::hub_client::settings::AgentKind>(
@@ -230,6 +223,12 @@ pub(super) async fn host_screen(
                     }
                 </section>
                 <aside aria-label="Invite and connection" class="flex flex-col gap-5">
+                    if matches!(hub_access, super::HubAccess::Unavailable) {
+                        alert(variant: AlertVariant::Destructive, attrs: attributes! { role="alert" },
+                            alert_title("Hub settings are unavailable")
+                            alert_description("This node cannot read its saved hub choice. Fix the data directory and reload.")
+                        )
+                    }
                     match &hub {
                         Some(hub) => {
                             hub_section(
@@ -881,8 +880,8 @@ async fn invite_form(error: String) -> TopcoatResult<impl View> {
                         name="days"
                         class="h-9 rounded-lg border border-border bg-background px-3 text-sm shadow-xs"
                     >
-                        for days in ACCESS_DAYS {
-                            <option value=(days) selected=((days == DEFAULT_ACCESS_DAYS).then_some(""))>
+                        for days in crate::direct::DIRECT_OFFER_DAYS {
+                            <option value=(days) selected=((days == crate::direct::DEFAULT_DIRECT_ACCESS_DAYS).then_some(""))>
                                 (if days == 1 { "1 day".to_owned() } else { format!("{days} days") })
                             </option>
                         }
@@ -924,9 +923,7 @@ pub(super) async fn invite(
         )
     } else if !crate::direct::valid_name(&form.friend_name) {
         Some("Use letters, digits, dots, dashes or underscores for their name.")
-    } else if !(1..=u64::from(aether_core::limits::MAX_DIRECT_ACCESS_DAYS))
-        .contains(&form.days)
-    {
+    } else if !crate::direct::valid_direct_invite_days(form.days) {
         Some("Choose how long they can use your agent.")
     } else {
         None
@@ -1047,7 +1044,7 @@ pub(super) async fn workspace(
         return Err(bad_request("task folders do not allow folder changes").into());
     }
     let applied = crate::admin::ChangeRequest::Workspace {
-        id: WORKSPACE_ID.to_owned(),
+        id: crate::direct::INVITE_WORKSPACE_ID.to_owned(),
         path: form.path.trim().to_owned(),
     }
     .into_change()

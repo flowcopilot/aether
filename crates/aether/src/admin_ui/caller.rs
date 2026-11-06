@@ -408,12 +408,17 @@ pub(super) async fn confirm_request(
     let Page(Some(page)) = app_context::<Page>(cx) else {
         return Err(bad_request("this node sends no access requests").into());
     };
-    let error = match page.current_hub() {
-        Some(hub) => confirm(&hub, &page.data_dir, &form.id, form.days)
-            .await
-            .err()
-            .unwrap_or_default(),
-        None => "Set a hub first: requests go through the hub.",
+    let error = match page.hub_access() {
+        super::HubAccess::Ready(hub) => {
+            confirm(&hub, &page.data_dir, &form.id, form.days)
+                .await
+                .err()
+                .unwrap_or_default()
+        }
+        super::HubAccess::Off => "Set a hub first: requests go through the hub.",
+        super::HubAccess::Unavailable => {
+            "This node cannot read its hub settings. Fix the data directory and try again."
+        }
     };
     Ok(view! { caller_screen(request_error: error.to_owned()) })
 }
@@ -434,12 +439,11 @@ async fn confirm(
         return Err("Choose 1 to 30 days.");
     }
     let now = aether_core::time::now();
-    let store = aether_store::NodeStore::in_dir(data_dir)
+    let store = crate::hub_store::HubStore::open(data_dir)
         .map_err(|_| "The requests are unavailable.")?;
     let draft = store
         .access_request_draft(id)
-        .ok()
-        .flatten()
+        .map_err(|_| "The requests are unavailable.")?
         .filter(|draft| draft.expires_at > now)
         .ok_or("This request is gone. Ask your agent again.")?;
     if draft.listing.expires_at <= now {
@@ -467,7 +471,7 @@ async fn confirm(
         expires_at: now.saturating_add(crate::hub_membership::APPROVAL_SECONDS),
         listing: Some(draft.listing),
     };
-    if store.put_hub_approval(&approval).is_err() {
+    if store.put_approval(&approval).is_err() {
         let _ = hub.remove(&invite.id).await;
         return Err("This node cannot keep the request. Try again.");
     }

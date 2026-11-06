@@ -34,7 +34,7 @@ use super::{
     page_data_dir, require_admin_session,
 };
 use crate::hub_client::protocol::{DEFAULT_ACCESS_DAYS, OFFER_DAYS};
-use aether_store::{ApprovalKind, ApprovalSide, HubApproval, NodeStore};
+use aether_store::{ApprovalKind, ApprovalSide, HubApproval};
 
 use crate::{
     admin::SharedAdministration,
@@ -142,22 +142,20 @@ pub(super) async fn hub_section(
     };
     // The ids of the sent invites that this page approved; the worker signs
     // no other.
-    let approved: std::collections::BTreeSet<String> =
-        page_data_dir(cx)
-            .and_then(|data_dir| NodeStore::in_dir(&data_dir).ok())
-            .map(|store| {
-                invites
-                    .iter()
-                    .filter(|invite| invite.role == Role::Sender)
-                    .filter(|invite| {
-                        store.hub_approval(&invite.id).ok().flatten().is_some_and(
-                            |approval| approval.side == ApprovalSide::Sender,
-                        )
-                    })
-                    .map(|invite| invite.id.clone())
-                    .collect()
+    let approved: std::collections::BTreeSet<String> = page_data_dir(cx)
+        .and_then(|data_dir| {
+            crate::hub_store::HubStore::open(&data_dir).ok().and_then(|store| {
+                store
+                    .sender_approved_invite_ids(
+                        invites
+                            .iter()
+                            .filter(|invite| invite.role == Role::Sender)
+                            .map(|invite| invite.id.clone()),
+                    )
+                    .ok()
             })
-            .unwrap_or_default();
+        })
+        .unwrap_or_default();
     // The page reloads while something moves without the person: the other
     // side's answer, or the two nodes finishing the connection. A request
     // can wait for days, so it does not reload the page.
@@ -692,6 +690,11 @@ fn current_hub(cx: &Cx) -> Option<HubClient> {
     page.as_ref().and_then(|page| page.current_hub())
 }
 
+fn hub_access(cx: &Cx) -> super::HubAccess {
+    let Page(page) = app_context::<Page>(cx);
+    page.as_ref().map_or(super::HubAccess::Off, |page| page.hub_access())
+}
+
 #[component]
 async fn screen(
     cx: &Cx,
@@ -914,13 +917,14 @@ async fn approve(
     if invite.status != Status::Requested {
         return Err(HubError::Forbidden);
     }
-    let store = NodeStore::in_dir(data_dir).map_err(|_| HubError::Unexpected)?;
-    if store.hub_blocked(&endpoint).unwrap_or(true) {
+    let store =
+        crate::hub_store::HubStore::open(data_dir).map_err(|_| HubError::Unexpected)?;
+    if store.is_blocked(&endpoint).map_err(|_| HubError::Unexpected)? {
         return Err(HubError::Forbidden);
     }
     let now = now();
     store
-        .put_hub_approval(&HubApproval {
+        .put_approval(&HubApproval {
             invite_id: invite.id.clone(),
             side: ApprovalSide::Sender,
             kind: ApprovalKind::Request,
@@ -935,7 +939,7 @@ async fn approve(
         })
         .map_err(|_| HubError::Unexpected)?;
     if let Err(error) = hub.approve(id, days).await {
-        let _ = store.remove_hub_approval(id);
+        let _ = store.remove_approval(id);
         return Err(error);
     }
     Ok(())
@@ -969,12 +973,12 @@ async fn block_requester(
     let (invite, endpoint) = open_request(hub, id).await?;
     {
         let _sign = page.hub_sign().lock().unwrap_or_else(PoisonError::into_inner);
-        let store =
-            NodeStore::in_dir(&page.data_dir).map_err(|_| HubError::Unexpected)?;
-        store
-            .put_hub_block(&endpoint, &invite.to, now())
+        let store = crate::hub_store::HubStore::open(&page.data_dir)
             .map_err(|_| HubError::Unexpected)?;
-        let _ = store.remove_hub_approval(id);
+        store
+            .put_block(&endpoint, &invite.to, now())
+            .map_err(|_| HubError::Unexpected)?;
+        let _ = store.remove_approval(id);
     }
     hub.block(&endpoint).await
 }
@@ -1122,10 +1126,10 @@ pub(super) async fn unblock(
     let error =
         hub.unblock(&form.endpoint).await.err().map(hub_message).unwrap_or_default();
     if error.is_empty()
-        && let Some(store) =
-            page_data_dir(cx).and_then(|data_dir| NodeStore::in_dir(&data_dir).ok())
+        && let Some(store) = page_data_dir(cx)
+            .and_then(|data_dir| crate::hub_store::HubStore::open(&data_dir).ok())
     {
-        let _ = store.remove_hub_block(&form.endpoint);
+        let _ = store.remove_block(&form.endpoint);
     }
     Ok(view! { screen(error: error.to_owned()) })
 }
@@ -1236,8 +1240,8 @@ pub(super) async fn hub_url(
 #[route(GET "/hub/presence")]
 pub(super) async fn presence(cx: &Cx) -> TopcoatResult<impl IntoResponse> {
     require_admin_session(cx).await?;
-    let presence: BTreeMap<String, bool> = match current_hub(cx) {
-        Some(hub) => tokio::time::timeout(PAGE_WAIT, hub.contacts())
+    let presence: BTreeMap<String, bool> = match hub_access(cx) {
+        super::HubAccess::Ready(hub) => tokio::time::timeout(PAGE_WAIT, hub.contacts())
             .await
             .ok()
             .and_then(Result::ok)
@@ -1245,7 +1249,13 @@ pub(super) async fn presence(cx: &Cx) -> TopcoatResult<impl IntoResponse> {
             .into_iter()
             .map(|contact| (contact.endpoint, contact.online))
             .collect(),
-        None => BTreeMap::new(),
+        super::HubAccess::Off => BTreeMap::new(),
+        super::HubAccess::Unavailable => {
+            return Err(internal_server_error(std::io::Error::other(
+                "hub settings are unavailable",
+            ))
+            .into());
+        }
     };
     let body = serde_json::to_string(&presence).map_err(internal_server_error)?;
     Ok(([(header::CONTENT_TYPE, HeaderValue::from_static("application/json"))], body))
@@ -1298,10 +1308,14 @@ pub(crate) async fn host_worker(
         let administration = administration.clone();
         let page = Arc::clone(&page);
         async move {
-            let Ok(store) = NodeStore::in_dir(&page.data_dir) else {
+            let Ok(store) = crate::hub_store::HubStore::open(&page.data_dir) else {
+                println!("{}", serde_json::json!({ "event": "hub_store_unavailable" }));
                 return;
             };
-            let _ = store.clear_expired_hub_approvals(now());
+            if store.clear_expired_approvals(now()).is_err() {
+                println!("{}", serde_json::json!({ "event": "hub_store_unavailable" }));
+                return;
+            }
             let own_name = crate::settings::setting::<
                 crate::hub_client::settings::HubName,
             >(&page.data_dir)
@@ -1352,17 +1366,22 @@ enum HostAction {
 fn host_action(
     administration: &SharedAdministration,
     page: &PageContext,
-    store: &NodeStore,
+    store: &crate::hub_store::HubStore,
     invite: &Invite,
     own_name: Option<&str>,
 ) -> HostAction {
     let _sign = page.hub_sign().lock().unwrap_or_else(PoisonError::into_inner);
-    let approval = store.hub_approval(&invite.id).ok().flatten();
-    // A block that cannot be read counts as a block.
-    let blocked = invite
-        .receiver_endpoint
-        .as_deref()
-        .is_some_and(|endpoint| store.hub_blocked(endpoint).unwrap_or(true));
+    let Ok(approval) = store.approval(&invite.id) else {
+        return HostAction::Failed;
+    };
+    let blocked = if let Some(endpoint) = invite.receiver_endpoint.as_deref() {
+        let Ok(blocked) = store.is_blocked(endpoint) else {
+            return HostAction::Failed;
+        };
+        blocked
+    } else {
+        false
+    };
     match host_step(invite, approval.as_ref(), own_name, blocked) {
         HostStep::Skip => HostAction::Skip,
         HostStep::Refuse => HostAction::Refuse,
@@ -1382,7 +1401,7 @@ fn host_action(
             ) else {
                 return HostAction::Failed;
             };
-            if store.pin_hub_approval(approval, &endpoint, &line).is_err() {
+            if store.pin_approval(approval, &endpoint, &line).is_err() {
                 let _ = administration
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
@@ -1405,11 +1424,14 @@ pub(crate) async fn caller_worker(page: Arc<PageContext>) {
     follow(current, |hub, invites| {
         let page = Arc::clone(&page);
         async move {
-            let Ok(store) = NodeStore::in_dir(&page.data_dir) else {
+            let Ok(store) = crate::hub_store::HubStore::open(&page.data_dir) else {
+                println!("{}", serde_json::json!({ "event": "hub_store_unavailable" }));
                 return;
             };
             for invite in invites {
-                let approval = store.hub_approval(&invite.id).ok().flatten();
+                let Ok(approval) = store.approval(&invite.id) else {
+                    continue;
+                };
                 match caller_step(&invite, approval.as_ref()) {
                     CallerStep::Skip => continue,
                     CallerStep::Import(bundle) => {
@@ -1430,7 +1452,7 @@ pub(crate) async fn caller_worker(page: Arc<PageContext>) {
                 }
                 // A line that this node did not keep cannot become valid,
                 // so it is removed too.
-                let _ = store.remove_hub_approval(&invite.id);
+                let _ = store.remove_approval(&invite.id);
                 if hub.remove(&invite.id).await.is_err() {
                     log("hub_invite_failed", &invite);
                 }

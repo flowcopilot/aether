@@ -618,6 +618,13 @@ pub type RelayFuture =
 pub type RelaySwitcher =
     Arc<dyn Fn(Option<String>, Option<String>) -> RelayFuture + Send + Sync>;
 
+#[derive(Clone)]
+pub enum HubAccess {
+    Off,
+    Ready(Box<crate::hub_client::HubClient>),
+    Unavailable,
+}
+
 pub struct PageContext {
     pub data_dir: PathBuf,
     pub task_folder_mode: bool,
@@ -683,7 +690,7 @@ impl PageContext {
     #[must_use]
     pub fn with_hub(self, hub: Option<crate::hub_client::HubClient>) -> Self {
         if let Some(client) = hub {
-            self.hub.prime(client);
+            let _ = self.hub.prime(client);
         }
         self
     }
@@ -694,13 +701,24 @@ impl PageContext {
         self
     }
 
+    pub(super) fn hub_access(&self) -> HubAccess {
+        match self.hub.client() {
+            Ok(Some(client)) => HubAccess::Ready(Box::new(client)),
+            Ok(None) => HubAccess::Off,
+            Err(_) => HubAccess::Unavailable,
+        }
+    }
+
     pub(super) fn current_hub(&self) -> Option<crate::hub_client::HubClient> {
-        self.hub.client().ok().flatten()
+        match self.hub_access() {
+            HubAccess::Ready(client) => Some(*client),
+            HubAccess::Off | HubAccess::Unavailable => None,
+        }
     }
 
     pub(super) fn set_hub(&self, hub: Option<crate::hub_client::HubClient>) {
         if let Some(client) = hub {
-            self.hub.prime(client);
+            let _ = self.hub.prime(client);
         }
     }
 
@@ -944,6 +962,29 @@ mod tests {
         )
         .expect("hub choice must save");
         assert!(page.current_hub().is_none());
+    }
+
+    #[test]
+    fn a_store_read_error_is_not_treated_as_hub_off() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let _ = crate::data_dir::DataDir::new(directory.path()).endpoint_key();
+        crate::settings::store_setting::<crate::hub_client::settings::Hub>(
+            directory.path(),
+            &Some(crate::hub_client::DEFAULT_HUB_URL.to_owned()),
+        )
+        .expect("store");
+        std::fs::create_dir_all(directory.path()).expect("directory");
+        let _ = NodeStore::in_dir(directory.path()).expect("store");
+        std::fs::write(directory.path().join("node.sqlite"), b"not sqlite")
+            .expect("break store");
+        let page = PageContext::host(
+            directory.path().to_path_buf(),
+            None,
+            None,
+            Arc::new(|_, _| Box::pin(async { Ok(()) })),
+            None,
+        );
+        assert!(matches!(page.hub_access(), super::HubAccess::Unavailable));
     }
 
     #[test]

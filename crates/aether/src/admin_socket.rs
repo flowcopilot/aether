@@ -48,6 +48,14 @@ pub enum Request {
     },
     /// Starts a round of the node's outbox.
     OutboxWake,
+    UpdatePolicy {
+        workspace: Option<String>,
+        max_context_tokens: Option<u32>,
+        max_seconds: Option<u64>,
+        queue_global: Option<usize>,
+        queue_per_peer: Option<usize>,
+        dry_run: bool,
+    },
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -238,6 +246,46 @@ fn handle(
                 Ok(ChangeOutcome::Applied) => Response::Applied,
                 Ok(ChangeOutcome::Pending) => Response::Pending,
                 Err(error) => error_response(&error),
+            }
+        }
+        Request::UpdatePolicy {
+            workspace,
+            max_context_tokens,
+            max_seconds,
+            queue_global,
+            queue_per_peer,
+            dry_run,
+        } => {
+            let Some(mut settings) =
+                crate::policy::policy_settings(data_dir).ok().flatten()
+            else {
+                return Response::Error { code: "unavailable".to_owned() };
+            };
+            if let Some(workspace) = workspace {
+                settings.workspace = workspace.into();
+            }
+            if let Some(value) = max_context_tokens {
+                settings.max_context_tokens = value;
+            }
+            if let Some(value) = max_seconds {
+                settings.max_seconds = value;
+            }
+            if let Some(value) = queue_global {
+                settings.queue_global = value;
+            }
+            if let Some(value) = queue_per_peer {
+                settings.queue_per_peer = value;
+            }
+            if dry_run {
+                match crate::policy::validate_policy_settings(&settings) {
+                    Ok(()) => Response::Validated,
+                    Err(_) => Response::Error { code: "invalid".to_owned() },
+                }
+            } else {
+                match administration.save_policy_settings(&settings, AuditActor::Mcp) {
+                    Ok(()) => Response::Applied,
+                    Err(error) => error_response(&error),
+                }
             }
         }
         Request::CreateInvite { .. } => Response::Error { code: "invalid".to_owned() },
