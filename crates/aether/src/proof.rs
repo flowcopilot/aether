@@ -12,7 +12,7 @@ use std::{
 
 use aether_core::{
     Admission, Claim, Denial, EndpointId, PolicyEngine, Request, Scope, ScopeId,
-    ScopeKind, TrustProvider,
+    ScopeKind, TrustProvider, limits::QueueLimitId,
 };
 use aether_store::TaskExecutionData;
 use aether_store::{
@@ -152,32 +152,14 @@ struct ExecutionBundle {
     task: Task,
 }
 
-fn permits_dispatch<T>(
-    policy: &PolicyEngine<T>,
-    scopes: &BTreeMap<ScopeId, Scope>,
-    data: &TaskExecutionData,
-) -> Result<(), Denial>
-where
-    T: TrustProvider,
-{
-    let scope = scopes.get(&data.request.scope_id).ok_or(Denial::ScopeMismatch)?;
-    policy.permits_dispatch(&data.request, scope)
+enum DispatchBlock {
+    Policy(Denial),
+    Group,
 }
 
-fn group_allows_dispatch(
-    store: &StoreWorker,
-    scopes: &BTreeMap<ScopeId, Scope>,
-    data: &TaskExecutionData,
-) -> Result<bool, ProofError> {
-    if scopes
-        .get(&data.request.scope_id)
-        .is_none_or(|scope| scope.kind != ScopeKind::Direct)
-    {
-        return Ok(true);
-    }
-    let agent = data.request.caller_agent_id.as_str().to_owned();
-    let endpoint = data.request.caller_endpoint_id.as_str().to_owned();
-    store.call(move |store| store.access_group_allows(&agent, &endpoint))
+enum TaskOutcome {
+    Succeeded(String),
+    Failed,
 }
 
 struct SchedulerContext<T, P> {
@@ -196,11 +178,114 @@ struct SchedulerContext<T, P> {
     scopes: BTreeMap<ScopeId, Scope>,
 }
 
+impl<T, P: Clone> Clone for SchedulerContext<T, P> {
+    fn clone(&self) -> Self {
+        Self {
+            store: self.store.clone(),
+            executor: Arc::clone(&self.executor),
+            canceller: self.canceller.clone(),
+            event_sender: self.event_sender.clone(),
+            shutdown: Arc::clone(&self.shutdown),
+            executing: Arc::clone(&self.executing),
+            active_task: Arc::clone(&self.active_task),
+            execution_thread: Arc::clone(&self.execution_thread),
+            workspace: self.workspace.clone(),
+            dispatch_serial: Arc::clone(&self.dispatch_serial),
+            scheduler_wake: self.scheduler_wake.clone(),
+            policy: Arc::clone(&self.policy),
+            scopes: self.scopes.clone(),
+        }
+    }
+}
+
 impl<T, P> SchedulerContext<T, P>
 where
     T: TrustProvider + 'static,
     P: Agent + Clone + Send + 'static,
 {
+    fn dispatch_allowed(&self, data: &TaskExecutionData) -> Result<(), DispatchBlock> {
+        let policy = self.policy.lock().map_err(|_| DispatchBlock::Group)?;
+        let scope = self
+            .scopes
+            .get(&data.request.scope_id)
+            .ok_or(DispatchBlock::Policy(Denial::ScopeMismatch))?;
+        policy.permits_dispatch(&data.request, scope).map_err(DispatchBlock::Policy)?;
+        drop(policy);
+        if self
+            .scopes
+            .get(&data.request.scope_id)
+            .is_some_and(|scope| scope.kind == ScopeKind::Direct)
+        {
+            let agent = data.request.caller_agent_id.as_str().to_owned();
+            let endpoint = data.request.caller_endpoint_id.as_str().to_owned();
+            let allowed = self
+                .store
+                .call(move |store| store.access_group_allows(&agent, &endpoint))
+                .map_err(|_| DispatchBlock::Group)?;
+            if !allowed {
+                return Err(DispatchBlock::Group);
+            }
+        }
+        Ok(())
+    }
+
+    fn log_store(label: &'static str, result: Result<(), ProofError>) {
+        if let Err(error) = result {
+            eprintln!("aether: scheduler {label}: {error:?}");
+        }
+    }
+
+    fn notify_task(&self, task_id: &str) {
+        if self.event_sender.send(task_id.to_owned()).is_err() {
+            eprintln!("aether: scheduler event broadcast failed for {task_id}");
+        }
+    }
+
+    fn reject_leased(
+        &self,
+        task_id: &str,
+        execution_id: &str,
+    ) -> Result<(), ProofError> {
+        let task_id = task_id.to_owned();
+        let execution_id = execution_id.to_owned();
+        let notify = task_id.clone();
+        self.store.call(move |store| store.mark_rejected(&task_id, &execution_id))?;
+        self.notify_task(&notify);
+        Ok(())
+    }
+
+    fn settle(
+        &self,
+        task_id: &str,
+        execution_id: &str,
+        start_confirmed: bool,
+        outcome: TaskOutcome,
+    ) -> Result<(), ProofError> {
+        let task_id = task_id.to_owned();
+        let execution_id = execution_id.to_owned();
+        self.store.call(move |store| match outcome {
+            TaskOutcome::Succeeded(text) => {
+                store.mark_succeeded(&task_id, &execution_id, &text, result_expiry())
+            }
+            TaskOutcome::Failed => {
+                if start_confirmed {
+                    store.mark_unknown_result(&task_id, &execution_id)
+                } else {
+                    store.mark_failed(&task_id, &execution_id)
+                }
+            }
+        })
+    }
+
+    fn fail_leased(&self, task_id: &str, execution_id: &str) -> Result<(), ProofError> {
+        let task_id = task_id.to_owned();
+        let execution_id = execution_id.to_owned();
+        let notify = task_id.clone();
+        self.store.call(move |store| store.mark_failed(&task_id, &execution_id))?;
+        self.notify_task(&notify);
+        Ok(())
+    }
+
     fn prepare_execution(&self) -> Result<Option<ExecutionBundle>, ProofError> {
         let _dispatch_guard =
             self.dispatch_serial.lock().map_err(|_| ProofError::Queue)?;
@@ -245,33 +330,34 @@ where
         })?;
         let workspace_id = execution_data.request.workspace_id.as_str();
         if workspace_id.contains("..") || workspace_id.starts_with('/') {
-            return Err(ProofError::Execution(ExecutionError::Path));
+            Self::log_store(
+                "invalid workspace id",
+                self.fail_leased(&task_id, &execution_id),
+            );
+            return Ok(None);
         }
-        let policy = self.policy.lock().map_err(|_| ProofError::Queue)?;
-        let dispatch = permits_dispatch(&policy, &self.scopes, &execution_data);
-        drop(policy);
-        let allowed =
-            group_allows_dispatch(&self.store, &self.scopes, &execution_data)?;
-        let refusal = match dispatch {
-            Err(denial) => Some(ProofError::Denied(denial)),
-            Ok(()) if !allowed => Some(ProofError::GroupDenied),
-            Ok(()) => None,
-        };
-        if let Some(refusal) = refusal {
-            let reject_id = task_id.clone();
-            let reject_execution = execution_id;
-            let _ = self
-                .store
-                .call(move |store| store.mark_rejected(&reject_id, &reject_execution));
-            let _ = self.event_sender.send(task_id);
-            return Err(refusal);
+        match self.dispatch_allowed(&execution_data) {
+            Ok(()) => {}
+            Err(DispatchBlock::Policy(denial)) => {
+                Self::log_store(
+                    "reject leased",
+                    self.reject_leased(&task_id, &execution_id),
+                );
+                return Err(ProofError::Denied(denial));
+            }
+            Err(DispatchBlock::Group) => {
+                Self::log_store(
+                    "reject leased",
+                    self.reject_leased(&task_id, &execution_id),
+                );
+                return Err(ProofError::GroupDenied);
+            }
         }
         let task = Task {
             id: task_id.clone(),
             skill: execution_data.skill,
             workspace_id: execution_data.request.workspace_id.as_str().to_owned(),
             remote_text: execution_data.remote_text,
-            context_tokens: 0,
         };
         Ok(Some(ExecutionBundle { task_id, execution_id, task }))
     }
@@ -310,10 +396,6 @@ where
                             Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
                             Err(RecvTimeoutError::Timeout) => {
                                 if renewal_failed.load(Ordering::Acquire) {
-                                    // Say it again until the turn ends: an
-                                    // adapter drops a cancel for a turn that
-                                    // it has not registered yet.
-                                    canceller.cancel(&task_id);
                                     continue;
                                 }
                                 if store
@@ -358,64 +440,54 @@ where
         let executor = Arc::clone(&self.executor);
         let store = self.store.clone();
         let event_sender = self.event_sender.clone();
-        let Ok(workspace) = self.workspace.path() else {
+        if self.workspace.path().is_err() {
+            Self::log_store(
+                "workspace path",
+                self.fail_leased(&task_id, &execution_id),
+            );
+            if let Ok(mut active) = self.active_task.lock()
+                && active.as_deref() == Some(task_id.as_str())
+            {
+                *active = None;
+            }
             self.finish_execution();
             return;
-        };
+        }
         let dispatch_task_id = task_id.clone();
+        let dispatch_ctx = self.clone();
         let start_store = self.store.clone();
         let dispatch_serial = Arc::clone(&self.dispatch_serial);
         let shutdown = Arc::clone(&self.shutdown);
-        let policy = Arc::clone(&self.policy);
-        let scopes = self.scopes.clone();
         let start_execution_id = execution_id.clone();
         let start_confirmed = Arc::new(AtomicBool::new(false));
         let confirmed_flag = Arc::clone(&start_confirmed);
-        let mut event_error: Option<ProofError> = None;
+        let mut event_error = false;
         let result = executor.lock().map_err(|_| ExecutionError::Unavailable).and_then(
             |mut executor| {
                 executor.execute_with_confirmed_start(
                     &task,
-                    &workspace,
                     &mut || {
-                        // Serialize against `cancel`/`cancel_from` so the
-                        // decision to actually start cannot interleave with a
-                        // cancellation racing in on the same task.
                         let _dispatch_guard = dispatch_serial
                             .lock()
                             .map_err(|_| ExecutionError::Unavailable)?;
                         if shutdown.load(Ordering::Acquire) {
                             return Err(ExecutionError::Cancelled);
                         }
-                        // Recheck policy against the live grants: one revoked
-                        // after this task was leased must not authorize a
-                        // stale start.
                         let execution_data = start_store
                             .call({
                                 let task_id = dispatch_task_id.clone();
                                 move |store| store.task_execution_data(&task_id)
                             })
                             .map_err(|_| ExecutionError::Unavailable)?;
-                        {
-                            let policy_guard = policy
-                                .lock()
-                                .map_err(|_| ExecutionError::Unavailable)?;
-                            if permits_dispatch(&policy_guard, &scopes, &execution_data)
-                                .is_err()
-                                || !group_allows_dispatch(
-                                    &start_store,
-                                    &scopes,
-                                    &execution_data,
-                                )
-                                .unwrap_or(false)
-                            {
-                                let reject_id = dispatch_task_id.clone();
-                                let reject_execution = start_execution_id.clone();
-                                let _ = start_store.call(move |store| {
-                                    store.mark_rejected(&reject_id, &reject_execution)
-                                });
-                                return Err(ExecutionError::Unavailable);
-                            }
+                        if dispatch_ctx.dispatch_allowed(&execution_data).is_err() {
+                            Self::log_store(
+                                "reject at start",
+                                dispatch_ctx.reject_leased(
+                                    &dispatch_task_id,
+                                    &start_execution_id,
+                                ),
+                            );
+                            return Err(ExecutionError::Unavailable);
                         }
                         start_store
                             .call({
@@ -438,27 +510,33 @@ where
                         outcome
                     },
                     &mut |event| {
-                        if event_error.is_none() {
-                            if event == ExecutionEvent::Completed {
-                                let event_task_id = dispatch_task_id.clone();
-                                if matches!(
-                                    store
-                                        .call(move |store| store.state(&event_task_id)),
-                                    Ok(TaskState::Cancelled)
-                                ) {
-                                    return;
-                                }
-                            }
+                        if event_error {
+                            return;
+                        }
+                        if event == ExecutionEvent::Completed {
                             let event_task_id = dispatch_task_id.clone();
-                            let event_type = event.event_type();
-                            event_error = store
-                                .call(move |store| {
-                                    store.append_event(&event_task_id, event_type)
-                                })
-                                .err();
-                            if event_error.is_none() {
-                                let _ = event_sender.send(dispatch_task_id.clone());
+                            if matches!(
+                                store.call(move |store| store.state(&event_task_id)),
+                                Ok(TaskState::Cancelled)
+                            ) {
+                                return;
                             }
+                        }
+                        let event_task_id = dispatch_task_id.clone();
+                        let event_type = event.event_type();
+                        if store
+                            .call(move |store| {
+                                store.append_event(&event_task_id, event_type)
+                            })
+                            .is_err()
+                        {
+                            event_error = true;
+                            return;
+                        }
+                        if event_sender.send(dispatch_task_id.clone()).is_err() {
+                            eprintln!(
+                                "aether: scheduler event broadcast failed for {dispatch_task_id}"
+                            );
                         }
                     },
                 )
@@ -474,17 +552,15 @@ where
         let start_confirmed = start_confirmed.load(Ordering::Acquire);
         if renewal_failed.load(Ordering::Acquire) {
             if let Ok(late_result) = &result {
-                let task_id = task_id.clone();
-                let late_result = late_result.clone();
-                let late_execution = execution_id.clone();
-                let _ = self.store.call(move |store| {
-                    store.mark_succeeded(
+                Self::log_store(
+                    "late success after renewal loss",
+                    self.settle(
                         &task_id,
-                        &late_execution,
-                        &late_result,
-                        result_expiry(),
-                    )
-                });
+                        &execution_id,
+                        start_confirmed,
+                        TaskOutcome::Succeeded(late_result.clone()),
+                    ),
+                );
             }
             if matches!(
                 self.store.call({
@@ -496,65 +572,59 @@ where
                 self.finish_execution();
                 return;
             }
-            let outcome_task_id = task_id.clone();
-            let outcome_execution = execution_id;
-            let _ = self.store.call(move |store| {
-                if start_confirmed {
-                    store.mark_unknown_result(&outcome_task_id, &outcome_execution)
-                } else {
-                    store.mark_failed(&outcome_task_id, &outcome_execution)
-                }
-            });
-            let _ = self.event_sender.send(task_id);
+            Self::log_store(
+                "renewal failed",
+                self.settle(
+                    &task_id,
+                    &execution_id,
+                    start_confirmed,
+                    TaskOutcome::Failed,
+                ),
+            );
+            self.notify_task(&task_id);
             self.finish_execution();
             return;
         }
-        if event_error.is_some() {
-            let outcome_task_id = task_id.clone();
-            let outcome_execution = execution_id;
-            let _ = self.store.call(move |store| {
-                if start_confirmed {
-                    store.mark_unknown_result(&outcome_task_id, &outcome_execution)
-                } else {
-                    store.mark_failed(&outcome_task_id, &outcome_execution)
-                }
-            });
-            let _ = self.event_sender.send(task_id);
+        if event_error {
+            Self::log_store(
+                "event journal write",
+                self.settle(
+                    &task_id,
+                    &execution_id,
+                    start_confirmed,
+                    TaskOutcome::Failed,
+                ),
+            );
+            self.notify_task(&task_id);
             self.finish_execution();
             return;
         }
         match result {
-            Ok(result) => {
-                let succeeded_task_id = task_id.clone();
-                let succeeded_execution = execution_id;
-                let _ = self.store.call(move |store| {
-                    store.mark_succeeded(
-                        &succeeded_task_id,
-                        &succeeded_execution,
-                        &result,
-                        result_expiry(),
-                    )
-                });
+            Ok(text) => {
+                Self::log_store(
+                    "succeeded",
+                    self.settle(
+                        &task_id,
+                        &execution_id,
+                        start_confirmed,
+                        TaskOutcome::Succeeded(text),
+                    ),
+                );
             }
             Err(ExecutionError::Cancelled) => {}
             Err(_) => {
-                // Once the process was told to start, a failure here means
-                // its outcome is genuinely unknown: it may have completed on
-                // the remote side even though this node lost track of it.
-                // Preserve that ambiguity for operator review rather than
-                // silently discarding the task as failed.
-                let outcome_task_id = task_id.clone();
-                let outcome_execution = execution_id;
-                let _ = self.store.call(move |store| {
-                    if start_confirmed {
-                        store.mark_unknown_result(&outcome_task_id, &outcome_execution)
-                    } else {
-                        store.mark_failed(&outcome_task_id, &outcome_execution)
-                    }
-                });
+                Self::log_store(
+                    "execution failed",
+                    self.settle(
+                        &task_id,
+                        &execution_id,
+                        start_confirmed,
+                        TaskOutcome::Failed,
+                    ),
+                );
             }
         }
-        let _ = self.event_sender.send(task_id);
+        self.notify_task(&task_id);
         self.finish_execution();
     }
 
@@ -570,10 +640,18 @@ where
         if self.executing.swap(true, Ordering::AcqRel) {
             return;
         }
-        let Ok(Some(bundle)) = self.prepare_execution() else {
-            // Nothing queued, or the task failed before it started.
-            self.executing.store(false, Ordering::Release);
-            return;
+        let bundle = match self.prepare_execution() {
+            Ok(Some(bundle)) => bundle,
+            Ok(None) => {
+                self.executing.store(false, Ordering::Release);
+                return;
+            }
+            Err(error) => {
+                eprintln!("aether: scheduler prepare execution: {error:?}");
+                self.executing.store(false, Ordering::Release);
+                let _ = self.scheduler_wake.try_send(());
+                return;
+            }
         };
         // Join the previous execution thread's handle before replacing it.
         // The `executing` gate above guarantees it has already returned; this
@@ -584,32 +662,7 @@ where
         {
             let _ = handle.join();
         }
-        let store = self.store.clone();
-        let executor = Arc::clone(&self.executor);
-        let canceller = self.canceller.clone();
-        let event_sender = self.event_sender.clone();
-        let shutdown = Arc::clone(&self.shutdown);
-        let executing = Arc::clone(&self.executing);
-        let active_task = Arc::clone(&self.active_task);
-        let execution_thread = Arc::clone(&self.execution_thread);
-        let workspace = self.workspace.clone();
-        let dispatch_serial = Arc::clone(&self.dispatch_serial);
-        let scheduler_wake = self.scheduler_wake.clone();
-        let ctx = Self {
-            store,
-            executor,
-            canceller,
-            event_sender,
-            shutdown,
-            executing,
-            active_task,
-            execution_thread: Arc::clone(&execution_thread),
-            workspace,
-            dispatch_serial,
-            scheduler_wake,
-            policy: Arc::clone(&self.policy),
-            scopes: self.scopes.clone(),
-        };
+        let ctx = self.clone();
         let task_id = bundle.task_id.clone();
         if let Ok(handle) = thread::Builder::new()
             .name("aether-execution".to_owned())
@@ -838,11 +891,6 @@ where
     }
 
     #[must_use]
-    pub const fn scope_kind(&self) -> ScopeKind {
-        self.scope.kind
-    }
-
-    #[must_use]
     pub fn scope_kind_for(&self, scope_id: &str) -> Option<ScopeKind> {
         self.scopes.get(&aether_core::ScopeId::new(scope_id)).map(|scope| scope.kind)
     }
@@ -862,24 +910,26 @@ where
         Some(scope.id.as_str())
     }
 
-    pub fn set_queue_limit(&self, id: &str, limit: u32) -> Result<(), ProofError> {
+    pub fn set_queue_limit(
+        &self,
+        id: QueueLimitId,
+        limit: u32,
+    ) -> Result<(), ProofError> {
         let limit = usize::try_from(limit).map_err(|_| ProofError::Queue)?;
         let mut limits = self.limits.lock().map_err(|_| ProofError::Queue)?;
         match id {
-            "queue_global" => limits.global = limit,
-            "queue_per_peer" => limits.per_peer = limit,
-            _ => return Err(ProofError::Queue),
+            QueueLimitId::Global => limits.global = limit,
+            QueueLimitId::PerPeer => limits.per_peer = limit,
         }
         drop(limits);
         Ok(())
     }
 
-    pub fn current_queue_limit(&self, id: &str) -> Result<u32, ProofError> {
+    pub fn current_queue_limit(&self, id: QueueLimitId) -> Result<u32, ProofError> {
         let limits = self.queue_limits()?;
         let limit = match id {
-            "queue_global" => limits.global,
-            "queue_per_peer" => limits.per_peer,
-            _ => return Err(ProofError::Queue),
+            QueueLimitId::Global => limits.global,
+            QueueLimitId::PerPeer => limits.per_peer,
         };
         u32::try_from(limit).map_err(|_| ProofError::Queue)
     }
@@ -1095,26 +1145,8 @@ where
 
     /// Reads at most `limit` events after `sequence` in one bounded store
     /// operation. The returned `bool` is `true` when more events remain.
-    pub fn events_page(
-        &self,
-        task_id: &str,
-        sequence: i64,
-        limit: usize,
-    ) -> Result<(Vec<aether_store::TaskEvent>, bool), ProofError> {
-        let task_id = task_id.to_owned();
-        self.store.call(move |store| store.events_page(&task_id, sequence, limit))
-    }
-
     pub fn subscribe_events(&self) -> broadcast::Receiver<String> {
         self.event_sender.subscribe()
-    }
-
-    pub fn stored_task(
-        &self,
-        task_id: &str,
-    ) -> Result<aether_store::StoredTask, ProofError> {
-        let task_id = task_id.to_owned();
-        self.store.call(move |store| store.stored_task(&task_id))
     }
 
     /// Reads a task's current state and final result without loading its
@@ -1228,7 +1260,6 @@ pub(crate) fn request_fingerprint(request: &Request, task: &Task) -> String {
         fingerprint.update(&length.to_be_bytes());
         fingerprint.update(field.as_bytes());
     }
-    fingerprint.update(&task.context_tokens.to_be_bytes());
     fingerprint.finalize().to_hex().to_string()
 }
 
@@ -1253,6 +1284,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::execution::TurnContext;
 
     struct Trusted;
 
@@ -1281,12 +1313,7 @@ mod tests {
     }
 
     impl Agent for Cancellable {
-        fn start_turn(
-            &mut self,
-            _task_id: &str,
-            _instruction: &str,
-            _remote_text: &str,
-        ) -> Result<String, ExecutionError> {
+        fn start_turn(&mut self, _ctx: &TurnContext) -> Result<String, ExecutionError> {
             Ok("done".to_owned())
         }
 
@@ -1303,21 +1330,16 @@ mod tests {
     }
 
     impl Agent for Blocking {
-        fn start_turn(
-            &mut self,
-            task_id: &str,
-            _instruction: &str,
-            _remote_text: &str,
-        ) -> Result<String, ExecutionError> {
+        fn start_turn(&mut self, ctx: &TurnContext) -> Result<String, ExecutionError> {
             self.active.fetch_add(1, Ordering::AcqRel);
             if let Ok(mut order) = self.order.lock() {
-                order.push(task_id.to_owned());
+                order.push(ctx.task_id.clone());
             }
             while !self.gate.load(Ordering::Acquire) {
                 thread::sleep(Duration::from_millis(5));
             }
             self.active.fetch_sub(1, Ordering::AcqRel);
-            Ok(format!("done:{task_id}"))
+            Ok(format!("done:{}", ctx.task_id))
         }
 
         fn cancel(&self, _task_id: &str) {}
@@ -1420,7 +1442,7 @@ mod tests {
         store
             .add_access_group_member("requests", "bob", bob.as_str())
             .expect("access must add");
-        node.apply_grant(test_grant("bob", &bob)).expect("grant must apply");
+        node.apply_stored_grant(test_grant("bob", &bob)).expect("grant must apply");
         node.apply_grant(test_grant("carol", &carol)).expect("grant must apply");
         let members = |group: &str| {
             store
@@ -1539,7 +1561,6 @@ mod tests {
             skill: "review".to_owned(),
             workspace_id: "workspace".to_owned(),
             remote_text: format!("input-{id}"),
-            context_tokens: 1,
         };
         (request, claim, endpoint, task)
     }
@@ -1552,12 +1573,7 @@ mod tests {
     }
 
     impl Agent for BlockingCancellable {
-        fn start_turn(
-            &mut self,
-            _task_id: &str,
-            _instruction: &str,
-            _remote_text: &str,
-        ) -> Result<String, ExecutionError> {
+        fn start_turn(&mut self, _ctx: &TurnContext) -> Result<String, ExecutionError> {
             self.active.fetch_add(1, Ordering::AcqRel);
             while !self.gate.load(Ordering::Acquire) {
                 if self.cancelled.load(Ordering::Acquire) {
@@ -1670,7 +1686,8 @@ mod tests {
             QueueLimits { global: 1, per_peer: 1 },
             &workspace,
         );
-        node.set_queue_limit("queue_global", 2).expect("queue limit must update");
+        node.set_queue_limit(aether_core::limits::QueueLimitId::Global, 2)
+            .expect("queue limit must update");
         assert_eq!(
             node.queue_limits().expect("queue limits must load"),
             QueueLimits { global: 2, per_peer: 1 }
@@ -1684,12 +1701,7 @@ mod tests {
     }
 
     impl Agent for RecordsWorkspace {
-        fn start_turn(
-            &mut self,
-            _task_id: &str,
-            _instruction: &str,
-            _remote_text: &str,
-        ) -> Result<String, ExecutionError> {
+        fn start_turn(&mut self, _ctx: &TurnContext) -> Result<String, ExecutionError> {
             Ok("done".to_owned())
         }
 
@@ -1780,7 +1792,7 @@ mod tests {
                 Cancellable { cancelled: Arc::new(AtomicBool::new(false)) },
                 crate::execution::Limits {
                     workspace: directory.path().to_path_buf(),
-                    max_context_tokens: 1,
+                    max_context_tokens: 32,
                     max_seconds: 1,
                 },
             ),
@@ -2196,7 +2208,6 @@ mod tests {
             skill: "review".to_owned(),
             workspace_id: "workspace".to_owned(),
             remote_text: "task text".to_owned(),
-            context_tokens: 1,
         };
         let result = submit_and_wait(&node, &request, &claim, &endpoint, "key", &task);
         assert!(
@@ -2213,12 +2224,7 @@ mod tests {
     struct FailsAfterStart;
 
     impl Agent for FailsAfterStart {
-        fn start_turn(
-            &mut self,
-            _task_id: &str,
-            _instruction: &str,
-            _remote_text: &str,
-        ) -> Result<String, ExecutionError> {
+        fn start_turn(&mut self, _ctx: &TurnContext) -> Result<String, ExecutionError> {
             Err(ExecutionError::Protocol)
         }
 
@@ -2256,7 +2262,7 @@ mod tests {
     #[test]
     fn a_grant_revoked_while_queued_rejects_the_task_at_dispatch() {
         grant_withdrawn_while_queued_rejects_the_task(|node, grant_b, _| {
-            node.apply_grant(Grant { capabilities: BTreeSet::new(), ..grant_b })
+            node.apply_stored_grant(Grant { capabilities: BTreeSet::new(), ..grant_b })
                 .expect("grant replacement must apply");
         });
     }
@@ -2358,6 +2364,48 @@ mod tests {
         assert!(matches!(result_b, Ok((TaskState::Rejected, None))), "{result_b:?}");
         let execution_order = order.lock().expect("order must lock").clone();
         assert_eq!(execution_order, vec!["task-a".to_owned()]);
+        node.shutdown();
+    }
+
+    #[test]
+    fn invalid_workspace_id_at_lease_settles_failed() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let workspace = directory.path().to_path_buf();
+        let (mut request, claim, endpoint, mut task) = test_request("task", "peer");
+        request.workspace_id = WorkspaceId::new("../outside");
+        task.workspace_id = "../outside".to_owned();
+        let mut grant = test_grant("peer", &endpoint);
+        grant.workspaces.insert(WorkspaceId::new("../outside"));
+        let node = ProofNode::new(
+            PolicyEngine::new(Trusted, [grant]),
+            NodeStore::in_dir(&workspace).expect("store must open"),
+            Executor::new(
+                Cancellable { cancelled: Arc::new(AtomicBool::new(false)) },
+                crate::execution::Limits {
+                    workspace: workspace.clone(),
+                    max_context_tokens: 32,
+                    max_seconds: 120,
+                },
+            ),
+            QueueLimits { global: 1, per_peer: 1 },
+            Scope { id: ScopeId::new("direct"), kind: ScopeKind::Direct },
+        )
+        .expect("node must create");
+        node.admit(
+            SubmissionInput {
+                request: &request,
+                authenticated_endpoint: &endpoint,
+                idempotency_key: "once",
+                task: &task,
+            },
+            Identity::Claim(&claim),
+            None,
+        )
+        .expect("task must admit");
+        wait_until("task fails", || {
+            node.state("task").is_ok_and(|state| state == TaskState::Failed)
+        });
+        assert_ne!(node.state("task").expect("state must load"), TaskState::Leased);
         node.shutdown();
     }
 }

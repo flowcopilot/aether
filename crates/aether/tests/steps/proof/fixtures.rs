@@ -107,7 +107,6 @@ pub fn task(id: &str) -> Task {
         skill: "review".to_owned(),
         workspace_id: "workspace".to_owned(),
         remote_text: "untrusted task text".to_owned(),
-        context_tokens: 1,
     }
 }
 

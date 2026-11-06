@@ -2,7 +2,7 @@
 
 use std::{fs, path::PathBuf};
 
-use aether::execution::{Agent, ExecutionError, Executor, Limits, Task};
+use aether::execution::{Agent, ExecutionError, Executor, Limits, Task, TurnContext};
 use cucumber::{given, then, when};
 use tempfile::TempDir;
 
@@ -30,13 +30,8 @@ impl State {
 struct EchoAgent;
 
 impl Agent for EchoAgent {
-    fn start_turn(
-        &mut self,
-        _task_id: &str,
-        instruction: &str,
-        remote_text: &str,
-    ) -> Result<String, ExecutionError> {
-        Ok(format!("{instruction}:{remote_text}"))
+    fn start_turn(&mut self, ctx: &TurnContext) -> Result<String, ExecutionError> {
+        Ok(format!("{}:{}", ctx.skill, ctx.text))
     }
 
     fn cancel(&self, _task_id: &str) {}
@@ -83,7 +78,7 @@ async fn outside_link(world: &mut World) {
 async fn runs(world: &mut World) {
     let state = &world.proof.workspace;
     let workspace = state.root().join("workspace");
-    let requested = state.requested.clone().unwrap_or_else(|| workspace.clone());
+    let run_at = state.requested.clone().unwrap_or_else(|| workspace.clone());
     let base = task("one");
     let task = Task {
         remote_text: state
@@ -97,11 +92,16 @@ async fn runs(world: &mut World) {
         ..base
     };
     let result = blocking(move || {
-        Executor::new(
+        let mut executor = Executor::new(
             EchoAgent,
-            Limits { workspace, max_context_tokens: 32, max_seconds: 10 },
-        )
-        .execute(&task, &requested)
+            Limits {
+                workspace: workspace.clone(),
+                max_context_tokens: 32,
+                max_seconds: 10,
+            },
+        );
+        executor.set_workspace(&run_at)?;
+        executor.execute_with_confirmed_start(&task, &mut || Ok(()), &mut |_| {})
     })
     .await;
     world.proof.workspace.result = Some(result);
