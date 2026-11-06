@@ -939,10 +939,7 @@ fn create_invite(
 ) -> TopcoatResult<String> {
     sign_direct_invite(
         app_context::<SharedAdministration>(cx),
-        &DirectInviteSigning::for_data_dir_with_relay(
-            &page.data_dir,
-            page.relay_url(),
-        ),
+        &DirectInviteSigning::for_data_dir_with_relay(&page.data_dir, page.relay_url()),
         &page.agent_name(),
         friend_name,
         endpoint_id,

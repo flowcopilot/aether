@@ -840,12 +840,13 @@ mod tests {
         switch_relay: crate::admin_ui::RelaySwitcher,
         hub_flag: Option<String>,
     ) -> PageContext {
+        let hub = test_node_hub(&data_dir, hub_flag);
         PageContext::host(
-            data_dir.clone(),
+            data_dir,
             name,
             relay_url,
             switch_relay,
-            test_node_hub(&data_dir, hub_flag),
+            hub,
             Arc::new(Mutex::new(())),
         )
     }

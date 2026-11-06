@@ -21,15 +21,11 @@ impl DirectInviteSigning {
         data_dir: &Path,
         relay_fallback: Option<String>,
     ) -> Self {
-        let stored = crate::settings::setting::<crate::transport::relay::ActiveRelay>(
-            data_dir,
-        )
-        .ok()
-        .flatten();
-        Self {
-            data_dir: data_dir.to_path_buf(),
-            relay_url: stored.or(relay_fallback),
-        }
+        let stored =
+            crate::settings::setting::<crate::transport::relay::ActiveRelay>(data_dir)
+                .ok()
+                .flatten();
+        Self { data_dir: data_dir.to_path_buf(), relay_url: stored.or(relay_fallback) }
     }
 
     fn relay_url(&self) -> Option<String> {
