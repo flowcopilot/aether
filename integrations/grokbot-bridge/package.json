@@ -1,0 +1,16 @@
+{
+  "name": "@aether/grokbot-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Experimental Grok Bot executor mailbox for an Aether connected node",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "start": "node src/main.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.3.6"
+  }
+}

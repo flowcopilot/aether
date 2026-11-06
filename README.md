@@ -48,6 +48,12 @@ with `aether node serve --adapter connected` and follow the
 [OpenClaw plugin README](integrations/openclaw-plugin/README.md). The node keeps the
 choice for its data directory.
 
+An [experimental Grok Bot bridge](integrations/grokbot-bridge/README.md) can
+also answer tasks through the connected adapter. It uses an authenticated MCP
+mailbox and routine wakes; stopping hosted Bot work remains cooperative.
+Give your Grok Bot the [installation guide](integrations/grokbot-bridge/INSTALL.md)
+to install a local node and command-based MCP connector on its own computer.
+
 ## Connect to another person
 
 1. The caller opens **Agents you can use** and copies the connect code.
