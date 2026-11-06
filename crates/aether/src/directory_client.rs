@@ -1,4 +1,9 @@
-use reqwest::{Client, StatusCode, Url};
+pub mod cli;
+
+use std::path::Path;
+
+use hex::FromHex;
+use reqwest::{StatusCode, Url};
 
 use aether_store::DirectoryEventType;
 
@@ -8,6 +13,7 @@ use crate::{
         wire::{self, WireDirectoryEvent, WireRecord},
     },
     pinned_https::{self, PinnedError},
+    transport::{self, Frame, TransportError},
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -28,8 +34,7 @@ pub enum DirectoryClientError {
 
 #[derive(Clone)]
 pub struct DirectoryClient {
-    client: Client,
-    directory: Url,
+    pinned: pinned_https::PinnedOrigin,
     trusted_signing_key: [u8; 32],
 }
 
@@ -39,13 +44,13 @@ impl DirectoryClient {
         certificate_der: &[u8],
         trusted_signing_key: [u8; 32],
     ) -> Result<Self, DirectoryClientError> {
-        let (client, directory) = pinned_https::client(directory, certificate_der)
+        let pinned = pinned_https::PinnedOrigin::open(directory, certificate_der)
             .map_err(|error| match error {
                 PinnedError::Origin => DirectoryClientError::InvalidDirectory,
                 PinnedError::Certificate => DirectoryClientError::InvalidCertificate,
                 PinnedError::Client => DirectoryClientError::Request,
             })?;
-        Ok(Self { client, directory, trusted_signing_key })
+        Ok(Self { pinned, trusted_signing_key })
     }
 
     pub async fn publish(
@@ -53,6 +58,7 @@ impl DirectoryClient {
         record: &WireRecord,
     ) -> Result<WireRecord, DirectoryClientError> {
         let response = self
+            .pinned
             .client
             .post(self.records_url()?)
             .json(record)
@@ -73,6 +79,7 @@ impl DirectoryClient {
         agent_id: &str,
     ) -> Result<WireRecord, DirectoryClientError> {
         let response = self
+            .pinned
             .client
             .get(self.record_url(agent_id)?)
             .send()
@@ -95,6 +102,7 @@ impl DirectoryClient {
             return Err(DirectoryClientError::InvalidRecord);
         }
         let response = self
+            .pinned
             .client
             .get(self.records_url()?)
             .query(&[("capability", capability)])
@@ -117,6 +125,7 @@ impl DirectoryClient {
         record: &WireRecord,
     ) -> Result<(), DirectoryClientError> {
         let response = self
+            .pinned
             .client
             .delete(self.record_url(&record.agent_id)?)
             .json(record)
@@ -137,6 +146,7 @@ impl DirectoryClient {
             return Err(DirectoryClientError::InvalidRecord);
         }
         let response = self
+            .pinned
             .client
             .get(self.events_url()?)
             .query(&[("after", cursor)])
@@ -175,8 +185,7 @@ impl DirectoryClient {
     }
 
     fn url(&self, segments: &[&str]) -> Result<Url, DirectoryClientError> {
-        pinned_https::url(&self.directory, segments)
-            .ok_or(DirectoryClientError::InvalidDirectory)
+        self.pinned.url(segments).ok_or(DirectoryClientError::InvalidDirectory)
     }
 
     fn validate(&self, record: &WireRecord) -> Result<(), DirectoryClientError> {
@@ -211,6 +220,149 @@ impl DirectoryClient {
             DirectoryEventType::Revoked => Err(DirectoryClientError::InvalidRecord),
         }
     }
+}
+
+#[allow(
+    clippy::result_unit_err,
+    clippy::ignored_unit_patterns,
+    clippy::match_same_arms
+)]
+pub fn read_authorization(path: &Path) -> Result<transport::A2aAuthorization, ()> {
+    let source = std::fs::read(path).map_err(|_| ())?;
+    serde_json::from_slice(&source).map_err(|_| ())
+}
+
+#[allow(clippy::result_unit_err)]
+pub fn read_verifying_key(path: &Path) -> Result<[u8; 32], ()> {
+    let source = std::fs::read_to_string(path).map_err(|_| ())?;
+    <[u8; 32]>::from_hex(source.trim()).map_err(|_| ())
+}
+
+#[allow(clippy::result_unit_err)]
+pub fn read_directory_record(path: &Path) -> Result<WireRecord, ()> {
+    serde_json::from_slice(&std::fs::read(path).map_err(|_| ())?).map_err(|_| ())
+}
+
+#[allow(clippy::result_unit_err)]
+pub fn cache_directory_record(
+    data_dir: &Path,
+    record: &crate::discovery::Record,
+) -> Result<(), ()> {
+    let store = aether_store::NodeStore::in_dir(data_dir).map_err(|_| ())?;
+    cache_wire_directory_record(&store, &WireRecord::from_record(record))
+}
+
+#[allow(clippy::result_unit_err)]
+pub fn cache_wire_directory_record(
+    store: &aether_store::NodeStore,
+    record: &WireRecord,
+) -> Result<(), ()> {
+    store
+        .cache_directory_record(&aether_store::SignedRecord {
+            scope_id: record.scope_id.clone(),
+            agent_id: record.agent_id.clone(),
+            record: serde_json::to_vec(record).map_err(|_| ())?,
+            expires_at: i64::try_from(record.expires_at).map_err(|_| ())?,
+        })
+        .map_err(|_| ())
+}
+
+#[allow(clippy::result_unit_err)]
+pub fn cached_directory_record(
+    data_dir: &Path,
+    scope_id: &str,
+    agent_id: &str,
+    trusted_key: [u8; 32],
+) -> Result<crate::discovery::Record, ()> {
+    let store = aether_store::NodeStore::in_dir(data_dir).map_err(|_| ())?;
+    let stored = store.directory_record(scope_id, agent_id).map_err(|_| ())?;
+    if stored.scope_id != scope_id || stored.agent_id != agent_id {
+        return Err(());
+    }
+    if stored.expires_at <= aether_core::time::now() {
+        return Err(());
+    }
+    let wire: WireRecord = serde_json::from_slice(&stored.record).map_err(|_| ())?;
+    let record = wire.to_record().map_err(|_| ())?;
+    if record.signing_key != trusted_key {
+        return Err(());
+    }
+    validate_record(&record).map_err(|_| ())?;
+    Ok(record)
+}
+
+#[allow(clippy::result_unit_err)]
+pub async fn sync_directory(
+    data_dir: &Path,
+    directory: &str,
+    trusted_key: [u8; 32],
+    client: &DirectoryClient,
+) -> Result<(i64, usize), ()> {
+    std::fs::create_dir_all(data_dir).map_err(|_| ())?;
+    let store = aether_store::NodeStore::in_dir(data_dir).map_err(|_| ())?;
+    let mut cursor = store.directory_cursor(directory, &trusted_key).map_err(|_| ())?;
+    let mut records = 0usize;
+    let directory = directory.to_owned();
+    loop {
+        let changes = client.events_after(cursor).await.map_err(|_| ())?;
+        if changes.is_empty() {
+            return Ok((cursor, records));
+        }
+        for change in changes {
+            if change.cursor <= cursor {
+                return Err(());
+            }
+            if matches!(
+                change.event,
+                aether_store::DirectoryEventType::Published
+                    | aether_store::DirectoryEventType::Renewed
+            ) {
+                records = records.checked_add(1).ok_or(())?;
+            }
+            crate::roster_sync::apply_directory_change(&store, &change)?;
+            cursor = change.cursor;
+            store
+                .advance_directory_cursor(&directory, &trusted_key, cursor)
+                .map_err(|_| ())?;
+        }
+    }
+}
+
+#[allow(clippy::ignored_unit_patterns, clippy::match_same_arms)]
+pub async fn request_via_directory(
+    data_dir: &Path,
+    directory: &str,
+    certificate: &Path,
+    key: &Path,
+    agent_id: &str,
+    scope: &str,
+    request: Frame,
+) -> Result<Vec<Frame>, TransportError> {
+    let certificate =
+        std::fs::read(certificate).map_err(|_| TransportError::Address)?;
+    let trusted_key = read_verifying_key(key).map_err(|_| TransportError::Address)?;
+    let client =
+        DirectoryClient::with_pinned_certificate(directory, &certificate, trusted_key)
+            .map_err(|_| TransportError::Address)?;
+    let record = match client.resolve(agent_id).await.and_then(|wire| {
+        wire.to_record().map_err(|_| DirectoryClientError::InvalidRecord)
+    }) {
+        Ok(record) if record.scope_id == scope => {
+            if cache_directory_record(data_dir, &record).is_err() {
+                return Err(TransportError::Network(
+                    "local directory state is unavailable".to_owned(),
+                ));
+            }
+            record
+        }
+        Ok(_) => return Err(TransportError::Address),
+        Err(DirectoryClientError::Request) => {
+            cached_directory_record(data_dir, scope, agent_id, trusted_key)
+                .map_err(|_| TransportError::Address)?
+        }
+        Err(_) => return Err(TransportError::Address),
+    };
+    transport::request_once_record(data_dir, &record, request).await
 }
 
 #[cfg(test)]

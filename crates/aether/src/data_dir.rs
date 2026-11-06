@@ -177,6 +177,27 @@ impl From<&Path> for DataDir {
     }
 }
 
+#[must_use]
+pub fn expand_home(path: PathBuf) -> PathBuf {
+    path.strip_prefix("~")
+        .ok()
+        .and_then(|rest| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(rest))
+        })
+        .unwrap_or(path)
+}
+
+fn data_dir_from_env(
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    env("AETHER_DATA_DIR").and_then(|value| value.into_string().ok()).and_then(
+        |value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() { None } else { Some(PathBuf::from(trimmed)) }
+        },
+    )
+}
+
 /// The node data directory when `--data-dir` is not given: trimmed
 /// `$AETHER_DATA_DIR` when it is not blank, else `home/.aether/host`.
 #[must_use]
@@ -188,19 +209,50 @@ pub fn default_node_data_dir(
     if let Some(path) = explicit {
         return path;
     }
-    if let Some(value) =
-        env("AETHER_DATA_DIR").and_then(|value| value.into_string().ok())
-    {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed);
-        }
+    if let Some(path) = data_dir_from_env(&env) {
+        return path;
     }
     if let Some(home) = home {
         home.join(".aether").join("host")
     } else {
         PathBuf::from(".aether/host")
     }
+}
+
+/// The daemon data directory when no config file is given: trimmed
+/// `$AETHER_DATA_DIR` when it is not blank, else `./.aether/{command}`.
+#[must_use]
+pub fn default_daemon_data_dir(
+    explicit: Option<PathBuf>,
+    command: crate::Command,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> PathBuf {
+    if let Some(path) = explicit {
+        return path;
+    }
+    if let Some(path) = data_dir_from_env(&env) {
+        return path;
+    }
+    PathBuf::from(format!("./.aether/{}", command.name()))
+}
+
+#[must_use]
+pub fn resolve_node_data_dir(explicit: Option<PathBuf>) -> PathBuf {
+    expand_home(default_node_data_dir(
+        explicit,
+        |name| std::env::var_os(name),
+        std::env::var_os("HOME").map(PathBuf::from),
+    ))
+}
+
+#[must_use]
+pub fn resolve_daemon_data_dir(
+    explicit: Option<PathBuf>,
+    command: crate::Command,
+) -> PathBuf {
+    expand_home(default_daemon_data_dir(explicit, command, |name| {
+        std::env::var_os(name)
+    }))
 }
 
 /// The login file in the Codex home `codex_home`.

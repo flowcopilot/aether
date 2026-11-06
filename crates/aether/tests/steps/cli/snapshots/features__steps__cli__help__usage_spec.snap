@@ -1,5 +1,6 @@
 ---
 source: crates/aether/tests/steps/cli/help.rs
+assertion_line: 37
 expression: spec
 ---
 name aether
@@ -17,7 +18,7 @@ cmd node {
         flag --policy help="Old policy file to import on the first start. Later changes use SQLite." default="~/.aether/policy.json" {
             arg <POLICY>
         }
-        flag --data-dir default="~/.aether/host" {
+        flag --data-dir {
             arg <DATA_DIR>
         }
         flag --port default="0" {
@@ -142,7 +143,7 @@ cmd node {
         }
     }
     cmd invite {
-        flag --data-dir required=#true {
+        flag --data-dir {
             arg <DATA_DIR>
         }
         flag --agent-id required=#true {
@@ -185,7 +186,7 @@ cmd node {
             arg <RECORD>
         }
         cmd sync {
-            flag --data-dir required=#true {
+            flag --data-dir {
                 arg <DATA_DIR>
             }
             flag "-h --help" help="Print help" action=help builtin=#true
@@ -218,7 +219,7 @@ cmd node {
             arg <SCOPE>
         }
         cmd sync {
-            flag --data-dir required=#true {
+            flag --data-dir {
                 arg <DATA_DIR>
             }
             flag "-h --help" help="Print help" action=help builtin=#true
@@ -226,7 +227,7 @@ cmd node {
         }
     }
     cmd record {
-        flag --data-dir required=#true {
+        flag --data-dir {
             arg <DATA_DIR>
         }
         flag --agent-id required=#true {
@@ -247,13 +248,13 @@ cmd node {
         flag "-h --help" help="Print help" action=help builtin=#true
     }
     cmd endpoint {
-        flag --data-dir required=#true {
+        flag --data-dir {
             arg <DATA_DIR>
         }
         flag "-h --help" help="Print help" action=help builtin=#true
     }
     cmd fixture {
-        flag --data-dir required=#true {
+        flag --data-dir {
             arg <DATA_DIR>
         }
         flag --scope {

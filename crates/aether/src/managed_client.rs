@@ -1,5 +1,9 @@
+pub mod cli;
+
+use std::path::Path;
+
 use hex::FromHex;
-use reqwest::{Client, StatusCode, Url};
+use reqwest::{StatusCode, Url};
 
 use aether_store::ManagedEventType;
 
@@ -9,6 +13,7 @@ use crate::{
         wire::{self, WireManagedEvent, WireManagedRedeem, WireRecord},
     },
     pinned_https::{self, PinnedError},
+    transport::{self, Frame, TransportError},
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -27,8 +32,7 @@ pub enum ManagedClientError {
 
 #[derive(Clone)]
 pub struct ManagedClient {
-    client: Client,
-    control: Url,
+    pinned: pinned_https::PinnedOrigin,
 }
 
 impl ManagedClient {
@@ -36,13 +40,13 @@ impl ManagedClient {
         control: &str,
         certificate_der: &[u8],
     ) -> Result<Self, ManagedClientError> {
-        let (client, control) = pinned_https::client(control, certificate_der)
+        let pinned = pinned_https::PinnedOrigin::open(control, certificate_der)
             .map_err(|error| match error {
                 PinnedError::Origin => ManagedClientError::InvalidControl,
                 PinnedError::Certificate => ManagedClientError::InvalidCertificate,
                 PinnedError::Client => ManagedClientError::Request,
             })?;
-        Ok(Self { client, control })
+        Ok(Self { pinned })
     }
 
     pub async fn redeem(
@@ -58,6 +62,7 @@ impl ManagedClient {
         let expires_at = aether_core::time::unix_timestamp(signed.expires_at)
             .ok_or(ManagedClientError::InvalidRecord)?;
         let response = self
+            .pinned
             .client
             .post(self.redeem_url()?)
             .json(&WireManagedRedeem {
@@ -88,6 +93,7 @@ impl ManagedClient {
         scope_id: &str,
     ) -> Result<Vec<aether_store::ManagedMember>, ManagedClientError> {
         let response = self
+            .pinned
             .client
             .get(self.members_url(scope_id)?)
             .send()
@@ -116,6 +122,7 @@ impl ManagedClient {
             return Err(ManagedClientError::InvalidRecord);
         }
         let response = self
+            .pinned
             .client
             .get(self.events_url(scope_id)?)
             .query(&[("after", cursor)])
@@ -182,8 +189,7 @@ impl ManagedClient {
     }
 
     fn url(&self, segments: &[&str]) -> Result<Url, ManagedClientError> {
-        pinned_https::url(&self.control, segments)
-            .ok_or(ManagedClientError::InvalidControl)
+        self.pinned.url(segments).ok_or(ManagedClientError::InvalidControl)
     }
 
     fn validate_member(
@@ -199,6 +205,100 @@ impl ManagedClient {
         }
         Ok(())
     }
+}
+
+#[must_use]
+pub fn managed_member_active(
+    member: &aether_store::ManagedMember,
+    agent_id: &str,
+) -> bool {
+    member.agent_id == agent_id && member.is_active(aether_core::time::now())
+}
+
+#[allow(clippy::result_unit_err)]
+pub fn cached_managed_member(
+    data_dir: &Path,
+    scope_id: &str,
+    agent_id: &str,
+) -> Result<aether_store::ManagedMember, ()> {
+    let store = aether_store::NodeStore::in_dir(data_dir).map_err(|_| ())?;
+    store
+        .managed_members(scope_id)
+        .map_err(|_| ())?
+        .into_iter()
+        .find(|member| managed_member_active(member, agent_id))
+        .ok_or(())
+}
+
+#[allow(clippy::result_unit_err)]
+pub async fn sync_managed(
+    data_dir: &Path,
+    control: &str,
+    scope_id: &str,
+    client: &ManagedClient,
+) -> Result<(i64, usize), ()> {
+    std::fs::create_dir_all(data_dir).map_err(|_| ())?;
+    let mut store = aether_store::NodeStore::in_dir(data_dir).map_err(|_| ())?;
+    let mut cursor = store.managed_cursor(control, scope_id).map_err(|_| ())?;
+    let mut changes = 0usize;
+    let control = control.to_owned();
+    loop {
+        let events = client.events_after(scope_id, cursor).await.map_err(|_| ())?;
+        if events.is_empty() {
+            return Ok((cursor, changes));
+        }
+        for event in events {
+            if event.cursor <= cursor {
+                return Err(());
+            }
+            crate::roster_sync::apply_managed_change(&mut store, &control, &event)?;
+            cursor = event.cursor;
+            changes = changes.checked_add(1).ok_or(())?;
+        }
+    }
+}
+
+pub async fn request_task(
+    input: &crate::node_request::RequestInput,
+    data_dir: &Path,
+    control: &str,
+    request: Frame,
+    relay_url: Option<&str>,
+) -> Result<Vec<Frame>, TransportError> {
+    let certificate_path =
+        input.managed_control_certificate.as_deref().ok_or(TransportError::Address)?;
+    let agent_id = input.agent_id.as_deref().ok_or(TransportError::Address)?;
+    let certificate =
+        std::fs::read(certificate_path).map_err(|_| TransportError::Address)?;
+    let client = ManagedClient::with_pinned_certificate(control, &certificate)
+        .map_err(|_| TransportError::Address)?;
+    if sync_managed(data_dir, control, &input.scope, &client).await.is_err() {
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "level": "error",
+                "event": "managed_sync_failed",
+            })
+        );
+    }
+    let members = match client.members(&input.scope).await {
+        Ok(members) => members,
+        Err(ManagedClientError::Request) => {
+            vec![cached_managed_member(data_dir, &input.scope, agent_id).map_err(
+                |()| TransportError::Network("roster lookup failed".to_owned()),
+            )?]
+        }
+        Err(_) => {
+            return Err(TransportError::Network("roster lookup failed".to_owned()));
+        }
+    };
+    let member = members
+        .into_iter()
+        .find(|member| managed_member_active(member, agent_id))
+        .ok_or(TransportError::Address)?;
+    let relay_url = relay_url.ok_or(TransportError::Address)?;
+    transport::request_once_via_relay(data_dir, &member.endpoint_id, relay_url, request)
+        .await
 }
 
 #[cfg(test)]
