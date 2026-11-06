@@ -32,8 +32,11 @@ release: a formula refers to their checksums.
    commit, for example a README.
 2. In the Aether repository, set the Actions variable
    `HOMEBREW_TAP_REPOSITORY` to `flowcopilot/homebrew-tap`.
-3. Add the Actions secret `HOMEBREW_TAP_TOKEN`. Use a token with Contents
-   write access only to that tap repository.
+3. Create an Ed25519 SSH key pair. Add the public key to the tap repository
+   as a deploy key with write access. Save the private key in the Aether
+   Actions secret `HOMEBREW_TAP_DEPLOY_KEY`. The release workflow uses this
+   key to push formula updates. Delete the local key files after you save
+   the secret.
 
 After each release, CI copies the generated formula to `Formula/aether.rb`
 in the tap and commits it. Without the variable, CI skips this step. The
