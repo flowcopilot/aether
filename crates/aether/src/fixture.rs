@@ -119,11 +119,8 @@ pub async fn create_for_scope(
         json!({"fixture-issuer": hex::encode(key.verifying_key().to_bytes())}),
     );
     object.insert("grants".to_owned(), json!([GrantRecord::from(&grant)]));
-    fs::write(
-        &policy_path,
-        serde_json::to_vec(&document).map_err(|_| FixtureError)?,
-    )
-    .map_err(|_| FixtureError)?;
+    fs::write(&policy_path, serde_json::to_vec(&document).map_err(|_| FixtureError)?)
+        .map_err(|_| FixtureError)?;
     let authorization = data_dir.join("authorization.json");
     fs::write(
         &authorization,

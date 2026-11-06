@@ -5,9 +5,7 @@ pub mod signing;
 pub mod store;
 
 pub use aether::fixture::PolicyLimits;
-pub use harness::{
-    FakeCodex, TestNodeDir, policy_for_grants, read_node_listening,
-};
+pub use harness::{FakeCodex, TestNodeDir, policy_for_grants, read_node_listening};
 pub use signing::{
     discovery_signing_key, host_signing_key, proof_issuer_key, review_claim,
     review_grant,

@@ -1,7 +1,4 @@
-use std::{
-    collections::BTreeSet,
-    time::SystemTime,
-};
+use std::{collections::BTreeSet, time::SystemTime};
 
 use aether::identity::{ClaimInput, GrantInput, signed_claim, signed_grant};
 use aether_core::{
