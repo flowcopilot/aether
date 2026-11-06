@@ -232,7 +232,7 @@ pub(super) async fn publish_listing(
     {
         return Err(bad_request("only a service agent has a public listing").into());
     }
-    let result = match (form.action.as_str(), page.hub.get()) {
+    let result = match (form.action.as_str(), page.current_hub()) {
         (_, None) => Err(PublishError::Hub(HubError::Unreachable)),
         ("list", Some(hub)) => {
             publish(&page.data_dir, &hub, now_seconds()).await.map(drop)
@@ -270,7 +270,7 @@ async fn renew(page: &PageContext) {
     .ok()
     .flatten()
         == Some(AgentKind::Service);
-    let (true, true, Some(hub)) = (due, service, page.hub.get()) else {
+    let (true, true, Some(hub)) = (due, service, page.current_hub()) else {
         return;
     };
     let event = match publish(&page.data_dir, &hub, now).await {

@@ -97,11 +97,12 @@ pub fn host_page_context(
     invite_name: Option<String>,
     relay_url: Option<String>,
     switch_relay: RelaySwitcher,
+    hub_flag: Option<String>,
     hub: Option<crate::hub_client::HubClient>,
     task_folder_mode: bool,
 ) -> Arc<PageContext> {
     Arc::new(
-        PageContext::host(data_dir, invite_name, relay_url, switch_relay)
+        PageContext::host(data_dir, invite_name, relay_url, switch_relay, hub_flag)
             .with_hub(hub)
             .with_caller(true)
             .with_task_folder_mode(task_folder_mode),
@@ -131,12 +132,14 @@ mod tests {
             None,
             switch,
             None,
+            None,
             false,
         );
         assert_eq!(page.agent_name(), invite_agent_name(&data_dir, Some("flag-name")));
         let switch: crate::admin_ui::RelaySwitcher =
             Arc::new(|_, _| Box::pin(async { Ok(()) }));
-        let page = host_page_context(data_dir.clone(), None, None, switch, None, false);
+        let page =
+            host_page_context(data_dir.clone(), None, None, switch, None, None, false);
         assert_eq!(page.agent_name(), invite_agent_name(&data_dir, None));
     }
 }

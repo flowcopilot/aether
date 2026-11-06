@@ -626,7 +626,7 @@ pub struct PageContext {
     name: Option<String>,
     relay_url: Mutex<Option<String>>,
     switch_relay: RelaySwitcher,
-    hub: HubSlot,
+    hub: crate::hub_client::NodeHub,
     hub_sign: Mutex<()>,
 }
 
@@ -637,8 +637,9 @@ impl PageContext {
         name: Option<String>,
         relay_url: Option<String>,
         switch_relay: RelaySwitcher,
+        hub_flag: Option<String>,
     ) -> Self {
-        let hub = HubSlot::new(data_dir.clone());
+        let hub = crate::hub_client::NodeHub::new(data_dir.clone(), hub_flag);
         Self {
             data_dir,
             task_folder_mode: false,
@@ -654,7 +655,7 @@ impl PageContext {
 
     #[must_use]
     pub fn admin_caller(data_dir: PathBuf) -> Self {
-        let hub = HubSlot::new(data_dir.clone());
+        let hub = crate::hub_client::NodeHub::new(data_dir.clone(), None);
         Self {
             data_dir,
             task_folder_mode: false,
@@ -681,7 +682,9 @@ impl PageContext {
 
     #[must_use]
     pub fn with_hub(self, hub: Option<crate::hub_client::HubClient>) -> Self {
-        self.hub.set(hub);
+        if let Some(client) = hub {
+            self.hub.prime(client);
+        }
         self
     }
 
@@ -692,11 +695,13 @@ impl PageContext {
     }
 
     pub(super) fn current_hub(&self) -> Option<crate::hub_client::HubClient> {
-        self.hub.get()
+        self.hub.client().ok().flatten()
     }
 
     pub(super) fn set_hub(&self, hub: Option<crate::hub_client::HubClient>) {
-        self.hub.set(hub);
+        if let Some(client) = hub {
+            self.hub.prime(client);
+        }
     }
 
     pub(super) const fn hub_sign(&self) -> &Mutex<()> {
@@ -722,57 +727,6 @@ impl PageContext {
         .await?;
         *self.relay_url.lock().unwrap_or_else(PoisonError::into_inner) = relay;
         Ok(())
-    }
-}
-
-/// The hub a page uses now. The settings form can change it while the page
-/// runs, so the workers read it again before each request.
-struct HubSlot {
-    data_dir: PathBuf,
-    state: Mutex<HubState>,
-}
-
-#[derive(Default)]
-struct HubState {
-    client: Option<crate::hub_client::HubClient>,
-    stored_url: Option<String>,
-}
-
-impl HubSlot {
-    fn new(data_dir: PathBuf) -> Self {
-        let stored_url =
-            crate::settings::setting::<crate::hub_client::settings::Hub>(&data_dir)
-                .ok()
-                .flatten();
-        Self { data_dir, state: Mutex::new(HubState { client: None, stored_url }) }
-    }
-
-    fn get(&self) -> Option<crate::hub_client::HubClient> {
-        let stored_url = crate::settings::setting::<crate::hub_client::settings::Hub>(
-            &self.data_dir,
-        )
-        .ok()
-        .flatten();
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if state.stored_url != stored_url {
-            state.client = crate::hub_client::resolve_url(None, stored_url.clone())
-                .and_then(|url| {
-                    crate::hub_client::HubClient::for_data_dir(&url, &self.data_dir)
-                        .ok()
-                });
-            state.stored_url = stored_url;
-        }
-        state.client.clone()
-    }
-
-    fn set(&self, hub: Option<crate::hub_client::HubClient>) {
-        let stored_url = crate::settings::setting::<crate::hub_client::settings::Hub>(
-            &self.data_dir,
-        )
-        .ok()
-        .flatten();
-        *self.state.lock().unwrap_or_else(PoisonError::into_inner) =
-            HubState { client: hub, stored_url };
     }
 }
 
@@ -952,8 +906,8 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{
-        AdminUi, HubSlot, PageContext, UiOptions, UiState, build_admin_ui, router,
-        tls_config, ui_service,
+        AdminUi, PageContext, UiOptions, UiState, build_admin_ui, router, tls_config,
+        ui_service,
     };
     use crate::admin::{
         ChangeRequest, SharedAdministration, shared_with_store,
@@ -966,23 +920,49 @@ mod tests {
     const PORT: u16 = 3000;
 
     #[test]
-    fn hub_slot_reads_a_saved_change_without_restarting_the_page() {
+    fn the_page_hub_reads_a_saved_change_without_restarting_the_page() {
         let directory = tempfile::tempdir().expect("directory must create");
-        let slot = HubSlot::new(directory.path().to_path_buf());
-        slot.set(Some(
+        let _ = crate::data_dir::DataDir::new(directory.path()).endpoint_key();
+        let page = PageContext::host(
+            directory.path().to_path_buf(),
+            None,
+            None,
+            Arc::new(|_, _| Box::pin(async { Ok(()) })),
+            None,
+        )
+        .with_hub(Some(
             crate::hub_client::HubClient::for_data_dir(
                 crate::hub_client::DEFAULT_HUB_URL,
                 directory.path(),
             )
             .expect("hub client must create"),
         ));
-        assert!(slot.get().is_some());
+        assert!(page.current_hub().is_some());
         crate::settings::store_setting::<crate::hub_client::settings::Hub>(
             directory.path(),
             &Some("off".to_owned()),
         )
         .expect("hub choice must save");
-        assert!(slot.get().is_none());
+        assert!(page.current_hub().is_none());
+    }
+
+    #[test]
+    fn the_page_hub_uses_the_serve_flag_over_the_saved_url() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let _ = crate::data_dir::DataDir::new(directory.path()).endpoint_key();
+        crate::settings::store_setting::<crate::hub_client::settings::Hub>(
+            directory.path(),
+            &Some("https://stored.example".to_owned()),
+        )
+        .expect("store");
+        let page = PageContext::host(
+            directory.path().to_path_buf(),
+            None,
+            None,
+            Arc::new(|_, _| Box::pin(async { Ok(()) })),
+            Some("https://flag.example".to_owned()),
+        );
+        assert_eq!(page.current_hub().expect("hub").url(), "https://flag.example");
     }
 
     fn managed_options() -> UiOptions {
@@ -1049,6 +1029,7 @@ mod tests {
                     }
                 })
             }),
+            None,
         )
     }
 
@@ -1061,6 +1042,7 @@ mod tests {
                 name.map(str::to_owned),
                 None,
                 Arc::new(|_, _| Box::pin(async { Ok(()) })),
+                None,
             )
         };
         let endpoint =
@@ -1074,11 +1056,11 @@ mod tests {
         assert_eq!(host(Some("server")).agent_name(), "server");
         crate::settings::store_setting::<crate::hub_client::settings::HubName>(
             directory.path(),
-            &Some("tudor".to_owned()),
+            &Some("tudor#0042".to_owned()),
         )
         .expect("hub name must store");
-        assert_eq!(host(Some("server")).agent_name(), "tudor");
-        assert_eq!(host(None).agent_name(), "tudor");
+        assert_eq!(host(Some("server")).agent_name(), "tudor#0042");
+        assert_eq!(host(None).agent_name(), "tudor#0042");
     }
 
     /// Waits until the hub invite `id` is delivered, or fails the test.
@@ -1134,7 +1116,7 @@ mod tests {
                 .with_hub(Some(hub.client(directory.path())));
         crate::settings::store_setting::<crate::hub_client::settings::HubName>(
             directory.path(),
-            &Some("tudor".to_owned()),
+            &Some("tudor#0042".to_owned()),
         )
         .expect("hub name must store");
         let own =
@@ -1142,15 +1124,15 @@ mod tests {
         let (ana, eve) = (peer_endpoint(5), peer_endpoint(6));
         let (unsent, sent) = {
             let mut state = hub.state();
-            state.add_account(&own, "tudor");
-            state.add_account(&ana, "ana");
-            state.add_account(&eve, "eve");
+            state.add_account(&own, "tudor#0042");
+            state.add_account(&ana, "ana#0007");
+            state.add_account(&eve, "eve#0008");
             (
                 state.add_invite(&own, &eve, "accepted"),
                 state.add_invite(&own, &ana, "accepted"),
             )
         };
-        approve(directory.path(), &sent, "ana");
+        approve(directory.path(), &sent, "ana#0007");
         let worker =
             tokio::spawn(super::hub::host_worker(administration, Arc::new(host)));
         wait_for_delivery(&hub, &sent).await;
@@ -2013,11 +1995,12 @@ mod tests {
             Some("server".to_owned()),
             None,
             Arc::new(|_, _| Box::pin(async { Ok(()) })),
+            None,
         )
         .with_hub(Some(hub.client(directory.path())));
         crate::settings::store_setting::<crate::hub_client::settings::HubName>(
             directory.path(),
-            &Some("tudor".to_owned()),
+            &Some("tudor#0042".to_owned()),
         )
         .expect("hub name must store");
         let own =
@@ -2025,11 +2008,11 @@ mod tests {
         let ana = peer_endpoint(5);
         let id = {
             let mut state = hub.state();
-            state.add_account(&own, "tudor");
-            state.add_account(&ana, "ana");
+            state.add_account(&own, "tudor#0042");
+            state.add_account(&ana, "ana#0007");
             state.add_invite(&own, &ana, "accepted")
         };
-        approve(directory.path(), &id, "ana");
+        approve(directory.path(), &id, "ana#0007");
         let worker =
             tokio::spawn(super::hub::host_worker(administration, Arc::new(host)));
         wait_for_delivery(&hub, &id).await;
@@ -2047,7 +2030,7 @@ mod tests {
             crate::direct::InvitationBundle::decode(&line).expect("bundle must decode");
         let invitation =
             bundle.invitation.to_invitation().expect("invitation must verify");
-        assert_eq!(invitation.agent_id, "tudor");
+        assert_eq!(invitation.agent_id, "tudor#0042");
         assert_eq!(bundle.authorization.claim.subject_endpoint_id, ana);
     }
 
@@ -2630,6 +2613,7 @@ mod tests {
                 Some("server".to_owned()),
                 None,
                 Arc::new(|_, _| Box::pin(async { Ok(()) })),
+                None,
             ))),
             ..UiOptions::default()
         };

@@ -92,7 +92,7 @@ pub(super) async fn caller_screen(
         .and_then(|store| store.sent_tasks_page(None, 20, None, false))
         .unwrap_or_default();
     let drafts = request_drafts_of(&page.data_dir, now);
-    let hub = page.hub.get();
+    let hub = page.current_hub();
     // The MCP server of this binary and this data directory, so the
     // person's own agent uses the same contacts as this page.
     let mcp_command = mcp_command(&page.data_dir);
@@ -406,7 +406,7 @@ pub(super) async fn confirm_request(
     let Page(Some(page)) = app_context::<Page>(cx) else {
         return Err(bad_request("this node sends no access requests").into());
     };
-    let error = match page.hub.get() {
+    let error = match page.current_hub() {
         Some(hub) => confirm(&hub, &page.data_dir, &form.id, form.days)
             .await
             .err()

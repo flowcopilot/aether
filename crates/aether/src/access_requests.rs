@@ -27,6 +27,31 @@ pub enum DraftError {
     Store,
 }
 
+fn listing_matches_saved_contact(data_dir: &Path, row: &AgentRow, now: i64) -> bool {
+    let now = u64::try_from(now).unwrap_or(u64::MAX);
+    let Ok(store) = crate::direct::open_store(data_dir) else {
+        return false;
+    };
+    let Ok(contacts) = crate::direct::contacts_by_endpoint(&store) else {
+        return false;
+    };
+    if let Some(endpoint) = row.endpoint.as_deref()
+        && contacts.contains_key(endpoint)
+    {
+        return true;
+    }
+    contacts.keys().any(|endpoint| {
+        crate::listing::verify(
+            &row.listing,
+            &row.signature,
+            endpoint,
+            row.expires_at,
+            now,
+        )
+        .is_ok()
+    })
+}
+
 /// Keeps a request to the listed agent `target_name` for `days` days, with
 /// its hub `row`, until the person confirms or discards it.
 pub fn draft(
@@ -55,10 +80,7 @@ pub fn draft(
     if !(1..=u64::from(aether_core::limits::MAX_HUB_ACCESS_DAYS)).contains(&days) {
         return Err(DraftError::Invalid("days must be from 1 to 30"));
     }
-    if crate::direct::open_store(data_dir)
-        .and_then(|store| crate::direct::contact_by_name(&store, target_name))
-        .is_ok()
-    {
+    if listing_matches_saved_contact(data_dir, row, now) {
         return Err(DraftError::Invalid("this agent is a contact already"));
     }
     let lifetime = i64::try_from(DRAFT_LIFETIME.as_secs()).unwrap_or(i64::MAX);
@@ -135,5 +157,41 @@ mod tests {
             draft(directory.path(), "law#0042", &good_row, 7),
             Err(DraftError::Duplicate)
         );
+    }
+
+    #[test]
+    fn a_contact_with_the_same_name_does_not_block_a_listed_agent() {
+        let host = tempfile::tempdir().expect("directory must create");
+        let caller = tempfile::tempdir().expect("directory must create");
+        let impostor = crate::direct::endpoint_id(caller.path()).expect("endpoint");
+        let service_key = iroh::SecretKey::generate();
+        crate::direct::import_bundle(
+            caller.path(),
+            &crate::direct::test_bundle_named(
+                host.path(),
+                &impostor,
+                "law#0042",
+                false,
+            ),
+        )
+        .expect("import");
+        let bytes = crate::listing::listing_bytes(&CardSettings::default(), "law#0042");
+        let expires_at = aether_core::time::unix_seconds(std::time::SystemTime::now())
+            .expect("clock")
+            .saturating_add(3600);
+        let listing = URL_SAFE_NO_PAD.encode(&bytes);
+        let signature = crate::listing::sign(&service_key, &bytes, expires_at);
+        let row = AgentRow {
+            handle: "law#0042".to_owned(),
+            listing,
+            signature,
+            expires_at,
+            online: true,
+            contact: false,
+            endpoint: None,
+            owner: None,
+        };
+        assert_ne!(service_key.public().to_string(), impostor);
+        draft(caller.path(), "law#0042", &row, 7).expect("draft must succeed");
     }
 }
