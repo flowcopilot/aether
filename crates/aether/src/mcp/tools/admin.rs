@@ -119,12 +119,23 @@ impl McpServer {
             }),
             Err(_) => return tool_error("the node policy is unavailable"),
         };
-        tool_success(json!({
-            "policy": policy,
-            "relayUrl": crate::settings::setting::<crate::transport::relay::Relay>(data_dir).ok().flatten(),
-            "hubUrl": self.node_hub(data_dir).resolve_url().ok().flatten(),
-            "policyChangesNeedRestart": true,
-        }).to_string())
+        let Ok(relay_url) =
+            crate::settings::setting::<crate::transport::relay::Relay>(data_dir)
+        else {
+            return tool_error("the node relay setting is unavailable");
+        };
+        let Ok(hub_url) = self.node_hub(data_dir).resolve_url() else {
+            return tool_error("the node hub setting is unavailable");
+        };
+        tool_success(
+            json!({
+                "policy": policy,
+                "relayUrl": relay_url,
+                "hubUrl": hub_url,
+                "policyChangesNeedRestart": true,
+            })
+            .to_string(),
+        )
     }
 
     #[tool(
