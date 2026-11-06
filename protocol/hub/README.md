@@ -30,6 +30,10 @@ Golden signing vectors. `keys` holds two test-only Ed25519 keys: `seed` is
 the 32-byte secret seed (RFC 8032) and `endpoint` the public key, both as
 lowercase hex. Never use them outside tests.
 
+`listingValidation` is a list of listing JSON bodies (UTF-8 bytes as a string)
+with a `handle` and `valid` flag. Each side replays them through its listing
+acceptance rules (the node, the test hub, and the Elixir hub).
+
 Each of `request`, `listing`, `ownerClaim` and `ownerConfirm` is a list of:
 
 ```json

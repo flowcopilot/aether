@@ -85,6 +85,7 @@ dependencies = [
  "predicates",
  "process-wrap",
  "rcgen",
+ "regex",
  "reqwest",
  "rmcp",
  "rusqlite",

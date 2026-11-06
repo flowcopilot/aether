@@ -327,7 +327,10 @@ mod tests {
         let sixth = server.access_request(access_arguments("service5#0001")).await;
         assert_eq!(
             decode_text(&sixth),
-            crate::access_requests::DraftError::Limit.to_string()
+            crate::access_requests::DraftError::Limit(
+                crate::hub_client::protocol::MAX_OPEN_REQUESTS,
+            )
+            .to_string()
         );
     }
 

@@ -59,6 +59,14 @@ defmodule AetherHub.Listings do
 
   def put(%Account{}, _body), do: {:error, :invalid}
 
+  @doc """
+  Whether `bytes` are a listing JSON object that the hub would accept for
+  `handle`, before signing or storage.
+  """
+  def valid_listing?(bytes, handle) when is_binary(bytes) and is_binary(handle) do
+    match?({:ok, _}, parse(bytes, handle))
+  end
+
   defp signed_body(endpoint, %{} = body) do
     now = Clock.now()
 

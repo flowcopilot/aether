@@ -1,7 +1,13 @@
 {
   "keys": {
-    "personal": {"seed": "0101010101010101010101010101010101010101010101010101010101010101", "endpoint": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c"},
-    "service": {"seed": "0202020202020202020202020202020202020202020202020202020202020202", "endpoint": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394"}
+    "personal": {
+      "seed": "0101010101010101010101010101010101010101010101010101010101010101",
+      "endpoint": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c"
+    },
+    "service": {
+      "seed": "0202020202020202020202020202020202020202020202020202020202020202",
+      "endpoint": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394"
+    }
   },
   "request": [
     {
@@ -57,6 +63,80 @@
       },
       "message": "aether-listing/v1\n8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\ntrue\n1762592000\nbbc996b776d2269e7e5114f9fd9da15d9ea56764cdd35406781b5271ca1e7829",
       "signature": "8lBWwRefM6LR2p_n7F1L0gYGvaiEroARRvMaUQ0NqpVOH5L2ZSmcVWPX0cRTNSmib5X4oTBklSNhxMNkyg59DA"
+    }
+  ],
+  "listingValidation": [
+    {
+      "name": "valid one skill",
+      "handle": "law#0042",
+      "listingBytes": "{\"description\":\"Reads contracts and answers questions about them.\",\"name\":\"law#0042\",\"skills\":[{\"description\":\"Reads a contract and lists its risks.\",\"id\":\"general\",\"name\":\"Contracts\",\"tags\":[\"law\",\"contracts\"]}]}",
+      "valid": true
+    },
+    {
+      "name": "handle mismatch",
+      "handle": "law#0042",
+      "listingBytes": "{\"description\":\"Reads contracts and answers questions about them.\",\"name\":\"bob#0001\",\"skills\":[{\"description\":\"Reads a contract and lists its risks.\",\"id\":\"general\",\"name\":\"Contracts\",\"tags\":[\"law\",\"contracts\"]}]}",
+      "valid": false
+    },
+    {
+      "name": "unknown top-level field",
+      "handle": "law#0042",
+      "listingBytes": "{\"description\":\"Reads contracts and answers questions about them.\",\"name\":\"law#0042\",\"skills\":[{\"description\":\"Reads a contract and lists its risks.\",\"id\":\"general\",\"name\":\"Contracts\",\"tags\":[\"law\",\"contracts\"]}],\"url\":\"https://example.com\"}",
+      "valid": false
+    },
+    {
+      "name": "unknown skill field",
+      "handle": "law#0042",
+      "listingBytes": "{\"description\":\"Reads contracts and answers questions about them.\",\"name\":\"law#0042\",\"skills\":[{\"description\":\"Reads a contract and lists its risks.\",\"id\":\"general\",\"name\":\"Contracts\",\"tags\":[\"law\",\"contracts\"],\"examples\":[\"x\"]}]}",
+      "valid": false
+    },
+    {
+      "name": "description too long",
+      "handle": "law#0042",
+      "listingBytes": "{\"description\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"name\":\"law#0042\",\"skills\":[{\"description\":\"Reads a contract and lists its risks.\",\"id\":\"general\",\"name\":\"Contracts\",\"tags\":[\"law\"]}]}",
+      "valid": false
+    },
+    {
+      "name": "too many skills",
+      "handle": "law#0042",
+      "listingBytes": "{\"description\":\"Reads contracts.\",\"name\":\"law#0042\",\"skills\":[{\"description\":\"a\",\"id\":\"s1\",\"name\":\"S1\",\"tags\":[\"a\"]},{\"description\":\"b\",\"id\":\"s2\",\"name\":\"S2\",\"tags\":[\"b\"]},{\"description\":\"c\",\"id\":\"s3\",\"name\":\"S3\",\"tags\":[\"c\"]},{\"description\":\"d\",\"id\":\"s4\",\"name\":\"S4\",\"tags\":[\"d\"]},{\"description\":\"e\",\"id\":\"s5\",\"name\":\"S5\",\"tags\":[\"e\"]},{\"description\":\"f\",\"id\":\"s6\",\"name\":\"S6\",\"tags\":[\"f\"]}]}",
+      "valid": false
+    },
+    {
+      "name": "too many tags",
+      "handle": "law#0042",
+      "listingBytes": "{\"description\":\"Reads contracts.\",\"name\":\"law#0042\",\"skills\":[{\"description\":\"Reads a contract.\",\"id\":\"general\",\"name\":\"Contracts\",\"tags\":[\"a\",\"b\",\"c\",\"d\",\"e\",\"f\"]}]}",
+      "valid": false
+    },
+    {
+      "name": "hidden codepoint in description",
+      "handle": "law#0042",
+      "listingBytes": "{\"description\":\"abc\u202edef\",\"name\":\"law#0042\",\"skills\":[{\"description\":\"Reads a contract.\",\"id\":\"general\",\"name\":\"Contracts\",\"tags\":[\"law\"]}]}",
+      "valid": false
+    },
+    {
+      "name": "zero-width in skill name",
+      "handle": "law#0042",
+      "listingBytes": "{\"description\":\"Reads contracts.\",\"name\":\"law#0042\",\"skills\":[{\"description\":\"Reads a contract.\",\"id\":\"general\",\"name\":\"a\u200bb\",\"tags\":[\"law\"]}]}",
+      "valid": false
+    },
+    {
+      "name": "control character in description",
+      "handle": "law#0042",
+      "listingBytes": "{\"description\":\"one\u0001two\",\"name\":\"law#0042\",\"skills\":[{\"description\":\"Reads a contract.\",\"id\":\"general\",\"name\":\"Contracts\",\"tags\":[\"law\"]}]}",
+      "valid": false
+    },
+    {
+      "name": "duplicate skill id",
+      "handle": "law#0042",
+      "listingBytes": "{\"description\":\"Reads contracts.\",\"name\":\"law#0042\",\"skills\":[{\"description\":\"a\",\"id\":\"general\",\"name\":\"A\",\"tags\":[\"a\"]},{\"description\":\"b\",\"id\":\"general\",\"name\":\"B\",\"tags\":[\"b\"]}]}",
+      "valid": false
+    },
+    {
+      "name": "upper-case tag",
+      "handle": "law#0042",
+      "listingBytes": "{\"description\":\"Reads contracts.\",\"name\":\"law#0042\",\"skills\":[{\"description\":\"Reads a contract.\",\"id\":\"general\",\"name\":\"Contracts\",\"tags\":[\"Law\"]}]}",
+      "valid": false
     }
   ],
   "ownerClaim": [

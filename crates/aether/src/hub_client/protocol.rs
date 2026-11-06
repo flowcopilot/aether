@@ -12,18 +12,33 @@ pub const TIME_HEADER: &str = "x-aether-time";
 pub const SIGNATURE_HEADER: &str = "x-aether-signature";
 pub const DEFAULT_HUB_URL: &str = "https://aether-hub.tudorandrei.xyz";
 pub const HUB_OFF: &str = "off";
+pub const MAX_SKEW_SECONDS: u64 = 300;
+pub const MAX_BODY_BYTES: usize = 16_384;
 pub const MAX_WAIT_SECONDS: u64 = 30;
 pub const ACCESS_DAYS_MIN: u64 = 1;
 pub const ACCESS_DAYS_MAX: u64 = 30;
 pub const DEFAULT_ACCESS_DAYS: u64 = 7;
 pub const OFFER_DAYS: [u64; 3] = [1, 7, 30];
+pub const INVITE_SECONDS: i64 = 604_800;
+pub const INVITE_PREFIX: &str = "aether-invite:";
+pub const MAX_INVITE_BYTES: usize = 8192;
 pub const MAX_OPEN_REQUESTS: u64 = 5;
+pub const MAX_LISTED_REQUESTS: u64 = 50;
+pub const MAX_BLOCKS: u64 = 1000;
+pub const MAX_DIRECTORY_AGENTS: u64 = 100;
+pub const PRESENCE_ONLINE_SECONDS: u64 = 45;
+pub const PRESENCE_LAST_SEEN_STEP_SECONDS: u64 = 900;
+pub const PRESENCE_KEEP_SECONDS: u64 = 604_800;
+pub const NAME_PART_PATTERN: &str = "^[a-z0-9][a-z0-9._-]{0,31}$";
+pub const NAME_NUMBER_MIN: u64 = 1;
+pub const NAME_NUMBER_MAX: u64 = 9999;
+pub const NAME_NUMBER_DIGITS: usize = 4;
+pub const AGENT_SEARCH_LIMIT_MIN: u64 = 1;
 pub const AGENT_SEARCH_LIMIT_DEFAULT: u64 = 10;
 pub const AGENT_SEARCH_LIMIT_MAX: u64 = 20;
 pub const AGENT_SEARCH_MAX_QUERY_CHARS: usize = 128;
-pub const NAME_PART_PATTERN: &str = "^[a-z0-9][a-z0-9._-]{0,31}$";
-pub const NAME_NUMBER_DIGITS: usize = 4;
-pub const INVITE_SECONDS: i64 = 604_800;
+pub const AGENT_SEARCH_MIN_WORD_CHARS: u64 = 2;
+pub const AGENT_SEARCH_MAX_WORDS: u64 = 8;
 pub const MAX_LISTING_BYTES: usize = 8192;
 pub const MAX_LISTING_DAYS: u64 = 30;
 pub const MAX_LISTING_SKILLS: usize = 5;
@@ -33,6 +48,27 @@ pub const MAX_LISTING_SKILL_NAME: usize = 64;
 pub const MAX_LISTING_SKILL_DESCRIPTION: usize = 300;
 pub const MAX_LISTING_TAGS: usize = 5;
 pub const MAX_LISTING_TAG: usize = 24;
+pub const LISTING_HIDDEN_CODEPOINTS: &[(u32, u32)] =
+    &[(0, 31), (127, 159), (8203, 8207), (8234, 8238), (8294, 8297), (65279, 65279)];
+pub const OWNER_LINK_MAX_DAYS: u64 = 365;
+pub const OWNER_CLAIM_SECONDS: i64 = 604_800;
+pub const MAX_OPEN_CLAIMS: u64 = 5;
+pub const MAX_OWNER_LINKS: u64 = 20;
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ListingPayload {
+    pub name: String,
+    pub description: String,
+    pub skills: Vec<ListingSkillPayload>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ListingSkillPayload {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub tags: Vec<String>,
+}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ListingWireError {
@@ -78,19 +114,39 @@ pub fn listing_bytes_match_handle(
     handle: &str,
 ) -> Result<(), ListingWireError> {
     let bytes = URL_SAFE_NO_PAD.decode(text).map_err(|_| ListingWireError::Invalid)?;
+    parse_listing_bytes(&bytes, handle).map(|_| ())
+}
+
+pub fn parse_listing_bytes(
+    bytes: &[u8],
+    handle: &str,
+) -> Result<ListingPayload, ListingWireError> {
     if bytes.len() > MAX_LISTING_BYTES {
         return Err(ListingWireError::Invalid);
     }
     let raw: RawListing =
-        serde_json::from_slice(&bytes).map_err(|_| ListingWireError::Invalid)?;
-    if listing_payload_valid(&raw, handle) {
-        Ok(())
-    } else {
-        Err(ListingWireError::Invalid)
+        serde_json::from_slice(bytes).map_err(|_| ListingWireError::Invalid)?;
+    if !listing_payload_valid(&raw, handle) {
+        return Err(ListingWireError::Invalid);
     }
+    Ok(ListingPayload {
+        name: raw.name,
+        description: raw.description,
+        skills: raw
+            .skills
+            .into_iter()
+            .map(|skill| ListingSkillPayload {
+                id: skill.id,
+                name: skill.name,
+                description: skill.description,
+                tags: skill.tags,
+            })
+            .collect(),
+    })
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawListing {
     name: String,
     description: String,
@@ -98,6 +154,7 @@ struct RawListing {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawSkill {
     id: String,
     name: String,
@@ -124,12 +181,15 @@ fn valid_listing_skill(skill: &RawSkill) -> bool {
         && skill.tags.iter().all(|tag| valid_listing_word(tag, MAX_LISTING_TAG))
 }
 
+fn listing_hidden(character: char) -> bool {
+    let code = u32::from(character);
+    LISTING_HIDDEN_CODEPOINTS.iter().any(|&(low, high)| (low..=high).contains(&code))
+}
+
 fn valid_listing_text(text: &str, max_chars: usize) -> bool {
     !text.trim().is_empty()
         && text.chars().count() <= max_chars
-        && !text.chars().any(|character| {
-            character.is_control() || crate::untrusted::hidden(character)
-        })
+        && !text.chars().any(listing_hidden)
 }
 
 fn valid_listing_word(word: &str, max: usize) -> bool {
@@ -150,6 +210,14 @@ pub fn hub_request_message(
         "aether-hub/v1\n{method}\n{path_and_query}\n{time}\n{}",
         hex::encode(Sha256::digest(body))
     )
+}
+
+#[must_use]
+pub fn hub_sign_target(path: &str, query: Option<&str>) -> String {
+    match query {
+        Some(query) if !query.is_empty() => format!("{path}?{query}"),
+        _ => path.to_owned(),
+    }
 }
 
 #[must_use]
@@ -221,20 +289,29 @@ mod tests {
     use std::sync::OnceLock;
 
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use regex::Regex;
     use serde::Deserialize;
     use serde_json::Value;
 
     use super::{
         ACCESS_DAYS_MAX, ACCESS_DAYS_MIN, AGENT_SEARCH_LIMIT_DEFAULT,
-        AGENT_SEARCH_LIMIT_MAX, AGENT_SEARCH_MAX_QUERY_CHARS, DEFAULT_ACCESS_DAYS,
-        DEFAULT_HUB_URL, HUB_OFF, INVITE_SECONDS, MAX_LISTING_BYTES, MAX_LISTING_DAYS,
-        MAX_LISTING_DESCRIPTION, MAX_LISTING_SKILL_DESCRIPTION, MAX_LISTING_SKILL_ID,
-        MAX_LISTING_SKILL_NAME, MAX_LISTING_SKILLS, MAX_LISTING_TAG, MAX_LISTING_TAGS,
-        MAX_OPEN_REQUESTS, MAX_WAIT_SECONDS, NAME_NUMBER_DIGITS, NAME_PART_PATTERN,
-        OFFER_DAYS, PROTOCOL_HEADER, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
-        hub_request_message, listing_message, owner_claim_message,
-        owner_confirm_message,
+        AGENT_SEARCH_LIMIT_MAX, AGENT_SEARCH_LIMIT_MIN, AGENT_SEARCH_MAX_QUERY_CHARS,
+        AGENT_SEARCH_MAX_WORDS, AGENT_SEARCH_MIN_WORD_CHARS, DEFAULT_ACCESS_DAYS,
+        DEFAULT_HUB_URL, ENDPOINT_HEADER, HUB_OFF, HubWireError, INVITE_PREFIX,
+        INVITE_SECONDS, LISTING_HIDDEN_CODEPOINTS, MAX_BLOCKS, MAX_BODY_BYTES,
+        MAX_DIRECTORY_AGENTS, MAX_INVITE_BYTES, MAX_LISTED_REQUESTS, MAX_LISTING_BYTES,
+        MAX_LISTING_DAYS, MAX_LISTING_DESCRIPTION, MAX_LISTING_SKILL_DESCRIPTION,
+        MAX_LISTING_SKILL_ID, MAX_LISTING_SKILL_NAME, MAX_LISTING_SKILLS,
+        MAX_LISTING_TAG, MAX_LISTING_TAGS, MAX_OPEN_CLAIMS, MAX_OPEN_REQUESTS,
+        MAX_OWNER_LINKS, MAX_SKEW_SECONDS, MAX_WAIT_SECONDS, NAME_NUMBER_DIGITS,
+        NAME_NUMBER_MAX, NAME_NUMBER_MIN, NAME_PART_PATTERN, OFFER_DAYS,
+        OWNER_CLAIM_SECONDS, OWNER_LINK_MAX_DAYS, PRESENCE_KEEP_SECONDS,
+        PRESENCE_LAST_SEEN_STEP_SECONDS, PRESENCE_ONLINE_SECONDS, PROTOCOL_HEADER,
+        PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, SIGNATURE_HEADER, TIME_HEADER,
+        hub_request_message, hub_sign_target, listing_bytes_match_handle,
+        listing_message, owner_claim_message, owner_confirm_message, wire_error,
     };
+    use crate::hub_client::valid_name_part;
 
     const CONTRACT_JSON: &str = include_str!("../../../../protocol/hub/contract.json");
     const VECTORS_JSON: &str = include_str!("../../../../protocol/hub/vectors.json");
@@ -260,10 +337,26 @@ mod tests {
     fn the_rust_table_matches_protocol_hub() {
         let limits = &contract()["limits"];
         let names = &contract()["names"];
+        let headers = &contract()["headers"];
+        let signing = &contract()["signing"];
         assert_eq!(contract()["protocol"].as_u64(), Some(PROTOCOL_VERSION));
         assert_eq!(PROTOCOL_VERSION_HEADER, "2");
-        assert_eq!(contract()["headers"]["protocol"].as_str(), Some(PROTOCOL_HEADER));
+        assert_eq!(headers["protocol"].as_str(), Some(PROTOCOL_HEADER));
+        assert_eq!(headers["endpoint"].as_str(), Some(ENDPOINT_HEADER));
+        assert_eq!(headers["time"].as_str(), Some(TIME_HEADER));
+        assert_eq!(headers["signature"].as_str(), Some(SIGNATURE_HEADER));
+        assert_eq!(signing["maxSkewSeconds"].as_u64(), Some(MAX_SKEW_SECONDS));
+        assert_eq!(signing["endpoint"].as_str(), Some("^[0-9a-f]{64}$"));
+        assert_eq!(
+            limits["maxBodyBytes"].as_u64(),
+            Some(u64::try_from(MAX_BODY_BYTES).expect("body"))
+        );
         assert_eq!(limits["inviteSeconds"].as_i64(), Some(INVITE_SECONDS));
+        assert_eq!(limits["invitePrefix"].as_str(), Some(INVITE_PREFIX));
+        assert_eq!(
+            limits["maxInviteBytes"].as_u64(),
+            Some(u64::try_from(MAX_INVITE_BYTES).expect("invite bytes"))
+        );
         let listing = &limits["listing"];
         assert_eq!(listing["maxDays"].as_u64(), Some(MAX_LISTING_DAYS));
         assert_eq!(
@@ -309,6 +402,19 @@ mod tests {
                 .and_then(|max| max.parse::<usize>().ok()),
             Some(MAX_LISTING_SKILL_ID)
         );
+        let hidden: Vec<(u32, u32)> = listing["hiddenCodepoints"]
+            .as_array()
+            .expect("hidden codepoints")
+            .iter()
+            .map(|range| {
+                let pair = range.as_array().expect("range pair");
+                (
+                    u32::try_from(pair[0].as_u64().expect("low")).expect("low u32"),
+                    u32::try_from(pair[1].as_u64().expect("high")).expect("high u32"),
+                )
+            })
+            .collect();
+        assert_eq!(hidden, LISTING_HIDDEN_CODEPOINTS);
         assert_eq!(limits["maxWaitSeconds"].as_u64(), Some(MAX_WAIT_SECONDS));
         assert_eq!(limits["accessDays"]["min"].as_u64(), Some(ACCESS_DAYS_MIN));
         assert_eq!(limits["accessDays"]["max"].as_u64(), Some(ACCESS_DAYS_MAX));
@@ -323,6 +429,20 @@ mod tests {
             OFFER_DAYS.to_vec()
         );
         assert_eq!(limits["maxOpenRequests"].as_u64(), Some(MAX_OPEN_REQUESTS));
+        assert_eq!(limits["maxListedRequests"].as_u64(), Some(MAX_LISTED_REQUESTS));
+        assert_eq!(limits["maxBlocks"].as_u64(), Some(MAX_BLOCKS));
+        assert_eq!(limits["maxDirectoryAgents"].as_u64(), Some(MAX_DIRECTORY_AGENTS));
+        let presence = &limits["presence"];
+        assert_eq!(presence["onlineSeconds"].as_u64(), Some(PRESENCE_ONLINE_SECONDS));
+        assert_eq!(
+            presence["lastSeenStepSeconds"].as_u64(),
+            Some(PRESENCE_LAST_SEEN_STEP_SECONDS)
+        );
+        assert_eq!(presence["keepSeconds"].as_u64(), Some(PRESENCE_KEEP_SECONDS));
+        assert_eq!(
+            limits["search"]["limit"]["min"].as_u64(),
+            Some(AGENT_SEARCH_LIMIT_MIN)
+        );
         assert_eq!(
             limits["search"]["limit"]["default"].as_u64(),
             Some(AGENT_SEARCH_LIMIT_DEFAULT)
@@ -335,13 +455,112 @@ mod tests {
             limits["search"]["agents"]["maxQueryChars"].as_u64(),
             Some(u64::try_from(AGENT_SEARCH_MAX_QUERY_CHARS).expect("query chars"))
         );
+        assert_eq!(
+            limits["search"]["agents"]["minWordChars"].as_u64(),
+            Some(AGENT_SEARCH_MIN_WORD_CHARS)
+        );
+        assert_eq!(
+            limits["search"]["agents"]["maxWords"].as_u64(),
+            Some(AGENT_SEARCH_MAX_WORDS)
+        );
+        let owner_links = &limits["ownerLinks"];
+        assert_eq!(owner_links["maxDays"].as_u64(), Some(OWNER_LINK_MAX_DAYS));
+        assert_eq!(owner_links["claimSeconds"].as_i64(), Some(OWNER_CLAIM_SECONDS));
+        assert_eq!(owner_links["maxOpenClaims"].as_u64(), Some(MAX_OPEN_CLAIMS));
+        assert_eq!(owner_links["maxLinks"].as_u64(), Some(MAX_OWNER_LINKS));
         assert_eq!(names["name"].as_str(), Some(NAME_PART_PATTERN));
+        assert_eq!(names["numbers"]["min"].as_u64(), Some(NAME_NUMBER_MIN));
+        assert_eq!(names["numbers"]["max"].as_u64(), Some(NAME_NUMBER_MAX));
         assert_eq!(
             names["numberDigits"].as_u64(),
             Some(u64::try_from(NAME_NUMBER_DIGITS).expect("digits"))
         );
         assert_eq!(DEFAULT_HUB_URL, "https://aether-hub.tudorandrei.xyz");
         assert_eq!(HUB_OFF, "off");
+        let errors = contract()["errors"].as_object().expect("errors");
+        for (code, status) in errors {
+            let status =
+                u16::try_from(status.as_u64().expect("status")).expect("status u16");
+            let mapped = wire_error(status, Some(code.as_str()));
+            let expected = match code.as_str() {
+                "invalid" | "too_large" => HubWireError::Invalid,
+                "unauthorized" => HubWireError::Unauthorized,
+                "no_account" => HubWireError::NoAccount,
+                "forbidden" => HubWireError::Forbidden,
+                "not_found" => HubWireError::NotFound,
+                "taken" => HubWireError::Taken,
+                "limit" => HubWireError::Limit,
+                "upgrade_required" => HubWireError::OldNode,
+                "rate_limited" => HubWireError::RateLimited,
+                _ => HubWireError::Unexpected,
+            };
+            assert_eq!(mapped, expected, "{code}");
+        }
+    }
+
+    #[test]
+    fn valid_name_part_matches_contract_name_pattern() {
+        let pattern = Regex::new(NAME_PART_PATTERN).expect("name pattern");
+        let alphabet: Vec<char> =
+            "abcdefghijklmnopqrstuvwxyz0123456789._-".chars().collect();
+        let mut stack = vec![String::new()];
+        while let Some(prefix) = stack.pop() {
+            if prefix.len() < 4 {
+                for character in &alphabet {
+                    let mut next = prefix.clone();
+                    next.push(*character);
+                    stack.push(next);
+                }
+            }
+            assert_eq!(valid_name_part(&prefix), pattern.is_match(&prefix), "{prefix}");
+        }
+        for len in 1..=32 {
+            let name = "a".repeat(len);
+            assert_eq!(valid_name_part(&name), pattern.is_match(&name), "{name}");
+        }
+    }
+
+    #[test]
+    fn hub_sign_target_matches_request_vectors() {
+        for vector in vectors()["request"].as_array().expect("request vectors") {
+            let path_and_query =
+                vector["fields"]["pathAndQuery"].as_str().expect("pathAndQuery");
+            let (path, query) = path_and_query
+                .split_once('?')
+                .map_or((path_and_query, None), |(path, query)| (path, Some(query)));
+            assert_eq!(
+                hub_sign_target(path, query),
+                path_and_query,
+                "{}",
+                vector["name"]
+            );
+        }
+    }
+
+    #[derive(Deserialize)]
+    struct ListingValidationVector {
+        name: String,
+        handle: String,
+        #[serde(rename = "listingBytes")]
+        listing_bytes: String,
+        valid: bool,
+    }
+
+    #[test]
+    fn listing_validation_vectors_match_protocol_hub() {
+        for entry in
+            vectors()["listingValidation"].as_array().expect("listing validation")
+        {
+            let vector: ListingValidationVector =
+                serde_json::from_value(entry.clone()).expect("vector shape");
+            let bytes = vector.listing_bytes.as_bytes();
+            let ok = listing_bytes_match_handle(
+                &URL_SAFE_NO_PAD.encode(bytes),
+                &vector.handle,
+            )
+            .is_ok();
+            assert_eq!(ok, vector.valid, "{}", vector.name);
+        }
     }
 
     #[derive(Deserialize)]

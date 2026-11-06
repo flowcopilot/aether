@@ -53,6 +53,7 @@ cucumber = "0.23.0"
 insta = "1.48.0"
 predicates = "3.1.4"
 rusqlite = "0.40.2"
+regex = "1.12.2"
 tempfile = "3.27.0"
 
 # Every product feature lives in `features/node/*.feature` at the repository

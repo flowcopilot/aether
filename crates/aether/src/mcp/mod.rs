@@ -257,7 +257,10 @@ impl McpServer {
         data_dir: &std::path::Path,
     ) -> Result<std::collections::BTreeMap<String, bool>, &'static str> {
         match self.node_hub(data_dir).client() {
-            Ok(Some(hub)) => Ok(hub.presence(PRESENCE_WAIT).await),
+            Ok(Some(hub)) => hub
+                .presence(PRESENCE_WAIT)
+                .await
+                .map_err(|_| "the hub cannot be reached now"),
             Ok(None) => Ok(std::collections::BTreeMap::new()),
             Err(_) => Err("the hub settings are unavailable"),
         }

@@ -374,8 +374,8 @@ fn authenticate(
 ) -> Option<String> {
     let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
     let endpoint = header(protocol::ENDPOINT_HEADER)?;
-    let time = header("x-aether-time")?;
-    let signature = URL_SAFE_NO_PAD.decode(header("x-aether-signature")?).ok()?;
+    let time = header(protocol::TIME_HEADER)?;
+    let signature = URL_SAFE_NO_PAD.decode(header(protocol::SIGNATURE_HEADER)?).ok()?;
     let signature = iroh::Signature::from_bytes(&signature.try_into().ok()?);
     let key = iroh::PublicKey::from_str(endpoint).ok()?;
     let message =
@@ -617,7 +617,10 @@ fn route(
                     invite.receiver == endpoint && invite.origin == "request"
                 })
                 .count();
-            if open >= 5 {
+            if open
+                >= usize::try_from(protocol::MAX_OPEN_REQUESTS)
+                    .expect("max open requests")
+            {
                 return error(StatusCode::CONFLICT, "limit");
             }
             let id = state.add_request(&service, endpoint, days);
@@ -767,6 +770,7 @@ fn route(
                 .map(|(_, contact)| {
                     json!({
                         "handle": state.handle(contact),
+                        "kind": state.kind(contact).as_str(),
                         "endpoint": contact,
                         "online": state.online.contains(contact),
                         "lastSeen": null,
@@ -803,7 +807,6 @@ fn route(
             if !valid {
                 return error(StatusCode::BAD_REQUEST, "invalid");
             }
-            // The hub keeps the text exactly as sent.
             state.listings.insert(endpoint.to_owned(), body.clone());
             ok(StatusCode::OK, body.clone())
         }
@@ -984,6 +987,9 @@ fn route(
             StatusCode::NO_CONTENT.into_response()
         }
         ("DELETE", ["v1", "contacts", contact]) => {
+            if contact.parse::<iroh::EndpointId>().is_err() {
+                return error(StatusCode::BAD_REQUEST, "invalid");
+            }
             let pair = (endpoint.to_owned(), (*contact).to_owned());
             if !state.contacts.remove(&pair) {
                 return error(StatusCode::NOT_FOUND, "not_found");
