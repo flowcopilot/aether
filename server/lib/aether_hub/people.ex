@@ -15,6 +15,7 @@ defmodule AetherHub.People do
   # Every character of the name alphabet sorts before "{", so the names that
   # start with `q` are the range from `q` up to `q <> "{"`.
   @after_alphabet "{"
+  @personal Protocol.kind(:personal)
 
   @doc """
   The personal agent `name#number`, as seen by `asker`. `{:error,
@@ -23,7 +24,7 @@ defmodule AetherHub.People do
   def lookup(%Account{endpoint: asker}, name, number) do
     case Repo.one(
            from a in Account,
-             where: a.name == ^name and a.number == ^number and a.kind == "personal"
+             where: a.name == ^name and a.number == ^number and a.kind == ^@personal
          ) do
       nil -> {:error, :not_found}
       account -> {:ok, row(account, Contacts.known(asker, [account.endpoint]))}
@@ -49,7 +50,7 @@ defmodule AetherHub.People do
     accounts =
       from(a in Account,
         where:
-          a.name >= ^q and a.name < ^(q <> @after_alphabet) and a.kind == "personal" and
+          a.name >= ^q and a.name < ^(q <> @after_alphabet) and a.kind == ^@personal and
             a.searchable == true,
         order_by: [asc: a.name, asc: a.number],
         limit: ^limit

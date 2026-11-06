@@ -30,10 +30,6 @@ defmodule AetherHub.Features.ContactsTest do
     connect(actor(state, one), actor(state, other))
   end
 
-  defstep ~r/^(?<who>\w+) invites (?<other>\w+)$/, %{who: who, other: other}, state do
-    {:ok, %{invite_id: json(invite(actor(state, who), actor(state, other)))["id"]}}
-  end
-
   defstep ~r/^(?<who>\w+) accepts the invite$/, %{who: who}, %{invite_id: id} = state do
     assert request(actor(state, who), "POST", "/v1/invites/#{id}/accept").status == 200
   end
@@ -72,6 +68,10 @@ defmodule AetherHub.Features.ContactsTest do
           state do
     path = "/v1/contacts/#{actor(state, other).endpoint}"
     {:ok, %{conn: request(actor(state, who), "DELETE", path)}}
+  end
+
+  defstep ~r/^(?<who>\w+) removes a contact with a bad key$/, %{who: who}, state do
+    {:ok, %{conn: request(actor(state, who), "DELETE", "/v1/contacts/not-an-endpoint")}}
   end
 
   defstep ~r/^(?<who>\w+) reads his contacts$/, %{who: who}, state do

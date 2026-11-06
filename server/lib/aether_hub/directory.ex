@@ -14,6 +14,7 @@ defmodule AetherHub.Directory do
   alias AetherHub.{Account, Clock, Listing, Listings, OwnerLinks, Presence, Repo}
 
   @max_agents AetherHub.Protocol.limit(:max_directory_agents)
+  @personal AetherHub.Protocol.kind(:personal)
 
   @doc """
   The listed service agents, online agents first, then by the latest
@@ -64,7 +65,7 @@ defmodule AetherHub.Directory do
       "agents" => page,
       "listed" => length(agents),
       "online" => Enum.count(agents, fn {_endpoint, agent} -> agent["online"] end),
-      "people" => Repo.aggregate(from(a in Account, where: a.kind == "personal"), :count)
+      "people" => Repo.aggregate(from(a in Account, where: a.kind == ^@personal), :count)
     }
   end
 end

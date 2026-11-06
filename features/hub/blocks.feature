@@ -101,6 +101,10 @@ Feature: Blocks
       | a key that is bad  |
       | herself            |
 
+  Scenario: A node cannot unblock a bad key
+    When alice unblocks a key that is bad
+    Then the hub answers 400
+
   Scenario: A person has at most 1,000 blocks
     Given alice has 1,000 blocks
     When alice blocks a new account

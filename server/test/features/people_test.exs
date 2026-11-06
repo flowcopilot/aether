@@ -5,7 +5,7 @@ defmodule AetherHub.Features.PeopleTest do
 
   alias AetherHub.Names
 
-  defp search(asker, params), do: request(asker, "GET", "/v1/people?" <> URI.encode_query(params))
+  defp search(asker, params), do: http_get(asker, "/v1/people", params)
 
   defp fill(text, %{word: word}), do: String.replace(text, "{word}", word)
   defp fill(text, _state), do: text

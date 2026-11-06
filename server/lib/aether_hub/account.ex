@@ -6,11 +6,15 @@ defmodule AetherHub.Account do
   """
   use Ecto.Schema
 
+  alias AetherHub.Protocol
+
+  @default_kind Protocol.default_kind()
+
   @primary_key {:endpoint, :string, autogenerate: false}
   schema "accounts" do
     field :name, :string
     field :number, :integer
-    field :kind, :string, default: "personal"
+    field :kind, :string, default: @default_kind
     field :searchable, :boolean, default: false
     field :created_at, :integer, default: 0
     field :version, :integer, default: 0

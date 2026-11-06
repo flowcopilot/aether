@@ -8,7 +8,8 @@ defmodule AetherHub.Features.InvitesTest do
   @bundle @prefix <> "signed-line"
 
   defp list(node, query \\ "") do
-    conn = request(node, "GET", "/v1/invites" <> query)
+    path = if query == "", do: "/v1/invites", else: "/v1/invites" <> query
+    conn = http_get(node, path)
     assert conn.status == 200
     json(conn)
   end

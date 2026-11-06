@@ -73,7 +73,21 @@ defmodule AetherHub.Protocol do
     max_open_claims: 5,
     max_owner_links: 20
   }
-  @kinds ["personal", "service"]
+  @kind %{personal: "personal", service: "service"}
+  @kinds [@kind.personal, @kind.service]
+  @default_kind @kind.personal
+  @invite_status %{
+    pending: "pending",
+    requested: "requested",
+    accepted: "accepted",
+    delivered: "delivered"
+  }
+  @invite_statuses Enum.map(~w(pending requested accepted delivered)a, &@invite_status[&1])
+  @invite_origin %{invite: "invite", request: "request"}
+  @invite_origins [@invite_origin.invite, @invite_origin.request]
+  @invite_role %{sender: "sender", receiver: "receiver"}
+  @invite_roles [@invite_role.sender, @invite_role.receiver]
+  @owner_link_roles @kinds
 
   def version, do: @version
   def headers, do: @headers
@@ -81,6 +95,15 @@ defmodule AetherHub.Protocol do
   def errors, do: @errors
   def status(code), do: Map.fetch!(@errors, code)
   def kinds, do: @kinds
+  def default_kind, do: @default_kind
+  def kind(name), do: Map.fetch!(@kind, name)
+  def invite_status(name), do: Map.fetch!(@invite_status, name)
+  def invite_origin(name), do: Map.fetch!(@invite_origin, name)
+  def invite_role(name), do: Map.fetch!(@invite_role, name)
+  def invite_statuses, do: @invite_statuses
+  def invite_origins, do: @invite_origins
+  def invite_roles, do: @invite_roles
+  def owner_link_roles, do: @owner_link_roles
   def limits, do: @limits
   def limit(name), do: Map.fetch!(@limits, name)
   def patterns, do: @patterns
@@ -90,4 +113,14 @@ defmodule AetherHub.Protocol do
   whole value, so `$` matches only at the end, not before a final newline.
   """
   def regex(name), do: Regex.compile!(Map.fetch!(@patterns, name), [:dollar_endonly])
+
+  @doc """
+  Whether `endpoint` is a 64-character lowercase hex endpoint id.
+  """
+  def valid_endpoint?(endpoint),
+    do: is_binary(endpoint) and Regex.match?(regex(:endpoint), endpoint)
+
+  @doc "`:ok` when `endpoint` is valid, else `{:error, :invalid}`."
+  def validate_endpoint(endpoint),
+    do: if(valid_endpoint?(endpoint), do: :ok, else: {:error, :invalid})
 end

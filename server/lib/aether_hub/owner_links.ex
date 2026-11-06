@@ -17,6 +17,8 @@ defmodule AetherHub.OwnerLinks do
   @claim_seconds Protocol.limit(:owner_claim_seconds)
   @max_open_claims Protocol.limit(:max_open_claims)
   @max_links Protocol.limit(:max_owner_links)
+  @personal Protocol.kind(:personal)
+  @service Protocol.kind(:service)
 
   @doc """
   The personal agent `account` claims the service agent in `body`. A new
@@ -32,11 +34,11 @@ defmodule AetherHub.OwnerLinks do
     now = Clock.now()
 
     Repo.atomic(fn ->
-      if me.kind != "personal", do: Repo.rollback(:forbidden)
+      if me.kind != @personal, do: Repo.rollback(:forbidden)
 
       target =
         case Names.find(service) do
-          {:ok, %Account{kind: "service"} = target} -> target
+          {:ok, %Account{kind: @service} = target} -> target
           {:ok, _personal} -> Repo.rollback(:not_found)
           {:error, reason} -> Repo.rollback(reason)
         end
@@ -208,7 +210,7 @@ defmodule AetherHub.OwnerLinks do
 
   defp json(%OwnerLink{} = link, service, personal, endpoint) do
     confirmed = link.confirm_signature != nil
-    role = if link.personal_endpoint == endpoint, do: "personal", else: "service"
+    role = if link.personal_endpoint == endpoint, do: @personal, else: @service
 
     %{
       "id" => link.id,
@@ -221,8 +223,8 @@ defmodule AetherHub.OwnerLinks do
       "confirmSignature" => link.confirm_signature,
       # The service signs the personal endpoint, so it sees it. The
       # personal side sees the service endpoint once the link is active.
-      "personalEndpoint" => if(role == "service", do: link.personal_endpoint),
-      "serviceEndpoint" => if(role == "personal" and confirmed, do: link.service_endpoint)
+      "personalEndpoint" => if(role == @service, do: link.personal_endpoint),
+      "serviceEndpoint" => if(role == @personal and confirmed, do: link.service_endpoint)
     }
   end
 end

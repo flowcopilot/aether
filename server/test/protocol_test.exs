@@ -30,6 +30,13 @@ defmodule AetherHub.ProtocolTest do
 
   test "the hub's names and patterns are the contract's" do
     assert Protocol.kinds() == Contract.get(["names", "kinds"])
+    assert Protocol.default_kind() == Contract.get(["names", "defaultKind"])
+    assert Protocol.kind(:personal) in Protocol.kinds()
+    assert Protocol.kind(:service) in Protocol.kinds()
+    assert Protocol.invite_statuses() == Contract.get(["values", "inviteStatus"])
+    assert Protocol.invite_origins() == Contract.get(["values", "inviteOrigin"])
+    assert Protocol.invite_roles() == Contract.get(["values", "inviteRole"])
+    assert Protocol.owner_link_roles() == Contract.get(["values", "ownerLinkRole"])
     assert Protocol.limit(:numbers) == range(Contract.get(["names", "numbers"]))
 
     assert Protocol.patterns() == %{
