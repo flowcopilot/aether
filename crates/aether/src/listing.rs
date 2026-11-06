@@ -1,5 +1,5 @@
 //! The public listing of a service agent on the hub (`PUT /v1/listing` in
-//! `server/PROTOCOL.md`).
+//! `protocol/hub/contract.json`).
 //!
 //! The listing reuses the text of the Agent Card, so the owner writes it one
 //! time. It holds the full name, the description and the skill, and no
@@ -20,7 +20,7 @@ pub use crate::hub_client::protocol::{
     MAX_LISTING_SKILL_DESCRIPTION as MAX_SKILL_DESCRIPTION,
     MAX_LISTING_SKILL_ID as MAX_SKILL_ID, MAX_LISTING_SKILL_NAME as MAX_SKILL_NAME,
     MAX_LISTING_SKILLS as MAX_SKILLS, MAX_LISTING_TAG as MAX_TAG,
-    MAX_LISTING_TAGS as MAX_TAGS,
+    MAX_LISTING_TAGS as MAX_TAGS, OWNER_LINK_MAX_DAYS,
 };
 
 /// How long a new listing stays on the hub. The hub accepts 30 days at most.
@@ -37,24 +37,6 @@ pub enum ListingError {
     Signature,
     #[error("the listing has expired")]
     Expired,
-}
-
-/// The listing bytes as JSON. A key two times is refused by the derive.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawListing {
-    name: String,
-    description: String,
-    skills: Vec<RawSkill>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawSkill {
-    id: String,
-    name: String,
-    description: String,
-    tags: Vec<String>,
 }
 
 /// A listing that passed the checks. Every text is from a stranger.
@@ -139,29 +121,8 @@ pub fn verify(
 }
 
 /// How long an owner link lasts. The hub accepts 365 days at most.
-pub const OWNER_LINK_LIFETIME: Duration = Duration::from_hours(365 * 24);
-
-/// The message that the personal agent `personal` signs to claim the service
-/// agent `service_handle` as its own until `expires_at`.
-#[must_use]
-pub fn owner_claim_message(
-    personal: &str,
-    service_handle: &str,
-    expires_at: u64,
-) -> String {
-    crate::hub_client::protocol::owner_claim_message(
-        personal,
-        service_handle,
-        expires_at,
-    )
-}
-
-/// The message that the service agent `service` signs to confirm the claim
-/// of the personal agent `personal` until `expires_at`.
-#[must_use]
-pub fn owner_confirm_message(service: &str, personal: &str, expires_at: u64) -> String {
-    crate::hub_client::protocol::owner_confirm_message(service, personal, expires_at)
-}
+pub const OWNER_LINK_LIFETIME: Duration =
+    Duration::from_hours(OWNER_LINK_MAX_DAYS.saturating_mul(24));
 
 /// The claim of the personal agent with the endpoint `key` for the service
 /// agent `service_handle`, as unpadded base64url.
@@ -171,8 +132,11 @@ pub fn sign_owner_claim(
     service_handle: &str,
     expires_at: u64,
 ) -> String {
-    let message =
-        owner_claim_message(&key.public().to_string(), service_handle, expires_at);
+    let message = crate::hub_client::protocol::owner_claim_message(
+        &key.public().to_string(),
+        service_handle,
+        expires_at,
+    );
     URL_SAFE_NO_PAD.encode(key.sign(message.as_bytes()).to_bytes())
 }
 
@@ -184,19 +148,20 @@ pub fn sign_owner_confirm(
     personal: &str,
     expires_at: u64,
 ) -> String {
-    let message =
-        owner_confirm_message(&key.public().to_string(), personal, expires_at);
+    let message = crate::hub_client::protocol::owner_confirm_message(
+        &key.public().to_string(),
+        personal,
+        expires_at,
+    );
     URL_SAFE_NO_PAD.encode(key.sign(message.as_bytes()).to_bytes())
 }
 
 /// The listing in `text` (base64url) when it passes the hub's rules and
 /// names `handle`. Every text is cleaned for display.
 pub fn parse(text: &str, handle: &str) -> Result<Listing, ListingError> {
-    crate::hub_client::protocol::listing_bytes_match_handle(text, handle)
-        .map_err(wire_error)?;
     let bytes = URL_SAFE_NO_PAD.decode(text).map_err(|_| ListingError::Invalid)?;
-    let raw: RawListing =
-        serde_json::from_slice(&bytes).map_err(|_| ListingError::Invalid)?;
+    let raw = crate::hub_client::protocol::parse_listing_bytes(&bytes, handle)
+        .map_err(wire_error)?;
     Ok(Listing {
         name: untrusted::single_line(&raw.name, raw.name.chars().count()),
         description: untrusted::single_line(&raw.description, MAX_DESCRIPTION),
@@ -384,23 +349,6 @@ mod tests {
 
     fn encode(bytes: &[u8]) -> String {
         URL_SAFE_NO_PAD.encode(bytes)
-    }
-
-    #[test]
-    fn the_owner_claim_signs_the_service_full_name() {
-        let key = iroh::SecretKey::generate();
-        let personal = key.public().to_string();
-        let signature = super::sign_owner_claim(&key, "law#0042", NOW);
-        let bytes: [u8; 64] = URL_SAFE_NO_PAD
-            .decode(&signature)
-            .expect("base64url")
-            .try_into()
-            .expect("64 bytes");
-        let signature = iroh::Signature::from_bytes(&bytes);
-        let message = super::owner_claim_message(&personal, "law#0042", NOW);
-        assert!(key.public().verify(message.as_bytes(), &signature).is_ok());
-        let other = super::owner_claim_message(&personal, "law#0043", NOW);
-        assert!(key.public().verify(other.as_bytes(), &signature).is_err());
     }
 
     #[test]

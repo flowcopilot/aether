@@ -576,8 +576,10 @@ pub async fn run(
         if active
             && presence_read.is_none_or(|read| read.elapsed() >= PRESENCE_INTERVAL)
         {
-            if let Ok(Some(hub)) = hubs.client() {
-                presence = Some(hub.presence(Duration::from_secs(4)).await);
+            if let Ok(Some(hub)) = hubs.client()
+                && let Ok(map) = hub.presence(Duration::from_secs(4)).await
+            {
+                presence = Some(map);
             }
             presence_read = Some(std::time::Instant::now());
         }

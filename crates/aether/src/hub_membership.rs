@@ -46,7 +46,8 @@ pub fn keep_hub_name(data_dir: &std::path::Path, handle: &str) {
         let _ = crate::settings::store_setting::<crate::hub_client::settings::HubName>(
             data_dir,
             &Some(handle.to_owned()),
-        );
+        )
+        .inspect_err(|error| tracing::warn!(?error, "hub name not kept locally"));
     }
 }
 
@@ -61,7 +62,9 @@ pub async fn offer(
 ) -> Result<Invite, &'static str> {
     let invite = hub.invite(to, days).await.map_err(hub_message)?;
     if approve_invite(data_dir, &invite, days).is_err() {
-        let _ = hub.remove(&invite.id).await;
+        hub.remove(&invite.id).await.inspect_err(|error| {
+            tracing::warn!(?error, invite_id = %invite.id, "hub invite left after local approval failed");
+        }).ok();
         return Err("This node cannot keep the invite. Try again.");
     }
     Ok(invite)
@@ -109,25 +112,25 @@ pub async fn accept(
         })
         .ok_or(HubError::Forbidden)?;
     let now = now();
+    let days = u32::try_from(invite.days.clamp(
+        crate::hub_client::protocol::ACCESS_DAYS_MIN,
+        crate::hub_client::protocol::ACCESS_DAYS_MAX,
+    ))
+    .map_err(|_| HubError::Unexpected)?;
     crate::hub_store::HubStore::open(data_dir)
-        .and_then(|store| {
-            store.put_approval(&HubApproval {
-                invite_id: invite.id.clone(),
-                side: ApprovalSide::Receiver,
-                kind: ApprovalKind::Invite,
-                peer_name: invite.from.clone(),
-                peer_endpoint: None,
-                days: u32::try_from(invite.days.clamp(
-                    crate::hub_client::protocol::ACCESS_DAYS_MIN,
-                    crate::hub_client::protocol::ACCESS_DAYS_MAX,
-                ))
-                .unwrap_or(u32::MAX),
-                access_group: crate::access_groups::FRIENDS_GROUP.to_owned(),
-                bundle: None,
-                created_at: now,
-                expires_at: now.saturating_add(APPROVAL_SECONDS),
-                listing: None,
-            })
+        .map_err(|_| HubError::Unexpected)?
+        .put_approval(&HubApproval {
+            invite_id: invite.id.clone(),
+            side: ApprovalSide::Receiver,
+            kind: ApprovalKind::Invite,
+            peer_name: invite.from.clone(),
+            peer_endpoint: None,
+            days,
+            access_group: crate::access_groups::FRIENDS_GROUP.to_owned(),
+            bundle: None,
+            created_at: now,
+            expires_at: now.saturating_add(APPROVAL_SECONDS),
+            listing: None,
         })
         .map_err(|_| HubError::Unexpected)?;
     hub.accept(id).await

@@ -1,5 +1,6 @@
 //! The client of the Aether hub (`server/`), which matches two people by
-//! name so that neither copies a code. `server/PROTOCOL.md` is the contract.
+//! name so that neither copies a code. `protocol/hub/contract.json` is the
+//! contract.
 //!
 //! The node's endpoint key is its hub account: every request is signed with
 //! it, and the hub knows the node by its endpoint ID.
@@ -116,20 +117,18 @@ impl HubClient {
         Self::new(origin, key)
     }
 
-    /// Whether each contact is online, by endpoint ID. Empty when the hub
-    /// does not answer within `wait`.
     pub async fn presence(
         &self,
         wait: Duration,
-    ) -> std::collections::BTreeMap<String, bool> {
-        tokio::time::timeout(wait, self.contacts())
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|contact| (contact.endpoint, contact.online))
-            .collect()
+    ) -> Result<std::collections::BTreeMap<String, bool>, HubError> {
+        match tokio::time::timeout(wait, self.contacts()).await {
+            Ok(Ok(contacts)) => Ok(contacts
+                .into_iter()
+                .map(|contact| (contact.endpoint, contact.online))
+                .collect()),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(HubError::Unreachable),
+        }
     }
 
     #[must_use]
@@ -407,7 +406,7 @@ impl HubClient {
         let signature = self.key.sign(
             protocol::hub_request_message(
                 method.as_str(),
-                &signed_target(&url),
+                &protocol::hub_sign_target(url.path(), url.query()),
                 &time,
                 &body,
             )
@@ -449,16 +448,6 @@ fn request_url(
         url.query_pairs_mut().extend_pairs(query);
     }
     Ok(url)
-}
-
-/// The path and query that the node signs, as the hub reads them: the path,
-/// and `?` with the query only when the query is not empty
-/// (`path_and_query/1` in `server/lib/aether_hub/verify.ex`).
-fn signed_target(url: &Url) -> String {
-    match url.query() {
-        Some(query) if !query.is_empty() => format!("{}?{query}", url.path()),
-        _ => url.path().to_owned(),
-    }
 }
 
 fn status_error(status: StatusCode, body: &[u8]) -> HubError {
@@ -548,7 +537,7 @@ mod tests {
     use super::{
         DEFAULT_HUB_URL, HubError, Invites, NodeHub, Origin, PROTOCOL_HEADER,
         PROTOCOL_VERSION_HEADER, Status, parse_origin, protocol, request_url,
-        resolve_url, signed_target, status_error, test_hub::TestHub,
+        resolve_url, status_error, test_hub::TestHub,
     };
 
     #[test]
@@ -574,7 +563,10 @@ mod tests {
             url.as_str(),
             "https://hub.example/v1/agents?q=review+go%231+%C3%BC%26x"
         );
-        assert_eq!(signed_target(&url), "/v1/agents?q=review+go%231+%C3%BC%26x");
+        assert_eq!(
+            protocol::hub_sign_target(url.path(), url.query()),
+            "/v1/agents?q=review+go%231+%C3%BC%26x"
+        );
     }
 
     #[tokio::test]
@@ -609,7 +601,7 @@ mod tests {
         let origin = parse_origin("https://hub.example").expect("origin must parse");
         let url = request_url(&origin, "/v1/account", &[]).expect("url must build");
         assert_eq!(url.as_str(), "https://hub.example/v1/account");
-        assert_eq!(signed_target(&url), "/v1/account");
+        assert_eq!(protocol::hub_sign_target(url.path(), url.query()), "/v1/account");
 
         let hub = TestHub::start().await;
         let directory = tempfile::tempdir().expect("directory must create");

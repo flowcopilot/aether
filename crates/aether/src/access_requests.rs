@@ -17,8 +17,8 @@ pub const DRAFT_LIFETIME: Duration = Duration::from_hours(24);
 pub enum DraftError {
     #[error("{0}")]
     Invalid(&'static str),
-    #[error("5 requests already wait for confirmation on the Aether page")]
-    Limit,
+    #[error("{0} requests already wait for confirmation on the Aether page")]
+    Limit(u64),
     #[error(
         "a request to this agent already waits for confirmation on the Aether page"
     )]
@@ -27,20 +27,21 @@ pub enum DraftError {
     Store,
 }
 
-fn listing_matches_saved_contact(data_dir: &Path, row: &AgentRow, now: i64) -> bool {
+fn listing_matches_saved_contact(
+    data_dir: &Path,
+    row: &AgentRow,
+    now: i64,
+) -> Result<bool, DraftError> {
     let now = u64::try_from(now).unwrap_or(u64::MAX);
-    let Ok(store) = crate::direct::open_store(data_dir) else {
-        return false;
-    };
-    let Ok(contacts) = crate::direct::contacts_by_endpoint(&store) else {
-        return false;
-    };
+    let store = crate::direct::open_store(data_dir).map_err(|_| DraftError::Store)?;
+    let contacts =
+        crate::direct::contacts_by_endpoint(&store).map_err(|_| DraftError::Store)?;
     if let Some(endpoint) = row.endpoint.as_deref()
         && contacts.contains_key(endpoint)
     {
-        return true;
+        return Ok(true);
     }
-    contacts.keys().any(|endpoint| {
+    Ok(contacts.keys().any(|endpoint| {
         crate::listing::verify(
             &row.listing,
             &row.signature,
@@ -49,7 +50,7 @@ fn listing_matches_saved_contact(data_dir: &Path, row: &AgentRow, now: i64) -> b
             now,
         )
         .is_ok()
-    })
+    }))
 }
 
 /// Keeps a request to the listed agent `target_name` for `days` days, with
@@ -83,7 +84,7 @@ pub fn draft(
     {
         return Err(DraftError::Invalid("days must be from 1 to 30"));
     }
-    if listing_matches_saved_contact(data_dir, row, now) {
+    if listing_matches_saved_contact(data_dir, row, now)? {
         return Err(DraftError::Invalid("this agent is a contact already"));
     }
     let lifetime = i64::try_from(DRAFT_LIFETIME.as_secs()).unwrap_or(i64::MAX);
@@ -102,7 +103,9 @@ pub fn draft(
     let mut store = NodeStore::in_dir(data_dir).map_err(|_| DraftError::Store)?;
     match store.add_access_request_draft(&draft) {
         Ok(()) => Ok(draft),
-        Err(StoreError::Overloaded) => Err(DraftError::Limit),
+        Err(StoreError::Overloaded) => {
+            Err(DraftError::Limit(crate::hub_client::protocol::MAX_OPEN_REQUESTS))
+        }
         Err(StoreError::DuplicateConflict) => Err(DraftError::Duplicate),
         Err(_) => Err(DraftError::Store),
     }
