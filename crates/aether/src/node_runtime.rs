@@ -10,7 +10,6 @@ use crate::{
     admin::SharedAdministration,
     admin_ui::{PageContext, RelaySwitcher, UiOptions},
     directory_publication::DirectoryPublication,
-    hub_client::HubClient,
     node_service::RunningNode,
     policy::AgentAdapter,
     transport,
@@ -129,14 +128,6 @@ impl BackgroundWorkers {
     }
 }
 
-pub fn hub_client(
-    hub_url: Option<&str>,
-    data_dir: &Path,
-) -> Result<Option<HubClient>, NodeRunError> {
-    crate::hub_client::configured_hub_client(hub_url, data_dir)
-        .map_err(|error| NodeRunError::Usage(error.to_string()))
-}
-
 pub fn start_background_workers(
     administration: &SharedAdministration,
     page: &Arc<PageContext>,
@@ -210,10 +201,10 @@ pub async fn run(options: NodeServeOptions) -> Result<(), NodeRunError> {
     if options
         .invite_name
         .as_deref()
-        .is_some_and(|name| !crate::hub_client::valid_name_part(name))
+        .is_some_and(|name| !crate::direct::valid_name(name))
     {
         return Err(NodeRunError::Usage(
-            "--invite-name must be 1 to 32 lowercase letters, digits, dots, underscores or dashes, starting with a letter or digit".to_owned(),
+            "--invite-name must be a valid direct contact name (1 to 64 letters, digits, dots, underscores or dashes, or a hub full name with #)".to_owned(),
         ));
     }
     let service = Arc::new(
@@ -241,7 +232,11 @@ pub async fn run(options: NodeServeOptions) -> Result<(), NodeRunError> {
             crate::data_dir::DataDir::new(&options.data_dir).agent_socket().display()
         ),
     }
-    let hub = hub_client(options.hub_url.as_deref(), &options.data_dir)?;
+    let hub = crate::hub_client::configured_hub_client(
+        options.hub_url.as_deref(),
+        &options.data_dir,
+    )
+    .map_err(|error| NodeRunError::Usage(error.to_string()))?;
     let pact = match (options.pact_listen.as_deref(), service.pact_config()) {
         (None, _) => None,
         (Some(_), None) => {
@@ -595,12 +590,14 @@ pub async fn start_directory_publication(
         }
         return Err(());
     };
-    if ttl < 2
-        || agent_id.is_empty()
-        || scope.is_empty()
-        || capability.is_empty()
-        || scope != configured_scope
-    {
+    if !crate::directory_publication::valid_publication_fields(
+        agent_id,
+        address,
+        scope,
+        capability,
+        ttl,
+        configured_scope,
+    ) {
         return Err(());
     }
     let mut address = address.parse::<std::net::SocketAddr>().map_err(|_| ())?;
@@ -624,8 +621,6 @@ pub async fn start_directory_publication(
     let record = publication.renew(&endpoint_id).await.map_err(|_| ())?;
     Ok(Some((publication, record)))
 }
-
-pub use crate::managed_client::{managed_member_active, sync_managed};
 
 #[cfg(test)]
 mod tests {

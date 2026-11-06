@@ -2,14 +2,31 @@
 
 use std::{path::PathBuf, process::ExitCode};
 
+use usage_rs::Subcommands;
+
 use super::{ManagedClient, ManagedClientError, sync_managed};
 use crate::directory_client::read_directory_record;
 
+#[derive(Subcommands)]
 pub enum Command {
-    Redeem { token_file: PathBuf, record: PathBuf },
-    Members { scope: String },
-    Events { scope: String, after: Option<i64> },
-    Sync { scope: String, data_dir: PathBuf },
+    Redeem {
+        #[usage(long)]
+        token_file: PathBuf,
+        record: PathBuf,
+    },
+    Members {
+        scope: String,
+    },
+    Events {
+        scope: String,
+        #[usage(long)]
+        after: Option<i64>,
+    },
+    Sync {
+        scope: String,
+        #[usage(long)]
+        data_dir: Option<PathBuf>,
+    },
 }
 
 pub struct Options {
@@ -68,6 +85,7 @@ pub async fn run(options: Options) -> ExitCode {
             }
         }
         Command::Sync { scope, data_dir } => {
+            let data_dir = crate::data_dir::resolve_node_data_dir(data_dir);
             if let Ok((cursor, changes)) =
                 sync_managed(&data_dir, &options.control, &scope, &client).await
             {
