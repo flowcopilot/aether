@@ -235,9 +235,6 @@ defmodule AetherHub.Router do
     reply(conn, {:error, :not_found})
   end
 
-  # A signed request counts against the endpoint's request limit. Only a
-  # request within the limit marks the endpoint as seen, and its account is
-  # read once for the route.
   defp admit(%Plug.Conn{assigns: %{endpoint: endpoint}} = conn, _opts) do
     case RateLimit.hit(:request, endpoint) do
       :ok ->
@@ -258,8 +255,6 @@ defmodule AetherHub.Router do
     with {:ok, body} <- decode(conn), do: as_account(conn, &fun.(&1, body))
   end
 
-  # Runs `fun` when `bucket` has room for `key`, and counts a success that
-  # makes something new. A request that fails uses up nothing.
   defp counted(nil, fun), do: fun.()
 
   defp counted({bucket, key}, fun) do
@@ -291,7 +286,6 @@ defmodule AetherHub.Router do
   defp limited(:ok), do: :ok
   defp limited(:rate_limited), do: {:error, :rate_limited}
 
-  # A path names an account with two segments, such as `/ana/0042`.
   defp parse_name(name, number) do
     case Names.parse_handle(name <> "#" <> number) do
       {:ok, parsed} -> {:ok, parsed}

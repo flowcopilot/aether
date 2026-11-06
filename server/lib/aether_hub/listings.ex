@@ -80,8 +80,6 @@ defmodule AetherHub.Listings do
 
   defp signed_body(_endpoint, _body), do: {:error, :invalid}
 
-  # The text fields of the listing `bytes` for the search index, when the
-  # listing passes the allowlist and names `handle`.
   defp parse(bytes, handle) do
     with {:ok, %{} = listing} <- Json.decode(bytes),
          true <- Enum.sort(Map.keys(listing)) == @listing_keys,

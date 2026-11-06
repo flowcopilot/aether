@@ -95,7 +95,6 @@ test("each task gets a route keyed by its task id with the per-account-channel-p
   assert.deepEqual(routeCalls[0].peer, { kind: "direct", id: "t1" });
   assert.equal(routeCalls[0].dmScope, "per-account-channel-peer");
 
-  // The ingress check and the dispatch use the session that the route chose.
   const sessionKey = "agent:aether:aether:default:direct:t1";
   assert.equal(calls.resolveStable[0].contextBinding.sessionKey, sessionKey);
   assert.equal(calls.dispatch[0].route.sessionKey, sessionKey);

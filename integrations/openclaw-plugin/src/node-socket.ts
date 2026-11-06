@@ -26,7 +26,6 @@ export class NodeSocket {
     this.#retryMs = options.retryMs ?? RECONNECT_MS;
   }
 
-  // Resolves when the signal aborts.
   async run(signal: AbortSignal): Promise<void> {
     while (!signal.aborted) {
       await this.#session(signal);
@@ -36,7 +35,6 @@ export class NodeSocket {
     }
   }
 
-  // False when no node is connected.
   send(message: AgentMessage): boolean {
     const socket = this.#socket;
     if (socket === undefined || socket.destroyed) {
@@ -71,7 +69,6 @@ export class NodeSocket {
           }
           end = buffer.indexOf(0x0a);
         }
-        // A line, its newline included, has at most MAX_LINE bytes.
         if (end >= MAX_LINE || (end === -1 && buffer.length >= MAX_LINE)) {
           socket.destroy();
         }

@@ -23,7 +23,6 @@ export interface AetherAccount {
   allowedTools: string[];
 }
 
-// channels.aether, as the manifest schema describes it.
 export function channelSection(cfg: OpenClawConfig): Record<string, unknown> | undefined {
   const channels: unknown = (cfg as { channels?: unknown }).channels;
   if (!isRecord(channels) || !isRecord(channels[CHANNEL_ID])) {
@@ -125,8 +124,6 @@ export const aetherChannelPlugin = createChatChannelPlugin<AetherAccount>({
           resolveRoute: resolveAgentRoute,
         });
 
-        // The socket hands each line to the runner. The runner answers through
-        // the socket. Neither callback runs before both are assigned.
         const socket = new NodeSocket({
           path: socketPath(account.dataDir),
           onMessage: (message) => runner.handle(message),

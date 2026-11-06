@@ -40,7 +40,6 @@ export class TaskRunner {
     }
   }
 
-  // Stops and forgets every open turn: the node has failed them.
   close(): void {
     const tasks = [...this.#open.values()];
     this.#open.clear();

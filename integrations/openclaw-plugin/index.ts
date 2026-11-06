@@ -1,5 +1,4 @@
 // Plugin entry. It registers the "aether" channel and a before_tool_call guard.
-// The guard limits the tools that an Aether task may call (src/tool-guard.ts).
 import { defineChannelPluginEntry } from "openclaw/plugin-sdk/channel-core";
 import { aetherChannelPlugin, allowedToolsFrom } from "./src/channel.ts";
 import { CHANNEL_ID, DESCRIPTION } from "./src/inbound.ts";
