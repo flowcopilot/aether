@@ -91,8 +91,7 @@ pub(super) async fn caller_screen(
     let connected = !contacts.is_empty();
     // The newest tasks that this computer sent, from its outbox.
     let sent = aether_store::NodeStore::in_dir(&page.data_dir)
-        .and_then(|store| store.sent_tasks_page(None, 20, None, false))
-        .unwrap_or_default();
+        .and_then(|store| store.sent_tasks_page(None, 20, None, false));
     let drafts = super::shared::request_drafts_of(&page.data_dir, now);
     let hub = page.current_hub();
     // The MCP server of this binary and this data directory, so the
@@ -217,8 +216,17 @@ pub(super) async fn caller_screen(
                     )
                 </section>
             }
-            if !sent.is_empty() {
-                sent_tasks(tasks: sent.clone(), now: now)
+            match &sent {
+                Ok(sent) if !sent.is_empty() => {
+                    sent_tasks(tasks: sent.clone(), now: now)
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    <section aria-labelledby="sent" class="flex flex-col gap-4">
+                        <h2 id="sent" class="text-xl font-semibold tracking-tight">"Sent tasks"</h2>
+                        <p role="alert" class="text-muted-foreground">"Sent tasks cannot be loaded."</p>
+                    </section>
+                }
             }
             if connected {
                 <section id="connect" aria-labelledby="connect-title" class="flex flex-col gap-4 rounded-xl border border-border px-5 py-4">
