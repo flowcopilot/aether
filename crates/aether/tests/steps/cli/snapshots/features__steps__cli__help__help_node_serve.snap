@@ -1,5 +1,6 @@
 ---
 source: crates/aether/tests/steps/cli/help.rs
+assertion_line: 29
 expression: world.cli.stdout()
 ---
 Usage: aether node serve [FLAGS]
@@ -9,7 +10,6 @@ Flags:
                                           changes use SQLite.
                                           (default: ~/.aether/policy.json)
       --data-dir <DATA_DIR>
-                                          (default: ~/.aether/host)
       --port <PORT>
                                           (default: 0)
       --admin-port <ADMIN_PORT>

@@ -13,6 +13,23 @@ pub enum PinnedError {
     Client,
 }
 
+#[derive(Clone)]
+pub struct PinnedOrigin {
+    pub client: Client,
+    pub origin: Url,
+}
+
+impl PinnedOrigin {
+    pub fn open(origin: &str, certificate_der: &[u8]) -> Result<Self, PinnedError> {
+        let (client, origin) = client(origin, certificate_der)?;
+        Ok(Self { client, origin })
+    }
+
+    pub fn url(&self, segments: &[&str]) -> Option<Url> {
+        url(&self.origin, segments)
+    }
+}
+
 /// A client that trusts only `certificate_der`, and the origin it talks
 /// to. The origin must be HTTPS with a host and nothing after it: no
 /// credentials, query or fragment. Any path is dropped.

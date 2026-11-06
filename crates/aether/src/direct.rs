@@ -2,6 +2,8 @@
 //! contact a caller keeps, and one text task sent to that contact. The CLI
 //! and the admin web UI both use these functions.
 
+pub mod cli;
+
 use std::{
     collections::BTreeMap,
     path::Path,

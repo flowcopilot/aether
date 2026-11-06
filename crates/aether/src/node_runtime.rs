@@ -17,6 +17,7 @@ use crate::{
 };
 
 #[derive(Debug, Clone)]
+#[allow(clippy::too_many_arguments)]
 pub struct NodeServeOptions {
     pub policy: PathBuf,
     pub data_dir: PathBuf,
@@ -169,7 +170,11 @@ pub fn start_background_workers(
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                if sync_managed(&data_dir, &control, &scope_id, &client).await.is_err()
+                if crate::managed_client::sync_managed(
+                    &data_dir, &control, &scope_id, &client,
+                )
+                .await
+                .is_err()
                 {
                     eprintln!(
                         "{}",
@@ -295,9 +300,14 @@ pub async fn run(options: NodeServeOptions) -> Result<(), NodeRunError> {
             .map_err(|_| {
                 NodeRunError::Usage("managed control connection is invalid".to_owned())
             })?;
-            if sync_managed(&options.data_dir, control, &scope_id, &client)
-                .await
-                .is_err()
+            if crate::managed_client::sync_managed(
+                &options.data_dir,
+                control,
+                &scope_id,
+                &client,
+            )
+            .await
+            .is_err()
             {
                 return Err(NodeRunError::Failed(
                     "managed roster synchronization failed".to_owned(),
@@ -615,58 +625,7 @@ pub async fn start_directory_publication(
     Ok(Some((publication, record)))
 }
 
-#[allow(clippy::result_unit_err)]
-pub async fn sync_managed(
-    data_dir: &Path,
-    control: &str,
-    scope_id: &str,
-    client: &crate::managed_client::ManagedClient,
-) -> Result<(i64, usize), ()> {
-    std::fs::create_dir_all(data_dir).map_err(|_| ())?;
-    let mut store = aether_store::NodeStore::in_dir(data_dir).map_err(|_| ())?;
-    let mut cursor = store.managed_cursor(control, scope_id).map_err(|_| ())?;
-    let mut changes = 0usize;
-    loop {
-        let events = client.events_after(scope_id, cursor).await.map_err(|_| ())?;
-        if events.is_empty() {
-            return Ok((cursor, changes));
-        }
-        for event in events {
-            if event.cursor <= cursor {
-                return Err(());
-            }
-            match event.event {
-                aether_store::ManagedEventType::Joined => {
-                    let member = event.member.ok_or(())?;
-                    store
-                        .apply_managed_member(control, event.cursor, &member)
-                        .map_err(|_| ())?;
-                }
-                aether_store::ManagedEventType::Revoked if event.member.is_none() => {
-                    store
-                        .revoke_managed_member(
-                            control,
-                            event.cursor,
-                            &event.scope_id,
-                            &event.agent_id,
-                        )
-                        .map_err(|_| ())?;
-                }
-                aether_store::ManagedEventType::Revoked => return Err(()),
-            }
-            cursor = event.cursor;
-            changes = changes.checked_add(1).ok_or(())?;
-        }
-    }
-}
-
-#[must_use]
-pub fn managed_member_active(
-    member: &aether_store::ManagedMember,
-    agent_id: &str,
-) -> bool {
-    member.agent_id == agent_id && member.is_active(aether_core::time::now())
-}
+pub use crate::managed_client::{managed_member_active, sync_managed};
 
 #[cfg(test)]
 mod tests {

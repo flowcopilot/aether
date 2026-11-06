@@ -1,12 +1,6 @@
 use std::{path::PathBuf, process::ExitCode, sync::Arc};
 
 use usage_rs::{Args, Cli, Subcommands};
-mod node_commands;
-use node_commands::{
-    cache_directory_record, cached_directory_record, managed_request,
-    read_authorization, read_verifying_key, run_direct, run_directory, run_invite,
-    run_managed, run_record,
-};
 
 #[derive(Cli)]
 #[usage(bin = "aether", version = env!("CARGO_PKG_VERSION"))]
@@ -82,8 +76,8 @@ struct NodeServe {
     /// Old policy file to import on the first start. Later changes use SQLite.
     #[usage(long, default = "~/.aether/policy.json")]
     policy: PathBuf,
-    #[usage(long, default = "~/.aether/host")]
-    data_dir: PathBuf,
+    #[usage(long)]
+    data_dir: Option<PathBuf>,
     #[usage(long, default = "0")]
     port: u16,
     #[usage(long, default = "0")]
@@ -214,31 +208,14 @@ enum NodeDirectCommand {
     },
 }
 
-/// The data directory a command uses when `--data-dir` is not given:
-/// `$AETHER_DATA_DIR`, else `~/.aether/host`. `node admin`, `node direct` and
-/// `node request` share it, so a copied invite command reaches the same
-/// contacts that the caller's web page shows.
-fn data_dir_or_default(data_dir: Option<PathBuf>) -> PathBuf {
-    aether::data_dir::default_node_data_dir(
-        data_dir,
-        |name| std::env::var_os(name),
-        std::env::var_os("HOME").map(PathBuf::from),
-    )
-}
-
-fn expand_home(path: PathBuf) -> PathBuf {
-    path.strip_prefix("~")
-        .ok()
-        .and_then(|rest| {
-            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(rest))
-        })
-        .unwrap_or(path)
+fn resolve_node_data_dir(data_dir: Option<PathBuf>) -> PathBuf {
+    aether::data_dir::resolve_node_data_dir(data_dir)
 }
 
 #[derive(Args)]
 struct NodeInvite {
     #[usage(long)]
-    data_dir: PathBuf,
+    data_dir: Option<PathBuf>,
     #[usage(long)]
     agent_id: String,
     #[usage(long)]
@@ -285,14 +262,14 @@ enum NodeManagedCommand {
     Sync {
         scope: String,
         #[usage(long)]
-        data_dir: PathBuf,
+        data_dir: Option<PathBuf>,
     },
 }
 
 #[derive(Args)]
 struct NodeRecord {
     #[usage(long)]
-    data_dir: PathBuf,
+    data_dir: Option<PathBuf>,
     #[usage(long)]
     agent_id: String,
     #[usage(long)]
@@ -324,20 +301,20 @@ enum NodeDirectoryCommand {
     },
     Sync {
         #[usage(long)]
-        data_dir: PathBuf,
+        data_dir: Option<PathBuf>,
     },
 }
 
 #[derive(Args)]
 struct NodeEndpoint {
     #[usage(long)]
-    data_dir: PathBuf,
+    data_dir: Option<PathBuf>,
 }
 
 #[derive(Args)]
 struct NodeFixture {
     #[usage(long)]
-    data_dir: PathBuf,
+    data_dir: Option<PathBuf>,
     #[usage(long)]
     scope: Option<String>,
 }
@@ -551,7 +528,7 @@ fn run_process(command: aether::Command, process: &Process) -> ExitCode {
 async fn run_mcp(mcp: Mcp) -> ExitCode {
     match mcp.command {
         Some(McpCommand::Serve(McpServe { socket, data_dir, caller_only })) => {
-            let data_dir = data_dir_or_default(data_dir);
+            let data_dir = resolve_node_data_dir(data_dir);
             let socket = socket.unwrap_or_else(|| {
                 aether::data_dir::DataDir::new(&data_dir).admin_socket()
             });
@@ -571,7 +548,7 @@ async fn run_mcp(mcp: Mcp) -> ExitCode {
 }
 
 async fn run_admin(arguments: NodeAdmin) -> ExitCode {
-    let data_dir = data_dir_or_default(arguments.data_dir);
+    let data_dir = resolve_node_data_dir(arguments.data_dir);
     if let Err(error) = std::fs::create_dir_all(&data_dir) {
         eprintln!("aether: admin failed: {error}");
         return ExitCode::from(1);
@@ -623,21 +600,167 @@ async fn run_admin(arguments: NodeAdmin) -> ExitCode {
     }
 }
 
+async fn run_request(arguments: NodeRequest) -> ExitCode {
+    let input = aether::node_request::RequestInput {
+        data_dir: resolve_node_data_dir(arguments.data_dir),
+        scope: arguments.scope,
+        text: arguments.text,
+        endpoint_id: arguments.endpoint_id,
+        address: arguments.address,
+        directory: arguments.directory,
+        directory_certificate: arguments.directory_certificate,
+        agent_id: arguments.agent_id,
+        agent_verifying_key: arguments.agent_verifying_key,
+        managed_control: arguments.managed_control,
+        managed_control_certificate: arguments.managed_control_certificate,
+        relay_url: arguments.relay_url,
+        authorization: arguments.authorization,
+        idempotency_key: arguments.idempotency_key,
+        task_id: arguments.task_id,
+    };
+    match aether::node_request::send(input).await {
+        Ok(response) => {
+            let exit_code = aether::transport::response_exit_code(&response);
+            println!(
+                "{}",
+                serde_json::json!({ "event": "node_completed", "response": response })
+            );
+            exit_code
+        }
+        Err(aether::node_request::RequestError::AuthorizationRequired) => {
+            eprintln!("aether: request authorization is required");
+            ExitCode::from(2)
+        }
+        Err(aether::node_request::RequestError::AuthorizationInvalid) => {
+            eprintln!("aether: request authorization is invalid");
+            ExitCode::from(2)
+        }
+        Err(aether::node_request::RequestError::TaskIdInvalid) => {
+            eprintln!("aether: request task id must be a UUID");
+            ExitCode::from(2)
+        }
+        Err(aether::node_request::RequestError::FrameInvalid) => {
+            eprintln!("aether: request is invalid");
+            ExitCode::from(2)
+        }
+        Err(aether::node_request::RequestError::Addressing) => {
+            eprintln!(
+                "aether: specify an endpoint and address, a direct agent and address, or directory settings"
+            );
+            ExitCode::from(2)
+        }
+        Err(aether::node_request::RequestError::Transport(error)) => {
+            transport_error(&error)
+        }
+    }
+}
+
+async fn run_directory(arguments: NodeDirectory) -> ExitCode {
+    let command = match arguments.command {
+        NodeDirectoryCommand::Publish { record } => {
+            aether::directory_client::cli::Command::Publish { record }
+        }
+        NodeDirectoryCommand::Renew { record } => {
+            aether::directory_client::cli::Command::Renew { record }
+        }
+        NodeDirectoryCommand::Resolve { agent_id } => {
+            aether::directory_client::cli::Command::Resolve { agent_id }
+        }
+        NodeDirectoryCommand::Search { capability } => {
+            aether::directory_client::cli::Command::Search { capability }
+        }
+        NodeDirectoryCommand::Revoke { record } => {
+            aether::directory_client::cli::Command::Revoke { record }
+        }
+        NodeDirectoryCommand::Sync { data_dir } => {
+            aether::directory_client::cli::Command::Sync {
+                data_dir: resolve_node_data_dir(data_dir),
+            }
+        }
+    };
+    aether::directory_client::cli::run(aether::directory_client::cli::Options {
+        directory: arguments.directory,
+        directory_certificate: arguments.directory_certificate,
+        agent_verifying_key: arguments.agent_verifying_key,
+        command,
+    })
+    .await
+}
+
+async fn run_managed(arguments: NodeManaged) -> ExitCode {
+    let command = match arguments.command {
+        NodeManagedCommand::Redeem { token_file, record } => {
+            aether::managed_client::cli::Command::Redeem { token_file, record }
+        }
+        NodeManagedCommand::Members { scope } => {
+            aether::managed_client::cli::Command::Members { scope }
+        }
+        NodeManagedCommand::Events { scope, after } => {
+            aether::managed_client::cli::Command::Events { scope, after }
+        }
+        NodeManagedCommand::Sync { scope, data_dir } => {
+            aether::managed_client::cli::Command::Sync {
+                scope,
+                data_dir: resolve_node_data_dir(data_dir),
+            }
+        }
+    };
+    aether::managed_client::cli::run(aether::managed_client::cli::Options {
+        control: arguments.control,
+        control_certificate: arguments.control_certificate,
+        command,
+    })
+    .await
+}
+
 async fn run_node(node: Node) -> ExitCode {
     match node.command {
         None => run_process(aether::Command::Node, &Process { config: node.config }),
         Some(NodeCommand::Admin(arguments)) => run_admin(arguments).await,
-        Some(NodeCommand::Direct(arguments)) => run_direct(arguments),
-        Some(NodeCommand::Invite(arguments)) => run_invite(&arguments),
+        Some(NodeCommand::Direct(arguments)) => {
+            let data_dir = resolve_node_data_dir(arguments.data_dir);
+            aether::direct::cli::run(
+                &data_dir,
+                match arguments.command {
+                    NodeDirectCommand::Import { invitation } => {
+                        aether::direct::cli::Command::Import { invitation }
+                    }
+                    NodeDirectCommand::Resolve { agent_id } => {
+                        aether::direct::cli::Command::Resolve { agent_id }
+                    }
+                    NodeDirectCommand::Remove { agent_id } => {
+                        aether::direct::cli::Command::Remove { agent_id }
+                    }
+                },
+            )
+        }
+        Some(NodeCommand::Invite(arguments)) => aether::direct::cli::run_invite(
+            &resolve_node_data_dir(arguments.data_dir),
+            &arguments.agent_id,
+            arguments.expires_in,
+        ),
         Some(NodeCommand::Directory(arguments)) => run_directory(arguments).await,
         Some(NodeCommand::Managed(arguments)) => run_managed(arguments).await,
-        Some(NodeCommand::Record(arguments)) => run_record(arguments),
+        Some(NodeCommand::Record(arguments)) => {
+            let data_dir = resolve_node_data_dir(arguments.data_dir);
+            aether::directory_publication::cli::run_record(
+                aether::directory_publication::cli::RecordInput {
+                    data_dir: &data_dir,
+                    agent_id: arguments.agent_id,
+                    address: arguments.address,
+                    scope: arguments.scope,
+                    capability: arguments.capability,
+                    expires_in: arguments.expires_in,
+                },
+            )
+        }
         Some(NodeCommand::Endpoint(arguments)) => {
-            let endpoint =
-                match aether::transport::bind_node(arguments.data_dir, 0, None).await {
-                    Ok(endpoint) => endpoint,
-                    Err(error) => return transport_error(&error),
-                };
+            let data_dir = resolve_node_data_dir(arguments.data_dir);
+            let endpoint = match aether::transport::bind_node(&data_dir, 0, None).await
+            {
+                Ok(endpoint) => endpoint,
+                Err(error) => return transport_error(&error),
+            };
             println!(
                 "{}",
                 serde_json::json!({ "endpoint_id": endpoint.id().to_string() })
@@ -646,8 +769,9 @@ async fn run_node(node: Node) -> ExitCode {
             ExitCode::SUCCESS
         }
         Some(NodeCommand::Fixture(arguments)) => {
+            let data_dir = resolve_node_data_dir(arguments.data_dir);
             match aether::fixture::create_for_scope(
-                &arguments.data_dir,
+                &data_dir,
                 arguments.scope.as_deref().unwrap_or("direct"),
             )
             .await
@@ -662,17 +786,15 @@ async fn run_node(node: Node) -> ExitCode {
                 }
             }
         }
-        Some(NodeCommand::Serve(mut arguments)) => {
-            arguments.policy = expand_home(arguments.policy);
-            arguments.data_dir = expand_home(arguments.data_dir);
+        Some(NodeCommand::Serve(arguments)) => {
             let Ok(adapter) = arguments.adapter.as_deref().map(str::parse).transpose()
             else {
                 eprintln!("aether: --adapter must be codex or connected");
                 return ExitCode::from(2);
             };
             let options = aether::node_runtime::NodeServeOptions {
-                policy: arguments.policy,
-                data_dir: arguments.data_dir,
+                policy: aether::data_dir::expand_home(arguments.policy),
+                data_dir: resolve_node_data_dir(arguments.data_dir),
                 port: arguments.port,
                 admin_port: arguments.admin_port,
                 pact_listen: arguments.pact_listen,
@@ -704,224 +826,7 @@ async fn run_node(node: Node) -> ExitCode {
                 },
             }
         }
-        Some(NodeCommand::Request(arguments)) => {
-            let data_dir = data_dir_or_default(arguments.data_dir.clone());
-            // A direct contact imported from an invite keeps its authorization
-            // and relay; the flags, when given, still win.
-            let bundle = match (arguments.scope.as_str(), arguments.agent_id.as_deref())
-            {
-                (aether::direct::SCOPE, Some(agent_id))
-                    if arguments.endpoint_id.is_none()
-                        && arguments.directory.is_none()
-                        && arguments.managed_control.is_none() =>
-                {
-                    aether::direct::open_store(&data_dir)
-                        .and_then(|store| {
-                            aether::direct::contact_bundle(&store, agent_id)
-                        })
-                        .ok()
-                }
-                _ => None,
-            };
-            let authorization = match (&arguments.authorization, &bundle) {
-                (Some(path), _) => {
-                    if let Ok(authorization) = read_authorization(path) {
-                        authorization
-                    } else {
-                        eprintln!("aether: request authorization is invalid");
-                        return ExitCode::from(2);
-                    }
-                }
-                (None, Some(bundle)) => bundle.authorization.clone(),
-                (None, None) => {
-                    eprintln!("aether: request authorization is required");
-                    return ExitCode::from(2);
-                }
-            };
-            let relay_url = arguments
-                .relay_url
-                .clone()
-                .or_else(|| bundle.and_then(|bundle| bundle.relay_url));
-            let fresh = aether::direct::RequestIds::fresh();
-            let task_id = match arguments.task_id.clone() {
-                Some(task_id) if uuid::Uuid::parse_str(&task_id).is_ok() => task_id,
-                Some(_) => {
-                    eprintln!("aether: request task id must be a UUID");
-                    return ExitCode::from(2);
-                }
-                None => fresh.task_id,
-            };
-            let ids = aether::direct::RequestIds {
-                task_id,
-                idempotency_key: arguments
-                    .idempotency_key
-                    .clone()
-                    .unwrap_or(fresh.idempotency_key),
-            };
-            let request = match aether::direct::request_frame(
-                authorization,
-                &arguments.scope,
-                &arguments.text,
-                ids,
-            ) {
-                Ok(request) => request,
-                Err(error) => {
-                    eprintln!("aether: {error}");
-                    return ExitCode::from(2);
-                }
-            };
-            let result = if let Some(control) = arguments.managed_control.as_deref() {
-                managed_request(&arguments, &data_dir, control, request).await
-            } else {
-                match (
-                    arguments.endpoint_id.as_deref(),
-                    arguments.address.as_deref(),
-                    arguments.directory.as_deref(),
-                    arguments.directory_certificate.as_deref(),
-                    arguments.agent_id.as_deref(),
-                    arguments.agent_verifying_key.as_deref(),
-                ) {
-                    (Some(endpoint_id), Some(address), None, None, None, None) => {
-                        match relay_url.as_deref() {
-                            Some(relay_url) => {
-                                aether::transport::request_once_via_relay(
-                                    &data_dir,
-                                    endpoint_id,
-                                    relay_url,
-                                    request,
-                                )
-                                .await
-                            }
-                            None => {
-                                aether::transport::request_once(
-                                    &data_dir,
-                                    endpoint_id,
-                                    address,
-                                    request,
-                                )
-                                .await
-                            }
-                        }
-                    }
-                    (None, address, None, None, Some(agent_id), None)
-                        if address.is_some() || relay_url.is_some() =>
-                    {
-                        let contact = if arguments.scope == aether::direct::SCOPE {
-                            aether::direct::open_store(&data_dir).and_then(|store| {
-                                aether::direct::contact(&store, agent_id)
-                            })
-                        } else {
-                            Err(aether::direct::DirectError::UnknownContact)
-                        };
-                        let invitation = match contact {
-                            Ok(invitation) => invitation,
-                            Err(error) => {
-                                eprintln!("aether: {error}");
-                                return ExitCode::from(2);
-                            }
-                        };
-                        aether::direct::send(
-                            &data_dir,
-                            &invitation,
-                            address,
-                            relay_url.as_deref(),
-                            request,
-                        )
-                        .await
-                    }
-                    (
-                        None,
-                        None,
-                        Some(directory),
-                        Some(certificate),
-                        Some(agent_id),
-                        Some(key),
-                    ) => {
-                        let Ok(certificate) = std::fs::read(certificate) else {
-                            eprintln!("aether: directory certificate cannot be read");
-                            return ExitCode::from(2);
-                        };
-                        let Ok(trusted_key) = read_verifying_key(key) else {
-                            eprintln!("aether: agent verification key is invalid");
-                            return ExitCode::from(2);
-                        };
-                        let Ok(directory) = aether::directory_client::DirectoryClient::with_pinned_certificate(
-                        directory,
-                        &certificate,
-                        trusted_key,
-                    ) else {
-                            eprintln!("aether: directory connection is invalid");
-                            return ExitCode::from(2);
-                        };
-                        let record = match directory.resolve(agent_id).await.and_then(|wire| {
-                            wire.to_record().map_err(|_| {
-                                aether::directory_client::DirectoryClientError::InvalidRecord
-                            })
-                        }) {
-                            Ok(record) if record.scope_id == arguments.scope => {
-                                if cache_directory_record(&data_dir, &record).is_err() {
-                                    eprintln!(
-                                        "aether: local directory state is unavailable"
-                                    );
-                                    return ExitCode::from(1);
-                                }
-                                record
-                            }
-                            Ok(_) => {
-                                eprintln!(
-                                    "aether: directory record scope does not match"
-                                );
-                                return ExitCode::from(2);
-                            }
-                            Err(
-                                aether::directory_client::DirectoryClientError::Request,
-                            ) => {
-                                if let Ok(record) = cached_directory_record(
-                                    &data_dir,
-                                    &arguments.scope,
-                                    agent_id,
-                                    trusted_key,
-                                ) {
-                                    record
-                                } else {
-                                    eprintln!(
-                                        "aether: directory record cannot be resolved"
-                                    );
-                                    return ExitCode::from(2);
-                                }
-                            }
-                            Err(_) => {
-                                eprintln!(
-                                    "aether: directory record cannot be resolved"
-                                );
-                                return ExitCode::from(2);
-                            }
-                        };
-                        aether::transport::request_once_record(
-                            &data_dir, &record, request,
-                        )
-                        .await
-                    }
-                    _ => {
-                        eprintln!(
-                            "aether: specify an endpoint and address, a direct agent and address, or directory settings"
-                        );
-                        return ExitCode::from(2);
-                    }
-                }
-            };
-            match result {
-                Ok(response) => {
-                    let exit_code = aether::transport::response_exit_code(&response);
-                    println!(
-                        "{}",
-                        serde_json::json!({ "event": "node_completed", "response": response })
-                    );
-                    exit_code
-                }
-                Err(error) => transport_error(&error),
-            }
-        }
+        Some(NodeCommand::Request(arguments)) => run_request(arguments).await,
     }
 }
 
@@ -948,12 +853,9 @@ mod tests {
         time::{Duration, SystemTime},
     };
 
-    use super::node_commands::{
-        cache_directory_record, cached_directory_record, cached_managed_member,
-    };
-    use aether::node_runtime::{
-        NodeServeOptions, start_directory_publication, sync_managed,
-    };
+    use aether::directory_client::{cache_directory_record, cached_directory_record};
+    use aether::managed_client::{cached_managed_member, sync_managed};
+    use aether::node_runtime::{NodeServeOptions, start_directory_publication};
     use axum_server::Handle;
     use ed25519_dalek::SigningKey;
 

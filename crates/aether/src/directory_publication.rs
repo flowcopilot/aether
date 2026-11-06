@@ -1,6 +1,8 @@
 //! The node's own record in a pinned directory, published at start and
 //! renewed while the node runs.
 
+pub mod cli;
+
 use std::{path::Path, sync::Mutex};
 
 use ed25519_dalek::SigningKey;

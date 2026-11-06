@@ -37,6 +37,7 @@ pub mod listing;
 pub mod managed_client;
 pub mod mcp;
 pub mod node_builder;
+pub mod node_request;
 pub mod node_runtime;
 pub mod node_service;
 pub mod outbox;
@@ -44,6 +45,7 @@ pub mod pact;
 mod pinned_https;
 pub mod policy;
 pub mod proof;
+pub mod roster_sync;
 pub mod settings;
 mod signed;
 pub mod transport;
@@ -93,9 +95,10 @@ impl std::fmt::Display for UserError {
 impl std::error::Error for UserError {}
 
 pub fn load_config(path: Option<&Path>, command: Command) -> Result<Config, UserError> {
-    let default_data_dir = PathBuf::from(format!("./.aether/{}", command.name()));
     let Some(path) = path else {
-        return Ok(Config { data_dir: default_data_dir });
+        return Ok(Config {
+            data_dir: data_dir::resolve_daemon_data_dir(None, command),
+        });
     };
 
     let source = fs::read_to_string(path).map_err(|_| UserError {
@@ -110,7 +113,7 @@ pub fn load_config(path: Option<&Path>, command: Command) -> Result<Config, User
         });
     }
 
-    Ok(Config { data_dir: PathBuf::from(file.data_dir) })
+    Ok(Config { data_dir: data_dir::expand_home(PathBuf::from(file.data_dir)) })
 }
 
 /// The configuration file. `data_dir` is its only setting.
