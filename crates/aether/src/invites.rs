@@ -3,7 +3,7 @@ use std::{path::Path, sync::Arc};
 use aether_store::AuditActor;
 
 use crate::{
-    admin::{ChangeRequest, SharedAdministration},
+    admin::{ApplyOutcome, ChangeRequest, SharedAdministration},
     admin_ui::{PageContext, RelaySwitcher},
 };
 
@@ -66,8 +66,12 @@ pub fn sign_direct_invite(
             administration.lock().map_err(|_| InviteError::Refused).and_then(
                 |mut admin| {
                     admin
-                        .apply_immediate(&change, actor)
+                        .apply(&change, actor)
                         .map_err(|_| InviteError::Refused)
+                        .and_then(|outcome| match outcome {
+                            ApplyOutcome::Applied => Ok(()),
+                            ApplyOutcome::Pending => Err(InviteError::Refused),
+                        })
                 },
             )
         },
@@ -94,10 +98,45 @@ pub fn host_page_context(
     relay_url: Option<String>,
     switch_relay: RelaySwitcher,
     hub: Option<crate::hub_client::HubClient>,
+    task_folder_mode: bool,
 ) -> Arc<PageContext> {
     Arc::new(
         PageContext::host(data_dir, invite_name, relay_url, switch_relay)
             .with_hub(hub)
-            .with_caller(true),
+            .with_caller(true)
+            .with_task_folder_mode(task_folder_mode),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::{host_page_context, invite_agent_name};
+
+    #[test]
+    fn invite_agent_name_matches_the_host_page() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let data_dir = directory.path().to_path_buf();
+        crate::settings::store_setting::<crate::direct::HostName>(
+            &data_dir,
+            &"page-name".to_owned(),
+        )
+        .expect("host name must store");
+        let switch: crate::admin_ui::RelaySwitcher =
+            Arc::new(|_, _| Box::pin(async { Ok(()) }));
+        let page = host_page_context(
+            data_dir.clone(),
+            Some("flag-name".to_owned()),
+            None,
+            switch,
+            None,
+            false,
+        );
+        assert_eq!(page.agent_name(), invite_agent_name(&data_dir, Some("flag-name")));
+        let switch: crate::admin_ui::RelaySwitcher =
+            Arc::new(|_, _| Box::pin(async { Ok(()) }));
+        let page = host_page_context(data_dir.clone(), None, None, switch, None, false);
+        assert_eq!(page.agent_name(), invite_agent_name(&data_dir, None));
+    }
 }

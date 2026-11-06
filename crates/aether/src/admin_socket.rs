@@ -306,7 +306,7 @@ mod tests {
     };
 
     use super::{Request, Response, send, start};
-    use crate::admin::{AuditEntry, test_support::shared_in};
+    use crate::admin::test_support::shared_in;
 
     #[test]
     fn queue_limit_increase_returns_pending_on_the_socket() {
@@ -335,11 +335,44 @@ mod tests {
     }
 
     #[test]
-    fn socket_shares_pending_changes_without_mcp_confirmation() {
+    fn high_risk_grant_from_mcp_is_pending_and_audited() {
         let directory = tempfile::tempdir().expect("directory must create");
         let socket = crate::data_dir::DataDir::new(directory.path()).admin_socket();
         let administration = shared_in(directory.path());
-        start(&socket, administration.clone()).expect("socket must start");
+        let node = std::sync::Arc::new(
+            crate::admin::test_support::FakeNode::default().with_queue_limit(1),
+        );
+        administration.lock().expect("administration must unlock").set_live(node);
+        start(&socket, administration).expect("socket must start");
+        let grant = crate::admin::peer_grant();
+        let id = grant.id.as_str();
+        assert!(matches!(
+            send(
+                &socket,
+                &Request::Change {
+                    change: Box::new(crate::admin::ChangeRequest::Grant {
+                        id: id.to_owned(),
+                        grant,
+                    }),
+                    dry_run: false,
+                }
+            )
+            .expect("change must send"),
+            Response::Pending
+        ));
+        assert!(matches!(
+            send(&socket, &Request::Audit).expect("audit must send"),
+            Response::Audit { entries }
+                if entries.last().is_some_and(|entry| entry.actor == "mcp" && entry.result == "pending")
+        ));
+    }
+
+    #[test]
+    fn workspace_change_from_mcp_is_pending_on_the_socket() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let socket = crate::data_dir::DataDir::new(directory.path()).admin_socket();
+        let administration = shared_in(directory.path());
+        start(&socket, administration).expect("socket must start");
         assert!(matches!(
             send(
                 &socket,
@@ -353,22 +386,6 @@ mod tests {
             )
             .expect("change must send"),
             Response::Pending
-        ));
-        administration
-            .lock()
-            .expect("administration must unlock")
-            .confirm_ui("workspace")
-            .expect("ui must confirm");
-        assert!(matches!(
-            send(&socket, &Request::Audit).expect("audit must send"),
-            Response::Audit { entries }
-                if entries
-                    == [("mcp", "pending"), ("ui", "confirmed"), ("ui", "applied")]
-                        .map(|(actor, result)| AuditEntry {
-                            actor: actor.to_owned(),
-                            action: "change".to_owned(),
-                            result: result.to_owned(),
-                        })
         ));
     }
 

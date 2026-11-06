@@ -1,8 +1,4 @@
-use std::{
-    path::{Path, PathBuf},
-    process::ExitCode,
-    sync::Arc,
-};
+use std::{path::PathBuf, process::ExitCode, sync::Arc};
 
 use hex::FromHex;
 
@@ -570,26 +566,6 @@ async fn run_mcp(mcp: Mcp) -> ExitCode {
     }
 }
 
-/// The hub client for `--hub-url`, the page setting or the default hub,
-/// signing with the node key in `data_dir`.
-fn hub_client(
-    hub_url: Option<&str>,
-    data_dir: &Path,
-) -> Result<Option<aether::hub_client::HubClient>, ExitCode> {
-    aether::hub_client::resolve_url(
-        hub_url,
-        aether::settings::setting::<aether::hub_client::settings::Hub>(data_dir)
-            .ok()
-            .flatten(),
-    )
-    .map(|url| aether::hub_client::HubClient::for_data_dir(&url, data_dir))
-    .transpose()
-    .map_err(|error| {
-        eprintln!("aether: {error}");
-        ExitCode::from(2)
-    })
-}
-
 async fn run_admin(arguments: NodeAdmin) -> ExitCode {
     let data_dir = data_dir_or_default(arguments.data_dir);
     if let Err(error) = std::fs::create_dir_all(&data_dir) {
@@ -604,10 +580,15 @@ async fn run_admin(arguments: NodeAdmin) -> ExitCode {
         }
     };
     let administration = aether::admin::shared_with_store(store);
-    let hub = match hub_client(arguments.hub_url.as_deref(), &data_dir) {
-        Ok(hub) => hub,
-        Err(code) => return code,
-    };
+    let hub =
+        match aether::node_runtime::hub_client(arguments.hub_url.as_deref(), &data_dir)
+        {
+            Ok(hub) => hub,
+            Err(error) => {
+                eprintln!("aether: {}", error_message(&error));
+                return error.exit_code();
+            }
+        };
     let socket = aether::data_dir::DataDir::new(&data_dir).admin_socket();
     if let Err(error) = aether::admin_socket::start(&socket, administration.clone()) {
         eprintln!("aether: admin failed: {error}");
@@ -680,410 +661,43 @@ async fn run_node(node: Node) -> ExitCode {
         Some(NodeCommand::Serve(mut arguments)) => {
             arguments.policy = expand_home(arguments.policy);
             arguments.data_dir = expand_home(arguments.data_dir);
-            // Only a hub gives a number, so the flag is a name part.
-            if arguments
-                .invite_name
-                .as_deref()
-                .is_some_and(|name| !aether::hub_client::valid_name_part(name))
-            {
-                eprintln!(
-                    "aether: --invite-name must be 1 to 32 lowercase letters, digits, dots, underscores or dashes, starting with a letter or digit"
-                );
-                return ExitCode::from(2);
-            }
             let Ok(adapter) = arguments.adapter.as_deref().map(str::parse).transpose()
             else {
                 eprintln!("aether: --adapter must be codex or connected");
                 return ExitCode::from(2);
             };
-            let service = match aether::node_builder::load_or_create_service(
-                &arguments.policy,
-                &arguments.data_dir,
-                arguments.codex_bin.clone(),
+            let options = aether::node_runtime::NodeServeOptions {
+                policy: arguments.policy,
+                data_dir: arguments.data_dir,
+                port: arguments.port,
+                admin_port: arguments.admin_port,
+                pact_listen: arguments.pact_listen,
+                managed_control: arguments.managed_control,
+                managed_control_certificate: arguments.managed_control_certificate,
                 adapter,
-            ) {
-                Ok(service) => Arc::new(service),
-                Err(error) => {
-                    eprintln!("aether: {error}");
-                    return ExitCode::from(2);
-                }
+                codex_bin: arguments.codex_bin,
+                relay_url: arguments.relay_url,
+                hub_url: arguments.hub_url,
+                directory: arguments.directory,
+                directory_certificate: arguments.directory_certificate,
+                agent_id: arguments.agent_id,
+                address: arguments.address,
+                scope: arguments.scope,
+                capability: arguments.capability,
+                directory_record_ttl: arguments.directory_record_ttl,
+                invite_name: arguments.invite_name,
             };
-            match service.agent_adapter() {
-                aether::policy::AgentAdapter::Codex => {
-                    let codex_home =
-                        aether::data_dir::DataDir::new(&arguments.data_dir)
-                            .codex_home();
-                    if !aether::data_dir::codex_login(&codex_home).exists() {
-                        eprintln!(
-                            "aether: Codex is not logged in for this node, so tasks will fail. Run: CODEX_HOME={} codex login --device-auth",
-                            codex_home.display()
-                        );
+            match aether::node_runtime::run(options).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => match error {
+                    aether::node_runtime::NodeRunError::Transport(transport) => {
+                        transport_error(&transport)
                     }
-                }
-                aether::policy::AgentAdapter::Connected => eprintln!(
-                    "aether: tasks go to the agent that connects to {}",
-                    aether::data_dir::DataDir::new(&arguments.data_dir)
-                        .agent_socket()
-                        .display()
-                ),
-            }
-            let hub =
-                match hub_client(arguments.hub_url.as_deref(), &arguments.data_dir) {
-                    Ok(hub) => hub,
-                    Err(code) => return code,
-                };
-            // The PACT gateway: started before the admin UI, which serves
-            // its consent page and tells it where that page is.
-            let pact = match (arguments.pact_listen.as_deref(), service.pact_config()) {
-                (None, _) => None,
-                (Some(_), None) => {
-                    eprintln!(
-                        "aether: --pact-listen needs a pact section in the policy"
-                    );
-                    return ExitCode::from(2);
-                }
-                (Some(address), Some(config)) => {
-                    let listener = match tokio::net::TcpListener::bind(address).await {
-                        Ok(listener) => listener,
-                        Err(error) => {
-                            eprintln!(
-                                "aether: the PACT gateway cannot listen: {error}"
-                            );
-                            return ExitCode::from(1);
-                        }
-                    };
-                    let node: Arc<dyn aether::pact::gateway::PactNode> =
-                        service.clone();
-                    match aether::pact::server::start(config, &arguments.data_dir, node)
-                    {
-                        Ok(started) => Some((
-                            listener,
-                            started,
-                            config.public_url.clone(),
-                            config.max_seconds,
-                        )),
-                        Err(error) => {
-                            eprintln!("aether: the PACT gateway cannot start: {error}");
-                            return ExitCode::from(1);
-                        }
+                    other => {
+                        eprintln!("aether: {}", error_message(&other));
+                        other.exit_code()
                     }
-                }
-            };
-            let managed_scope = service.has_scope_kind(aether_core::ScopeKind::Managed);
-            // The usage spec requires the two flags together.
-            let managed_sync = match arguments
-                .managed_control
-                .as_deref()
-                .zip(arguments.managed_control_certificate.as_deref())
-            {
-                None => None,
-                Some((control, certificate_path)) => {
-                    let Some(scope_id) = service
-                        .scope_id_for_kind(aether_core::ScopeKind::Managed)
-                        .map(str::to_owned)
-                    else {
-                        eprintln!(
-                            "aether: managed control requires exactly one managed node scope"
-                        );
-                        return ExitCode::from(2);
-                    };
-                    let Ok(certificate) = std::fs::read(certificate_path) else {
-                        eprintln!("aether: managed control certificate cannot be read");
-                        return ExitCode::from(2);
-                    };
-                    let Ok(client) =
-                        aether::managed_client::ManagedClient::with_pinned_certificate(
-                            control,
-                            &certificate,
-                        )
-                    else {
-                        eprintln!("aether: managed control connection is invalid");
-                        return ExitCode::from(2);
-                    };
-                    if sync_managed(&arguments.data_dir, control, &scope_id, &client)
-                        .await
-                        .is_err()
-                    {
-                        eprintln!("aether: managed roster synchronization failed");
-                        return ExitCode::from(1);
-                    }
-                    Some((client, control.to_owned(), scope_id))
-                }
-            };
-            let administration =
-                match aether_store::NodeStore::in_dir(&arguments.data_dir) {
-                    Ok(store) => aether::admin::shared_with_store(store),
-                    Err(error) => {
-                        eprintln!("aether: administration failed: {error}");
-                        return ExitCode::from(1);
-                    }
-                };
-            let socket =
-                aether::data_dir::DataDir::new(&arguments.data_dir).admin_socket();
-            let live = Arc::new(aether::node_service::RunningNode::new(
-                Arc::clone(&service),
-                arguments.data_dir.clone(),
-            ));
-            if let Ok(mut administration) = administration.lock() {
-                administration.set_live(live.clone());
-            } else {
-                eprintln!("aether: administration failed: service is unavailable");
-                return ExitCode::from(1);
-            }
-            if let Err(error) =
-                aether::admin_socket::start(&socket, administration.clone())
-            {
-                eprintln!("aether: administration failed: {error}");
-                return ExitCode::from(1);
-            }
-            // The flag or environment wins over the owner's saved choice.
-            // `off` also lets a headless node use only its local network.
-            let relay_url = arguments
-                .relay_url
-                .clone()
-                .or_else(|| {
-                    aether::settings::setting::<aether::transport::relay::Relay>(
-                        &arguments.data_dir,
-                    )
-                    .ok()
-                    .flatten()
-                })
-                .filter(|relay| relay != "off");
-            let endpoint = match aether::transport::bind_node(
-                &arguments.data_dir,
-                arguments.port,
-                relay_url.as_deref(),
-            )
-            .await
-            {
-                Ok(endpoint) => endpoint,
-                Err(error) => return transport_error(&error),
-            };
-            if aether::settings::store_setting::<aether::transport::relay::ActiveRelay>(
-                &arguments.data_dir,
-                &relay_url,
-            )
-            .and_then(|()| {
-                // The name of connect codes from the admin socket while the
-                // node has no name on the hub, as on the host page.
-                aether::settings::store_setting::<aether::direct::HostName>(
-                    &arguments.data_dir,
-                    &arguments.invite_name.clone().unwrap_or_else(|| {
-                        aether::direct::default_agent_name(
-                            &aether::direct::endpoint_id(&arguments.data_dir)
-                                .unwrap_or_default(),
-                        )
-                    }),
-                )
-            })
-            .is_err()
-            {
-                endpoint.close().await;
-                eprintln!("aether: node settings cannot be stored");
-                return ExitCode::from(1);
-            }
-            live.attach_endpoint(endpoint.clone(), tokio::runtime::Handle::current());
-            let bound_port = endpoint
-                .addr()
-                .ip_addrs()
-                .next()
-                .map_or(arguments.port, std::net::SocketAddr::port);
-            let publication_scope =
-                arguments.scope.as_deref().unwrap_or_else(|| service.scope_id());
-            if arguments.directory.is_some()
-                && service.scope_kind_for(publication_scope)
-                    != Some(aether_core::ScopeKind::Directory)
-            {
-                endpoint.close().await;
-                eprintln!(
-                    "aether: directory publication requires a directory node scope"
-                );
-                return ExitCode::from(2);
-            }
-            let Ok(directory_publication) = start_directory_publication(
-                &arguments,
-                endpoint.id().to_string(),
-                bound_port,
-                publication_scope,
-            )
-            .await
-            else {
-                endpoint.close().await;
-                eprintln!("aether: directory publication is unavailable");
-                return ExitCode::from(1);
-            };
-            println!(
-                "{}",
-                serde_json::json!({
-                    "event": "node_listening",
-                    "endpoint_id": endpoint.id().to_string(),
-                    "port": bound_port,
-                })
-            );
-            if let Some((_, record)) = &directory_publication {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "event": "directory_record_published",
-                        "agent_id": record.agent_id,
-                        "signing_key": hex::encode(record.signing_key),
-                    })
-                );
-            }
-            let directory_publication = directory_publication
-                .map(|(publication, record)| (Arc::new(publication), record));
-            if let Some((publication, _)) = &directory_publication {
-                // Admin-triggered "renew now" for the already-configured,
-                // already-pinned directory record, and its capability
-                // publication. `renew` reuses the same pinned client and
-                // signed-record construction the periodic renewer below uses.
-                live.attach_directory(Arc::clone(publication));
-            }
-            // The outbox sends the tasks of this node's own agent with the
-            // node's endpoint, and keeps their answers for the inbox.
-            let outbox_wake = Arc::new(tokio::sync::Notify::new());
-            live.attach_outbox(Arc::clone(&outbox_wake));
-            let outbox = tokio::spawn(aether::outbox::run(
-                arguments.data_dir.clone(),
-                Arc::new(aether::outbox::RelayCourier::shared(endpoint.clone())),
-                arguments.hub_url.clone(),
-                outbox_wake,
-            ));
-            let relay_switcher: aether::admin_ui::RelaySwitcher = Arc::new({
-                let endpoint = endpoint.clone();
-                move |previous, relay| {
-                    let endpoint = endpoint.clone();
-                    Box::pin(async move {
-                        aether::transport::switch_relay(
-                            &endpoint,
-                            previous.as_deref(),
-                            relay.as_deref(),
-                        )
-                        .await
-                    })
-                }
-            });
-            let background = aether::node_runtime::start_background_workers(
-                &administration,
-                &arguments.data_dir,
-                hub.clone(),
-                arguments.invite_name.clone(),
-                relay_url.clone(),
-                Some(Arc::clone(&relay_switcher)),
-                directory_publication
-                    .as_ref()
-                    .map(|(publication, _)| Arc::clone(publication)),
-                endpoint.id().to_string(),
-                managed_sync.map(|(client, control, scope_id)| {
-                    (Arc::new(client), control, scope_id)
-                }),
-            );
-            let admin_server = arguments.admin_port.map(|admin_port| {
-                let handle = axum_server::Handle::new();
-                let data_dir = arguments.data_dir.clone();
-                let administration = administration.clone();
-                let shutdown = handle.clone();
-                let options = aether::admin_ui::UiOptions {
-                    managed: managed_scope,
-                    page: Some(Arc::new(
-                        aether::admin_ui::PageContext::host(
-                            data_dir.clone(),
-                            arguments.invite_name.clone(),
-                            relay_url.clone(),
-                            Arc::clone(&relay_switcher),
-                        )
-                        .with_hub(hub.clone())
-                        .with_caller(true)
-                        .with_task_folder_mode(service.task_folder_mode()),
-                    )),
-                    pact: pact.as_ref().map(|(_, started, _, _)| {
-                        aether::admin_ui::PactUi {
-                            consent: Arc::clone(&started.consent),
-                            link: Arc::clone(&started.link),
-                        }
-                    }),
-                };
-                let server = tokio::spawn(async move {
-                    aether::admin_ui::serve_tls_with_scope_and_handle(
-                        admin_port,
-                        &data_dir,
-                        administration,
-                        options,
-                        shutdown,
-                    )
-                    .await
-                });
-                (handle, server)
-            });
-            let pact_shutdown = Arc::new(tokio::sync::Notify::new());
-            let pact_server = pact.map(|(listener, started, public_url, max_seconds)| {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "event": "pact_listening",
-                        "address": listener.local_addr().ok().map(|address| address.to_string()),
-                        "public_url": public_url,
-                    })
-                );
-                let shutdown = Arc::clone(&pact_shutdown);
-                tokio::spawn(aether::pact::server::serve(
-                    listener,
-                    started.gateway,
-                    max_seconds,
-                    async move { shutdown.notified().await },
-                ))
-            });
-            let service_for_shutdown = Arc::clone(&service);
-            let router =
-                aether::transport::router(endpoint.clone(), move |peer, frames| {
-                    service.handle(peer, frames)
-                });
-            let mut result = match tokio::signal::ctrl_c().await {
-                Ok(()) => router.shutdown().await.map_err(|error| {
-                    aether::transport::TransportError::Network(error.to_string())
-                }),
-                Err(error) => {
-                    Err(aether::transport::TransportError::Network(error.to_string()))
-                }
-            };
-            if let Some(mut server) = pact_server {
-                // A turn in flight may wait for Codex; give it five seconds.
-                pact_shutdown.notify_one();
-                if tokio::time::timeout(std::time::Duration::from_secs(5), &mut server)
-                    .await
-                    .is_err()
-                {
-                    server.abort();
-                }
-            }
-            if let Some((handle, server)) = admin_server {
-                handle.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
-                match server.await {
-                    Ok(Err(error)) if result.is_ok() => {
-                        result = Err(aether::transport::TransportError::Network(
-                            error.to_string(),
-                        ));
-                    }
-                    Err(_) if result.is_ok() => {
-                        result = Err(aether::transport::TransportError::Network(
-                            "administration server stopped".to_owned(),
-                        ));
-                    }
-                    // A clean stop, or a failure after an earlier one.
-                    _ => {}
-                }
-            }
-            background.shutdown().await;
-            outbox.abort();
-            let _ = outbox.await;
-            service_for_shutdown.shutdown();
-            endpoint.close().await;
-            match result {
-                Ok(()) => {
-                    println!("{}", serde_json::json!({ "event": "node_completed" }));
-                    ExitCode::SUCCESS
-                }
-                Err(error) => transport_error(&error),
+                },
             }
         }
         Some(NodeCommand::Request(arguments)) => {
@@ -1330,7 +944,18 @@ async fn managed_request(
         &certificate,
     )
     .map_err(|_| aether::transport::TransportError::Address)?;
-    let _ = sync_managed(data_dir, control, &arguments.scope, &client).await;
+    if aether::node_runtime::sync_managed(data_dir, control, &arguments.scope, &client)
+        .await
+        .is_err()
+    {
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "level": "error",
+                "event": "managed_sync_failed",
+            })
+        );
+    }
     let members = match client.members(&arguments.scope).await {
         Ok(members) => members,
         Err(aether::managed_client::ManagedClientError::Request) => {
@@ -1377,78 +1002,6 @@ fn cached_managed_member(
         .into_iter()
         .find(|member| aether::node_runtime::managed_member_active(member, agent_id))
         .ok_or(())
-}
-
-async fn start_directory_publication(
-    arguments: &NodeServe,
-    endpoint_id: String,
-    bound_port: u16,
-    configured_scope: &str,
-) -> Result<
-    Option<(
-        aether::directory_publication::DirectoryPublication,
-        aether::discovery::wire::WireRecord,
-    )>,
-    (),
-> {
-    let (
-        Some(directory),
-        Some(certificate),
-        Some(agent_id),
-        Some(address),
-        Some(scope),
-        Some(capability),
-        Some(ttl),
-    ) = (
-        arguments.directory.as_ref(),
-        arguments.directory_certificate.as_ref(),
-        arguments.agent_id.as_ref(),
-        arguments.address.as_ref(),
-        arguments.scope.as_ref(),
-        arguments.capability.as_ref(),
-        arguments.directory_record_ttl,
-    )
-    else {
-        if arguments.directory.is_none()
-            && arguments.directory_certificate.is_none()
-            && arguments.agent_id.is_none()
-            && arguments.address.is_none()
-            && arguments.scope.is_none()
-            && arguments.capability.is_none()
-            && arguments.directory_record_ttl.is_none()
-        {
-            return Ok(None);
-        }
-        return Err(());
-    };
-    if ttl < 2
-        || agent_id.is_empty()
-        || scope.is_empty()
-        || capability.is_empty()
-        || scope != configured_scope
-    {
-        return Err(());
-    }
-    let mut address = address.parse::<std::net::SocketAddr>().map_err(|_| ())?;
-    if address.port() == 0 {
-        address.set_port(bound_port);
-    }
-    let certificate = std::fs::read(certificate).map_err(|_| ())?;
-    let publication = aether::directory_publication::DirectoryPublication::new(
-        directory.clone(),
-        &certificate,
-        &arguments.data_dir,
-        aether::directory_publication::PublicationRecord {
-            agent_id: agent_id.clone(),
-            address: address.to_string(),
-            scope: scope.clone(),
-            capability: capability.clone(),
-            ttl,
-        },
-    )
-    .map_err(|_| ())?;
-    let record = publication.renew(&endpoint_id).await.map_err(|_| ())?;
-    Ok(Some((publication, record)))
 }
 
 fn run_direct(arguments: NodeDirect) -> ExitCode {
@@ -1661,8 +1214,13 @@ async fn run_managed(arguments: NodeManaged) -> ExitCode {
             }
         }
         NodeManagedCommand::Sync { scope, data_dir } => {
-            if let Ok((cursor, changes)) =
-                sync_managed(&data_dir, &arguments.control, &scope, &client).await
+            if let Ok((cursor, changes)) = aether::node_runtime::sync_managed(
+                &data_dir,
+                &arguments.control,
+                &scope,
+                &client,
+            )
+            .await
             {
                 println!(
                     "{}",
@@ -1689,50 +1247,6 @@ async fn run_managed(arguments: NodeManaged) -> ExitCode {
     } else {
         eprintln!("aether: managed control request failed");
         ExitCode::from(1)
-    }
-}
-
-async fn sync_managed(
-    data_dir: &std::path::Path,
-    control: &str,
-    scope_id: &str,
-    client: &aether::managed_client::ManagedClient,
-) -> Result<(i64, usize), ()> {
-    std::fs::create_dir_all(data_dir).map_err(|_| ())?;
-    let mut store = aether_store::NodeStore::in_dir(data_dir).map_err(|_| ())?;
-    let mut cursor = store.managed_cursor(control, scope_id).map_err(|_| ())?;
-    let mut changes = 0usize;
-    loop {
-        let events = client.events_after(scope_id, cursor).await.map_err(|_| ())?;
-        if events.is_empty() {
-            return Ok((cursor, changes));
-        }
-        for event in events {
-            if event.cursor <= cursor {
-                return Err(());
-            }
-            match event.event {
-                aether_store::ManagedEventType::Joined => {
-                    let member = event.member.ok_or(())?;
-                    store
-                        .apply_managed_member(control, event.cursor, &member)
-                        .map_err(|_| ())?;
-                }
-                aether_store::ManagedEventType::Revoked if event.member.is_none() => {
-                    store
-                        .revoke_managed_member(
-                            control,
-                            event.cursor,
-                            &event.scope_id,
-                            &event.agent_id,
-                        )
-                        .map_err(|_| ())?;
-                }
-                aether_store::ManagedEventType::Revoked => return Err(()),
-            }
-            cursor = event.cursor;
-            changes = changes.checked_add(1).ok_or(())?;
-        }
     }
 }
 
@@ -1941,6 +1455,16 @@ fn cached_directory_record(
     Ok(record)
 }
 
+fn error_message(error: &aether::node_runtime::NodeRunError) -> String {
+    match error {
+        aether::node_runtime::NodeRunError::Usage(message)
+        | aether::node_runtime::NodeRunError::Failed(message) => message.clone(),
+        aether::node_runtime::NodeRunError::Transport(transport) => {
+            format!("transport failed: {transport:?}")
+        }
+    }
+}
+
 fn transport_error(error: &aether::transport::TransportError) -> ExitCode {
     eprintln!("aether: transport failed: {error:?}");
     ExitCode::from(1)
@@ -1955,15 +1479,17 @@ mod tests {
     };
 
     use super::{
-        NodeServe, cache_directory_record, cached_directory_record,
-        cached_managed_member, start_directory_publication, sync_managed,
+        cache_directory_record, cached_directory_record, cached_managed_member,
+    };
+    use aether::node_runtime::{
+        NodeServeOptions, start_directory_publication, sync_managed,
     };
     use axum_server::Handle;
     use ed25519_dalek::SigningKey;
 
     #[tokio::test]
     async fn live_publication_rejects_a_scope_outside_the_node_policy() {
-        let arguments = NodeServe {
+        let arguments = NodeServeOptions {
             policy: PathBuf::from("policy.json"),
             data_dir: PathBuf::from("node"),
             port: 0,
