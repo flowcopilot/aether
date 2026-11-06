@@ -29,7 +29,7 @@ use super::{
 use crate::{
     execution::Task,
     pact::{
-        config::{PactConfig, PactFile},
+        config::PactConfig,
         consent::{ConsentLink, SharedPactStore},
         grant::pact_grant_record,
         jwks::{
@@ -39,6 +39,7 @@ use crate::{
         keys::ProviderKey,
         tokens::verify_receipt,
     },
+    policy::PactPolicySection,
     proof::ProofError,
 };
 
@@ -149,7 +150,7 @@ struct Fixture {
 }
 
 fn config() -> PactConfig {
-    serde_json::from_value::<PactFile>(json!({
+    serde_json::from_value::<PactPolicySection>(json!({
         "publicUrl": PUBLIC,
         "audience": AUDIENCE,
         "brands": [
