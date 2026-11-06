@@ -105,10 +105,7 @@ fn host_action(
     }
 }
 
-pub async fn host_worker(
-    administration: SharedAdministration,
-    page: Arc<PageContext>,
-) {
+pub async fn host_worker(administration: SharedAdministration, page: Arc<PageContext>) {
     let current = {
         let page = Arc::clone(&page);
         move || page.current_hub()
