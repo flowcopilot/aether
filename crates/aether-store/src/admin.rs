@@ -445,4 +445,23 @@ mod tests {
         assert_eq!(store.admin_revision(), Ok(3));
         assert_eq!(store.current_workspace(), Ok(Some("/work".to_owned())));
     }
+
+    #[test]
+    fn names_stay_the_same() {
+        for (kind, name) in [
+            (ChangeKind::Workspace, "workspace"),
+            (ChangeKind::Grant, "grant"),
+            (ChangeKind::Directory, "directory"),
+            (ChangeKind::Capability, "capability"),
+            (ChangeKind::Limit, "limit"),
+        ] {
+            assert_eq!(kind.as_str(), name);
+        }
+        assert_eq!(AuditActor::Mcp.as_str(), "mcp");
+        assert_eq!(AuditActor::Ui.as_str(), "ui");
+        assert_eq!(AuditResult::Pending.as_str(), "pending");
+        assert_eq!(AuditResult::Applied.as_str(), "applied");
+        assert_eq!(AuditResult::Confirmed.as_str(), "confirmed");
+        assert_eq!(AuditResult::Failed.as_str(), "failed");
+    }
 }

@@ -809,4 +809,19 @@ mod tests {
         store.put_receipt("c", "m3", "other", "g.h.i", 3).unwrap();
         assert_eq!(store.receipts("g").unwrap(), ["a.b.c", "d.e.f"]);
     }
+
+    #[test]
+    fn device_status_names_stay_the_same_and_parse_back() {
+        use super::DeviceStatus;
+        for (status, name) in [
+            (DeviceStatus::Pending, "pending"),
+            (DeviceStatus::Approved, "approved"),
+            (DeviceStatus::Denied, "denied"),
+            (DeviceStatus::Consumed, "consumed"),
+        ] {
+            assert_eq!(status.as_str(), name);
+            assert_eq!(DeviceStatus::parse(name), Some(status));
+        }
+        assert_eq!(DeviceStatus::parse("Pending"), None);
+    }
 }

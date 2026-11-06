@@ -452,11 +452,7 @@ mod tests {
         PolicyError,
     > {
         let source = fs::read(path).map_err(|_| PolicyError::Read)?;
-        build(
-            PolicyFile::parse(&source)?,
-            data_dir,
-            codex_binary,
-        )
+        build(PolicyFile::parse(&source)?, data_dir, codex_binary)
     }
 
     fn minimal_policy(root: &std::path::Path) -> PathBuf {

@@ -496,4 +496,31 @@ mod tests {
             Admission::Denied(Denial::EndpointMismatch),
         );
     }
+
+    #[test]
+    fn names_stay_the_same_and_parse_back() {
+        for (kind, name) in [
+            (ScopeKind::Direct, "direct"),
+            (ScopeKind::Directory, "directory"),
+            (ScopeKind::Managed, "managed"),
+            (ScopeKind::Pact, "pact"),
+        ] {
+            assert_eq!(kind.as_str(), name);
+            assert_eq!(ScopeKind::parse(name), Some(kind));
+        }
+        for (mode, name) in
+            [(AccessMode::ReadOnly, "read_only"), (AccessMode::ReadWrite, "read_write")]
+        {
+            assert_eq!(mode.as_str(), name);
+            assert_eq!(AccessMode::parse(name), Some(mode));
+        }
+        for (rule, name) in [
+            (ApprovalRule::Automatic, "automatic"),
+            (ApprovalRule::LocalUi, "local_ui"),
+        ] {
+            assert_eq!(rule.as_str(), name);
+            assert_eq!(ApprovalRule::parse(name), Some(rule));
+        }
+        assert_eq!(ScopeKind::parse("Direct"), None);
+    }
 }
