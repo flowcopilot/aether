@@ -82,14 +82,18 @@ pub struct ReceiptClaims {
     pub ts: String,
 }
 
-/// The `pact.receipt` metadata value: the compact JWS of `claims`, and the
-/// claims themselves.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub struct SignedReceipt {
+    pub jws: String,
+    pub claims: ReceiptClaims,
+}
+
 pub fn sign_receipt(
     key: &ProviderKey,
     claims: &ReceiptClaims,
-) -> Result<serde_json::Value, KeyError> {
+) -> Result<SignedReceipt, KeyError> {
     let jws = key.sign(RECEIPT_TYPE, claims)?;
-    Ok(serde_json::json!({ "jws": jws, "claims": claims }))
+    Ok(SignedReceipt { jws, claims: claims.clone() })
 }
 
 /// Verifies a receipt this node signed.
@@ -183,9 +187,8 @@ mod tests {
             ts: "2026-10-07T12:00:00Z".to_owned(),
         };
         let receipt = sign_receipt(&key, &claims).expect("receipt must sign");
-        assert_eq!(receipt["claims"]["scopesUsed"][0], "review:read_only");
-        assert_eq!(receipt["claims"]["actions"][0]["argsHash"], "hash");
-        let jws = receipt["jws"].as_str().expect("jws must be a string");
-        assert_eq!(verify_receipt(&key, jws), Some(claims));
+        assert_eq!(receipt.claims.scopes_used[0], "review:read_only");
+        assert_eq!(receipt.claims.actions[0].args_hash.as_deref(), Some("hash"));
+        assert_eq!(verify_receipt(&key, &receipt.jws), Some(claims));
     }
 }
