@@ -171,11 +171,6 @@ where
     }
 
     #[must_use]
-    pub const fn scope_kind(&self) -> ScopeKind {
-        self.node.scope_kind()
-    }
-
-    #[must_use]
     pub fn scope_kind_for(&self, scope_id: &str) -> Option<ScopeKind> {
         self.node.scope_kind_for(scope_id)
     }
@@ -200,10 +195,6 @@ where
             return Err(ProofError::Execution(crate::execution::ExecutionError::Path));
         }
         self.node.apply_workspace(path)
-    }
-
-    pub fn apply_grant(&self, grant: aether_core::Grant) -> Result<(), ProofError> {
-        self.node.apply_grant(grant)
     }
 
     pub fn apply_stored_grant(&self, grant_json: &str) -> Result<(), ProofError> {
@@ -269,7 +260,6 @@ where
             ),
             workspace_id: request.workspace_id.as_str().to_owned(),
             remote_text: text.to_owned(),
-            context_tokens: 0,
         };
         let admission = self
             .node
@@ -553,6 +543,8 @@ where
     }
 
     fn queue_limit(&self, id: &str) -> Result<u32, AdminError> {
+        let id = aether_core::limits::QueueLimitId::parse(id)
+            .ok_or(AdminError::InvalidField("id"))?;
         self.service
             .node
             .current_queue_limit(id)
@@ -560,6 +552,8 @@ where
     }
 
     fn set_queue_limit(&self, id: &str, limit: u32) -> Result<(), AdminError> {
+        let id = aether_core::limits::QueueLimitId::parse(id)
+            .ok_or(AdminError::InvalidField("id"))?;
         self.service
             .node
             .set_queue_limit(id, limit)
@@ -672,7 +666,7 @@ mod tests {
 
     use super::NodeService;
     use crate::{
-        execution::{Agent, ExecutionError, Executor, Limits},
+        execution::{Agent, ExecutionError, Executor, Limits, TurnContext},
         identity::{ClaimInput, GrantInput, SignedClaims, signed_claim, signed_grant},
         proof::ProofNode,
         transport::{
@@ -689,13 +683,8 @@ mod tests {
     struct Fake;
 
     impl Agent for Fake {
-        fn start_turn(
-            &mut self,
-            _task_id: &str,
-            instruction: &str,
-            text: &str,
-        ) -> Result<String, ExecutionError> {
-            Ok(format!("{instruction}:{text}"))
+        fn start_turn(&mut self, ctx: &TurnContext) -> Result<String, ExecutionError> {
+            Ok(format!("{}:{}", ctx.skill, ctx.text))
         }
 
         fn cancel(&self, _task_id: &str) {}
@@ -998,20 +987,13 @@ mod tests {
     struct ManyProgressEvents;
 
     impl Agent for ManyProgressEvents {
-        fn start_turn(
-            &mut self,
-            _task_id: &str,
-            instruction: &str,
-            text: &str,
-        ) -> Result<String, ExecutionError> {
-            Ok(format!("{instruction}:{text}"))
+        fn start_turn(&mut self, ctx: &TurnContext) -> Result<String, ExecutionError> {
+            Ok(format!("{}:{}", ctx.skill, ctx.text))
         }
 
         fn start_turn_with_events(
             &mut self,
-            _task_id: &str,
-            instruction: &str,
-            text: &str,
+            ctx: &TurnContext,
             events: &mut dyn FnMut(crate::execution::ExecutionEvent),
         ) -> Result<String, ExecutionError> {
             // More than `MAX_FRAMES - 1` progress events, so the durable
@@ -1021,7 +1003,7 @@ mod tests {
                 events(crate::execution::ExecutionEvent::Progress);
             }
             events(crate::execution::ExecutionEvent::Completed);
-            Ok(format!("{instruction}:{text}"))
+            Ok(format!("{}:{}", ctx.skill, ctx.text))
         }
 
         fn cancel(&self, _task_id: &str) {}
@@ -1355,7 +1337,6 @@ mod tests {
             skill: "general".to_owned(),
             workspace_id: "workspace".to_owned(),
             remote_text: "remote text".to_owned(),
-            context_tokens: 0,
         };
         let mut store = NodeStore::in_dir(&root).expect("store must open");
         store
@@ -1492,7 +1473,6 @@ mod tests {
             skill: "general".to_owned(),
             workspace_id: "workspace".to_owned(),
             remote_text: "remote text".to_owned(),
-            context_tokens: 0,
         };
         let mut store = NodeStore::in_dir(&root).expect("store must open");
         store
@@ -1652,7 +1632,6 @@ mod tests {
             skill: "general".to_owned(),
             workspace_id: "workspace".to_owned(),
             remote_text: "remote text".to_owned(),
-            context_tokens: 0,
         };
         let mut store = NodeStore::in_dir(&root).expect("store must open");
         store
@@ -1805,7 +1784,6 @@ mod tests {
                 skill: "general".to_owned(),
                 workspace_id: "workspace".to_owned(),
                 remote_text: "remote text".to_owned(),
-                context_tokens: 0,
             };
             let mut store = NodeStore::in_dir(&root).expect("store must open");
             store

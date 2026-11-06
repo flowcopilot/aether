@@ -1048,7 +1048,6 @@ impl Gateway {
             skill: turn.brand.capability.clone(),
             workspace_id: turn.brand.workspace.clone(),
             remote_text,
-            context_tokens: 0,
         };
         Ok((request, key, task, args_hash))
     }

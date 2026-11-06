@@ -16,10 +16,7 @@ use aether_store::QueueLimits;
 use crate::{
     agent::{
         NodeAgent,
-        codex::{
-            CodexAppServer, CodexLimits, MAX_ENVIRONMENT, valid_environment_key,
-            valid_environment_value,
-        },
+        codex::{CodexAppServer, CodexLimits, build_node_environment},
         connected::ConnectedAgent,
     },
     data_dir::{DataDir, codex_login},
@@ -186,26 +183,19 @@ fn build(
         Some(sandbox) => NodeAgent::Codex(codex_agent(
             data_dir,
             codex_binary,
+            workspace.clone(),
             CodexLimits {
-                workspace: workspace.clone(),
                 sandbox: sandbox.as_str().to_owned(),
-                // Nobody reads a remote task, so nothing waits for an
-                // approval. An MCP write tool runs only when the agent's
-                // config sets `approval_mode = "approve"` for it.
                 approval: "never".to_owned(),
                 allow_network: policy.allow_network,
                 environment: BTreeMap::new(),
-                max_context_tokens: policy.max_context_tokens,
-                max_seconds: policy.max_seconds,
             },
             &policy.environment_allowlist,
+            matches!(sandbox, PolicySandbox::TaskFolder),
         )?),
         None => NodeAgent::Connected(
-            ConnectedAgent::listen(
-                &layout.agent_socket(),
-                Duration::from_secs(policy.max_seconds),
-            )
-            .map_err(|_| PolicyError::InvalidField("adapter".to_owned()))?,
+            ConnectedAgent::listen(&layout.agent_socket())
+                .map_err(|_| PolicyError::InvalidField("adapter".to_owned()))?,
         ),
     };
     let adapter = agent.kind();
@@ -272,8 +262,10 @@ fn build(
 fn codex_agent(
     data_dir: &Path,
     codex_binary: PathBuf,
+    workspace: PathBuf,
     limits: CodexLimits,
     environment_allowlist: &[String],
+    task_folder: bool,
 ) -> Result<CodexAppServer, PolicyError> {
     let owner_codex_home = std::env::var_os("CODEX_HOME")
         .filter(|value| !value.is_empty())
@@ -282,26 +274,18 @@ fn codex_agent(
             std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex"))
         });
     let codex_home = prepare_codex_home(data_dir, owner_codex_home.as_deref())?;
-    let environment = codex_environment(&codex_home, environment_allowlist, |name| {
-        std::env::var(name).ok()
-    })?;
-    Ok(CodexAppServer::new(codex_binary, CodexLimits { environment, ..limits }))
+    let environment = build_node_environment(
+        &codex_home,
+        environment_allowlist,
+        task_folder,
+        |name| std::env::var(name).ok(),
+    )?;
+    Ok(CodexAppServer::new(
+        codex_binary,
+        workspace,
+        CodexLimits { environment, ..limits },
+    ))
 }
-
-/// Variables that choose where Codex reads its configuration, credentials or
-/// state. aether sets `CODEX_HOME` and `HOME` itself; letting the policy
-/// pass the node owner's own values would load the owner's `~/.codex` setup
-/// (its MCP servers, hooks, plugins, memories) for a remote peer's task. The
-/// agent's own MCP servers are in the node's Codex home.
-const RESERVED_ENVIRONMENT: &[&str] = &[
-    "HOME",
-    "CODEX_HOME",
-    "CODEX_SQLITE_HOME",
-    "CODEX_AUTH",
-    "CODEX_URL",
-    "CODEX_EXEC_SERVER_URL",
-    "CODEX_MANAGED_PACKAGE_ROOT",
-];
 
 /// Creates the node's Codex home. It shares only the owner's login file, when
 /// one exists. Codex writes refreshed credentials through the link, so both
@@ -335,52 +319,6 @@ fn prepare_codex_home(
     codex_home.canonicalize().map_err(|_| PolicyError::Invalid)
 }
 
-/// The spawned Codex environment: the allowlisted variables plus the node's
-/// own `CODEX_HOME` and `HOME`.
-fn codex_environment(
-    codex_home: &Path,
-    names: &[String],
-    lookup: impl Fn(&str) -> Option<String>,
-) -> Result<BTreeMap<String, String>, PolicyError> {
-    let mut environment = allowed_environment(names, lookup)?;
-    let home = codex_home.join("home");
-    for (name, path) in [("CODEX_HOME", codex_home), ("HOME", home.as_path())] {
-        let path = path.to_str().ok_or(PolicyError::Invalid)?;
-        environment.insert(name.to_owned(), path.to_owned());
-    }
-    Ok(environment)
-}
-
-/// Copies each allowlisted variable out of `lookup`. Fails closed, like a
-/// missing workspace: a name that is unset, malformed, reserved, or over the
-/// executor's own limit would otherwise pass startup and then reject or
-/// break every task at run time, with nothing pointing back at the policy.
-fn allowed_environment(
-    names: &[String],
-    lookup: impl Fn(&str) -> Option<String>,
-) -> Result<BTreeMap<String, String>, PolicyError> {
-    // Two slots stay free for the `CODEX_HOME` and `HOME` aether adds.
-    if names.len() > MAX_ENVIRONMENT - 2 {
-        return Err(PolicyError::InvalidField("environmentAllowlist".to_owned()));
-    }
-    names
-        .iter()
-        .enumerate()
-        .map(|(index, name)| {
-            lookup(name)
-                .filter(|value| {
-                    valid_environment_key(name)
-                        && valid_environment_value(value)
-                        && !RESERVED_ENVIRONMENT.contains(&name.as_str())
-                })
-                .map(|value| (name.clone(), value))
-                .ok_or_else(|| {
-                    PolicyError::InvalidField(format!("environmentAllowlist[{index}]"))
-                })
-        })
-        .collect()
-}
-
 #[cfg(test)]
 #[expect(
     clippy::arithmetic_side_effects,
@@ -403,9 +341,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        MAX_ENVIRONMENT, allowed_environment, build, codex_environment,
-        load_or_create_service, prepare_codex_home,
+        build, build_node_environment, load_or_create_service, prepare_codex_home,
     };
+    use crate::agent::codex::MAX_ENVIRONMENT;
     use crate::identity::{
         AccessInput, GrantInput, GrantRecord, encode_grant, sign_access, signed_grant,
     };
@@ -1036,6 +974,9 @@ mod tests {
 
     #[test]
     fn allowed_environment_copies_only_named_variables() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let codex_home =
+            prepare_codex_home(directory.path(), None).expect("home must create");
         let lookup = |name: &str| match name {
             "HOME" => Some("/home/owner".to_owned()),
             "CODEX_HOME" => Some("/home/owner/.codex".to_owned()),
@@ -1044,11 +985,16 @@ mod tests {
             "OTHER" => Some("other".to_owned()),
             _ => None,
         };
+        let path =
+            |path: PathBuf| path.to_str().expect("path must be UTF-8").to_owned();
         assert_eq!(
-            allowed_environment(&["PATH".to_owned()], lookup),
-            Ok(BTreeMap::from([("PATH".to_owned(), "/usr/bin".to_owned())]))
+            build_node_environment(&codex_home, &["PATH".to_owned()], false, lookup),
+            Ok(BTreeMap::from([
+                ("CODEX_HOME".to_owned(), path(codex_home.clone())),
+                ("HOME".to_owned(), path(codex_home.join("home"))),
+                ("PATH".to_owned(), "/usr/bin".to_owned()),
+            ]))
         );
-        assert_eq!(allowed_environment(&[], lookup), Ok(BTreeMap::new()));
         for (names, field) in [
             (vec!["PATH", "MISSING"], "environmentAllowlist[1]"),
             (vec!["NUL"], "environmentAllowlist[0]"),
@@ -1058,13 +1004,13 @@ mod tests {
         ] {
             let names = names.into_iter().map(str::to_owned).collect::<Vec<_>>();
             assert_eq!(
-                allowed_environment(&names, lookup),
+                build_node_environment(&codex_home, &names, false, lookup),
                 Err(PolicyError::InvalidField(field.to_owned()))
             );
         }
         let too_many = vec!["OTHER".to_owned(); MAX_ENVIRONMENT - 1];
         assert_eq!(
-            allowed_environment(&too_many, lookup),
+            build_node_environment(&codex_home, &too_many, false, lookup),
             Err(PolicyError::InvalidField("environmentAllowlist".to_owned()))
         );
     }
@@ -1079,8 +1025,9 @@ mod tests {
         ));
         assert!(codex_home.join("home").is_dir());
         let lookup = |name: &str| (name == "PATH").then(|| "/usr/bin".to_owned());
-        let environment = codex_environment(&codex_home, &["PATH".to_owned()], lookup)
-            .expect("environment must build");
+        let environment =
+            build_node_environment(&codex_home, &["PATH".to_owned()], false, lookup)
+                .expect("environment must build");
         let path =
             |path: PathBuf| path.to_str().expect("path must be UTF-8").to_owned();
         assert_eq!(
