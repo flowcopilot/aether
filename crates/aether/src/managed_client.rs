@@ -264,9 +264,17 @@ pub async fn request_task(
         std::fs::read(certificate_path).map_err(|_| TransportError::Address)?;
     let client = ManagedClient::with_pinned_certificate(control, &certificate)
         .map_err(|_| TransportError::Address)?;
-    sync_managed(data_dir, control, &input.scope, &client).await.map_err(|()| {
-        TransportError::Network("managed roster synchronization failed".to_owned())
-    })?;
+    // The cached roster below still answers when the control service is
+    // unreachable, so a failed synchronization is logged, not fatal.
+    if sync_managed(data_dir, control, &input.scope, &client).await.is_err() {
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "level": "error",
+                "event": "managed_sync_failed",
+            })
+        );
+    }
     let members = match client.members(&input.scope).await {
         Ok(members) => members,
         Err(ManagedClientError::Request) => {
