@@ -23,7 +23,6 @@ export type AgentMessage =
   | { type: "failed"; id: string }
   | { type: "cancelled"; id: string };
 
-// A task or a cancel, or undefined for a line to skip.
 export function parseNodeLine(line: string): NodeMessage | undefined {
   let value: unknown;
   try {

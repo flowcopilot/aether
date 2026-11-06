@@ -90,7 +90,6 @@ class Settings:
         return caller_command(self.aether_bin, self.data_dir)
 
     def tools_available(self) -> bool:
-        # The path is found again when it was not found, or when that file is gone.
         if self._found is None or not os.access(self._found, os.X_OK):
             self._found = shutil.which(self.aether_bin)
         return self._found is not None and self.data_dir.is_dir()

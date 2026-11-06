@@ -74,7 +74,6 @@ export class FakeNode {
     return JSON.parse(line);
   }
 
-  // Whether the agent closed the connection without another line.
   async closed(): Promise<boolean> {
     await waitFor(() => this.#ended, "the agent must close the connection");
     return this.#lines.length === 0;
