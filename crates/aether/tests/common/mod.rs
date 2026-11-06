@@ -67,6 +67,29 @@ impl Drop for ServerProcess {
     }
 }
 
+/// Reads JSON lines until each event in `names` has been seen once, in any
+/// order: a node prints events from concurrent tasks. `None` when the
+/// process stops first.
+pub fn read_events(
+    output: &mut impl BufRead,
+    names: &[&str],
+) -> Option<std::collections::BTreeMap<String, Value>> {
+    let mut seen = std::collections::BTreeMap::new();
+    while seen.len() < names.len() {
+        let mut line = String::new();
+        if output.read_line(&mut line).expect("event line must read") == 0 {
+            return None;
+        }
+        let event: Value =
+            serde_json::from_str(&line).expect("event line must be JSON");
+        if let Some(name) = event["event"].as_str().filter(|name| names.contains(name))
+        {
+            seen.entry(name.to_owned()).or_insert(event);
+        }
+    }
+    Some(seen)
+}
+
 /// Reads one JSON line that the process writes, such as a startup event.
 /// With a `name`, skips the lines until the event with that name.
 pub fn read_event(output: &mut impl BufRead, name: Option<&str>) -> Value {
