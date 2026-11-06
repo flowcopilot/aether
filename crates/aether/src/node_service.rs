@@ -203,7 +203,7 @@ where
     }
 
     #[must_use]
-    pub fn a2a(&self) -> A2aTransport<'_, T, P> {
+    pub const fn a2a(&self) -> A2aTransport<'_, T, P> {
         A2aTransport::new(self.proof())
     }
 }

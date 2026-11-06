@@ -357,4 +357,16 @@ mod tests {
             assert_eq!(event_status(event, TaskState::Succeeded), status);
         }
     }
+
+    #[test]
+    fn a2a_status_maps_store_states() {
+        assert_eq!(
+            super::a2a_status(aether_store::TaskState::Running),
+            A2aTaskStatus::Working
+        );
+        assert_eq!(
+            super::a2a_status(aether_store::TaskState::Cancelled),
+            A2aTaskStatus::Canceled
+        );
+    }
 }
