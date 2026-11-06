@@ -405,7 +405,6 @@ mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet},
         fs,
-        net::TcpListener,
         path::PathBuf,
         sync::{Arc, Mutex},
         time::{Duration, SystemTime},
@@ -575,11 +574,13 @@ mod tests {
         let server_data = root.join("server");
         let client_data = root.join("client");
         fs::create_dir_all(&workspace).expect("workspace must create");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("port must bind");
-        let port = listener.local_addr().expect("port must resolve").port();
-        drop(listener);
-        let server =
-            bind_node(&server_data, port, None).await.expect("server must bind");
+        let server = bind_node(&server_data, 0, None).await.expect("server must bind");
+        let port = server
+            .bound_sockets()
+            .into_iter()
+            .find(std::net::SocketAddr::is_ipv4)
+            .expect("server must have an IPv4 socket")
+            .port();
         let client = bind_node(&client_data, 0, None).await.expect("client must bind");
         let endpoint = aether_core::EndpointId::new(client.id().to_string());
         client.close().await;
@@ -760,11 +761,13 @@ mod tests {
         let server_data = root.join("server");
         let client_data = root.join("client");
         fs::create_dir_all(&workspace).expect("workspace must create");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("port must bind");
-        let port = listener.local_addr().expect("port must resolve").port();
-        drop(listener);
-        let server =
-            bind_node(&server_data, port, None).await.expect("server must bind");
+        let server = bind_node(&server_data, 0, None).await.expect("server must bind");
+        let port = server
+            .bound_sockets()
+            .into_iter()
+            .find(std::net::SocketAddr::is_ipv4)
+            .expect("server must have an IPv4 socket")
+            .port();
         let client = bind_node(&client_data, 0, None).await.expect("client must bind");
         let endpoint = aether_core::EndpointId::new(client.id().to_string());
         client.close().await;

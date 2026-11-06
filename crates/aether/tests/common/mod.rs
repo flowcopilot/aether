@@ -1,5 +1,20 @@
 //! Helpers that the integration tests share.
 
+pub mod harness;
+pub mod signing;
+pub mod store;
+
+pub use aether::fixture::PolicyLimits;
+pub use harness::{FakeCodex, TestNodeDir, policy_for_grants, read_node_listening};
+pub use signing::{
+    discovery_signing_key, host_signing_key, proof_issuer_key, review_claim,
+    review_grant,
+};
+pub use store::{
+    load_contact, load_directory_record, open_store, store_contact_invitation,
+    store_directory_record,
+};
+
 use std::{
     io::{BufRead, BufReader},
     process::{Child, ChildStdout, Command, ExitStatus},

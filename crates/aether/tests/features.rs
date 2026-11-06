@@ -16,6 +16,7 @@
     clippy::large_futures,
     clippy::needless_pass_by_value,
     clippy::needless_pass_by_ref_mut,
+    clippy::too_many_arguments,
     reason = "test code: a panic is a failed test, the values are small constants, and cucumber passes captures by value and the world by `&mut`"
 )]
 
