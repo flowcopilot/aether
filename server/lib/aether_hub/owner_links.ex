@@ -187,7 +187,6 @@ defmodule AetherHub.OwnerLinks do
     :ok
   end
 
-  # The active links and the recent claims of `endpoint`, on either side.
   defp seen_by(endpoint) do
     from l in OwnerLink,
       where:
