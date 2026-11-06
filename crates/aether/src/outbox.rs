@@ -576,11 +576,20 @@ pub async fn run(
         if active
             && presence_read.is_none_or(|read| read.elapsed() >= PRESENCE_INTERVAL)
         {
-            if let Ok(Some(hub)) = hubs.client()
-                && let Ok(map) = hub.presence(Duration::from_secs(4)).await
-            {
-                presence = Some(map);
-            }
+            presence = match hubs.client() {
+                Ok(Some(hub)) => match hub.presence(Duration::from_secs(4)).await {
+                    Ok(map) => Some(map),
+                    Err(error) => {
+                        tracing::warn!(?error, "hub presence refresh failed");
+                        None
+                    }
+                },
+                Ok(None) => None,
+                Err(error) => {
+                    tracing::warn!(?error, "hub client unavailable for presence");
+                    None
+                }
+            };
             presence_read = Some(std::time::Instant::now());
         }
         match run_once(&data_dir, Arc::clone(&courier), presence.as_ref(), now()).await
@@ -607,6 +616,14 @@ mod tests {
     };
 
     use aether_store::{NodeStore, SentState};
+
+    #[test]
+    fn response_linger_outlives_the_poll_interval() {
+        assert!(
+            crate::transport::RESPONSE_LINGER > super::POLL_INTERVAL,
+            "polling clients must keep connections between outbox polls"
+        );
+    }
 
     use super::{
         Courier, Delay, OutboxError, attempt, enqueue, next_delay, now, outcome,

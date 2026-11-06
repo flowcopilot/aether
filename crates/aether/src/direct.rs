@@ -93,7 +93,7 @@ impl crate::settings::Setting for HostName {
 }
 
 /// The prefix of an [`InvitationBundle`]'s one-line form.
-pub const INVITE_PREFIX: &str = "aether-invite:";
+pub use crate::hub_client::protocol::INVITE_PREFIX;
 
 impl InvitationBundle {
     /// A bundle without an Agent Card.

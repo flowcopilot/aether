@@ -127,6 +127,32 @@ struct NodeServe {
     invite_name: Option<String>,
 }
 
+impl From<NodeServe> for aether::node_runtime::NodeServeOptions {
+    fn from(arguments: NodeServe) -> Self {
+        Self {
+            policy: aether::data_dir::expand_home(arguments.policy),
+            data_dir: aether::data_dir::resolve_node_data_dir(arguments.data_dir),
+            port: arguments.port,
+            admin_port: arguments.admin_port,
+            pact_listen: arguments.pact_listen,
+            managed_control: arguments.managed_control,
+            managed_control_certificate: arguments.managed_control_certificate,
+            adapter: None,
+            codex_bin: arguments.codex_bin,
+            relay_url: arguments.relay_url,
+            hub_url: arguments.hub_url,
+            directory: arguments.directory,
+            directory_certificate: arguments.directory_certificate,
+            agent_id: arguments.agent_id,
+            address: arguments.address,
+            scope: arguments.scope,
+            capability: arguments.capability,
+            directory_record_ttl: arguments.directory_record_ttl,
+            invite_name: arguments.invite_name,
+        }
+    }
+}
+
 #[derive(Args)]
 struct NodeRequest {
     /// Defaults to `$AETHER_DATA_DIR`, else `~/.aether/host`.
@@ -705,27 +731,8 @@ async fn run_node(node: Node) -> ExitCode {
                 eprintln!("aether: --adapter must be codex or connected");
                 return ExitCode::from(2);
             };
-            let options = aether::node_runtime::NodeServeOptions {
-                policy: aether::data_dir::expand_home(arguments.policy),
-                data_dir: aether::data_dir::resolve_node_data_dir(arguments.data_dir),
-                port: arguments.port,
-                admin_port: arguments.admin_port,
-                pact_listen: arguments.pact_listen,
-                managed_control: arguments.managed_control,
-                managed_control_certificate: arguments.managed_control_certificate,
-                adapter,
-                codex_bin: arguments.codex_bin,
-                relay_url: arguments.relay_url,
-                hub_url: arguments.hub_url,
-                directory: arguments.directory,
-                directory_certificate: arguments.directory_certificate,
-                agent_id: arguments.agent_id,
-                address: arguments.address,
-                scope: arguments.scope,
-                capability: arguments.capability,
-                directory_record_ttl: arguments.directory_record_ttl,
-                invite_name: arguments.invite_name,
-            };
+            let mut options = aether::node_runtime::NodeServeOptions::from(arguments);
+            options.adapter = adapter;
             match aether::node_runtime::run(options).await {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => match error {

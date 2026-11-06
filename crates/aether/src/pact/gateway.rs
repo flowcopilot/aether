@@ -705,9 +705,12 @@ impl Gateway {
     /// calls this periodically.
     pub fn maintain(&self) {
         let now = now();
-        let _ = self
+        let closed = self
             .store()
             .close_idle_contexts(now.saturating_sub(CONTEXT_IDLE_SECONDS), now);
+        if let Err(error) = closed {
+            tracing::warn!(?error, "pact store idle context cleanup failed");
+        }
         self.callers.retain_recent();
     }
 
@@ -929,7 +932,14 @@ impl Gateway {
             }
             Err(failure) => {
                 // Nothing was answered: a retry with the same id runs again.
-                let _ = self.store().discard_message(turn.context_id, turn.message_id);
+                let discarded =
+                    self.store().discard_message(turn.context_id, turn.message_id);
+                if let Err(error) = discarded {
+                    tracing::warn!(
+                        ?error,
+                        "pact message discard failed after send error"
+                    );
+                }
                 failure.into_response()
             }
         }
