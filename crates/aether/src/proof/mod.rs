@@ -11,13 +11,10 @@ use std::{
 };
 
 use aether_core::{
-    Admission, Claim, Denial, EndpointId, PolicyEngine, Request, Scope, ScopeKind,
-    TrustProvider, limits::QueueLimitId,
+    Claim, Denial, EndpointId, PolicyEngine, Request, Scope, ScopeKind, TrustProvider,
+    limits::QueueLimitId,
 };
-use aether_store::{
-    NodeStore, QueueLimits, StoreError, TaskAdmission as StoreAdmission, TaskInput,
-    TaskState,
-};
+use aether_store::{NodeStore, QueueLimits, StoreError, TaskState};
 use tokio::sync::broadcast;
 
 use crate::execution::{Agent, ExecutionError, Executor, Task, Workspace};
@@ -30,7 +27,7 @@ pub enum ProofError {
     Store(StoreError),
     Execution(ExecutionError),
     TaskMismatch,
-    Queue,
+    Internal,
     Shutdown,
 }
 
@@ -88,8 +85,12 @@ pub(crate) fn timestamp_after(duration: Duration) -> i64 {
         .unwrap_or(i64::MAX)
 }
 
+mod admission;
+mod handle;
 mod scheduler;
 mod worker;
+
+pub use handle::ProofHandle;
 
 use scheduler::SchedulerContext;
 use worker::StoreWorker;
@@ -138,7 +139,7 @@ where
             .into_iter()
             .map(|scope| (scope.id.clone(), scope))
             .collect::<BTreeMap<_, _>>();
-        let scope = scopes.values().next().cloned().ok_or(ProofError::Queue)?;
+        let scope = scopes.values().next().cloned().ok_or(ProofError::Internal)?;
         let identities = policy
             .grants()
             .iter()
@@ -194,7 +195,7 @@ where
         let scheduler_thread = thread::Builder::new()
             .name("aether-scheduler".to_owned())
             .spawn(move || scheduler_ctx.run(&scheduler_wake_rx))
-            .map_err(|_| ProofError::Queue)?;
+            .map_err(|_| ProofError::Internal)?;
         Ok(Self {
             policy,
             store,
@@ -289,8 +290,8 @@ where
         id: QueueLimitId,
         limit: u32,
     ) -> Result<(), ProofError> {
-        let limit = usize::try_from(limit).map_err(|_| ProofError::Queue)?;
-        let mut limits = self.limits.lock().map_err(|_| ProofError::Queue)?;
+        let limit = usize::try_from(limit).map_err(|_| ProofError::Internal)?;
+        let mut limits = self.limits.lock().map_err(|_| ProofError::Internal)?;
         match id {
             QueueLimitId::Global => limits.global = limit,
             QueueLimitId::PerPeer => limits.per_peer = limit,
@@ -305,18 +306,18 @@ where
             QueueLimitId::Global => limits.global,
             QueueLimitId::PerPeer => limits.per_peer,
         };
-        u32::try_from(limit).map_err(|_| ProofError::Queue)
+        u32::try_from(limit).map_err(|_| ProofError::Internal)
     }
 
     /// Moves the executor and its agent to `path`. The executor
     /// canonicalizes the path; `workspace` then reads the new value.
     pub fn apply_workspace(&self, path: &Path) -> Result<(), ProofError> {
-        self.executor.lock().map_err(|_| ProofError::Queue)?.set_workspace(path)?;
+        self.executor.lock().map_err(|_| ProofError::Internal)?.set_workspace(path)?;
         Ok(())
     }
 
     pub fn workspace(&self) -> Result<PathBuf, ProofError> {
-        self.workspace.path().map_err(|_| ProofError::Queue)
+        self.workspace.path().map_err(|_| ProofError::Internal)
     }
 
     pub fn apply_grant(&self, grant: aether_core::Grant) -> Result<(), ProofError> {
@@ -339,7 +340,7 @@ where
             .scopes
             .get(&grant.scope_id)
             .ok_or(ProofError::Denied(Denial::ScopeMismatch))?;
-        let mut policy = self.policy.lock().map_err(|_| ProofError::Queue)?;
+        let mut policy = self.policy.lock().map_err(|_| ProofError::Internal)?;
         policy.verify_grant(&grant, scope).map_err(ProofError::Denied)?;
         if add_to_friends
             && scope.kind == ScopeKind::Direct
@@ -369,7 +370,7 @@ where
     }
 
     pub fn has_grant(&self, id: &aether_core::GrantId) -> Result<bool, ProofError> {
-        Ok(self.policy.lock().map_err(|_| ProofError::Queue)?.has_grant(id))
+        Ok(self.policy.lock().map_err(|_| ProofError::Internal)?.has_grant(id))
     }
 
     /// Removes the grant `id` from the live policy. A queued task under it
@@ -381,12 +382,12 @@ where
     /// task under the grant starts after it.
     pub fn revoke_grant(&self, id: &aether_core::GrantId) -> Result<bool, ProofError> {
         let _dispatch_guard =
-            self.dispatch_serial.lock().map_err(|_| ProofError::Queue)?;
-        Ok(self.policy.lock().map_err(|_| ProofError::Queue)?.remove_grant(id))
+            self.dispatch_serial.lock().map_err(|_| ProofError::Internal)?;
+        Ok(self.policy.lock().map_err(|_| ProofError::Internal)?.remove_grant(id))
     }
 
     pub fn grants(&self) -> Result<Vec<aether_core::Grant>, ProofError> {
-        Ok(self.policy.lock().map_err(|_| ProofError::Queue)?.grants().to_vec())
+        Ok(self.policy.lock().map_err(|_| ProofError::Internal)?.grants().to_vec())
     }
 
     pub fn content_is_expired(&self, task_id: &str) -> Result<bool, ProofError> {
@@ -397,99 +398,7 @@ where
     }
 
     pub fn queue_limits(&self) -> Result<QueueLimits, ProofError> {
-        self.limits.lock().map(|limits| *limits).map_err(|_| ProofError::Queue)
-    }
-
-    /// Admits a task and queues it for the scheduler. Only the identity
-    /// step differs between an Iroh task and a PACT task: both enter the
-    /// same queue and limits, and dispatch rechecks the same grant. A
-    /// transport request gives a `replay_key`, so that a replayed frame
-    /// cannot queue the task again.
-    pub fn admit(
-        &self,
-        input: SubmissionInput<'_>,
-        identity: Identity<'_>,
-        replay_key: Option<String>,
-    ) -> Result<StoreAdmission, ProofError> {
-        if self.shutdown.load(Ordering::Acquire) {
-            return Err(ProofError::Shutdown);
-        }
-        let SubmissionInput { request, authenticated_endpoint, idempotency_key, task } =
-            input;
-        if task.id != request.task_id.as_str()
-            || task.workspace_id != request.workspace_id.as_str()
-        {
-            return Err(ProofError::TaskMismatch);
-        }
-        let scope = self
-            .scopes
-            .get(&request.scope_id)
-            .ok_or(ProofError::Denied(Denial::ScopeMismatch))?;
-        let policy = self.policy.lock().map_err(|_| ProofError::Queue)?;
-        let admission = match identity {
-            Identity::Claim(claim) => {
-                policy.admit(request, claim, scope, authenticated_endpoint)
-            }
-            Identity::Verified => {
-                policy.admit_verified(request, scope, authenticated_endpoint)
-            }
-        };
-        drop(policy);
-        if let Admission::Denied(denial) = admission {
-            return Err(ProofError::Denied(denial));
-        }
-        self.check_group(scope, request, authenticated_endpoint)?;
-        self.enqueue(request, authenticated_endpoint, idempotency_key, task, replay_key)
-    }
-
-    fn check_group(
-        &self,
-        scope: &Scope,
-        request: &Request,
-        endpoint: &EndpointId,
-    ) -> Result<(), ProofError> {
-        if scope.kind == ScopeKind::Direct {
-            let agent = request.caller_agent_id.as_str().to_owned();
-            let endpoint = endpoint.as_str().to_owned();
-            if !self
-                .store
-                .call(move |store| store.access_group_allows(&agent, &endpoint))?
-            {
-                return Err(ProofError::GroupDenied);
-            }
-        }
-        Ok(())
-    }
-
-    fn enqueue(
-        &self,
-        request: &Request,
-        authenticated_endpoint: &EndpointId,
-        idempotency_key: &str,
-        task: &Task,
-        replay_key: Option<String>,
-    ) -> Result<StoreAdmission, ProofError> {
-        let input = TaskInput {
-            request: Request {
-                caller_endpoint_id: authenticated_endpoint.clone(),
-                ..request.clone()
-            },
-            idempotency_key: idempotency_key.to_owned(),
-            request_fingerprint: request_fingerprint(request, task),
-            skill: task.skill.clone(),
-            remote_text: task.remote_text.clone(),
-        };
-        let limits = self.queue_limits()?;
-        let admission = {
-            let _dispatch_guard =
-                self.dispatch_serial.lock().map_err(|_| ProofError::Queue)?;
-            self.store.admit_only(input, limits, replay_key)?
-        };
-        if let StoreAdmission::Accepted(task_id) = &admission {
-            let _ = self.scheduler_wake.try_send(());
-            let _ = self.event_sender.send(task_id.clone());
-        }
-        Ok(admission)
+        self.limits.lock().map(|limits| *limits).map_err(|_| ProofError::Internal)
     }
 
     pub fn state(&self, task_id: &str) -> Result<TaskState, ProofError> {
@@ -549,7 +458,8 @@ where
     pub fn cancel(&self, task_id: &str) -> Result<(), ProofError> {
         let task_id = task_id.to_owned();
         {
-            let _guard = self.dispatch_serial.lock().map_err(|_| ProofError::Queue)?;
+            let _guard =
+                self.dispatch_serial.lock().map_err(|_| ProofError::Internal)?;
             let stored_task_id = task_id.clone();
             self.store.call(move |store| store.cancel(&stored_task_id))?;
         }
@@ -567,7 +477,8 @@ where
     ) -> Result<(), ProofError> {
         let task_id = task_id.to_owned();
         {
-            let _guard = self.dispatch_serial.lock().map_err(|_| ProofError::Queue)?;
+            let _guard =
+                self.dispatch_serial.lock().map_err(|_| ProofError::Internal)?;
             let caller_endpoint = caller_endpoint.as_str().to_owned();
             let scope_id = scope_id.to_owned();
             let stored_task_id = task_id.clone();
@@ -620,6 +531,8 @@ mod tests {
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
     };
+
+    use aether_store::{TaskAdmission as StoreAdmission, TaskInput};
 
     use aether_core::{
         AccessMode, AgentId, ApprovalRule, CapabilityId, Claim, ClaimId, EndpointId,
@@ -835,7 +748,7 @@ mod tests {
                 | TaskState::Running => {
                     // A task that never ends fails the test with this error.
                     if Instant::now() >= deadline {
-                        return Err(ProofError::Queue);
+                        return Err(ProofError::Internal);
                     }
                     thread::sleep(Duration::from_millis(5));
                 }

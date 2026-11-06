@@ -116,7 +116,9 @@ pub(super) async fn host_screen(
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         (
-            administration.grants(),
+            administration.grants().map_err(|_| {
+                internal_server_error(std::io::Error::other("grants unavailable"))
+            })?,
             administration.last_tasks(crate::direct::SCOPE),
             administration.current_workspace().unwrap_or_default(),
             administration.pending().len(),
@@ -438,6 +440,7 @@ pub(super) async fn change_group(
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .grants()
+        .map_err(|_| bad_request("grants are unavailable"))?
         .into_iter()
         .filter(|grant| {
             grant.scope_id.as_str() == crate::direct::SCOPE

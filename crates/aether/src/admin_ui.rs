@@ -3023,8 +3023,8 @@ mod tests {
             .expect("policy must exist");
         assert_eq!(settings.max_context_tokens, 12_000);
         assert_eq!(settings.max_seconds, 90);
-        assert_eq!(settings.queue_global, 3);
-        assert_eq!(settings.queue_per_peer, 2);
+        assert_eq!(settings.queue.global, 3);
+        assert_eq!(settings.queue.per_peer, 2);
     }
 
     #[tokio::test]

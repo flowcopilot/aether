@@ -61,6 +61,7 @@ fn build(
     data_dir: &Path,
     codex_binary: PathBuf,
 ) -> Result<NodeService<RosterClaims, NodeAgent>, PolicyError> {
+    let queue = policy.queue;
     let mut scopes = parse_scopes(policy.scope, policy.scopes)?;
     if scopes.iter().any(|scope| scope.kind == ScopeKind::Pact) {
         // The gateway owns the one `pact` scope; it is not declared by hand.
@@ -121,8 +122,8 @@ fn build(
     // A grant revoked from the admin UI stays revoked, even when the policy
     // file still lists it.
     let mut grants = Vec::new();
-    for grant in policy.grants {
-        let grant = Grant::try_from(grant).map_err(|_| PolicyError::Invalid)?;
+    for grant in &policy.grants {
+        let grant = Grant::try_from(grant.clone()).map_err(|_| PolicyError::Invalid)?;
         if !store.grant_revoked(grant.id.as_str()).map_err(|_| PolicyError::Invalid)? {
             grants.push(grant);
         }
@@ -139,12 +140,12 @@ fn build(
         global: stored_limit(
             &store,
             aether_core::limits::QueueLimitId::Global,
-            policy.queue_global,
+            queue.get(aether_core::limits::QueueLimitId::Global),
         )?,
         per_peer: stored_limit(
             &store,
             aether_core::limits::QueueLimitId::PerPeer,
-            policy.queue_per_peer,
+            queue.get(aether_core::limits::QueueLimitId::PerPeer),
         )?,
     };
     let stored_workspace =

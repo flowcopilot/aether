@@ -13,11 +13,11 @@ use crate::{
     admin::{AdminError, LiveNode},
     directory_publication::{DirectoryPublication, PublicationError},
     execution::{Agent, Task},
-    proof::{Identity, ProofError, ProofNode, SubmissionInput},
+    proof::{Identity, ProofError, ProofHandle, ProofNode, SubmissionInput},
 };
 
 pub struct NodeService<T, P> {
-    pub(crate) node: ProofNode<T, P>,
+    proof: ProofNode<T, P>,
     // Empty unless the policy file names approved workspaces — see
     // `set_approved_workspaces`'s own doc comment. Immutable after
     // construction: the approved set itself is not something a live admin
@@ -37,7 +37,7 @@ where
     #[must_use]
     pub const fn new(node: ProofNode<T, P>) -> Self {
         Self {
-            node,
+            proof: node,
             approved_workspaces: BTreeMap::new(),
             task_folder_mode: false,
             agent_adapter: AgentAdapter::Codex,
@@ -69,7 +69,7 @@ where
             idempotency_key,
             task,
         };
-        match self.node.admit(input, Identity::Verified, None)? {
+        match self.proof().admit(input, Identity::Verified, None)? {
             aether_store::TaskAdmission::Accepted(task_id)
             | aether_store::TaskAdmission::Existing(task_id) => Ok(task_id),
         }
@@ -80,7 +80,12 @@ where
         &self,
         task_id: &str,
     ) -> Result<(aether_store::TaskState, Option<String>), ProofError> {
-        self.node.task_snapshot(task_id)
+        self.proof().task_snapshot(task_id)
+    }
+
+    #[must_use]
+    pub const fn proof(&self) -> ProofHandle<'_, T, P> {
+        ProofHandle::new(&self.proof)
     }
 
     /// Names the workspace paths a live `Change::Workspace` may switch to
@@ -141,52 +146,52 @@ where
     }
 
     pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<String> {
-        self.node.subscribe_events()
+        self.proof().subscribe_events()
     }
 
     #[must_use]
     pub fn scope_id(&self) -> &str {
-        self.node.scope_id()
+        self.proof.scope_id()
     }
 
     #[must_use]
     pub fn scope_kind_for(&self, scope_id: &str) -> Option<ScopeKind> {
-        self.node.scope_kind_for(scope_id)
+        self.proof.scope_kind_for(scope_id)
     }
 
     #[must_use]
     pub fn has_scope_kind(&self, kind: ScopeKind) -> bool {
-        self.node.has_scope_kind(kind)
+        self.proof.has_scope_kind(kind)
     }
 
     #[must_use]
     pub fn scope_id_for_kind(&self, kind: ScopeKind) -> Option<&str> {
-        self.node.scope_id_for_kind(kind)
+        self.proof.scope_id_for_kind(kind)
     }
 
     pub fn current_workspace(&self) -> Result<PathBuf, ProofError> {
-        self.node.workspace()
+        self.proof().workspace()
     }
 
     pub fn apply_workspace(&self, path: &std::path::Path) -> Result<(), ProofError> {
         if self.task_folder_mode {
             return Err(ProofError::Execution(crate::execution::ExecutionError::Path));
         }
-        self.node.apply_workspace(path)
+        self.proof().apply_workspace(path)
     }
 
     pub fn apply_stored_grant(&self, grant_json: &str) -> Result<(), ProofError> {
         let grant = crate::identity::decode_grant(grant_json)
             .map_err(|_| ProofError::Denied(aether_core::Denial::GrantDenied))?;
-        self.node.apply_stored_grant(grant)
+        self.proof().apply_stored_grant(grant)
     }
 
     pub fn has_grant(&self, id: &aether_core::GrantId) -> Result<bool, ProofError> {
-        self.node.has_grant(id)
+        self.proof().has_grant(id)
     }
 
     pub fn queue_limits(&self) -> Result<aether_store::QueueLimits, ProofError> {
-        self.node.queue_limits()
+        self.proof().queue_limits()
     }
 
     pub fn shutdown(&self)
@@ -194,12 +199,12 @@ where
         T: TrustProvider + 'static,
         P: Agent + Clone + Send + 'static,
     {
-        self.node.shutdown();
+        self.proof().shutdown();
     }
 
     #[must_use]
     pub const fn a2a(&self) -> A2aTransport<'_, T, P> {
-        A2aTransport::new(&self.node)
+        A2aTransport::new(self.proof())
     }
 }
 
@@ -289,7 +294,7 @@ where
     P: Agent + Clone + Send + Sync + 'static,
 {
     fn cancel_task(&self, task_id: &str) -> Result<(), AdminError> {
-        self.service.node.cancel(task_id).map_err(|_| AdminError::Task)
+        self.service.proof().cancel(task_id).map_err(|_| AdminError::Task)
     }
 
     fn queue_limit(
@@ -297,7 +302,7 @@ where
         id: aether_core::limits::QueueLimitId,
     ) -> Result<u32, AdminError> {
         self.service
-            .node
+            .proof()
             .current_queue_limit(id)
             .map_err(|_| AdminError::InvalidField("id"))
     }
@@ -308,7 +313,7 @@ where
         limit: u32,
     ) -> Result<(), AdminError> {
         self.service
-            .node
+            .proof()
             .set_queue_limit(id, limit)
             .map_err(|_| AdminError::InvalidField("id"))
     }
@@ -333,14 +338,14 @@ where
 
     fn revoke_grant(&self, id: &str) -> Result<(), AdminError> {
         self.service
-            .node
+            .proof()
             .revoke_grant(&aether_core::GrantId::new(id))
             .map(|_| ())
             .map_err(|_| AdminError::InvalidField("grant"))
     }
 
-    fn grants(&self) -> Vec<aether_core::Grant> {
-        self.service.node.grants().unwrap_or_default()
+    fn grants(&self) -> Result<Vec<aether_core::Grant>, AdminError> {
+        self.service.proof().grants().map_err(|_| AdminError::Store)
     }
 
     fn renew_directory(&self, url: &str) -> Result<(), AdminError> {

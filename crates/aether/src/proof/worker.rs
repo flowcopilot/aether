@@ -39,7 +39,7 @@ impl StoreWorker {
                     command(&mut store);
                 }
             })
-            .map_err(|_| ProofError::Queue)?;
+            .map_err(|_| ProofError::Internal)?;
         Ok(Self { sender, thread: Mutex::new(Some(thread)) })
     }
 
@@ -52,8 +52,8 @@ impl StoreWorker {
             .send(StoreMessage::Operation(Box::new(move |store| {
                 let _ = sender.send(operation(store));
             })))
-            .map_err(|_| ProofError::Queue)?;
-        receiver.recv().map_err(|_| ProofError::Queue)?.map_err(ProofError::Store)
+            .map_err(|_| ProofError::Internal)?;
+        receiver.recv().map_err(|_| ProofError::Internal)?.map_err(ProofError::Store)
     }
 
     pub(in crate::proof) fn admit_only(

@@ -14,6 +14,36 @@ use serde::{Deserialize, Serialize};
 
 use crate::{data_dir::DataDir, identity::GrantRecord};
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QueuePolicyLimits {
+    #[serde(rename = "queueGlobal")]
+    pub global: usize,
+    #[serde(rename = "queuePerPeer")]
+    pub per_peer: usize,
+}
+
+impl QueuePolicyLimits {
+    #[must_use]
+    pub const fn new(global: usize, per_peer: usize) -> Self {
+        Self { global, per_peer }
+    }
+
+    #[must_use]
+    pub const fn get(self, id: QueueLimitId) -> usize {
+        match id {
+            QueueLimitId::Global => self.global,
+            QueueLimitId::PerPeer => self.per_peer,
+        }
+    }
+
+    pub const fn set(&mut self, id: QueueLimitId, value: usize) {
+        match id {
+            QueueLimitId::Global => self.global = value,
+            QueueLimitId::PerPeer => self.per_peer = value,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 pub enum PolicyError {
     #[error("node policy cannot be read")]
@@ -50,8 +80,8 @@ pub(crate) struct PolicyFile {
     pub(crate) sandbox: Option<PolicySandbox>,
     pub(crate) max_context_tokens: u32,
     pub(crate) max_seconds: u64,
-    pub(crate) queue_global: usize,
-    pub(crate) queue_per_peer: usize,
+    #[serde(flatten)]
+    pub(crate) queue: QueuePolicyLimits,
     /// Names workspace paths a live `Change::Workspace` may switch to by
     /// id. Absent or empty (the default for an existing policy file, since
     /// `deny_unknown_fields` still requires this to parse) keeps today's
@@ -177,8 +207,7 @@ impl PolicyFile {
             sandbox: None,
             max_context_tokens: DEFAULT_MAX_CONTEXT_TOKENS,
             max_seconds: DEFAULT_MAX_SECONDS,
-            queue_global: DEFAULT_QUEUE,
-            queue_per_peer: DEFAULT_QUEUE,
+            queue: QueuePolicyLimits::new(DEFAULT_QUEUE, DEFAULT_QUEUE),
             approved_workspaces: BTreeMap::new(),
             allow_network: false,
             environment_allowlist: Vec::new(),
@@ -207,9 +236,12 @@ impl PolicyFile {
             workspace: self.workspace.clone(),
             max_context_tokens: self.max_context_tokens,
             max_seconds: self.max_seconds,
-            queue_global: self.queue_global,
-            queue_per_peer: self.queue_per_peer,
+            queue: self.queue,
         }
+    }
+
+    pub(crate) const fn queue_limit(&self, id: QueueLimitId) -> usize {
+        self.queue.get(id)
     }
 }
 
@@ -273,8 +305,7 @@ pub struct PolicySettings {
     pub workspace: PathBuf,
     pub max_context_tokens: u32,
     pub max_seconds: u64,
-    pub queue_global: usize,
-    pub queue_per_peer: usize,
+    pub queue: QueuePolicyLimits,
 }
 
 /// The settings of the stored policy; `None` before the first start.
@@ -305,8 +336,7 @@ pub fn save_policy_settings_in_store(
         workspace: settings.workspace.clone(),
         max_context_tokens: settings.max_context_tokens,
         max_seconds: settings.max_seconds,
-        queue_global: settings.queue_global,
-        queue_per_peer: settings.queue_per_peer,
+        queue: settings.queue,
         ..policy
     };
     keep(store, &serde_json::to_string(&policy).map_err(|_| PolicyError::Invalid)?)?;
@@ -332,8 +362,8 @@ pub fn validate_policy_settings(settings: &PolicySettings) -> Result<(), PolicyE
     }
     if settings.max_context_tokens == 0
         || settings.max_seconds == 0
-        || settings.queue_global == 0
-        || settings.queue_per_peer == 0
+        || settings.queue.get(QueueLimitId::Global) == 0
+        || settings.queue.get(QueueLimitId::PerPeer) == 0
     {
         return Err(PolicyError::InvalidField("limits".to_owned()));
     }
@@ -349,8 +379,16 @@ pub fn queue_limits(data_dir: &Path) -> Result<Option<QueueLimits>, PolicyError>
         return Ok(None);
     };
     Ok(Some(QueueLimits {
-        global: stored_limit(&store, QueueLimitId::Global, policy.queue_global)?,
-        per_peer: stored_limit(&store, QueueLimitId::PerPeer, policy.queue_per_peer)?,
+        global: stored_limit(
+            &store,
+            QueueLimitId::Global,
+            policy.queue_limit(QueueLimitId::Global),
+        )?,
+        per_peer: stored_limit(
+            &store,
+            QueueLimitId::PerPeer,
+            policy.queue_limit(QueueLimitId::PerPeer),
+        )?,
     }))
 }
 

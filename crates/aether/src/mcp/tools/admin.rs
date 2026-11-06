@@ -113,8 +113,8 @@ impl McpServer {
                     "workspace": settings.workspace,
                     "maxContextTokens": settings.max_context_tokens,
                     "maxSeconds": settings.max_seconds,
-                    "queueGlobal": settings.queue_global,
-                    "queuePerPeer": settings.queue_per_peer,
+                    "queueGlobal": settings.queue.global,
+                    "queuePerPeer": settings.queue.per_peer,
                 })
             }),
             Err(_) => return tool_error("the node policy is unavailable"),
@@ -655,7 +655,7 @@ mod tests {
             .expect("policy must read")
             .expect("policy must exist");
         assert_eq!(settings.max_seconds, 75);
-        assert_eq!(settings.queue_global, 2);
+        assert_eq!(settings.queue.global, 2);
     }
 
     #[tokio::test]
@@ -719,7 +719,11 @@ mod tests {
         let bundle =
             crate::direct::InvitationBundle::decode(&code).expect("code must decode");
         assert_eq!(bundle.format, crate::direct::BUNDLE_FORMAT_V2);
-        let grants = administration.lock().expect("administration must lock").grants();
+        let grants = administration
+            .lock()
+            .expect("administration must lock")
+            .grants()
+            .expect("grants must load");
         assert_eq!(grants.len(), 1);
         assert!(grants.iter().all(|grant| {
             grant
