@@ -132,15 +132,8 @@ pub fn hub_client(
     hub_url: Option<&str>,
     data_dir: &Path,
 ) -> Result<Option<HubClient>, NodeRunError> {
-    crate::hub_client::resolve_url(
-        hub_url,
-        crate::settings::setting::<crate::hub_client::settings::Hub>(data_dir)
-            .ok()
-            .flatten(),
-    )
-    .map(|url| HubClient::for_data_dir(&url, data_dir))
-    .transpose()
-    .map_err(|error| NodeRunError::Usage(error.to_string()))
+    crate::hub_client::configured_hub_client(hub_url, data_dir)
+        .map_err(|error| NodeRunError::Usage(error.to_string()))
 }
 
 pub fn start_background_workers(
@@ -444,6 +437,7 @@ pub async fn run(options: NodeServeOptions) -> Result<(), NodeRunError> {
         options.invite_name.clone(),
         relay_url.clone(),
         Arc::clone(&relay_switcher),
+        options.hub_url.clone(),
         hub.clone(),
         service.task_folder_mode(),
     );
@@ -692,6 +686,7 @@ mod tests {
             None,
             None,
             switch,
+            None,
             None,
             false,
         );

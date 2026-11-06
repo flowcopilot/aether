@@ -47,7 +47,7 @@ pub fn host_step(
     };
     if blocked
         || endpoint.parse::<iroh::EndpointId>().is_err()
-        || !crate::direct::valid_name(&invite.to)
+        || !crate::hub_client::valid_full_name(&invite.to)
         || approval.side != ApprovalSide::Sender
         || invite.to != approval.peer_name
         || invite.days > u64::from(approval.days)
@@ -168,8 +168,8 @@ mod tests {
     fn accepted() -> Invite {
         Invite {
             id: "0123456789abcdef0123456789abcdef".to_owned(),
-            from: "tudor".to_owned(),
-            to: "ana".to_owned(),
+            from: "tudor#0042".to_owned(),
+            to: "ana#0007".to_owned(),
             role: Role::Sender,
             days: 7,
             status: Status::Accepted,
@@ -186,7 +186,7 @@ mod tests {
             invite_id: accepted().id,
             side: ApprovalSide::Sender,
             kind: ApprovalKind::Invite,
-            peer_name: "ana".to_owned(),
+            peer_name: "ana#0007".to_owned(),
             peer_endpoint: None,
             days: 7,
             access_group: "friends".to_owned(),
@@ -199,15 +199,18 @@ mod tests {
 
     #[test]
     fn the_host_signs_only_an_invite_it_sent() {
-        assert_eq!(host_step(&accepted(), None, Some("tudor"), false), HostStep::Skip);
+        assert_eq!(
+            host_step(&accepted(), None, Some("tudor#0042"), false),
+            HostStep::Skip
+        );
         assert_eq!(
             host_step(&accepted(), Some(&approval()), None, false),
             HostStep::Skip
         );
         assert_eq!(
-            host_step(&accepted(), Some(&approval()), Some("tudor"), false),
+            host_step(&accepted(), Some(&approval()), Some("tudor#0042"), false),
             HostStep::Sign {
-                friend_name: "ana".to_owned(),
+                friend_name: "ana#0007".to_owned(),
                 endpoint: endpoint(),
                 days: 7,
                 access_group: "friends".to_owned(),
@@ -215,12 +218,12 @@ mod tests {
         );
         let pending = Invite { status: Status::Pending, ..accepted() };
         assert_eq!(
-            host_step(&pending, Some(&approval()), Some("tudor"), false),
+            host_step(&pending, Some(&approval()), Some("tudor#0042"), false),
             HostStep::Skip
         );
         let received = Invite { role: Role::Receiver, ..accepted() };
         assert_eq!(
-            host_step(&received, Some(&approval()), Some("tudor"), false),
+            host_step(&received, Some(&approval()), Some("tudor#0042"), false),
             HostStep::Skip
         );
     }
@@ -228,8 +231,9 @@ mod tests {
     #[test]
     fn the_host_refuses_a_row_whose_name_days_or_endpoint_changed() {
         let approval = approval();
-        let refuse =
-            |invite: Invite| host_step(&invite, Some(&approval), Some("tudor"), false);
+        let refuse = |invite: Invite| {
+            host_step(&invite, Some(&approval), Some("tudor#0042"), false)
+        };
         assert_eq!(
             refuse(Invite { to: "eve".to_owned(), ..accepted() }),
             HostStep::Refuse
@@ -253,18 +257,18 @@ mod tests {
             ..approval.clone()
         };
         assert_eq!(
-            host_step(&accepted(), Some(&pinned), Some("tudor"), false),
+            host_step(&accepted(), Some(&pinned), Some("tudor#0042"), false),
             HostStep::Refuse
         );
         let received = HubApproval { side: ApprovalSide::Receiver, ..approval.clone() };
         assert_eq!(
-            host_step(&accepted(), Some(&received), Some("tudor"), false),
+            host_step(&accepted(), Some(&received), Some("tudor#0042"), false),
             HostStep::Refuse
         );
         assert_eq!(
             refuse(Invite { days: 1, ..accepted() }),
             HostStep::Sign {
-                friend_name: "ana".to_owned(),
+                friend_name: "ana#0007".to_owned(),
                 endpoint: endpoint(),
                 days: 1,
                 access_group: "friends".to_owned(),
@@ -277,7 +281,7 @@ mod tests {
     fn delivered(host: &std::path::Path, agent: &str, caller: &str) -> Invite {
         let access = crate::identity::AccessInput {
             issuer_agent_id: "node".to_owned(),
-            subject_agent_id: "ana".to_owned(),
+            subject_agent_id: "ana#0007".to_owned(),
             subject_endpoint_id: caller.to_owned(),
             scope_id: crate::direct::SCOPE.to_owned(),
             capabilities: vec![crate::execution::GENERAL_SKILL.to_owned()],
@@ -311,8 +315,8 @@ mod tests {
         .encode()
         .expect("the line must encode");
         Invite {
-            from: "tudor".to_owned(),
-            to: "ana".to_owned(),
+            from: "tudor#0042".to_owned(),
+            to: "ana#0007".to_owned(),
             role: Role::Receiver,
             status: Status::Delivered,
             receiver_endpoint: None,
@@ -325,7 +329,7 @@ mod tests {
     fn accepted_by_caller() -> HubApproval {
         HubApproval {
             side: ApprovalSide::Receiver,
-            peer_name: "tudor".to_owned(),
+            peer_name: "tudor#0042".to_owned(),
             ..approval()
         }
     }
@@ -334,7 +338,7 @@ mod tests {
     fn the_caller_imports_only_a_bundle_from_the_named_sender_endpoint() {
         let host = tempfile::tempdir().expect("directory must create");
         let caller = endpoint();
-        let row = delivered(host.path(), "tudor", &caller);
+        let row = delivered(host.path(), "tudor#0042", &caller);
         let approval = accepted_by_caller();
         assert!(matches!(caller_step(&row, Some(&approval)), CallerStep::Import(_)));
 
@@ -442,7 +446,7 @@ mod tests {
             HostStep::Refuse
         );
         assert_eq!(
-            host_step(&accepted(), Some(&approval()), Some("tudor"), true),
+            host_step(&accepted(), Some(&approval()), Some("tudor#0042"), true),
             HostStep::Refuse
         );
         let signed = HubApproval {
@@ -451,7 +455,7 @@ mod tests {
             ..approval()
         };
         assert_eq!(
-            host_step(&accepted(), Some(&signed), Some("tudor"), true),
+            host_step(&accepted(), Some(&signed), Some("tudor#0042"), true),
             HostStep::Refuse
         );
     }
@@ -536,7 +540,7 @@ mod tests {
             ..approval()
         };
         assert_eq!(
-            host_step(&accepted(), Some(&signed), Some("tudor"), false),
+            host_step(&accepted(), Some(&signed), Some("tudor#0042"), false),
             HostStep::Deliver("aether-invite:signed".to_owned())
         );
     }

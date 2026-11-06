@@ -36,7 +36,7 @@ pub const fn hub_message(error: HubError) -> &'static str {
 /// Keeps `handle`, this node's name as the hub gives it, for the agent name
 /// in invites. A name that cannot be an agent name is not kept.
 pub fn keep_hub_name(data_dir: &std::path::Path, handle: &str) {
-    if crate::direct::valid_name(handle)
+    if crate::hub_client::valid_full_name(handle)
         && crate::settings::setting::<crate::hub_client::settings::HubName>(data_dir)
             .ok()
             .flatten()

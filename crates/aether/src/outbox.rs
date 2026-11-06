@@ -578,7 +578,7 @@ pub async fn run(
     hub_flag: Option<String>,
     wake: Arc<tokio::sync::Notify>,
 ) {
-    let hubs = crate::hub_client::HubCache::default();
+    let hubs = crate::hub_client::NodeHub::new(data_dir.clone(), hub_flag.clone());
     let mut presence: Option<BTreeMap<String, bool>> = None;
     let mut presence_read: Option<std::time::Instant> = None;
     let mut active = true;
@@ -586,7 +586,7 @@ pub async fn run(
         if active
             && presence_read.is_none_or(|read| read.elapsed() >= PRESENCE_INTERVAL)
         {
-            if let Some(hub) = hubs.configured(hub_flag.as_deref(), &data_dir) {
+            if let Ok(Some(hub)) = hubs.client() {
                 presence = Some(hub.presence(Duration::from_secs(4)).await);
             }
             presence_read = Some(std::time::Instant::now());

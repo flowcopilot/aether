@@ -42,8 +42,6 @@ pub struct McpServer {
     /// The courier of an attempt without a running node; by default a new
     /// endpoint on the relay of the contact.
     courier: Option<Arc<dyn Courier>>,
-    /// The client of the hub, kept while its URL stays the same.
-    hubs: crate::hub_client::HubCache,
 }
 
 /// How a request to wake the node's outbox ended.
@@ -101,16 +99,16 @@ impl McpServer {
     }
 
     /// The hub of this node: `AETHER_HUB_URL`, else the one set on the page.
+    fn node_hub(&self, data_dir: &Path) -> crate::hub_client::NodeHub {
+        crate::hub_client::NodeHub::new(data_dir.to_path_buf(), self.hub_flag.clone())
+    }
+
     fn hub(&self) -> Result<HubClient, &'static str> {
         let data_dir = self.data_dir()?;
-        let url = crate::hub_client::resolve_url(
-            self.hub_flag.as_deref(),
-            crate::settings::setting::<crate::hub_client::settings::Hub>(data_dir)
-                .ok()
-                .flatten(),
-        )
-        .ok_or("the hub is off")?;
-        self.hubs.client(&url, data_dir).map_err(|_| "the hub URL is invalid")
+        self.node_hub(data_dir)
+            .client()
+            .map_err(|_| "the hub URL is invalid")?
+            .ok_or("the hub is off")
     }
 
     /// The tool router of this server: every tool, or with `caller_only`
@@ -140,7 +138,6 @@ impl McpServer {
             caller_only: false,
             send_wait: SEND_WAIT,
             courier: None,
-            hubs: crate::hub_client::HubCache::default(),
         }
     }
 
@@ -281,9 +278,9 @@ impl McpServer {
         &self,
         data_dir: &std::path::Path,
     ) -> std::collections::BTreeMap<String, bool> {
-        match self.hubs.configured(self.hub_flag.as_deref(), data_dir) {
-            Some(hub) => hub.presence(PRESENCE_WAIT).await,
-            None => std::collections::BTreeMap::new(),
+        match self.node_hub(data_dir).client() {
+            Ok(Some(hub)) => hub.presence(PRESENCE_WAIT).await,
+            _ => std::collections::BTreeMap::new(),
         }
     }
 
@@ -590,7 +587,7 @@ impl McpServer {
         tool_success(json!({
             "policy": policy,
             "relayUrl": crate::settings::setting::<crate::transport::relay::Relay>(data_dir).ok().flatten(),
-            "hubUrl": crate::hub_client::resolve_url(None, crate::settings::setting::<crate::hub_client::settings::Hub>(data_dir).ok().flatten()),
+            "hubUrl": self.node_hub(data_dir).resolve_url().ok().flatten(),
             "policyChangesNeedRestart": true,
         }).to_string())
     }
@@ -1136,7 +1133,7 @@ impl McpServer {
         if !(1..=20).contains(&limit) {
             return tool_error("aether.agents.find limit must be from 1 to 20");
         }
-        let Some(hub) = self.hubs.configured(self.hub_flag.as_deref(), data_dir) else {
+        let Some(hub) = self.node_hub(data_dir).client().ok().flatten() else {
             return tool_error("no hub is set, so there is no search");
         };
         let rows = match tokio::time::timeout(FIND_WAIT, hub.find_agents(query, limit))
@@ -1204,9 +1201,8 @@ impl McpServer {
                 "hint": if ready { READY_HINT } else { ENDED_HINT },
             }));
         }
-        let note = match self.hubs.configured(self.hub_flag.as_deref(), data_dir) {
-            None => Some("no hub is set: only saved contacts are listed"),
-            Some(hub) => {
+        let note = match self.node_hub(data_dir).client() {
+            Ok(Some(hub)) => {
                 match tokio::time::timeout(FIND_WAIT, hub_people(&hub, &query)).await {
                     Ok(Ok(rows)) => {
                         for row in rows {
@@ -1224,6 +1220,8 @@ impl McpServer {
                     }
                 }
             }
+            Ok(None) => Some("no hub is set: only saved contacts are listed"),
+            Err(_) => Some("the hub URL is invalid"),
         };
         tool_success(json!({ "people": people, "note": note }).to_string())
     }
@@ -1249,7 +1247,7 @@ impl McpServer {
         if !(1..=u64::from(aether_core::limits::MAX_HUB_ACCESS_DAYS)).contains(&days) {
             return tool_error("aether.access.request days must be from 1 to 30");
         }
-        let Some(hub) = self.hubs.configured(self.hub_flag.as_deref(), data_dir) else {
+        let Some(hub) = self.node_hub(data_dir).client().ok().flatten() else {
             return tool_error("no hub is set, so there are no access requests");
         };
         let row = match tokio::time::timeout(FIND_WAIT, hub.agent(agent)).await {

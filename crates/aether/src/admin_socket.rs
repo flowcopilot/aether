@@ -264,6 +264,7 @@ fn create_invite_response(
             .ok()
             .flatten(),
         std::sync::Arc::new(|_, _| Box::pin(async { Ok(()) })),
+        None,
     );
     match crate::invites::sign_direct_invite(
         administration,
