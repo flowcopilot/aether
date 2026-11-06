@@ -1,5 +1,5 @@
 defmodule AetherHub.Features.InvitesTest do
-  use AetherHub.Feature, file: "invites.feature", async: true
+  use AetherHub.Feature, file: "invites.feature", async: false
 
   alias AetherHub.{Contract, Invite, Repo}
 

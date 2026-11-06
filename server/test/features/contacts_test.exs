@@ -1,12 +1,12 @@
 defmodule AetherHub.Features.ContactsTest do
-  use AetherHub.Feature, file: "contacts.feature", async: true
+  use AetherHub.Feature, file: "contacts.feature", async: false
 
   alias AetherHub.{Clock, Contract, Presence, Sweeper}
 
   @step Contract.get(["limits", "presence", "lastSeenStepSeconds"])
   @keep Contract.get(["limits", "presence", "keepSeconds"])
 
-  defp now, do: System.system_time(:second)
+  defp now, do: Clock.now()
   defp rounded(time), do: time - rem(time, @step)
 
   defstep ~r/^(?<first>\w+) and (?<second>\w+) have names, and the handle of \k<first> sorts first$/,
@@ -133,11 +133,17 @@ defmodule AetherHub.Features.ContactsTest do
   end
 
   defstep ~r/^(?<who>\w+) sees (?<other>\w+) (?<presence>online|offline), last seen (?<seconds>\d+) seconds ago rounded down to 15 minutes$/,
-          %{who: who, presence: presence},
+          %{who: who, presence: presence, seconds: seconds},
           %{seen_at: seen_at} = state do
-    online = presence == "online"
-    assert [%{"online" => ^online, "lastSeen" => last_seen}] = contacts(actor(state, who))
-    assert last_seen == rounded(seen_at)
+    previous = Clock.set(seen_at + String.to_integer(seconds))
+
+    try do
+      online = presence == "online"
+      assert [%{"online" => ^online, "lastSeen" => last_seen}] = contacts(actor(state, who))
+      assert last_seen == rounded(seen_at)
+    after
+      Clock.set(previous)
+    end
   end
 
   defstep ~r/^(?<who>\w+) sees (?<other>\w+) online, last seen now rounded down to 15 minutes$/,
@@ -166,7 +172,7 @@ defmodule AetherHub.Features.ContactsTest do
         ghost
       end)
 
-    Sweeper.sweep()
+    Presence.sweep()
     {:ok, put_actor(state, ghost_name, ghost)}
   end
 

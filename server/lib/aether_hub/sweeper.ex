@@ -26,7 +26,7 @@ defmodule AetherHub.Sweeper do
 
   @impl true
   def init(nil) do
-    schedule()
+    if Application.fetch_env!(:aether_hub, :schedule_sweep), do: schedule()
     {:ok, nil}
   end
 

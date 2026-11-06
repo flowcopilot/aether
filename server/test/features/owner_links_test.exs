@@ -1,5 +1,5 @@
 defmodule AetherHub.Features.OwnerLinksTest do
-  use AetherHub.Feature, file: "owner-links.feature", async: true
+  use AetherHub.Feature, file: "owner-links.feature", async: false
 
   alias AetherHub.{Clock, Repo}
 

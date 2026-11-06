@@ -1,7 +1,7 @@
 defmodule AetherHub.Features.RateLimitsTest do
   use AetherHub.Feature, file: "rate-limits.feature", async: true
 
-  alias AetherHub.Presence
+  alias AetherHub.{Clock, Presence}
 
   defp account(node), do: request(node, "GET", "/v1/account")
 
@@ -19,6 +19,9 @@ defmodule AetherHub.Features.RateLimitsTest do
           %{who: who, count: count},
           state do
     node = actor(state, who)
+    {_limit, seconds} = AetherHub.RateLimit.limit(:request)
+    Clock.set(div(Clock.now(), seconds) * seconds)
+
     {:ok, %{statuses: for(_ <- 1..String.to_integer(count), do: account(node).status)}}
   end
 
