@@ -34,6 +34,7 @@ use crate::{
         input::input,
     },
     hub_client::{HubClient, Role},
+    hub_membership::{accept, hub_message},
 };
 
 /// An agent this computer can use, from its kept invite.
@@ -92,7 +93,7 @@ pub(super) async fn caller_screen(
     let sent = aether_store::NodeStore::in_dir(&page.data_dir)
         .and_then(|store| store.sent_tasks_page(None, 20, None, false))
         .unwrap_or_default();
-    let drafts = request_drafts_of(&page.data_dir, now);
+    let drafts = super::shared::request_drafts_of(&page.data_dir, now);
     let hub = page.current_hub();
     // The MCP server of this binary and this data directory, so the
     // person's own agent uses the same contacts as this page.
@@ -297,19 +298,6 @@ async fn connect_steps(endpoint_id: String, error: String) -> TopcoatResult<impl
     })
 }
 
-/// The access requests that wait for the person in `data_dir` at Unix time
-/// `now`.
-pub(super) fn request_drafts_of(
-    data_dir: &std::path::Path,
-    now: u64,
-) -> Vec<aether_store::AccessRequestDraft> {
-    aether_store::NodeStore::in_dir(data_dir)
-        .and_then(|store| {
-            store.access_request_drafts(i64::try_from(now).unwrap_or(i64::MAX))
-        })
-        .unwrap_or_default()
-}
-
 /// The access requests that the person's agent prepared. The node sends one
 /// only after **Confirm**.
 #[component]
@@ -390,6 +378,34 @@ async fn request_draft(
             </div>
         </li>
     })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct InviteIdForm {
+    id: String,
+}
+
+#[page(POST "/hub/accept")]
+pub(super) async fn accept_invite(
+    cx: &Cx,
+    Form(form): Form<InviteIdForm>,
+) -> TopcoatResult<impl View> {
+    require_admin_session(cx).await?;
+    let Page(Some(page)) = app_context::<Page>(cx) else {
+        return Err(bad_request("this node cannot accept invites").into());
+    };
+    if !page.caller {
+        return Err(bad_request("this node cannot accept invites").into());
+    }
+    let Some(hub) = page.current_hub() else {
+        return Err(bad_request("this node has no hub").into());
+    };
+    let error = match accept(&hub, &page.data_dir, &form.id).await {
+        Ok(_) => "",
+        Err(error) => hub_message(error),
+    };
+    Ok(view! { caller_screen(hub_error: error.to_owned()) })
 }
 
 #[derive(Deserialize)]

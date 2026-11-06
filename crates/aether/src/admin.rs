@@ -842,56 +842,49 @@ impl Administration {
         }
     }
 
-    #[must_use]
-    pub fn audit(&self) -> Vec<String> {
-        self.audit_entries().into_iter().map(|entry| entry.result).collect()
+    pub fn audit(&self) -> Result<Vec<String>, aether_store::StoreError> {
+        Ok(self.audit_entries()?.into_iter().map(|entry| entry.result).collect())
     }
-    #[must_use]
-    pub fn audit_entries(&self) -> Vec<AuditEntry> {
-        self.store.audit_records().map_or_else(
-            |_| Vec::new(),
-            |records| {
-                records
-                    .into_iter()
-                    .map(|record| AuditEntry {
-                        actor: record.actor.as_str().to_owned(),
-                        action: record.action.as_str().to_owned(),
-                        result: record.result.as_str().to_owned(),
-                    })
-                    .collect()
-            },
-        )
+    pub fn audit_entries(&self) -> Result<Vec<AuditEntry>, aether_store::StoreError> {
+        Ok(self
+            .store
+            .audit_records()?
+            .into_iter()
+            .map(|record| AuditEntry {
+                actor: record.actor.as_str().to_owned(),
+                action: record.action.as_str().to_owned(),
+                result: record.result.as_str().to_owned(),
+            })
+            .collect())
     }
-    #[must_use]
-    pub fn pending(&self) -> Vec<PendingChange> {
-        self.store.pending_changes().map_or_else(
-            |_| Vec::new(),
-            |changes| {
-                changes
-                    .into_iter()
-                    .map(|change| PendingChange {
-                        id: change.id,
-                        kind: change.kind.as_str().to_owned(),
-                    })
-                    .collect()
-            },
-        )
+    pub fn pending(&self) -> Result<Vec<PendingChange>, aether_store::StoreError> {
+        Ok(self
+            .store
+            .pending_changes()?
+            .into_iter()
+            .map(|change| PendingChange {
+                id: change.id,
+                kind: change.kind.as_str().to_owned(),
+            })
+            .collect())
     }
 
-    #[must_use]
-    pub fn configured_change_counts(&self) -> BTreeMap<ChangeKind, usize> {
-        self.store.applied_change_counts().unwrap_or_default()
+    pub fn configured_change_counts(
+        &self,
+    ) -> Result<BTreeMap<ChangeKind, usize>, aether_store::StoreError> {
+        self.store.applied_change_counts()
     }
 
-    #[must_use]
-    pub fn node_summary(&self) -> NodeSummary {
-        self.store.summary().unwrap_or_default()
+    pub fn node_summary(&self) -> Result<NodeSummary, aether_store::StoreError> {
+        self.store.summary()
     }
 
     /// Each caller endpoint's newest task in `scope_id`.
-    #[must_use]
-    pub fn last_tasks(&self, scope_id: &str) -> Vec<aether_store::LastTask> {
-        self.store.last_tasks(scope_id).unwrap_or_default()
+    pub fn last_tasks(
+        &self,
+        scope_id: &str,
+    ) -> Result<Vec<aether_store::LastTask>, aether_store::StoreError> {
+        self.store.last_tasks(scope_id)
     }
 
     /// At most `limit` audit results, after the first `skip`.
@@ -908,14 +901,18 @@ impl Administration {
         )
     }
 
-    #[must_use]
-    pub fn task_activity_after(&self, cursor: i64, limit: usize) -> Vec<TaskActivity> {
-        self.store.task_activity_after(cursor, limit).unwrap_or_default()
+    pub fn task_activity_after(
+        &self,
+        cursor: i64,
+        limit: usize,
+    ) -> Result<Vec<TaskActivity>, aether_store::StoreError> {
+        self.store.task_activity_after(cursor, limit)
     }
 
-    #[must_use]
-    pub fn managed_members(&self) -> Vec<ManagedMember> {
-        self.store.all_managed_members().unwrap_or_default()
+    pub fn managed_members(
+        &self,
+    ) -> Result<Vec<ManagedMember>, aether_store::StoreError> {
+        self.store.all_managed_members()
     }
 }
 
@@ -996,7 +993,7 @@ mod tests {
             Ok(ChangeOutcome::Pending)
         );
         admin.confirm_ui("one").expect("ui confirmation");
-        assert_eq!(admin.audit(), ["pending", "confirmed", "applied"]);
+        assert_eq!(admin.audit().expect("audit"), ["pending", "confirmed", "applied"]);
     }
 
     #[test]
@@ -1061,7 +1058,7 @@ mod tests {
             )
             .expect("limit decrease must apply");
         assert_eq!(node.calls(), ["limit queue_global 2"]);
-        assert!(administration.pending().is_empty());
+        assert!(administration.pending().expect("pending").is_empty());
     }
 
     #[test]
@@ -1076,7 +1073,7 @@ mod tests {
             )
             .expect("limit increase must queue");
         assert_eq!(
-            administration.pending(),
+            administration.pending().expect("pending"),
             [PendingChange { id: "queue_global".to_owned(), kind: "limit".to_owned() }]
         );
     }
@@ -1094,7 +1091,7 @@ mod tests {
             )
             .expect("limit change without a reader must queue");
         assert_eq!(
-            administration.pending(),
+            administration.pending().expect("pending"),
             [PendingChange { id: "queue_global".to_owned(), kind: "limit".to_owned() }]
         );
 
@@ -1110,7 +1107,7 @@ mod tests {
             )
             .expect("limit change with a failing reader must queue");
         assert_eq!(
-            administration.pending(),
+            administration.pending().expect("pending"),
             [PendingChange {
                 id: "queue_per_peer".to_owned(),
                 kind: "limit".to_owned()
@@ -1276,7 +1273,7 @@ mod tests {
         );
         // The failed live application must leave no durable trace and the
         // pending change gone, matching how an immediate change behaves.
-        assert!(administration.pending().is_empty());
+        assert!(administration.pending().expect("pending").is_empty());
         drop(administration);
         let store = NodeStore::open(&database).expect("store must reopen");
         assert_eq!(
@@ -1317,6 +1314,7 @@ mod tests {
         assert_eq!(
             administration
                 .pending()
+                .expect("pending")
                 .into_iter()
                 .map(|change| change.id)
                 .collect::<Vec<_>>(),
@@ -1411,7 +1409,11 @@ mod tests {
                 );
             } else {
                 assert!(
-                    administration.pending().iter().any(|change| &change.id == id),
+                    administration
+                        .pending()
+                        .expect("pending")
+                        .iter()
+                        .any(|change| &change.id == id),
                     "{id} was rejected as stale but is no longer queued"
                 );
             }
@@ -1559,7 +1561,10 @@ mod tests {
             ),
             Err(AdminError::InvalidField("limit"))
         );
-        assert_eq!(administration.audit(), ["applied".to_owned(), "failed".to_owned()]);
+        assert_eq!(
+            administration.audit().expect("audit"),
+            ["applied".to_owned(), "failed".to_owned()]
+        );
         drop(administration);
 
         let store = NodeStore::open(&database).expect("store must reopen");
@@ -1634,7 +1639,7 @@ mod tests {
         let store = NodeStore::open(&database).expect("store must reopen");
         let mut administration = Administration::with_store(store);
         assert_eq!(
-            administration.pending(),
+            administration.pending().expect("pending"),
             [PendingChange {
                 id: "workspace".to_owned(),
                 kind: "workspace".to_owned()

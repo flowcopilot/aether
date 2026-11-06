@@ -31,6 +31,9 @@ pub(super) async fn audit_screen(cx: &Cx) -> TopcoatResult<impl View> {
             .unwrap_or_else(PoisonError::into_inner);
         (administration.store_access(), administration.audit_entries())
     };
+    let store_unavailable =
+        matches!(store_access, AdminStoreAccess::Unavailable) || entries.is_err();
+    let entries = entries.unwrap_or_default();
     Ok(view! {
         node_header(current: Tab::Advanced)
         <main id="main" class="mx-auto flex max-w-3xl flex-col gap-8 px-4 py-10 sm:px-8">
@@ -38,7 +41,7 @@ pub(super) async fn audit_screen(cx: &Cx) -> TopcoatResult<impl View> {
                 title: "Administration audit",
                 "Redacted results of local administration actions."
             )
-            if matches!(store_access, AdminStoreAccess::Unavailable) {
+            if store_unavailable {
                 alert(variant: AlertVariant::Destructive, attrs: attributes! { role="alert" },
                     alert_title("Administration store is unavailable")
                     alert_description("This node cannot read its local administration database. Fix the data directory and reload.")

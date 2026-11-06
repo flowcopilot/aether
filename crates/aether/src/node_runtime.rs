@@ -10,6 +10,8 @@ use crate::{
     admin::SharedAdministration,
     admin_ui::{PageContext, RelaySwitcher, UiOptions},
     directory_publication::DirectoryPublication,
+    hub_client::NodeHub,
+    node_serve_context::NodeServeContext,
     node_service::RunningNode,
     policy::AgentAdapter,
     transport,
@@ -130,7 +132,7 @@ impl BackgroundWorkers {
 
 pub fn start_background_workers(
     administration: &SharedAdministration,
-    page: &Arc<PageContext>,
+    ctx: &Arc<NodeServeContext>,
     directory_publication: Option<Arc<DirectoryPublication>>,
     endpoint_id: String,
     managed_sync: Option<(Arc<crate::managed_client::ManagedClient>, String, String)>,
@@ -180,13 +182,12 @@ pub fn start_background_workers(
     });
     let hub_host = tokio::spawn(crate::hub_workers::host_worker(
         Arc::clone(administration),
-        Arc::clone(page),
+        Arc::clone(ctx),
     ));
-    let hub_caller = page
+    let hub_caller = ctx
         .caller
-        .then(|| tokio::spawn(crate::hub_workers::caller_worker(Arc::clone(page))));
-    let listing =
-        tokio::spawn(crate::listing::listing_renewal_worker(Arc::clone(page)));
+        .then(|| tokio::spawn(crate::hub_workers::caller_worker(Arc::clone(ctx))));
+    let listing = tokio::spawn(crate::listing::listing_renewal_worker(Arc::clone(ctx)));
     BackgroundWorkers {
         directory_renewer,
         managed_renewer,
@@ -437,18 +438,33 @@ pub async fn run(options: NodeServeOptions) -> Result<(), NodeRunError> {
             })
         }
     });
-    let page = crate::invites::host_page_context(
-        options.data_dir.clone(),
-        options.invite_name.clone(),
-        relay_url.clone(),
-        Arc::clone(&relay_switcher),
-        options.hub_url.clone(),
-        hub.clone(),
-        service.task_folder_mode(),
+    let node_hub =
+        Arc::new(NodeHub::new(options.data_dir.clone(), options.hub_url.clone()));
+    if let Some(client) = hub {
+        let _ = node_hub.prime(client);
+    }
+    let hub_sign = Arc::new(std::sync::Mutex::new(()));
+    let worker_ctx = Arc::new(NodeServeContext {
+        data_dir: options.data_dir.clone(),
+        hub: Arc::clone(&node_hub),
+        hub_sign: Arc::clone(&hub_sign),
+        caller: true,
+    });
+    let page = Arc::new(
+        PageContext::host(
+            options.data_dir.clone(),
+            options.invite_name.clone(),
+            relay_url.clone(),
+            Arc::clone(&relay_switcher),
+            Arc::clone(&node_hub),
+            Arc::clone(&hub_sign),
+        )
+        .with_caller(true)
+        .with_task_folder_mode(service.task_folder_mode()),
     );
     let background = start_background_workers(
         &administration,
-        &page,
+        &worker_ctx,
         directory_publication.as_ref().map(|(publication, _)| Arc::clone(publication)),
         endpoint.id().to_string(),
         managed_sync
@@ -626,27 +642,27 @@ pub async fn start_directory_publication(
 mod tests {
     use std::sync::Arc;
 
+    use std::sync::Mutex;
+
     use super::start_background_workers;
-    use crate::{admin::test_support::shared_in, invites::host_page_context};
+    use crate::{
+        admin::test_support::shared_in, hub_client::NodeHub,
+        node_serve_context::NodeServeContext,
+    };
 
     #[tokio::test]
     async fn hub_sync_and_listing_renewal_start_without_the_admin_page() {
         let directory = tempfile::tempdir().expect("directory must create");
         let administration = shared_in(directory.path());
-        let switch: crate::admin_ui::RelaySwitcher =
-            Arc::new(|_, _| Box::pin(async { Ok(()) }));
-        let page = host_page_context(
-            directory.path().to_path_buf(),
-            None,
-            None,
-            switch,
-            None,
-            None,
-            false,
-        );
+        let ctx = Arc::new(NodeServeContext {
+            data_dir: directory.path().to_path_buf(),
+            hub: Arc::new(NodeHub::new(directory.path().to_path_buf(), None)),
+            hub_sign: Arc::new(Mutex::new(())),
+            caller: false,
+        });
         let workers = start_background_workers(
             &administration,
-            &page,
+            &ctx,
             None,
             "endpoint".to_owned(),
             None,

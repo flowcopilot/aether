@@ -42,6 +42,7 @@ pub(crate) mod hub;
 mod layout;
 pub(crate) mod listing;
 mod pact;
+mod shared;
 
 use crate::admin::SharedAdministration;
 use advanced::dashboard;
@@ -426,7 +427,9 @@ impl ActivityFeed {
                 self.administration.lock().unwrap_or_else(PoisonError::into_inner);
             (
                 administration.audit_page(self.cursor.audit, ACTIVITY_BATCH),
-                administration.task_activity_after(self.cursor.task, ACTIVITY_BATCH),
+                administration
+                    .task_activity_after(self.cursor.task, ACTIVITY_BATCH)
+                    .unwrap_or_default(),
             )
         };
         let found = !audit.is_empty() || !tasks.is_empty();
@@ -497,12 +500,7 @@ pub type RelayFuture =
 pub type RelaySwitcher =
     Arc<dyn Fn(Option<String>, Option<String>) -> RelayFuture + Send + Sync>;
 
-#[derive(Clone)]
-pub enum HubAccess {
-    Off,
-    Ready(Box<crate::hub_client::HubClient>),
-    Unavailable,
-}
+pub use crate::hub_client::HubAccess;
 
 pub struct PageContext {
     pub data_dir: PathBuf,
@@ -512,8 +510,8 @@ pub struct PageContext {
     name: Option<String>,
     relay_url: Mutex<Option<String>>,
     switch_relay: RelaySwitcher,
-    hub: crate::hub_client::NodeHub,
-    hub_sign: Mutex<()>,
+    hub: Arc<crate::hub_client::NodeHub>,
+    hub_sign: Arc<Mutex<()>>,
 }
 
 impl PageContext {
@@ -523,9 +521,9 @@ impl PageContext {
         name: Option<String>,
         relay_url: Option<String>,
         switch_relay: RelaySwitcher,
-        hub_flag: Option<String>,
+        hub: Arc<crate::hub_client::NodeHub>,
+        hub_sign: Arc<Mutex<()>>,
     ) -> Self {
-        let hub = crate::hub_client::NodeHub::new(data_dir.clone(), hub_flag);
         Self {
             data_dir,
             task_folder_mode: false,
@@ -535,13 +533,13 @@ impl PageContext {
             relay_url: Mutex::new(relay_url),
             switch_relay,
             hub,
-            hub_sign: Mutex::new(()),
+            hub_sign,
         }
     }
 
     #[must_use]
     pub fn admin_caller(data_dir: PathBuf) -> Self {
-        let hub = crate::hub_client::NodeHub::new(data_dir.clone(), None);
+        let hub = Arc::new(crate::hub_client::NodeHub::new(data_dir.clone(), None));
         Self {
             data_dir,
             task_folder_mode: false,
@@ -551,7 +549,7 @@ impl PageContext {
             relay_url: Mutex::new(None),
             switch_relay: Arc::new(|_, _| Box::pin(async { Ok(()) })),
             hub,
-            hub_sign: Mutex::new(()),
+            hub_sign: Arc::new(Mutex::new(())),
         }
     }
 
@@ -569,7 +567,7 @@ impl PageContext {
     #[must_use]
     pub fn with_hub(self, hub: Option<crate::hub_client::HubClient>) -> Self {
         if let Some(client) = hub {
-            let _ = self.hub.prime(client);
+            let _ = self.hub.as_ref().prime(client);
         }
         self
     }
@@ -581,11 +579,7 @@ impl PageContext {
     }
 
     pub(super) fn hub_access(&self) -> HubAccess {
-        match self.hub.client() {
-            Ok(Some(client)) => HubAccess::Ready(Box::new(client)),
-            Ok(None) => HubAccess::Off,
-            Err(_) => HubAccess::Unavailable,
-        }
+        self.hub.access()
     }
 
     pub(crate) fn current_hub(&self) -> Option<crate::hub_client::HubClient> {
@@ -597,12 +591,24 @@ impl PageContext {
 
     pub(super) fn set_hub(&self, hub: Option<crate::hub_client::HubClient>) {
         if let Some(client) = hub {
-            let _ = self.hub.prime(client);
+            let _ = self.hub.as_ref().prime(client);
         }
     }
 
-    pub(crate) const fn hub_sign(&self) -> &Mutex<()> {
+    pub(crate) const fn hub_sign(&self) -> &Arc<Mutex<()>> {
         &self.hub_sign
+    }
+
+    #[cfg(test)]
+    pub(crate) fn worker_context(
+        &self,
+    ) -> Arc<crate::node_serve_context::NodeServeContext> {
+        Arc::new(crate::node_serve_context::NodeServeContext {
+            data_dir: self.data_dir.clone(),
+            hub: Arc::clone(&self.hub),
+            hub_sign: Arc::clone(&self.hub_sign),
+            caller: self.caller,
+        })
     }
 
     pub(super) fn relay_url(&self) -> Option<String> {
@@ -684,7 +690,7 @@ fn build_admin_ui(
         .page(host::workspace)
         .page(host::relay)
         .page(host::save_card)
-        .page(listing::publish_listing)
+        .page(host::publish_listing)
         .page(caller::import)
         .page(caller::remove_contact)
         .page(caller::confirm_request)
@@ -692,7 +698,7 @@ fn build_admin_ui(
         .page(hub::claim_name)
         .page(hub::set_search)
         .page(hub::invite_by_name)
-        .page(hub::accept_invite)
+        .page(caller::accept_invite)
         .page(hub::remove_invite)
         .page(hub::block_invite)
         .page(hub::approve_request)
@@ -794,7 +800,10 @@ fn tls_config(data_dir: &Path) -> io::Result<Arc<ServerConfig>> {
     reason = "test fixtures hold a lock only while they set up; nothing contends"
 )]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -817,11 +826,35 @@ mod tests {
 
     const PORT: u16 = 3000;
 
+    fn test_node_hub(
+        data_dir: &std::path::Path,
+        hub_flag: Option<String>,
+    ) -> Arc<crate::hub_client::NodeHub> {
+        Arc::new(crate::hub_client::NodeHub::new(data_dir.to_path_buf(), hub_flag))
+    }
+
+    fn test_host_page(
+        data_dir: std::path::PathBuf,
+        name: Option<String>,
+        relay_url: Option<String>,
+        switch_relay: crate::admin_ui::RelaySwitcher,
+        hub_flag: Option<String>,
+    ) -> PageContext {
+        PageContext::host(
+            data_dir.clone(),
+            name,
+            relay_url,
+            switch_relay,
+            test_node_hub(&data_dir, hub_flag),
+            Arc::new(Mutex::new(())),
+        )
+    }
+
     #[test]
     fn the_page_hub_reads_a_saved_change_without_restarting_the_page() {
         let directory = tempfile::tempdir().expect("directory must create");
         let _ = crate::data_dir::DataDir::new(directory.path()).endpoint_key();
-        let page = PageContext::host(
+        let page = test_host_page(
             directory.path().to_path_buf(),
             None,
             None,
@@ -857,7 +890,7 @@ mod tests {
         let _ = NodeStore::in_dir(directory.path()).expect("store");
         std::fs::write(directory.path().join("node.sqlite"), b"not sqlite")
             .expect("break store");
-        let page = PageContext::host(
+        let page = test_host_page(
             directory.path().to_path_buf(),
             None,
             None,
@@ -876,7 +909,7 @@ mod tests {
             &Some("https://stored.example".to_owned()),
         )
         .expect("store");
-        let page = PageContext::host(
+        let page = test_host_page(
             directory.path().to_path_buf(),
             None,
             None,
@@ -935,7 +968,7 @@ mod tests {
     /// A host on relay.test whose relay switches are recorded in `switches`
     /// instead of reaching a node. `https://down.test` never answers.
     fn test_host(data_dir: &std::path::Path, switches: Switches) -> PageContext {
-        PageContext::host(
+        test_host_page(
             data_dir.to_path_buf(),
             Some("tudor".to_owned()),
             Some("https://relay.test".to_owned()),
@@ -958,7 +991,7 @@ mod tests {
     fn the_agent_name_comes_from_the_hub_name_then_the_invite_name_then_the_endpoint() {
         let directory = tempfile::tempdir().expect("directory must create");
         let host = |name: Option<&str>| {
-            PageContext::host(
+            test_host_page(
                 directory.path().to_path_buf(),
                 name.map(str::to_owned),
                 None,
@@ -1056,7 +1089,7 @@ mod tests {
         approve(directory.path(), &sent, "ana#0007");
         let worker = tokio::spawn(crate::hub_workers::host_worker(
             administration,
-            Arc::new(host),
+            host.worker_context(),
         ));
         wait_for_delivery(&hub, &sent).await;
         worker.abort();
@@ -1151,11 +1184,10 @@ mod tests {
                 });
             }
         }
-        let context = Arc::new(
-            PageContext::admin_caller(caller_dir.path().to_path_buf())
-                .with_hub(Some(client)),
-        );
-        let worker = tokio::spawn(crate::hub_workers::caller_worker(context));
+        let context = PageContext::admin_caller(caller_dir.path().to_path_buf())
+            .with_hub(Some(client));
+        let worker =
+            tokio::spawn(crate::hub_workers::caller_worker(context.worker_context()));
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             while !hub.state().invites.is_empty() {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -1186,7 +1218,7 @@ mod tests {
         );
         tokio::spawn(crate::hub_workers::host_worker(
             administration.clone(),
-            Arc::clone(&page),
+            page.worker_context(),
         ));
         let options = UiOptions { page: Some(page), ..UiOptions::default() };
         app(build_admin_ui(administration, options, PORT))
@@ -1913,7 +1945,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("directory must create");
         let hub = crate::hub_client::test_hub::TestHub::start().await;
         let (administration, node) = test_administration(directory.path());
-        let host = PageContext::host(
+        let host = test_host_page(
             directory.path().to_path_buf(),
             Some("server".to_owned()),
             None,
@@ -1938,7 +1970,7 @@ mod tests {
         approve(directory.path(), &id, "ana#0007");
         let worker = tokio::spawn(crate::hub_workers::host_worker(
             administration,
-            Arc::new(host),
+            host.worker_context(),
         ));
         wait_for_delivery(&hub, &id).await;
         worker.abort();
@@ -2533,7 +2565,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("directory must create");
         let (administration, _) = test_administration(directory.path());
         let options = UiOptions {
-            page: Some(Arc::new(PageContext::host(
+            page: Some(Arc::new(test_host_page(
                 directory.path().to_path_buf(),
                 Some("server".to_owned()),
                 None,
@@ -2590,7 +2622,10 @@ mod tests {
         let longest = format!("{}#0001", "a".repeat(32));
         let (line, _) = crate::invites::sign_direct_invite(
             &administration,
-            &crate::invites::DirectInviteSigning::from_page(&host),
+            &crate::invites::DirectInviteSigning::for_data_dir_with_relay(
+                &host.data_dir,
+                host.relay_url(),
+            ),
             &longest,
             &longest,
             &iroh::SecretKey::generate().public().to_string(),
@@ -3512,7 +3547,11 @@ mod tests {
             post(application, "/confirm", Some(cookie), &format!("id={token}")).await;
         assert!(response.body.contains("No changes need confirmation."));
         assert_eq!(
-            administration.lock().expect("administration must unlock").audit(),
+            administration
+                .lock()
+                .expect("administration must unlock")
+                .audit()
+                .expect("audit"),
             ["pending", "confirmed", "applied"]
         );
     }

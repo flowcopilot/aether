@@ -282,20 +282,20 @@ pub(crate) const fn hub_publish_message(error: HubPublishError) -> &'static str 
 }
 
 pub async fn listing_renewal_worker(
-    page: std::sync::Arc<crate::admin_ui::PageContext>,
+    ctx: std::sync::Arc<crate::node_serve_context::NodeServeContext>,
 ) {
     loop {
-        renew_listing(&page).await;
+        renew_listing(&ctx).await;
         tokio::time::sleep(RENEW_INTERVAL).await;
     }
 }
 
-async fn renew_listing(page: &crate::admin_ui::PageContext) {
-    use crate::hub_client::AgentKind;
+async fn renew_listing(ctx: &crate::node_serve_context::NodeServeContext) {
+    use crate::hub_client::{AgentKind, HubAccess};
     use aether_core::time::now_seconds;
 
     let now = now_seconds();
-    let due = crate::settings::setting::<settings::ListingState>(&page.data_dir)
+    let due = crate::settings::setting::<settings::ListingState>(&ctx.data_dir)
         .ok()
         .flatten()
         .is_some_and(|state| {
@@ -303,15 +303,23 @@ async fn renew_listing(page: &crate::admin_ui::PageContext) {
                 && state.expires_at.saturating_sub(now) < RENEW_BEFORE.as_secs()
         });
     let service = crate::settings::setting::<crate::hub_client::settings::AgentKind>(
-        &page.data_dir,
+        &ctx.data_dir,
     )
     .ok()
     .flatten()
         == Some(AgentKind::Service);
-    let (true, true, Some(hub)) = (due, service, page.current_hub()) else {
+    if !(due && service) {
         return;
+    }
+    let hub = match ctx.hub.access() {
+        HubAccess::Ready(client) => *client,
+        HubAccess::Unavailable => {
+            println!("{}", serde_json::json!({ "event": "hub_access_unavailable" }));
+            return;
+        }
+        HubAccess::Off => return,
     };
-    let event = match publish_to_hub(&page.data_dir, &hub, now).await {
+    let event = match publish_to_hub(&ctx.data_dir, &hub, now).await {
         Ok(_) => "listing_renewed",
         Err(_) => "listing_renew_failed",
     };

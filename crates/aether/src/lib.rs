@@ -41,6 +41,7 @@ pub mod mcp;
 pub mod node_builder;
 pub mod node_request;
 pub mod node_runtime;
+mod node_serve_context;
 pub mod node_service;
 pub mod outbox;
 pub mod pact;

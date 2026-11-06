@@ -3,6 +3,8 @@
 
 use std::{sync::PoisonError, time::SystemTime};
 
+use aether_core::time::now_seconds;
+
 use serde::Deserialize;
 use topcoat::{
     Result as TopcoatResult,
@@ -21,7 +23,7 @@ use super::{
     hub::{hub_section, hub_setting},
     layout::{Tab, node_header},
     listing::listing_section,
-    require_admin_session,
+    require_admin_session, shared,
 };
 use crate::access_groups::{self, Action};
 use crate::hub_client::{HubClient, Role};
@@ -100,7 +102,7 @@ pub(super) async fn host_screen(
     };
     let drafts = if page.caller {
         let now = aether_core::time::now_seconds();
-        super::caller::request_drafts_of(&page.data_dir, now).len()
+        super::shared::request_drafts_of(&page.data_dir, now).len()
     } else {
         0
     };
@@ -119,9 +121,16 @@ pub(super) async fn host_screen(
             administration.grants().map_err(|_| {
                 internal_server_error(std::io::Error::other("grants unavailable"))
             })?,
-            administration.last_tasks(crate::direct::SCOPE),
+            administration.last_tasks(crate::direct::SCOPE).map_err(|_| {
+                internal_server_error(std::io::Error::other("tasks unavailable"))
+            })?,
             administration.current_workspace().unwrap_or_default(),
-            administration.pending().len(),
+            administration
+                .pending()
+                .map_err(|_| {
+                    internal_server_error(std::io::Error::other("pending unavailable"))
+                })?
+                .len(),
         )
     };
     let now = SystemTime::now();
@@ -250,7 +259,7 @@ pub(super) async fn host_screen(
                                     <p class="text-sm text-muted-foreground">"Ask them for the connect code on their Aether page. The invite works only on their computer."</p>
                                 </div>
                                 if relay_host.is_none() {
-                                    relay_notice()
+                                    shared::relay_notice()
                                 }
                                 invite_form(error: notice.invite_error.clone())
                                 if !invitation.line.is_empty() {
@@ -286,20 +295,6 @@ pub(super) async fn host_screen(
     }
     // The page is deep: on the heap, its view does not fill the stack.
     .boxed())
-}
-
-/// The notice that only the local network can reach the agent.
-#[component]
-pub(super) async fn relay_notice() -> TopcoatResult<impl View> {
-    Ok(view! {
-        alert(
-            alert_description(
-                "Only your local network can reach this agent. "
-                <a href="#relay">"Set a relay"</a>
-                " before you invite someone elsewhere."
-            )
-        )
-    })
 }
 
 /// A new invite, shown once: the line for the friend's page and the command
@@ -944,7 +939,10 @@ fn create_invite(
 ) -> TopcoatResult<String> {
     sign_direct_invite(
         app_context::<SharedAdministration>(cx),
-        &DirectInviteSigning::from_page(page),
+        &DirectInviteSigning::for_data_dir_with_relay(
+            &page.data_dir,
+            page.relay_url(),
+        ),
         &page.agent_name(),
         friend_name,
         endpoint_id,
@@ -1039,4 +1037,50 @@ pub(super) async fn workspace(
         }
     };
     Ok(view! { host_screen(notice: notice) })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ListingForm {
+    action: String,
+}
+
+#[page(POST "/listing/publish")]
+pub(super) async fn publish_listing(
+    cx: &Cx,
+    Form(form): Form<ListingForm>,
+) -> TopcoatResult<impl View> {
+    ensure_admin_session(cx).await?;
+    let Page(Some(page)) = app_context::<Page>(cx) else {
+        return Err(bad_request("this node has no listing").into());
+    };
+    if crate::settings::setting::<crate::hub_client::settings::AgentKind>(
+        &page.data_dir,
+    )
+    .ok()
+    .flatten()
+        != Some(crate::hub_client::AgentKind::Service)
+    {
+        return Err(bad_request("only a service agent has a public listing").into());
+    }
+    let result = match (form.action.as_str(), page.current_hub()) {
+        (_, None) => Err(crate::listing::HubPublishError::Hub(
+            crate::hub_client::HubError::Unreachable,
+        )),
+        ("list", Some(hub)) => {
+            crate::listing::publish_to_hub(&page.data_dir, &hub, now_seconds())
+                .await
+                .map(drop)
+        }
+        ("stop", Some(hub)) => {
+            crate::listing::stop_hub_listing(&page.data_dir, &hub).await
+        }
+        _ => return Err(bad_request("unknown listing action").into()),
+    };
+    let error = result
+        .err()
+        .map(crate::listing::hub_publish_message)
+        .unwrap_or_default()
+        .to_owned();
+    Ok(view! { host_screen(notice: Notice::listing(error)) })
 }
