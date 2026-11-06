@@ -5,7 +5,7 @@
 //! and the transcript that the tests replay are in `protocol/agent-socket/`.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::{self, BufRead, BufReader, Read, Write},
     net::Shutdown,
     os::unix::{
@@ -18,18 +18,21 @@ use std::{
         atomic::{AtomicU64, Ordering},
         mpsc,
     },
+    thread,
     time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
 
-use crate::execution::{Agent, ExecutionError, ExecutionEvent, agent_instructions};
+use crate::execution::{
+    Agent, ExecutionError, ExecutionEvent, TurnContext, agent_instructions,
+};
 
 const PROTOCOL: u64 = 1;
 
-/// The longest line the node reads from an agent, its newline included: a
-/// final answer is bounded again by the executor's context limit.
 const MAX_LINE: u64 = 4 * 1024 * 1024;
+
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(250);
 
 #[derive(Clone)]
 pub struct ConnectedAgent {
@@ -39,18 +42,15 @@ pub struct ConnectedAgent {
 struct Shared {
     connection: Mutex<Option<Connection>>,
     generation: AtomicU64,
-    timeout: Duration,
+    early_cancels: Mutex<BTreeSet<String>>,
 }
 
-/// The node's end of the connection, shared by the turns that write to it.
 type Writer = Arc<Mutex<UnixStream>>;
 
-/// The turns that wait for an answer, by task ID.
 type Pending = Arc<Mutex<BTreeMap<String, mpsc::Sender<Reply>>>>;
 
 struct Connection {
     generation: u64,
-    /// Closes the connection when a newer agent replaces it.
     stream: UnixStream,
     writer: Writer,
     pending: Pending,
@@ -82,10 +82,7 @@ enum AgentMessage {
 }
 
 impl ConnectedAgent {
-    /// Listens on `path` for the agent. A stale socket file from an earlier
-    /// run is replaced; any other file there is an error. Each turn may run
-    /// for at most `timeout`.
-    pub fn listen(path: &Path, timeout: Duration) -> io::Result<Self> {
+    pub fn listen(path: &Path) -> io::Result<Self> {
         match std::fs::symlink_metadata(path) {
             Ok(metadata) if metadata.file_type().is_socket() => {
                 std::fs::remove_file(path)?;
@@ -105,15 +102,29 @@ impl ConnectedAgent {
             shared: Arc::new(Shared {
                 connection: Mutex::new(None),
                 generation: AtomicU64::new(0),
-                timeout,
+                early_cancels: Mutex::new(BTreeSet::new()),
             }),
         };
         let shared = Arc::clone(&agent.shared);
-        std::thread::spawn(move || {
+        thread::spawn(move || {
             for stream in listener.incoming() {
-                let Ok(stream) = stream else { continue };
-                let shared = Arc::clone(&shared);
-                std::thread::spawn(move || shared.serve(stream));
+                match stream {
+                    Ok(stream) => {
+                        let shared = Arc::clone(&shared);
+                        thread::spawn(move || shared.serve(stream));
+                    }
+                    Err(error) => {
+                        eprintln!("aether: agent socket accept failed: {error}");
+                        if error.kind() == io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        if error.kind() == io::ErrorKind::WouldBlock {
+                            thread::sleep(ACCEPT_BACKOFF);
+                            continue;
+                        }
+                        break;
+                    }
+                }
             }
         });
         Ok(agent)
@@ -131,7 +142,6 @@ impl ConnectedAgent {
             .ok_or(ExecutionError::Unavailable)
     }
 
-    /// The generation of the attached connection, if one is attached.
     #[cfg(test)]
     fn generation(&self) -> Option<u64> {
         self.shared
@@ -144,9 +154,6 @@ impl ConnectedAgent {
 }
 
 impl Shared {
-    /// Runs one agent connection until it closes. The newest agent that
-    /// says `ready` replaces an older one: the older connection closes, and
-    /// its turns fail.
     fn serve(&self, stream: UnixStream) {
         let (Ok(writer), Ok(control)) = (stream.try_clone(), stream.try_clone()) else {
             return;
@@ -168,8 +175,15 @@ impl Shared {
         });
         drop(connection);
         if let Some(replaced) = replaced {
-            // Its own serve thread then reads the end of the stream and
-            // fails its turns.
+            if let Ok(pending) = replaced.pending.lock() {
+                for (task_id, sender) in pending.iter() {
+                    let _ = write_line(
+                        &replaced.writer,
+                        &NodeMessage::Cancel { id: task_id.as_str() },
+                    );
+                    let _ = sender.send(Reply::Cancelled);
+                }
+            }
             let _ = replaced.stream.shutdown(Shutdown::Both);
         }
         while let Some(message) = read_message(&mut reader) {
@@ -183,7 +197,6 @@ impl Shared {
             if let Ok(pending) = pending.lock()
                 && let Some(sender) = pending.get(&id)
             {
-                // The turn has ended when its receiver is gone.
                 let _ = sender.send(reply);
             }
         }
@@ -194,15 +207,12 @@ impl Shared {
         {
             *connection = None;
         }
-        // Dropping the senders ends every waiting turn as unavailable.
         if let Ok(mut pending) = pending.lock() {
             pending.clear();
         }
     }
 }
 
-/// Reads the next message and skips lines that are not one. `None` at the
-/// end of the stream, on a read error and on a line that is too long.
 fn read_message(reader: &mut impl BufRead) -> Option<AgentMessage> {
     loop {
         let mut line = Vec::new();
@@ -228,47 +238,47 @@ fn write_line(
 }
 
 impl Agent for ConnectedAgent {
-    fn start_turn(
-        &mut self,
-        task_id: &str,
-        skill: &str,
-        remote_text: &str,
-    ) -> Result<String, ExecutionError> {
-        self.start_turn_with_events(task_id, skill, remote_text, &mut |_| {})
+    fn start_turn(&mut self, ctx: &TurnContext) -> Result<String, ExecutionError> {
+        self.start_turn_with_events(ctx, &mut |_| {})
     }
 
     fn start_turn_with_events(
         &mut self,
-        task_id: &str,
-        skill: &str,
-        remote_text: &str,
+        ctx: &TurnContext,
         events: &mut dyn FnMut(ExecutionEvent),
     ) -> Result<String, ExecutionError> {
+        if self
+            .shared
+            .early_cancels
+            .lock()
+            .map_err(|_| ExecutionError::Unavailable)?
+            .remove(&ctx.task_id)
+        {
+            return Err(ExecutionError::Cancelled);
+        }
         let (writer, pending) = self.connection()?;
         let (sender, receiver) = mpsc::channel();
         {
             let mut pending =
                 pending.lock().map_err(|_| ExecutionError::Unavailable)?;
-            if pending.contains_key(task_id) {
+            if pending.contains_key(&ctx.task_id) {
                 return Err(ExecutionError::Protocol);
             }
-            pending.insert(task_id.to_owned(), sender);
+            pending.insert(ctx.task_id.clone(), sender);
         }
         let result = (|| {
             write_line(
                 &writer,
                 &NodeMessage::Task {
-                    id: task_id,
-                    instructions: agent_instructions(skill),
-                    text: remote_text,
+                    id: &ctx.task_id,
+                    instructions: agent_instructions(&ctx.skill),
+                    text: &ctx.text,
                 },
             )?;
-            let started_at = Instant::now();
             loop {
-                let remaining = self
-                    .shared
-                    .timeout
-                    .checked_sub(started_at.elapsed())
+                let remaining = ctx
+                    .deadline
+                    .checked_duration_since(Instant::now())
                     .ok_or(ExecutionError::Timeout)?;
                 match receiver.recv_timeout(remaining) {
                     Ok(Reply::Progress) => events(ExecutionEvent::Progress),
@@ -288,29 +298,37 @@ impl Agent for ConnectedAgent {
             }
         })();
         if let Ok(mut pending) = pending.lock() {
-            pending.remove(task_id);
+            pending.remove(&ctx.task_id);
         }
         if result == Err(ExecutionError::Timeout) {
-            // A failed write means the connection is gone, and the agent
-            // forgets its turns then.
-            let _ = write_line(&writer, &NodeMessage::Cancel { id: task_id });
+            write_line(&writer, &NodeMessage::Cancel { id: &ctx.task_id })?;
         }
         result
     }
 
     fn cancel(&self, task_id: &str) {
-        let Ok((writer, pending)) = self.connection() else { return };
-        let active = pending.lock().is_ok_and(|pending| pending.contains_key(task_id));
-        if active {
+        if let Ok((writer, pending)) = self.connection()
+            && pending.lock().is_ok_and(|pending| pending.contains_key(task_id))
+        {
             let _ = write_line(&writer, &NodeMessage::Cancel { id: task_id });
+            return;
         }
+        if let Ok(mut early) = self.shared.early_cancels.lock() {
+            early.insert(task_id.to_owned());
+        }
+    }
+
+    fn supports_workspace_change(&self) -> bool {
+        false
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{AgentMessage, ConnectedAgent, MAX_LINE, NodeMessage, PROTOCOL};
-    use crate::execution::{Agent, ExecutionError, GENERAL_SKILL, agent_instructions};
+    use crate::execution::{
+        Agent, ExecutionError, GENERAL_SKILL, TurnContext, agent_instructions,
+    };
     use serde_json::{Value, json};
     use std::{
         collections::BTreeMap,
@@ -330,15 +348,12 @@ mod tests {
         serde_json::from_str(text).expect("the protocol file is JSON")
     }
 
-    /// The test's end of one agent connection.
     struct Peer {
         stream: UnixStream,
         lines: BufReader<UnixStream>,
     }
 
     impl Peer {
-        /// Connects, writes `ready`, and waits until the node has attached
-        /// this connection.
         fn attach(agent: &ConnectedAgent, path: &Path, ready: &Value) -> Self {
             let before = agent.generation();
             let mut peer = Self::connect(path);
@@ -375,7 +390,6 @@ mod tests {
             serde_json::from_str(&line).expect("the node sends JSON")
         }
 
-        /// Whether the node has closed the connection.
         fn closed(&mut self) -> bool {
             let mut rest = Vec::new();
             match self.lines.read_to_end(&mut rest) {
@@ -385,8 +399,16 @@ mod tests {
         }
     }
 
-    /// A line of exactly `bytes` bytes, the newline included, of a type
-    /// that no side knows.
+    fn turn_ctx(id: &str, text: &str, deadline: Instant) -> TurnContext {
+        TurnContext {
+            task_id: id.to_owned(),
+            skill: GENERAL_SKILL.to_owned(),
+            text: text.to_owned(),
+            workspace: std::env::temp_dir(),
+            deadline,
+        }
+    }
+
     fn noise(bytes: u64) -> Vec<u8> {
         let mut line = br#"{"type":"noise","pad":""#.to_vec();
         let filler = usize::try_from(bytes)
@@ -402,16 +424,16 @@ mod tests {
         message[field].as_str().expect("the field is a string")
     }
 
-    /// Replays one transcript case with the node under test.
     fn replay(case: &Value) {
         let name = case["name"].as_str().unwrap_or_default();
         let directory = tempfile::tempdir().expect("directory must create");
         let path = crate::data_dir::DataDir::new(directory.path()).agent_socket();
-        let agent =
-            ConnectedAgent::listen(&path, Duration::from_secs(5)).expect("listen");
+        let agent = ConnectedAgent::listen(&path).expect("listen");
         let mut peer: Option<Peer> = None;
         let mut turns = BTreeMap::<String, JoinHandle<_>>::new();
         let mut answers = BTreeMap::<String, String>::new();
+        let deadline =
+            Instant::now().checked_add(Duration::from_secs(5)).expect("deadline");
         for step in case["steps"].as_array().expect("steps") {
             let ignored = step["ignored"] == true;
             if let Some(message) = step.get("agent") {
@@ -433,7 +455,7 @@ mod tests {
                     let text = text_of(message, "text").to_owned();
                     if ignored {
                         assert_eq!(
-                            agent.clone().start_turn(&id, GENERAL_SKILL, &text),
+                            agent.clone().start_turn(&turn_ctx(&id, &text, deadline)),
                             Err(ExecutionError::Protocol),
                             "{name}"
                         );
@@ -441,12 +463,10 @@ mod tests {
                     }
                     expected["instructions"] = json!(agent_instructions(GENERAL_SKILL));
                     let mut runner = agent.clone();
-                    let turn_id = id.clone();
+                    let ctx = turn_ctx(&id, &text, deadline);
                     turns.insert(
-                        id,
-                        std::thread::spawn(move || {
-                            runner.start_turn(&turn_id, GENERAL_SKILL, &text)
-                        }),
+                        id.clone(),
+                        std::thread::spawn(move || runner.start_turn(&ctx)),
                     );
                 } else {
                     agent.cancel(&id);
@@ -462,7 +482,6 @@ mod tests {
                     .write_line(line.as_str().expect("a line"));
             } else if let Some(bytes) = step.get("agent_line_bytes") {
                 let line = noise(bytes.as_u64().expect("a size"));
-                // The node may close before the whole line is read.
                 let _ = peer.as_mut().expect("a connection").stream.write_all(&line);
             } else if step["closes"] == "node" {
                 assert!(peer.take().expect("a connection").closed(), "{name}");
@@ -543,8 +562,7 @@ mod tests {
     fn the_socket_is_owner_only() {
         let directory = tempfile::tempdir().expect("directory must create");
         let path = crate::data_dir::DataDir::new(directory.path()).agent_socket();
-        let _agent =
-            ConnectedAgent::listen(&path, Duration::from_secs(5)).expect("listen");
+        let _agent = ConnectedAgent::listen(&path).expect("listen");
         let mode =
             std::fs::metadata(&path).expect("socket exists").permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
@@ -555,11 +573,12 @@ mod tests {
         let directory = tempfile::tempdir().expect("directory must create");
         let mut agent = ConnectedAgent::listen(
             &crate::data_dir::DataDir::new(directory.path()).agent_socket(),
-            Duration::from_secs(5),
         )
         .expect("listen");
+        let deadline =
+            Instant::now().checked_add(Duration::from_secs(5)).expect("deadline");
         assert_eq!(
-            agent.start_turn("task-1", GENERAL_SKILL, "hello"),
+            agent.start_turn(&turn_ctx("task-1", "hello", deadline)),
             Err(ExecutionError::Unavailable)
         );
     }
@@ -568,12 +587,13 @@ mod tests {
     fn a_turn_past_its_time_limit_times_out_and_is_cancelled() {
         let directory = tempfile::tempdir().expect("directory must create");
         let path = crate::data_dir::DataDir::new(directory.path()).agent_socket();
-        let mut agent =
-            ConnectedAgent::listen(&path, Duration::from_millis(50)).expect("listen");
+        let mut agent = ConnectedAgent::listen(&path).expect("listen");
         let mut peer =
             Peer::attach(&agent, &path, &json!({"type": "ready", "protocol": 1}));
+        let deadline =
+            Instant::now().checked_add(Duration::from_millis(50)).expect("deadline");
         assert_eq!(
-            agent.start_turn("task-1", GENERAL_SKILL, "wait"),
+            agent.start_turn(&turn_ctx("task-1", "wait", deadline)),
             Err(ExecutionError::Timeout)
         );
         assert_eq!(peer.read()["type"], "task");
@@ -584,23 +604,25 @@ mod tests {
     fn a_replaced_agent_is_closed_and_its_turns_fail() {
         let directory = tempfile::tempdir().expect("directory must create");
         let path = crate::data_dir::DataDir::new(directory.path()).agent_socket();
-        let agent =
-            ConnectedAgent::listen(&path, Duration::from_secs(5)).expect("listen");
+        let agent = ConnectedAgent::listen(&path).expect("listen");
         let ready = json!({"type": "ready", "protocol": 1});
         let mut first = Peer::attach(&agent, &path, &ready);
         let mut runner = agent.clone();
+        let deadline =
+            Instant::now().checked_add(Duration::from_secs(5)).expect("deadline");
         let turn = std::thread::spawn(move || {
-            runner.start_turn("task-1", GENERAL_SKILL, "hello")
+            runner.start_turn(&turn_ctx("task-1", "hello", deadline))
         });
         assert_eq!(first.read()["id"], "task-1");
 
         let mut second = Peer::attach(&agent, &path, &ready);
+        assert_eq!(first.read(), json!({"type": "cancel", "id": "task-1"}));
         assert!(first.closed());
-        assert_eq!(turn.join().expect("turn joins"), Err(ExecutionError::Unavailable));
+        assert_eq!(turn.join().expect("turn joins"), Err(ExecutionError::Cancelled));
 
         let mut runner = agent;
         let turn = std::thread::spawn(move || {
-            runner.start_turn("task-2", GENERAL_SKILL, "hello")
+            runner.start_turn(&turn_ctx("task-2", "hello", deadline))
         });
         assert_eq!(second.read()["id"], "task-2");
         second.write(&json!({"type": "result", "id": "task-2", "text": "answer"}));
@@ -608,11 +630,27 @@ mod tests {
     }
 
     #[test]
+    fn cancel_before_turn_registration_is_honored() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let path = crate::data_dir::DataDir::new(directory.path()).agent_socket();
+        let mut agent = ConnectedAgent::listen(&path).expect("listen");
+        let _peer =
+            Peer::attach(&agent, &path, &json!({"type": "ready", "protocol": 1}));
+        agent.cancel("task-early");
+        let deadline =
+            Instant::now().checked_add(Duration::from_secs(5)).expect("deadline");
+        assert_eq!(
+            agent.start_turn(&turn_ctx("task-early", "hello", deadline)),
+            Err(ExecutionError::Cancelled)
+        );
+    }
+
+    #[test]
     fn a_file_that_is_not_a_socket_is_kept() {
         let directory = tempfile::tempdir().expect("directory must create");
         let path = crate::data_dir::DataDir::new(directory.path()).agent_socket();
         std::fs::write(&path, "owner data").expect("file must write");
-        assert!(ConnectedAgent::listen(&path, Duration::from_secs(5)).is_err());
+        assert!(ConnectedAgent::listen(&path).is_err());
         assert_eq!(std::fs::read_to_string(&path).ok().as_deref(), Some("owner data"));
     }
 }
