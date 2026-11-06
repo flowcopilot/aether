@@ -2,10 +2,38 @@ use std::{path::Path, sync::Arc};
 
 use aether_store::AuditActor;
 
-use crate::{
-    admin::{ApplyOutcome, ChangeRequest, SharedAdministration},
-    admin_ui::{PageContext, RelaySwitcher},
-};
+use crate::admin::{ApplyOutcome, ChangeRequest, SharedAdministration};
+
+#[derive(Clone)]
+pub struct DirectInviteSigning {
+    pub data_dir: std::path::PathBuf,
+    relay_url: Option<String>,
+}
+
+impl DirectInviteSigning {
+    #[must_use]
+    pub fn for_data_dir(data_dir: &Path) -> Self {
+        Self {
+            data_dir: data_dir.to_path_buf(),
+            relay_url:
+                crate::settings::setting::<crate::transport::relay::ActiveRelay>(
+                    data_dir,
+                )
+                .ok()
+                .flatten(),
+        }
+    }
+
+    #[must_use]
+    pub fn from_page(page: &crate::admin_ui::PageContext) -> Self {
+        Self { data_dir: page.data_dir.clone(), relay_url: page.relay_url() }
+    }
+
+    fn relay_url(&self) -> Option<String> {
+        crate::settings::setting::<crate::transport::relay::ActiveRelay>(&self.data_dir)
+            .unwrap_or_else(|_| self.relay_url.clone())
+    }
+}
 
 #[derive(Debug)]
 pub enum InviteError {
@@ -33,7 +61,7 @@ pub fn invite_agent_name(data_dir: &Path, invite_name: Option<&str>) -> String {
 #[allow(clippy::too_many_arguments)]
 pub fn sign_direct_invite(
     administration: &SharedAdministration,
-    page: &PageContext,
+    signing: &DirectInviteSigning,
     agent_name: &str,
     friend_name: &str,
     endpoint_id: &str,
@@ -44,10 +72,10 @@ pub fn sign_direct_invite(
     let internal = |error: &dyn std::fmt::Display| {
         InviteError::Internal(std::io::Error::other(error.to_string()))
     };
-    let agent_card = crate::direct::create_card(&page.data_dir, agent_name)
+    let agent_card = crate::direct::create_card(&signing.data_dir, agent_name)
         .map_err(|error| internal(&error))?;
     let (authorization, grant) = crate::direct::sign_invite_access(
-        &page.data_dir,
+        &signing.data_dir,
         friend_name,
         endpoint_id,
         days,
@@ -58,7 +86,7 @@ pub fn sign_direct_invite(
         .into_change()
         .map_err(|error| internal(&error))?;
     crate::access_groups::join_and_apply(
-        &page.data_dir,
+        &signing.data_dir,
         access_group,
         friend_name,
         endpoint_id,
@@ -81,11 +109,11 @@ pub fn sign_direct_invite(
         crate::access_groups::JoinError::Apply(_) => InviteError::Refused,
     })?;
     crate::direct::encode_invite_after_grant(
-        &page.data_dir,
+        &signing.data_dir,
         agent_name,
         days,
         authorization,
-        page.relay_url(),
+        signing.relay_url(),
         agent_card,
     )
     .map(|line| (line, grant_id))
@@ -96,16 +124,22 @@ pub fn host_page_context(
     data_dir: std::path::PathBuf,
     invite_name: Option<String>,
     relay_url: Option<String>,
-    switch_relay: RelaySwitcher,
+    switch_relay: crate::admin_ui::RelaySwitcher,
     hub_flag: Option<String>,
     hub: Option<crate::hub_client::HubClient>,
     task_folder_mode: bool,
-) -> Arc<PageContext> {
+) -> Arc<crate::admin_ui::PageContext> {
     Arc::new(
-        PageContext::host(data_dir, invite_name, relay_url, switch_relay, hub_flag)
-            .with_hub(hub)
-            .with_caller(true)
-            .with_task_folder_mode(task_folder_mode),
+        crate::admin_ui::PageContext::host(
+            data_dir,
+            invite_name,
+            relay_url,
+            switch_relay,
+            hub_flag,
+        )
+        .with_hub(hub)
+        .with_caller(true)
+        .with_task_folder_mode(task_folder_mode),
     )
 }
 

@@ -305,18 +305,10 @@ fn create_invite_response(
     days: u64,
 ) -> Response {
     let agent_name = crate::invites::invite_agent_name(data_dir, None);
-    let page = crate::admin_ui::PageContext::host(
-        data_dir.to_path_buf(),
-        None,
-        crate::settings::setting::<crate::transport::relay::ActiveRelay>(data_dir)
-            .ok()
-            .flatten(),
-        std::sync::Arc::new(|_, _| Box::pin(async { Ok(()) })),
-        None,
-    );
+    let signing = crate::invites::DirectInviteSigning::for_data_dir(data_dir);
     match crate::invites::sign_direct_invite(
         administration,
-        &page,
+        &signing,
         &agent_name,
         friend_name,
         endpoint_id,

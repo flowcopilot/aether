@@ -7,7 +7,10 @@ use topcoat::{
     view::{View, ViewExt, attributes, component, view},
 };
 
-use super::{Tab, ensure_admin_session, node_header};
+use super::{
+    ensure_admin_session,
+    layout::{Tab, node_header},
+};
 use crate::{
     admin::{AdminStoreAccess, SharedAdministration},
     admin_components::page_title,

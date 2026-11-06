@@ -17,13 +17,15 @@ use topcoat::{
 };
 
 use super::{
-    Page, PageContext, Tab, ensure_admin_session,
+    Page, PageContext, ensure_admin_session,
     hub::{hub_section, hub_setting},
+    layout::{Tab, node_header},
     listing::listing_section,
-    node_header, require_admin_session,
+    require_admin_session,
 };
 use crate::access_groups::{self, Action};
 use crate::hub_client::{HubClient, Role};
+use crate::invites::{DirectInviteSigning, sign_direct_invite};
 use crate::{
     admin::SharedAdministration,
     admin_components::{
@@ -937,14 +939,15 @@ fn create_invite(
     endpoint_id: &str,
     days: u64,
 ) -> TopcoatResult<String> {
-    sign_invite(
+    sign_direct_invite(
         app_context::<SharedAdministration>(cx),
-        page,
+        &DirectInviteSigning::from_page(page),
         &page.agent_name(),
         friend_name,
         endpoint_id,
         days,
         crate::access_groups::FRIENDS_GROUP,
+        aether_store::AuditActor::Ui,
     )
     .map(|(line, _)| line)
     .map_err(|error| match error {
@@ -955,27 +958,6 @@ fn create_invite(
             internal_server_error(error).into()
         }
     })
-}
-
-pub(super) fn sign_invite(
-    administration: &SharedAdministration,
-    page: &PageContext,
-    agent_name: &str,
-    friend_name: &str,
-    endpoint_id: &str,
-    days: u64,
-    access_group: &str,
-) -> Result<(String, String), crate::invites::InviteError> {
-    crate::invites::sign_direct_invite(
-        administration,
-        page,
-        agent_name,
-        friend_name,
-        endpoint_id,
-        days,
-        access_group,
-        aether_store::AuditActor::Ui,
-    )
 }
 
 #[derive(Deserialize)]

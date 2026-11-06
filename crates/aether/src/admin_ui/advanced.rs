@@ -21,7 +21,8 @@ use topcoat::{
 };
 
 use super::{
-    AdminConfirmations, Managed, Page, Tab, ensure_admin_session, node_header,
+    AdminConfirmations, Managed, Page, ensure_admin_session,
+    layout::{Tab, node_header, page_data_dir},
 };
 use crate::{
     admin::{AdminStoreAccess, SharedAdministration},
@@ -50,7 +51,7 @@ pub(super) async fn dashboard(
 ) -> TopcoatResult<impl View> {
     ensure_admin_session(cx).await?;
     let Page(page) = app_context::<Page>(cx);
-    let data_dir = super::page_data_dir(cx);
+    let data_dir = page_data_dir(cx);
     let policy = data_dir
         .map(|path| policy_settings(&path))
         .transpose()
@@ -348,8 +349,7 @@ pub(super) async fn save_policy(
     Form(form): Form<PolicyForm>,
 ) -> TopcoatResult<impl View> {
     super::require_admin_session(cx).await?;
-    super::page_data_dir(cx)
-        .ok_or_else(|| bad_request("this page has no node data"))?;
+    page_data_dir(cx).ok_or_else(|| bad_request("this page has no node data"))?;
     let settings = PolicySettings {
         workspace: PathBuf::from(form.workspace),
         max_context_tokens: form.max_context_tokens,

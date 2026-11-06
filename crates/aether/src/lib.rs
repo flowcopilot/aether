@@ -31,6 +31,7 @@ pub mod hub_client;
 mod hub_membership;
 mod hub_store;
 mod hub_sync;
+mod hub_workers;
 pub mod identity;
 mod invites;
 mod key_file;

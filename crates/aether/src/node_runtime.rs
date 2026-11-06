@@ -187,15 +187,15 @@ pub fn start_background_workers(
             }
         })
     });
-    let hub_host = tokio::spawn(crate::admin_ui::hub::host_worker(
+    let hub_host = tokio::spawn(crate::hub_workers::host_worker(
         Arc::clone(administration),
         Arc::clone(page),
     ));
     let hub_caller = page
         .caller
-        .then(|| tokio::spawn(crate::admin_ui::hub::caller_worker(Arc::clone(page))));
+        .then(|| tokio::spawn(crate::hub_workers::caller_worker(Arc::clone(page))));
     let listing =
-        tokio::spawn(crate::admin_ui::listing::listing_worker(Arc::clone(page)));
+        tokio::spawn(crate::listing::listing_renewal_worker(Arc::clone(page)));
     BackgroundWorkers {
         directory_renewer,
         managed_renewer,
