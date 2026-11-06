@@ -12,12 +12,14 @@ pub struct RecordInput<'a> {
 }
 
 pub fn run_record(input: RecordInput<'_>) -> ExitCode {
-    if input.agent_id.is_empty()
-        || input.scope.is_empty()
-        || input.capability.is_empty()
-        || input.expires_in == 0
-        || input.address.parse::<std::net::SocketAddr>().is_err()
-    {
+    if !super::valid_publication_fields(
+        &input.agent_id,
+        &input.address,
+        &input.scope,
+        &input.capability,
+        input.expires_in,
+        &input.scope,
+    ) {
         eprintln!("aether: node record is invalid");
         return ExitCode::from(2);
     }

@@ -309,8 +309,6 @@ fn import_invitation_in(
         Ok(invitation) if invitation.scope_id == SCOPE => invitation,
         _ => return Err(DirectError::Invalid),
     };
-    let expires_at =
-        i64::try_from(wire.expires_at).map_err(|_| DirectError::Invalid)?;
     // A name stays with its endpoint: an invite from another key does not
     // take over a contact that is still valid.
     if contact(store, &invitation.agent_id)
@@ -318,14 +316,10 @@ fn import_invitation_in(
     {
         return Err(DirectError::NameInUse);
     }
-    let record = serde_json::to_vec(wire).map_err(|_| DirectError::Invalid)?;
     store
-        .put_contact_record(&aether_store::SignedRecord {
-            scope_id: SCOPE.to_owned(),
-            agent_id: invitation.agent_id.clone(),
-            record,
-            expires_at,
-        })
+        .put_contact_record(
+            &wire.signed_store_record().map_err(|_| DirectError::Invalid)?,
+        )
         .map_err(|_| DirectError::Unavailable)?;
     Ok(invitation)
 }

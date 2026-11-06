@@ -4,7 +4,7 @@
 use std::time::{Duration, SystemTime};
 
 use aether_core::time::{from_unix_seconds, unix_seconds};
-use aether_store::{DirectoryEventType, ManagedEventType, ManagedMember};
+use aether_store::{DirectoryEventType, ManagedEventType, ManagedMember, SignedRecord};
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 
@@ -22,6 +22,7 @@ pub const MANAGED: [&str; 2] = ["v1", "managed"];
 /// The roster operations under [`MANAGED`] and a scope.
 pub const MEMBERS: &str = "members";
 pub const MANAGED_EVENTS: &str = "events";
+pub const MANAGED_MEMBER_ROLE: &str = "member";
 
 /// The most events one page of changes holds. A client reads pages until
 /// one is empty.
@@ -141,6 +142,16 @@ impl WireRecord {
             signature: self.signature.clone(),
         })
     }
+
+    pub fn signed_store_record(&self) -> Result<SignedRecord, DiscoveryError> {
+        Ok(SignedRecord {
+            scope_id: self.scope_id.clone(),
+            agent_id: self.agent_id.clone(),
+            record: serde_json::to_vec(self).map_err(|_| DiscoveryError::Malformed)?,
+            expires_at: i64::try_from(self.expires_at)
+                .map_err(|_| DiscoveryError::Malformed)?,
+        })
+    }
 }
 
 impl WireInvitation {
@@ -173,6 +184,16 @@ impl WireInvitation {
         };
         validate_invitation(&invitation)?;
         Ok(invitation)
+    }
+
+    pub fn signed_store_record(&self) -> Result<SignedRecord, DiscoveryError> {
+        Ok(SignedRecord {
+            scope_id: self.scope_id.clone(),
+            agent_id: self.agent_id.clone(),
+            record: serde_json::to_vec(self).map_err(|_| DiscoveryError::Malformed)?,
+            expires_at: i64::try_from(self.expires_at)
+                .map_err(|_| DiscoveryError::Malformed)?,
+        })
     }
 }
 

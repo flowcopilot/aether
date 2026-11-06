@@ -41,6 +41,23 @@ pub struct PublicationRecord {
     pub ttl: u64,
 }
 
+#[must_use]
+pub fn valid_publication_fields(
+    agent_id: &str,
+    address: &str,
+    scope: &str,
+    capability: &str,
+    ttl: u64,
+    configured_scope: &str,
+) -> bool {
+    ttl >= 2
+        && !agent_id.is_empty()
+        && !scope.is_empty()
+        && !capability.is_empty()
+        && scope == configured_scope
+        && address.parse::<std::net::SocketAddr>().is_ok()
+}
+
 impl DirectoryPublication {
     /// A publication to `directory`, reached through its pinned
     /// `certificate`. Records are signed with the discovery key of

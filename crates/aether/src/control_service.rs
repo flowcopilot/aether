@@ -84,14 +84,7 @@ impl ControlService {
             Err(error) => return Err(ControlError::Store(error)),
         };
         store.publish_signed_record(
-            &aether_store::SignedRecord {
-                scope_id: wire.scope_id.clone(),
-                agent_id: wire.agent_id.clone(),
-                record: serde_json::to_vec(wire)
-                    .map_err(|_| ControlError::InvalidRecord)?,
-                expires_at: i64::try_from(wire.expires_at)
-                    .map_err(|_| ControlError::InvalidRecord)?,
-            },
+            &wire.signed_store_record().map_err(|_| ControlError::InvalidRecord)?,
             if is_renewal {
                 aether_store::DirectoryEventType::Renewed
             } else {
@@ -215,7 +208,7 @@ impl ControlService {
             scope_id: record.scope_id,
             agent_id: record.agent_id,
             endpoint_id: record.endpoint_id,
-            role: "member".to_owned(),
+            role: wire::MANAGED_MEMBER_ROLE.to_owned(),
             expires_at: unix_timestamp(record.expires_at)
                 .ok_or(ControlError::InvalidRecord)?,
             revoked_at: None,

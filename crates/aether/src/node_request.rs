@@ -41,6 +41,15 @@ impl From<TransportError> for RequestError {
     }
 }
 
+fn direct_store_unavailable(error: DirectError) -> Option<RequestError> {
+    match error {
+        DirectError::Unavailable => Some(RequestError::Transport(
+            TransportError::Network("direct store is unavailable".to_owned()),
+        )),
+        _ => None,
+    }
+}
+
 pub async fn send(input: RequestInput) -> Result<Vec<Frame>, RequestError> {
     let data_dir = &input.data_dir;
     if input
@@ -56,9 +65,23 @@ pub async fn send(input: RequestInput) -> Result<Vec<Frame>, RequestError> {
                 && input.directory.is_none()
                 && input.managed_control.is_none() =>
         {
-            direct::open_store(data_dir)
-                .and_then(|store| direct::contact_bundle(&store, agent_id))
-                .ok()
+            match direct::open_store(data_dir) {
+                Ok(store) => match direct::contact_bundle(&store, agent_id) {
+                    Ok(bundle) => Some(bundle),
+                    Err(error) => {
+                        if let Some(error) = direct_store_unavailable(error) {
+                            return Err(error);
+                        }
+                        None
+                    }
+                },
+                Err(error) => {
+                    if let Some(error) = direct_store_unavailable(error) {
+                        return Err(error);
+                    }
+                    None
+                }
+            }
         }
         _ => None,
     };

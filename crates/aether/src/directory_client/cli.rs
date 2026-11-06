@@ -2,18 +2,34 @@
 
 use std::{path::PathBuf, process::ExitCode};
 
+use usage_rs::Subcommands;
+
 use super::{
     DirectoryClient, DirectoryClientError, read_directory_record, read_verifying_key,
     sync_directory,
 };
 
+#[derive(Subcommands)]
 pub enum Command {
-    Publish { record: PathBuf },
-    Renew { record: PathBuf },
-    Resolve { agent_id: String },
-    Search { capability: String },
-    Revoke { record: PathBuf },
-    Sync { data_dir: PathBuf },
+    Publish {
+        record: PathBuf,
+    },
+    Renew {
+        record: PathBuf,
+    },
+    Resolve {
+        agent_id: String,
+    },
+    Search {
+        capability: String,
+    },
+    Revoke {
+        record: PathBuf,
+    },
+    Sync {
+        #[usage(long)]
+        data_dir: Option<PathBuf>,
+    },
 }
 
 pub struct Options {
@@ -78,6 +94,7 @@ pub async fn run(options: Options) -> ExitCode {
             }
         }
         Command::Sync { data_dir } => {
+            let data_dir = crate::data_dir::resolve_node_data_dir(data_dir);
             if let Ok((cursor, records)) =
                 sync_directory(&data_dir, &options.directory, verifying_key, &client)
                     .await

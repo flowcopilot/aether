@@ -3,7 +3,7 @@ pub mod cli;
 use std::path::Path;
 
 use hex::FromHex;
-use reqwest::{StatusCode, Url};
+use reqwest::StatusCode;
 
 use aether_store::DirectoryEventType;
 
@@ -12,7 +12,8 @@ use crate::{
         validate_record,
         wire::{self, WireDirectoryEvent, WireRecord},
     },
-    pinned_https::{self, PinnedError},
+    pinned_https::PinnedError,
+    pinned_json::{self, HttpError, PinnedJsonClient},
     transport::{self, Frame, TransportError},
 };
 
@@ -32,9 +33,31 @@ pub enum DirectoryClientError {
     UntrustedRecord,
 }
 
+impl From<PinnedError> for DirectoryClientError {
+    fn from(error: PinnedError) -> Self {
+        match error {
+            PinnedError::Origin => Self::InvalidDirectory,
+            PinnedError::Certificate => Self::InvalidCertificate,
+            PinnedError::Client => Self::Request,
+        }
+    }
+}
+
+impl From<HttpError> for DirectoryClientError {
+    fn from(error: HttpError) -> Self {
+        match error {
+            HttpError::Origin => Self::InvalidDirectory,
+            HttpError::Certificate => Self::InvalidCertificate,
+            HttpError::Client | HttpError::Request => Self::Request,
+            HttpError::Status => Self::Status,
+            HttpError::Body => Self::InvalidRecord,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct DirectoryClient {
-    pinned: pinned_https::PinnedOrigin,
+    http: PinnedJsonClient,
     trusted_signing_key: [u8; 32],
 }
 
@@ -44,32 +67,24 @@ impl DirectoryClient {
         certificate_der: &[u8],
         trusted_signing_key: [u8; 32],
     ) -> Result<Self, DirectoryClientError> {
-        let pinned = pinned_https::PinnedOrigin::open(directory, certificate_der)
-            .map_err(|error| match error {
-                PinnedError::Origin => DirectoryClientError::InvalidDirectory,
-                PinnedError::Certificate => DirectoryClientError::InvalidCertificate,
-                PinnedError::Client => DirectoryClientError::Request,
-            })?;
-        Ok(Self { pinned, trusted_signing_key })
+        Ok(Self {
+            http: PinnedJsonClient::open(directory, certificate_der)?,
+            trusted_signing_key,
+        })
     }
 
     pub async fn publish(
         &self,
         record: &WireRecord,
     ) -> Result<WireRecord, DirectoryClientError> {
-        let response = self
-            .pinned
-            .client
-            .post(self.records_url()?)
-            .json(record)
-            .send()
-            .await
-            .map_err(|_| DirectoryClientError::Request)?;
-        if !matches!(response.status(), StatusCode::CREATED | StatusCode::OK) {
-            return Err(DirectoryClientError::Status);
-        }
-        let record =
-            response.json().await.map_err(|_| DirectoryClientError::InvalidRecord)?;
+        let record = self
+            .http
+            .post_json_any(
+                self.records_url()?,
+                record,
+                &[StatusCode::CREATED, StatusCode::OK],
+            )
+            .await?;
         self.validate(&record)?;
         Ok(record)
     }
@@ -78,18 +93,7 @@ impl DirectoryClient {
         &self,
         agent_id: &str,
     ) -> Result<WireRecord, DirectoryClientError> {
-        let response = self
-            .pinned
-            .client
-            .get(self.record_url(agent_id)?)
-            .send()
-            .await
-            .map_err(|_| DirectoryClientError::Request)?;
-        if response.status() != StatusCode::OK {
-            return Err(DirectoryClientError::Status);
-        }
-        let record =
-            response.json().await.map_err(|_| DirectoryClientError::InvalidRecord)?;
+        let record = self.http.get_json(self.record_url(agent_id)?).await?;
         self.validate(&record)?;
         Ok(record)
     }
@@ -101,19 +105,10 @@ impl DirectoryClient {
         if capability.is_empty() {
             return Err(DirectoryClientError::InvalidRecord);
         }
-        let response = self
-            .pinned
-            .client
-            .get(self.records_url()?)
-            .query(&[("capability", capability)])
-            .send()
-            .await
-            .map_err(|_| DirectoryClientError::Request)?;
-        if response.status() != StatusCode::OK {
-            return Err(DirectoryClientError::Status);
-        }
-        let records: Vec<WireRecord> =
-            response.json().await.map_err(|_| DirectoryClientError::InvalidRecord)?;
+        let records: Vec<WireRecord> = self
+            .http
+            .get_json_query(self.records_url()?, &[("capability", capability)])
+            .await?;
         for record in &records {
             self.validate(record)?;
         }
@@ -124,17 +119,7 @@ impl DirectoryClient {
         &self,
         record: &WireRecord,
     ) -> Result<(), DirectoryClientError> {
-        let response = self
-            .pinned
-            .client
-            .delete(self.record_url(&record.agent_id)?)
-            .json(record)
-            .send()
-            .await
-            .map_err(|_| DirectoryClientError::Request)?;
-        if response.status() != StatusCode::NO_CONTENT {
-            return Err(DirectoryClientError::Status);
-        }
+        self.http.delete_json(self.record_url(&record.agent_id)?, record).await?;
         Ok(())
     }
 
@@ -145,47 +130,35 @@ impl DirectoryClient {
         if cursor < 0 {
             return Err(DirectoryClientError::InvalidRecord);
         }
-        let response = self
-            .pinned
-            .client
-            .get(self.events_url()?)
-            .query(&[("after", cursor)])
-            .send()
-            .await
-            .map_err(|_| DirectoryClientError::Request)?;
-        if response.status() != StatusCode::OK {
-            return Err(DirectoryClientError::Status);
+        let events: Vec<WireDirectoryEvent> = self
+            .http
+            .get_json_query(self.events_url()?, &[("after", &cursor.to_string())])
+            .await?;
+        if !pinned_json::monotonic_cursors(
+            cursor,
+            events.iter().map(|event| event.cursor),
+        ) {
+            return Err(DirectoryClientError::InvalidRecord);
         }
-        let events: Vec<WireDirectoryEvent> =
-            response.json().await.map_err(|_| DirectoryClientError::InvalidRecord)?;
-        let mut previous = cursor;
         for event in &events {
-            if event.cursor <= previous {
-                return Err(DirectoryClientError::InvalidRecord);
-            }
             self.validate_event(event)?;
-            previous = event.cursor;
         }
         Ok(events)
     }
 
-    fn records_url(&self) -> Result<Url, DirectoryClientError> {
-        self.url(&wire::RECORDS)
+    fn records_url(&self) -> Result<reqwest::Url, DirectoryClientError> {
+        self.http.url(&wire::RECORDS).map_err(Into::into)
     }
 
-    fn record_url(&self, agent_id: &str) -> Result<Url, DirectoryClientError> {
-        if !pinned_https::valid_segment(agent_id) {
-            return Err(DirectoryClientError::InvalidRecord);
-        }
-        self.url(&[wire::RECORDS[0], wire::RECORDS[1], agent_id])
+    fn record_url(&self, agent_id: &str) -> Result<reqwest::Url, DirectoryClientError> {
+        PinnedJsonClient::require_segment(agent_id)?;
+        self.http
+            .url(&[wire::RECORDS[0], wire::RECORDS[1], agent_id])
+            .map_err(Into::into)
     }
 
-    fn events_url(&self) -> Result<Url, DirectoryClientError> {
-        self.url(&wire::EVENTS)
-    }
-
-    fn url(&self, segments: &[&str]) -> Result<Url, DirectoryClientError> {
-        self.pinned.url(segments).ok_or(DirectoryClientError::InvalidDirectory)
+    fn events_url(&self) -> Result<reqwest::Url, DirectoryClientError> {
+        self.http.url(&wire::EVENTS).map_err(Into::into)
     }
 
     fn validate(&self, record: &WireRecord) -> Result<(), DirectoryClientError> {
@@ -249,47 +222,13 @@ pub fn cache_directory_record(
     record: &crate::discovery::Record,
 ) -> Result<(), ()> {
     let store = aether_store::NodeStore::in_dir(data_dir).map_err(|_| ())?;
-    cache_wire_directory_record(&store, &WireRecord::from_record(record))
+    crate::roster_sync::cache_wire_directory_record(
+        &store,
+        &WireRecord::from_record(record),
+    )
 }
 
-#[allow(clippy::result_unit_err)]
-pub fn cache_wire_directory_record(
-    store: &aether_store::NodeStore,
-    record: &WireRecord,
-) -> Result<(), ()> {
-    store
-        .cache_directory_record(&aether_store::SignedRecord {
-            scope_id: record.scope_id.clone(),
-            agent_id: record.agent_id.clone(),
-            record: serde_json::to_vec(record).map_err(|_| ())?,
-            expires_at: i64::try_from(record.expires_at).map_err(|_| ())?,
-        })
-        .map_err(|_| ())
-}
-
-#[allow(clippy::result_unit_err)]
-pub fn cached_directory_record(
-    data_dir: &Path,
-    scope_id: &str,
-    agent_id: &str,
-    trusted_key: [u8; 32],
-) -> Result<crate::discovery::Record, ()> {
-    let store = aether_store::NodeStore::in_dir(data_dir).map_err(|_| ())?;
-    let stored = store.directory_record(scope_id, agent_id).map_err(|_| ())?;
-    if stored.scope_id != scope_id || stored.agent_id != agent_id {
-        return Err(());
-    }
-    if stored.expires_at <= aether_core::time::now() {
-        return Err(());
-    }
-    let wire: WireRecord = serde_json::from_slice(&stored.record).map_err(|_| ())?;
-    let record = wire.to_record().map_err(|_| ())?;
-    if record.signing_key != trusted_key {
-        return Err(());
-    }
-    validate_record(&record).map_err(|_| ())?;
-    Ok(record)
-}
+pub use crate::roster_sync::cache_wire_directory_record;
 
 #[allow(clippy::result_unit_err)]
 pub async fn sync_directory(
@@ -326,6 +265,30 @@ pub async fn sync_directory(
                 .map_err(|_| ())?;
         }
     }
+}
+
+#[allow(clippy::result_unit_err)]
+pub fn cached_directory_record(
+    data_dir: &Path,
+    scope_id: &str,
+    agent_id: &str,
+    trusted_key: [u8; 32],
+) -> Result<crate::discovery::Record, ()> {
+    let store = aether_store::NodeStore::in_dir(data_dir).map_err(|_| ())?;
+    let stored = store.directory_record(scope_id, agent_id).map_err(|_| ())?;
+    if stored.scope_id != scope_id || stored.agent_id != agent_id {
+        return Err(());
+    }
+    if stored.expires_at <= aether_core::time::now() {
+        return Err(());
+    }
+    let wire: WireRecord = serde_json::from_slice(&stored.record).map_err(|_| ())?;
+    let record = wire.to_record().map_err(|_| ())?;
+    if record.signing_key != trusted_key {
+        return Err(());
+    }
+    validate_record(&record).map_err(|_| ())?;
+    Ok(record)
 }
 
 #[allow(clippy::ignored_unit_patterns, clippy::match_same_arms)]

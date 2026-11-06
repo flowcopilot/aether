@@ -208,10 +208,6 @@ enum NodeDirectCommand {
     },
 }
 
-fn resolve_node_data_dir(data_dir: Option<PathBuf>) -> PathBuf {
-    aether::data_dir::resolve_node_data_dir(data_dir)
-}
-
 #[derive(Args)]
 struct NodeInvite {
     #[usage(long)]
@@ -231,7 +227,7 @@ struct NodeDirectory {
     #[usage(long)]
     agent_verifying_key: PathBuf,
     #[usage(subcommand)]
-    command: NodeDirectoryCommand,
+    command: aether::directory_client::cli::Command,
 }
 
 #[derive(Args)]
@@ -241,29 +237,7 @@ struct NodeManaged {
     #[usage(long)]
     control_certificate: PathBuf,
     #[usage(subcommand)]
-    command: NodeManagedCommand,
-}
-
-#[derive(Subcommands)]
-enum NodeManagedCommand {
-    Redeem {
-        #[usage(long)]
-        token_file: PathBuf,
-        record: PathBuf,
-    },
-    Members {
-        scope: String,
-    },
-    Events {
-        scope: String,
-        #[usage(long)]
-        after: Option<i64>,
-    },
-    Sync {
-        scope: String,
-        #[usage(long)]
-        data_dir: Option<PathBuf>,
-    },
+    command: aether::managed_client::cli::Command,
 }
 
 #[derive(Args)]
@@ -280,29 +254,6 @@ struct NodeRecord {
     capability: String,
     #[usage(long)]
     expires_in: u64,
-}
-
-#[derive(Subcommands)]
-enum NodeDirectoryCommand {
-    Publish {
-        record: PathBuf,
-    },
-    Renew {
-        record: PathBuf,
-    },
-    Resolve {
-        agent_id: String,
-    },
-    Search {
-        capability: String,
-    },
-    Revoke {
-        record: PathBuf,
-    },
-    Sync {
-        #[usage(long)]
-        data_dir: Option<PathBuf>,
-    },
 }
 
 #[derive(Args)]
@@ -528,7 +479,7 @@ fn run_process(command: aether::Command, process: &Process) -> ExitCode {
 async fn run_mcp(mcp: Mcp) -> ExitCode {
     match mcp.command {
         Some(McpCommand::Serve(McpServe { socket, data_dir, caller_only })) => {
-            let data_dir = resolve_node_data_dir(data_dir);
+            let data_dir = aether::data_dir::resolve_node_data_dir(data_dir);
             let socket = socket.unwrap_or_else(|| {
                 aether::data_dir::DataDir::new(&data_dir).admin_socket()
             });
@@ -548,7 +499,7 @@ async fn run_mcp(mcp: Mcp) -> ExitCode {
 }
 
 async fn run_admin(arguments: NodeAdmin) -> ExitCode {
-    let data_dir = resolve_node_data_dir(arguments.data_dir);
+    let data_dir = aether::data_dir::resolve_node_data_dir(arguments.data_dir);
     if let Err(error) = std::fs::create_dir_all(&data_dir) {
         eprintln!("aether: admin failed: {error}");
         return ExitCode::from(1);
@@ -561,15 +512,16 @@ async fn run_admin(arguments: NodeAdmin) -> ExitCode {
         }
     };
     let administration = aether::admin::shared_with_store(store);
-    let hub =
-        match aether::node_runtime::hub_client(arguments.hub_url.as_deref(), &data_dir)
-        {
-            Ok(hub) => hub,
-            Err(error) => {
-                eprintln!("aether: {}", error_message(&error));
-                return error.exit_code();
-            }
-        };
+    let hub = match aether::hub_client::configured_hub_client(
+        arguments.hub_url.as_deref(),
+        &data_dir,
+    ) {
+        Ok(hub) => hub,
+        Err(error) => {
+            eprintln!("aether: {error}");
+            return ExitCode::from(2);
+        }
+    };
     let socket = aether::data_dir::DataDir::new(&data_dir).admin_socket();
     if let Err(error) = aether::admin_socket::start(&socket, administration.clone()) {
         eprintln!("aether: admin failed: {error}");
@@ -602,7 +554,7 @@ async fn run_admin(arguments: NodeAdmin) -> ExitCode {
 
 async fn run_request(arguments: NodeRequest) -> ExitCode {
     let input = aether::node_request::RequestInput {
-        data_dir: resolve_node_data_dir(arguments.data_dir),
+        data_dir: aether::data_dir::resolve_node_data_dir(arguments.data_dir),
         scope: arguments.scope,
         text: arguments.text,
         endpoint_id: arguments.endpoint_id,
@@ -656,59 +608,20 @@ async fn run_request(arguments: NodeRequest) -> ExitCode {
 }
 
 async fn run_directory(arguments: NodeDirectory) -> ExitCode {
-    let command = match arguments.command {
-        NodeDirectoryCommand::Publish { record } => {
-            aether::directory_client::cli::Command::Publish { record }
-        }
-        NodeDirectoryCommand::Renew { record } => {
-            aether::directory_client::cli::Command::Renew { record }
-        }
-        NodeDirectoryCommand::Resolve { agent_id } => {
-            aether::directory_client::cli::Command::Resolve { agent_id }
-        }
-        NodeDirectoryCommand::Search { capability } => {
-            aether::directory_client::cli::Command::Search { capability }
-        }
-        NodeDirectoryCommand::Revoke { record } => {
-            aether::directory_client::cli::Command::Revoke { record }
-        }
-        NodeDirectoryCommand::Sync { data_dir } => {
-            aether::directory_client::cli::Command::Sync {
-                data_dir: resolve_node_data_dir(data_dir),
-            }
-        }
-    };
     aether::directory_client::cli::run(aether::directory_client::cli::Options {
         directory: arguments.directory,
         directory_certificate: arguments.directory_certificate,
         agent_verifying_key: arguments.agent_verifying_key,
-        command,
+        command: arguments.command,
     })
     .await
 }
 
 async fn run_managed(arguments: NodeManaged) -> ExitCode {
-    let command = match arguments.command {
-        NodeManagedCommand::Redeem { token_file, record } => {
-            aether::managed_client::cli::Command::Redeem { token_file, record }
-        }
-        NodeManagedCommand::Members { scope } => {
-            aether::managed_client::cli::Command::Members { scope }
-        }
-        NodeManagedCommand::Events { scope, after } => {
-            aether::managed_client::cli::Command::Events { scope, after }
-        }
-        NodeManagedCommand::Sync { scope, data_dir } => {
-            aether::managed_client::cli::Command::Sync {
-                scope,
-                data_dir: resolve_node_data_dir(data_dir),
-            }
-        }
-    };
     aether::managed_client::cli::run(aether::managed_client::cli::Options {
         control: arguments.control,
         control_certificate: arguments.control_certificate,
-        command,
+        command: arguments.command,
     })
     .await
 }
@@ -718,7 +631,7 @@ async fn run_node(node: Node) -> ExitCode {
         None => run_process(aether::Command::Node, &Process { config: node.config }),
         Some(NodeCommand::Admin(arguments)) => run_admin(arguments).await,
         Some(NodeCommand::Direct(arguments)) => {
-            let data_dir = resolve_node_data_dir(arguments.data_dir);
+            let data_dir = aether::data_dir::resolve_node_data_dir(arguments.data_dir);
             aether::direct::cli::run(
                 &data_dir,
                 match arguments.command {
@@ -735,14 +648,14 @@ async fn run_node(node: Node) -> ExitCode {
             )
         }
         Some(NodeCommand::Invite(arguments)) => aether::direct::cli::run_invite(
-            &resolve_node_data_dir(arguments.data_dir),
+            &aether::data_dir::resolve_node_data_dir(arguments.data_dir),
             &arguments.agent_id,
             arguments.expires_in,
         ),
         Some(NodeCommand::Directory(arguments)) => run_directory(arguments).await,
         Some(NodeCommand::Managed(arguments)) => run_managed(arguments).await,
         Some(NodeCommand::Record(arguments)) => {
-            let data_dir = resolve_node_data_dir(arguments.data_dir);
+            let data_dir = aether::data_dir::resolve_node_data_dir(arguments.data_dir);
             aether::directory_publication::cli::run_record(
                 aether::directory_publication::cli::RecordInput {
                     data_dir: &data_dir,
@@ -755,7 +668,7 @@ async fn run_node(node: Node) -> ExitCode {
             )
         }
         Some(NodeCommand::Endpoint(arguments)) => {
-            let data_dir = resolve_node_data_dir(arguments.data_dir);
+            let data_dir = aether::data_dir::resolve_node_data_dir(arguments.data_dir);
             let endpoint = match aether::transport::bind_node(&data_dir, 0, None).await
             {
                 Ok(endpoint) => endpoint,
@@ -769,7 +682,7 @@ async fn run_node(node: Node) -> ExitCode {
             ExitCode::SUCCESS
         }
         Some(NodeCommand::Fixture(arguments)) => {
-            let data_dir = resolve_node_data_dir(arguments.data_dir);
+            let data_dir = aether::data_dir::resolve_node_data_dir(arguments.data_dir);
             match aether::fixture::create_for_scope(
                 &data_dir,
                 arguments.scope.as_deref().unwrap_or("direct"),
@@ -794,7 +707,7 @@ async fn run_node(node: Node) -> ExitCode {
             };
             let options = aether::node_runtime::NodeServeOptions {
                 policy: aether::data_dir::expand_home(arguments.policy),
-                data_dir: resolve_node_data_dir(arguments.data_dir),
+                data_dir: aether::data_dir::resolve_node_data_dir(arguments.data_dir),
                 port: arguments.port,
                 admin_port: arguments.admin_port,
                 pact_listen: arguments.pact_listen,

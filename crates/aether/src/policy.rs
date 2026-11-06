@@ -12,7 +12,7 @@ use aether_store::{NodeStore, QueueLimits, StoreError};
 use hex::FromHex;
 use serde::{Deserialize, Serialize};
 
-use crate::{agent::codex::TASK_FOLDER, data_dir::DataDir, identity::GrantRecord};
+use crate::{data_dir::DataDir, identity::GrantRecord};
 
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 pub enum PolicyError {
@@ -127,7 +127,7 @@ pub(crate) const fn default_sandbox() -> PolicySandbox {
 impl PolicySandbox {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
-            Self::TaskFolder => TASK_FOLDER,
+            Self::TaskFolder => "task-folder",
             Self::WorkspaceWrite => "workspace-write",
         }
     }
