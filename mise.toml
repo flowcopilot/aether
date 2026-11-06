@@ -53,6 +53,11 @@ run = "python3 -m unittest discover -s integrations/hermes-plugin/tests"
 description = "Run the OpenClaw plugin tests"
 run = "node --test integrations/openclaw-plugin/test/"
 
+[tasks.grokbot-bridge-test]
+description = "Run the experimental Grok Bot bridge tests (npm ci in integrations/grokbot-bridge first)"
+dir = "integrations/grokbot-bridge"
+run = "npm test"
+
 [tasks.tla]
 description = "Model-check the TLA+ specs in specs/ with TLC"
 run = "sh scripts/tla.sh"
