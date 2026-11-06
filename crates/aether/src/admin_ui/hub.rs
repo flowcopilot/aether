@@ -1,15 +1,10 @@
 //! Invite and connect by name through the hub (`server/`), instead of two
 //! copied codes. The host offers its agent to a name, the other person
-//! accepts on their page, and the two workers here do the rest: the host's
-//! signs the access for the endpoint that accepted, and the caller's keeps
-//! the invite it receives.
+//! accepts on their page. Background workers in `hub_workers` sign access and
+//! keep delivered invite lines.
 
 use aether_core::time::now;
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, PoisonError},
-    time::Duration,
-};
+use std::{collections::BTreeMap, sync::PoisonError, time::Duration};
 
 use serde::Deserialize;
 use topcoat::{
@@ -28,16 +23,13 @@ use topcoat::{
 };
 
 use super::{
-    Page, PageContext,
-    caller::caller_screen,
-    host::{Notice, host_screen, sign_invite},
-    page_data_dir, require_admin_session,
+    Page, PageContext, caller::caller_screen, hub_form_screen, layout::page_data_dir,
+    require_admin_session,
 };
 use crate::hub_client::protocol::{DEFAULT_ACCESS_DAYS, OFFER_DAYS};
 use aether_store::{ApprovalKind, ApprovalSide, HubApproval};
 
 use crate::{
-    admin::SharedAdministration,
     admin_components::{ALERT, copy_button, field},
     components::{
         button::{ButtonSize, ButtonVariant, button},
@@ -48,16 +40,11 @@ use crate::{
         Origin, OwnerLink, Role, Status, valid_full_name, valid_name_part,
     },
     hub_membership::{APPROVAL_SECONDS, accept, hub_message, keep_hub_name, offer},
-    hub_sync::{CallerStep, HostStep, caller_step, host_step},
 };
 
 /// How long a page waits for the hub before it shows the page without it.
 const PAGE_WAIT: Duration = Duration::from_secs(4);
 /// How long a worker waits after the hub fails before it asks again.
-const RETRY_WAIT: Duration = Duration::from_secs(5);
-/// How long a worker's long poll asks the hub to wait for a change.
-const POLL_WAIT: Duration = Duration::from_secs(25);
-
 /// The hub's answer for one page, or why there is none.
 enum HubState {
     Ready {
@@ -695,23 +682,6 @@ fn hub_access(cx: &Cx) -> super::HubAccess {
     page.as_ref().map_or(super::HubAccess::Off, |page| page.hub_access())
 }
 
-#[component]
-async fn screen(
-    cx: &Cx,
-    #[default] error: String,
-    #[default] setting_error: String,
-) -> TopcoatResult<impl View> {
-    let Page(page) = app_context::<Page>(cx);
-    let hosting = page.as_ref().is_some_and(|page| page.host_ui);
-    Ok(view! {
-        if hosting {
-            host_screen(notice: Notice::hub(error.clone(), setting_error.clone()))
-        } else {
-            caller_screen(hub_error: error.clone(), hub_setting_error: setting_error.clone())
-        }
-    })
-}
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct NameForm {
@@ -768,7 +738,7 @@ pub(super) async fn claim_name(
             }
         }
     };
-    Ok(view! { screen(error: error.to_owned()) })
+    Ok(view! { hub_form_screen(error: error.to_owned()) })
 }
 
 #[derive(Deserialize)]
@@ -792,7 +762,7 @@ pub(super) async fn set_search(
         Err(HubError::Invalid) => "Only a personal agent can be found by name search.",
         Err(error) => hub_message(error),
     };
-    Ok(view! { screen(error: error.to_owned()) })
+    Ok(view! { hub_form_screen(error: error.to_owned()) })
 }
 
 #[derive(Deserialize)]
@@ -821,7 +791,7 @@ pub(super) async fn invite_by_name(
     } else {
         offer(&hub, &page.data_dir, to, form.days).await.err().unwrap_or_default()
     };
-    Ok(view! { screen(error: error.to_owned()) })
+    Ok(view! { hub_form_screen(error: error.to_owned()) })
 }
 
 #[derive(Deserialize)]
@@ -879,7 +849,7 @@ pub(super) async fn approve_request(
     } else {
         "Choose how long they can use your agent."
     };
-    Ok(view! { screen(error: error.to_owned()) })
+    Ok(view! { hub_form_screen(error: error.to_owned()) })
 }
 
 /// The open request `id` to this service agent, with the endpoint that
@@ -962,7 +932,7 @@ pub(super) async fn block_request(
         .err()
         .map(hub_message)
         .unwrap_or_default();
-    Ok(view! { screen(error: error.to_owned()) })
+    Ok(view! { hub_form_screen(error: error.to_owned()) })
 }
 
 async fn block_requester(
@@ -1033,7 +1003,7 @@ pub(super) async fn claim_owner(
     } else {
         "Use the full name of the service agent, with the four digits, such as law#0042."
     };
-    Ok(view! { screen(error: error.to_owned()) })
+    Ok(view! { hub_form_screen(error: error.to_owned()) })
 }
 
 /// The service agent confirms the claim of its owner's personal agent.
@@ -1049,7 +1019,7 @@ pub(super) async fn confirm_owner(
         return Err(bad_request("only a service agent confirms an owner").into());
     }
     let error = confirm_claim(&hub, &key, &form.id).await.err().unwrap_or_default();
-    Ok(view! { screen(error: error.to_owned()) })
+    Ok(view! { hub_form_screen(error: error.to_owned()) })
 }
 
 /// Signs the confirm of the open claim `id` with the endpoint `key`.
@@ -1093,7 +1063,7 @@ pub(super) async fn remove_owner(
         .err()
         .map(hub_message)
         .unwrap_or_default();
-    Ok(view! { screen(error: error.to_owned()) })
+    Ok(view! { hub_form_screen(error: error.to_owned()) })
 }
 
 /// Blocks the sender of a received invite.
@@ -1106,7 +1076,7 @@ pub(super) async fn block_invite(
     let hub = page_hub(cx)?;
     let error =
         hub.block_invite(&form.id).await.err().map(hub_message).unwrap_or_default();
-    Ok(view! { screen(error: error.to_owned()) })
+    Ok(view! { hub_form_screen(error: error.to_owned()) })
 }
 
 #[derive(Deserialize)]
@@ -1130,7 +1100,7 @@ pub(super) async fn unblock(
     {
         let _ = store.remove_block(&form.endpoint);
     }
-    Ok(view! { screen(error: error.to_owned()) })
+    Ok(view! { hub_form_screen(error: error.to_owned()) })
 }
 
 /// Declines or cancels an invite.
@@ -1142,7 +1112,7 @@ pub(super) async fn remove_invite(
     require_admin_session(cx).await?;
     let hub = page_hub(cx)?;
     let error = hub.remove(&form.id).await.err().map(hub_message).unwrap_or_default();
-    Ok(view! { screen(error: error.to_owned()) })
+    Ok(view! { hub_form_screen(error: error.to_owned()) })
 }
 
 /// Which hub names go through, as a row of the Connection card, and a form
@@ -1231,7 +1201,7 @@ pub(super) async fn hub_url(
         }
         None => "Use an https:// address, such as the public hub.".to_owned(),
     };
-    Ok(view! { screen(setting_error: setting_error) })
+    Ok(view! { hub_form_screen(setting_error: setting_error) })
 }
 
 /// presence dots. Empty without a hub or an answer.
@@ -1257,224 +1227,4 @@ pub(super) async fn presence(cx: &Cx) -> TopcoatResult<impl IntoResponse> {
     };
     let body = serde_json::to_string(&presence).map_err(internal_server_error)?;
     Ok(([(header::CONTENT_TYPE, HeaderValue::from_static("application/json"))], body))
-}
-
-/// Follows the invites on the hub that `current` names, and gives `act`
-/// each list. The hub can change or go away while this runs: a new hub
-/// starts a new list, and a failed request waits [`RETRY_WAIT`].
-async fn follow<C, F, Fut>(current: C, mut act: F)
-where
-    C: Fn() -> Option<HubClient>,
-    F: FnMut(HubClient, Vec<Invite>) -> Fut,
-    Fut: Future<Output = ()>,
-{
-    let mut version = None;
-    let mut followed = String::new();
-    loop {
-        let Some(hub) = current() else {
-            version = None;
-            tokio::time::sleep(RETRY_WAIT).await;
-            continue;
-        };
-        if hub.url() != followed {
-            followed = hub.url();
-            version = None;
-        }
-        if let Ok(list) = hub.invites(version, POLL_WAIT).await {
-            version = Some(list.version);
-            act(hub, list.invites).await;
-        } else {
-            // No name yet, or no answer: ask again later.
-            version = None;
-            tokio::time::sleep(RETRY_WAIT).await;
-        }
-    }
-}
-
-/// The host's worker: when someone accepts, sign their access for the
-/// endpoint that accepted and send the invite line.
-#[allow(clippy::redundant_pub_crate)]
-pub(crate) async fn host_worker(
-    administration: SharedAdministration,
-    page: Arc<PageContext>,
-) {
-    let current = {
-        let page = Arc::clone(&page);
-        move || page.current_hub()
-    };
-    follow(current, |hub, invites| {
-        let administration = administration.clone();
-        let page = Arc::clone(&page);
-        async move {
-            let Ok(store) = crate::hub_store::HubStore::open(&page.data_dir) else {
-                println!("{}", serde_json::json!({ "event": "hub_store_unavailable" }));
-                return;
-            };
-            if store.clear_expired_approvals(now()).is_err() {
-                println!("{}", serde_json::json!({ "event": "hub_store_unavailable" }));
-                return;
-            }
-            let own_name = crate::settings::setting::<
-                crate::hub_client::settings::HubName,
-            >(&page.data_dir)
-            .ok()
-            .flatten();
-            for invite in invites {
-                let line = match host_action(
-                    &administration,
-                    &page,
-                    &store,
-                    &invite,
-                    own_name.as_deref(),
-                ) {
-                    HostAction::Skip => continue,
-                    HostAction::Refuse => {
-                        log("hub_invite_refused", &invite);
-                        let _ = hub.remove(&invite.id).await;
-                        continue;
-                    }
-                    HostAction::Failed => {
-                        log("hub_invite_failed", &invite);
-                        continue;
-                    }
-                    HostAction::Deliver(line) => line,
-                };
-                match hub.deliver(&invite.id, &line).await {
-                    Ok(_) => log("hub_invite_delivered", &invite),
-                    Err(_) => log("hub_invite_failed", &invite),
-                }
-            }
-        }
-    })
-    .await;
-}
-
-/// What the host worker does with one hub row after the store part.
-enum HostAction {
-    Skip,
-    Refuse,
-    Failed,
-    Deliver(String),
-}
-
-/// The store part of the host worker for one row: read the approval and
-/// the block, then sign and pin. It holds `hub_sign`, so a block from the
-/// page lands before the block check or after the pin. A grant whose line
-/// cannot be pinned is revoked: the next pass would sign a second one.
-fn host_action(
-    administration: &SharedAdministration,
-    page: &PageContext,
-    store: &crate::hub_store::HubStore,
-    invite: &Invite,
-    own_name: Option<&str>,
-) -> HostAction {
-    let _sign = page.hub_sign().lock().unwrap_or_else(PoisonError::into_inner);
-    let Ok(approval) = store.approval(&invite.id) else {
-        return HostAction::Failed;
-    };
-    let blocked = if let Some(endpoint) = invite.receiver_endpoint.as_deref() {
-        let Ok(blocked) = store.is_blocked(endpoint) else {
-            return HostAction::Failed;
-        };
-        blocked
-    } else {
-        false
-    };
-    match host_step(invite, approval.as_ref(), own_name, blocked) {
-        HostStep::Skip => HostAction::Skip,
-        HostStep::Refuse => HostAction::Refuse,
-        HostStep::Deliver(line) => HostAction::Deliver(line),
-        HostStep::Sign { friend_name, endpoint, days, access_group } => {
-            let (Some(own_name), Some(approval)) = (own_name, approval.as_ref()) else {
-                return HostAction::Skip;
-            };
-            let Ok((line, grant_id)) = sign_invite(
-                administration,
-                page,
-                own_name,
-                &friend_name,
-                &endpoint,
-                days,
-                &access_group,
-            ) else {
-                return HostAction::Failed;
-            };
-            if store.pin_approval(approval, &endpoint, &line).is_err() {
-                let _ = administration
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .revoke(&grant_id, aether_store::AuditActor::Ui);
-                return HostAction::Failed;
-            }
-            HostAction::Deliver(line)
-        }
-    }
-}
-
-/// The caller's worker: keep each delivered invite line that is for this
-/// computer, then remove the invite from the hub.
-#[allow(clippy::redundant_pub_crate)]
-pub(crate) async fn caller_worker(page: Arc<PageContext>) {
-    let current = {
-        let page = Arc::clone(&page);
-        move || page.current_hub()
-    };
-    follow(current, |hub, invites| {
-        let page = Arc::clone(&page);
-        async move {
-            let Ok(store) = crate::hub_store::HubStore::open(&page.data_dir) else {
-                println!("{}", serde_json::json!({ "event": "hub_store_unavailable" }));
-                return;
-            };
-            for invite in invites {
-                let Ok(approval) = store.approval(&invite.id) else {
-                    continue;
-                };
-                match caller_step(&invite, approval.as_ref()) {
-                    CallerStep::Skip => continue,
-                    CallerStep::Import(bundle) => {
-                        match crate::direct::import_bundle(&page.data_dir, &bundle) {
-                            Ok(_) => log("hub_invite_kept", &invite),
-                            Err(error) => {
-                                log_reason(
-                                    "hub_invite_refused",
-                                    &invite,
-                                    &error.to_string(),
-                                );
-                            }
-                        }
-                    }
-                    CallerStep::Refuse(reason) => {
-                        log_reason("hub_invite_refused", &invite, reason);
-                    }
-                }
-                // A line that this node did not keep cannot become valid,
-                // so it is removed too.
-                let _ = store.remove_approval(&invite.id);
-                if hub.remove(&invite.id).await.is_err() {
-                    log("hub_invite_failed", &invite);
-                }
-            }
-        }
-    })
-    .await;
-}
-
-fn log(event: &str, invite: &Invite) {
-    println!(
-        "{}",
-        serde_json::json!({ "event": event, "from": invite.from, "to": invite.to })
-    );
-}
-
-fn log_reason(event: &str, invite: &Invite, reason: &str) {
-    println!(
-        "{}",
-        serde_json::json!({
-            "event": event,
-            "from": invite.from,
-            "to": invite.to,
-            "reason": reason,
-        })
-    );
 }

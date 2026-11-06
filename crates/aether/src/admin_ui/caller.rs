@@ -18,9 +18,10 @@ use topcoat::{
 };
 
 use super::{
-    Page, Tab, ensure_admin_session,
+    Page, ensure_admin_session,
     hub::{error_line, hub_section, hub_setting},
-    node_header, require_admin_session,
+    layout::{Tab, node_header},
+    require_admin_session,
 };
 use crate::{
     admin_components::{

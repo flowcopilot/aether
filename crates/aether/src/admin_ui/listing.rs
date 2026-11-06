@@ -3,13 +3,8 @@
 //! agent or stops the listing.
 
 use aether_core::time::now_seconds;
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+use std::path::{Path, PathBuf};
 
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::Deserialize;
 use topcoat::{
     Result as TopcoatResult,
@@ -18,84 +13,12 @@ use topcoat::{
     view::{View, attributes, component, view},
 };
 
-use super::{Page, PageContext, host::host_screen, require_admin_session};
+use super::{Page, host, require_admin_session};
 use crate::{
     components::button::{ButtonSize, ButtonVariant, button},
-    hub_client::{AgentKind, HubClient, HubError},
-    listing::{LISTING_LIFETIME, ListingState, RENEW_BEFORE},
+    hub_client::{AgentKind, HubError},
+    listing::{HubPublishError, publish_to_hub, stop_hub_listing},
 };
-
-/// How often the worker looks at the expiry of the listing.
-const RENEW_INTERVAL: Duration = Duration::from_hours(6);
-
-/// Why a listing was not sent.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum PublishError {
-    NoName,
-    Key,
-    Store,
-    Hub(HubError),
-}
-
-/// Signs the current card text for 30 days and sends it to `hub`.
-async fn publish(
-    data_dir: &Path,
-    hub: &HubClient,
-    now: u64,
-) -> Result<ListingState, PublishError> {
-    let name =
-        crate::settings::setting::<crate::hub_client::settings::HubName>(data_dir)
-            .ok()
-            .flatten()
-            .ok_or(PublishError::NoName)?;
-    let settings = crate::agent_card::settings(data_dir);
-    let bytes = crate::listing::listing_bytes(&settings, &name);
-    let key = crate::data_dir::DataDir::new(data_dir)
-        .endpoint_key()
-        .map_err(|_| PublishError::Key)?;
-    let expires_at = now.saturating_add(LISTING_LIFETIME.as_secs());
-    let signature = crate::listing::sign(&key, &bytes, expires_at);
-    let text = URL_SAFE_NO_PAD.encode(&bytes);
-    hub.put_listing(&text, &signature, expires_at).await.map_err(PublishError::Hub)?;
-    let state = ListingState { listed: true, expires_at, listing: text };
-    crate::settings::store_setting::<crate::listing::settings::ListingState>(
-        data_dir,
-        &Some(state.clone()),
-    )
-    .map_err(|_| PublishError::Store)?;
-    Ok(state)
-}
-
-/// Stops the listing on `hub`.
-async fn stop(data_dir: &Path, hub: &HubClient) -> Result<(), PublishError> {
-    hub.delete_listing().await.map_err(PublishError::Hub)?;
-    crate::settings::store_setting::<crate::listing::settings::ListingState>(
-        data_dir, &None,
-    )
-    .map_err(|_| PublishError::Store)
-}
-
-const fn publish_message(error: PublishError) -> &'static str {
-    match error {
-        PublishError::NoName => "Choose your name on Aether first.",
-        PublishError::Key | PublishError::Store => {
-            "The listing was not saved on this computer. Try again."
-        }
-        PublishError::Hub(HubError::Invalid) => {
-            "The hub refused the listing. Check the text of your agent's card."
-        }
-        PublishError::Hub(HubError::OldHub) => {
-            "This hub is older than this node. Ask its operator to update it."
-        }
-        PublishError::Hub(HubError::OldNode) => {
-            "This node is older than the hub. Update Aether."
-        }
-        PublishError::Hub(HubError::RateLimited) => {
-            "Too many requests. Wait a minute and try again."
-        }
-        PublishError::Hub(_) => "The hub cannot be reached now. Try again later.",
-    }
-}
 
 /// The text about the shared task queue.
 pub(super) fn queue_text(data_dir: &Path) -> String {
@@ -233,49 +156,19 @@ pub(super) async fn publish_listing(
         return Err(bad_request("only a service agent has a public listing").into());
     }
     let result = match (form.action.as_str(), page.current_hub()) {
-        (_, None) => Err(PublishError::Hub(HubError::Unreachable)),
+        (_, None) => Err(HubPublishError::Hub(HubError::Unreachable)),
         ("list", Some(hub)) => {
-            publish(&page.data_dir, &hub, now_seconds()).await.map(drop)
+            publish_to_hub(&page.data_dir, &hub, now_seconds()).await.map(drop)
         }
-        ("stop", Some(hub)) => stop(&page.data_dir, &hub).await,
+        ("stop", Some(hub)) => stop_hub_listing(&page.data_dir, &hub).await,
         _ => return Err(bad_request("unknown listing action").into()),
     };
-    let error = result.err().map(publish_message).unwrap_or_default().to_owned();
-    Ok(view! { host_screen(notice: super::host::Notice::listing(error)) })
-}
-
-/// Keeps the listing of a service agent on the hub: when less than 7 days
-/// remain, it signs the current card text again.
-#[allow(clippy::redundant_pub_crate)]
-pub(crate) async fn listing_worker(page: Arc<PageContext>) {
-    loop {
-        renew(&page).await;
-        tokio::time::sleep(RENEW_INTERVAL).await;
-    }
-}
-
-async fn renew(page: &PageContext) {
-    let now = now_seconds();
-    let due = crate::settings::setting::<crate::listing::settings::ListingState>(
-        &page.data_dir,
-    )
-    .ok()
-    .flatten()
-    .is_some_and(|state| {
-        state.listed && state.expires_at.saturating_sub(now) < RENEW_BEFORE.as_secs()
-    });
-    let service = crate::settings::setting::<crate::hub_client::settings::AgentKind>(
-        &page.data_dir,
-    )
-    .ok()
-    .flatten()
-        == Some(AgentKind::Service);
-    let (true, true, Some(hub)) = (due, service, page.current_hub()) else {
-        return;
-    };
-    let event = match publish(&page.data_dir, &hub, now).await {
-        Ok(_) => "listing_renewed",
-        Err(_) => "listing_renew_failed",
-    };
-    println!("{}", serde_json::json!({ "event": event }));
+    let error = result
+        .err()
+        .map(crate::listing::hub_publish_message)
+        .unwrap_or_default()
+        .to_owned();
+    Ok(view! {
+        host::host_screen(notice: host::Notice::listing(error))
+    })
 }

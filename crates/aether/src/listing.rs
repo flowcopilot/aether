@@ -252,6 +252,116 @@ pub mod settings {
     }
 }
 
+const RENEW_INTERVAL: std::time::Duration = std::time::Duration::from_hours(6);
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum HubPublishError {
+    NoName,
+    Key,
+    Store,
+    Hub(crate::hub_client::HubError),
+}
+
+pub(crate) async fn publish_to_hub(
+    data_dir: &std::path::Path,
+    hub: &crate::hub_client::HubClient,
+    now: u64,
+) -> Result<ListingState, HubPublishError> {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    let name =
+        crate::settings::setting::<crate::hub_client::settings::HubName>(data_dir)
+            .ok()
+            .flatten()
+            .ok_or(HubPublishError::NoName)?;
+    let settings = crate::agent_card::settings(data_dir);
+    let bytes = listing_bytes(&settings, &name);
+    let key = crate::data_dir::DataDir::new(data_dir)
+        .endpoint_key()
+        .map_err(|_| HubPublishError::Key)?;
+    let expires_at = now.saturating_add(LISTING_LIFETIME.as_secs());
+    let signature = sign(&key, &bytes, expires_at);
+    let text = URL_SAFE_NO_PAD.encode(&bytes);
+    hub.put_listing(&text, &signature, expires_at)
+        .await
+        .map_err(HubPublishError::Hub)?;
+    let state = ListingState { listed: true, expires_at, listing: text };
+    crate::settings::store_setting::<settings::ListingState>(
+        data_dir,
+        &Some(state.clone()),
+    )
+    .map_err(|_| HubPublishError::Store)?;
+    Ok(state)
+}
+
+pub(crate) async fn stop_hub_listing(
+    data_dir: &std::path::Path,
+    hub: &crate::hub_client::HubClient,
+) -> Result<(), HubPublishError> {
+    hub.delete_listing().await.map_err(HubPublishError::Hub)?;
+    crate::settings::store_setting::<settings::ListingState>(data_dir, &None)
+        .map_err(|_| HubPublishError::Store)
+}
+
+pub(crate) const fn hub_publish_message(error: HubPublishError) -> &'static str {
+    match error {
+        HubPublishError::NoName => "Choose your name on Aether first.",
+        HubPublishError::Key | HubPublishError::Store => {
+            "The listing was not saved on this computer. Try again."
+        }
+        HubPublishError::Hub(crate::hub_client::HubError::Invalid) => {
+            "The hub refused the listing. Check the text of your agent's card."
+        }
+        HubPublishError::Hub(crate::hub_client::HubError::OldHub) => {
+            "This hub is older than this node. Ask its operator to update it."
+        }
+        HubPublishError::Hub(crate::hub_client::HubError::OldNode) => {
+            "This node is older than the hub. Update Aether."
+        }
+        HubPublishError::Hub(crate::hub_client::HubError::RateLimited) => {
+            "Too many requests. Wait a minute and try again."
+        }
+        HubPublishError::Hub(_) => "The hub cannot be reached now. Try again later.",
+    }
+}
+
+pub async fn listing_renewal_worker(
+    page: std::sync::Arc<crate::admin_ui::PageContext>,
+) {
+    loop {
+        renew_listing(&page).await;
+        tokio::time::sleep(RENEW_INTERVAL).await;
+    }
+}
+
+async fn renew_listing(page: &crate::admin_ui::PageContext) {
+    use crate::hub_client::AgentKind;
+    use aether_core::time::now_seconds;
+
+    let now = now_seconds();
+    let due = crate::settings::setting::<settings::ListingState>(&page.data_dir)
+        .ok()
+        .flatten()
+        .is_some_and(|state| {
+            state.listed
+                && state.expires_at.saturating_sub(now) < RENEW_BEFORE.as_secs()
+        });
+    let service = crate::settings::setting::<crate::hub_client::settings::AgentKind>(
+        &page.data_dir,
+    )
+    .ok()
+    .flatten()
+        == Some(AgentKind::Service);
+    let (true, true, Some(hub)) = (due, service, page.current_hub()) else {
+        return;
+    };
+    let event = match publish_to_hub(&page.data_dir, &hub, now).await {
+        Ok(_) => "listing_renewed",
+        Err(_) => "listing_renew_failed",
+    };
+    println!("{}", serde_json::json!({ "event": event }));
+}
+
 #[cfg(test)]
 mod tests {
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};

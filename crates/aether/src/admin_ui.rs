@@ -39,14 +39,14 @@ mod audit;
 mod caller;
 mod host;
 pub(crate) mod hub;
+mod layout;
 pub(crate) mod listing;
 mod pact;
 
 use crate::admin::SharedAdministration;
-use crate::admin_components::status_dot;
 use advanced::dashboard;
 use caller::caller_screen;
-use host::host_screen;
+use host::{Notice, host_screen};
 
 const UI_SESSION_LIFETIME: Duration = Duration::from_secs(3_600);
 /// Matches the `DefaultBodyLimit` of `UI_HARDENING`: both cap the same
@@ -278,126 +278,20 @@ async fn root_layout(slot: Slot<'_>) -> TopcoatResult<impl View> {
     })
 }
 
-/// The page a [`node_header`] marks as the current one.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-pub(super) enum Tab {
-    /// The host screen: who can use the agent.
-    #[default]
-    Sharing,
-    /// The caller screen: the agents this computer can use.
-    Agents,
-    /// The Advanced page.
-    Advanced,
-}
-
-pub(super) fn page_data_dir(cx: &Cx) -> Option<std::path::PathBuf> {
-    let Page(page) = app_context::<Page>(cx);
-    page.as_ref().map(|page| page.data_dir.clone())
-}
-
-/// The bar on top of every page: the product, one tab for each screen that
-/// this mode has, with the count of what waits on it, and on the right how
-/// the node is reached and its name on Aether.
 #[component]
-pub(super) async fn node_header(cx: &Cx, current: Tab) -> TopcoatResult<impl View> {
-    let Page(page) = app_context::<Page>(cx);
-    let data_dir = page_data_dir(cx);
-    let drafts = page.as_ref().filter(|page| page.caller).map_or(0, |page| {
-        let now = aether_core::time::now_seconds();
-        caller::request_drafts_of(&page.data_dir, now).len()
-    });
-    let pending = app_context::<SharedAdministration>(cx)
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .pending()
-        .len();
-    let relay_host = page.as_ref().filter(|page| page.host_ui).map(|page| {
-        page.relay_url().map(|url| {
-            reqwest::Url::parse(&url)
-                .ok()
-                .and_then(|url| url.host_str().map(str::to_owned))
-                .unwrap_or(url)
-        })
-    });
-    let name = data_dir.as_deref().and_then(|dir| {
-        crate::settings::setting::<crate::hub_client::settings::HubName>(dir)
-            .ok()
-            .flatten()
-    });
-    let tabs = page.is_some();
-    let agents_href =
-        if page.as_ref().is_some_and(|page| page.host_ui) { "/agents" } else { "/" };
-    Ok(view! {
-        <header class="border-b border-border">
-            <div class="mx-auto flex min-h-14 max-w-6xl flex-wrap items-center gap-x-6 gap-y-2 px-4 sm:px-8">
-                <a href="/" class="text-base font-semibold tracking-tight text-foreground no-underline">"Aether"</a>
-                if tabs {
-                    <nav aria-label="Pages" class="-mb-px flex self-stretch overflow-x-auto">
-                        if page.as_ref().is_some_and(|page| page.host_ui) {
-                            node_tab(href: "/", current: current == Tab::Sharing, "Who can use your agent")
-                        }
-                        if page.as_ref().is_some_and(|page| page.caller) {
-                            node_tab(
-                                href: agents_href,
-                                current: current == Tab::Agents,
-                                "Agents you use"
-                                if drafts > 0 {
-                                    <span
-                                        class="flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-primary px-1.5 text-[11px] font-semibold text-primary-foreground"
-                                        aria-label=(format!("{drafts} requests wait"))
-                                    >(drafts)</span>
-                                }
-                            )
-                        }
-                        node_tab(
-                            href: "/advanced",
-                            current: current == Tab::Advanced,
-                            "Advanced"
-                            if pending > 0 {
-                                <span
-                                    class="flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-warning px-1.5 text-[11px] font-semibold text-primary-foreground"
-                                    aria-label=(format!("{pending} changes wait"))
-                                >(pending)</span>
-                            }
-                        )
-                    </nav>
-                }
-                <span class="flex-1"></span>
-                <div class="flex flex-wrap items-center gap-x-4 gap-y-1 py-2 text-sm">
-                    if let Some(relay_host) = &relay_host {
-                        match relay_host {
-                            Some(reached_through) => status_dot(ok: true, text: format!("Reachable through {reached_through}")),
-                            None => status_dot(ok: false, text: "No relay: only your network can reach it"),
-                        }
-                    }
-                    if let Some(name) = &name {
-                        <span class="rounded-md border border-border bg-background px-2.5 py-1 font-mono text-[13px] text-foreground">(name)</span>
-                    }
-                </div>
-            </div>
-        </header>
-    })
-}
-
-/// One tab of the [`node_header`]: a link that underlines the current page.
-#[component]
-async fn node_tab(
-    href: &'static str,
-    current: bool,
-    #[default] child: topcoat::view::Child<'_>,
+async fn hub_form_screen(
+    cx: &Cx,
+    #[default] error: String,
+    #[default] setting_error: String,
 ) -> TopcoatResult<impl View> {
+    let Page(page) = app_context::<Page>(cx);
+    let hosting = page.as_ref().is_some_and(|page| page.host_ui);
     Ok(view! {
-        <a
-            href=(href)
-            aria-current=(current.then_some("page"))
-            class=(if current {
-                "flex items-center gap-2 border-b-2 border-primary px-3 text-sm font-medium whitespace-nowrap text-foreground no-underline"
-            } else {
-                "flex items-center gap-2 border-b-2 border-transparent px-3 text-sm whitespace-nowrap text-muted-foreground no-underline hover:text-foreground"
-            })
-        >
-            (child)
-        </a>
+        if hosting {
+            host_screen(notice: Notice::hub(error.clone(), setting_error.clone()))
+        } else {
+            caller_screen(hub_error: error.clone(), hub_setting_error: setting_error.clone())
+        }
     })
 }
 
@@ -694,7 +588,7 @@ impl PageContext {
         }
     }
 
-    pub(super) fn current_hub(&self) -> Option<crate::hub_client::HubClient> {
+    pub(crate) fn current_hub(&self) -> Option<crate::hub_client::HubClient> {
         match self.hub_access() {
             HubAccess::Ready(client) => Some(*client),
             HubAccess::Off | HubAccess::Unavailable => None,
@@ -707,7 +601,7 @@ impl PageContext {
         }
     }
 
-    pub(super) const fn hub_sign(&self) -> &Mutex<()> {
+    pub(crate) const fn hub_sign(&self) -> &Mutex<()> {
         &self.hub_sign
     }
 
@@ -1160,8 +1054,10 @@ mod tests {
             )
         };
         approve(directory.path(), &sent, "ana#0007");
-        let worker =
-            tokio::spawn(super::hub::host_worker(administration, Arc::new(host)));
+        let worker = tokio::spawn(crate::hub_workers::host_worker(
+            administration,
+            Arc::new(host),
+        ));
         wait_for_delivery(&hub, &sent).await;
         worker.abort();
 
@@ -1259,7 +1155,7 @@ mod tests {
             PageContext::admin_caller(caller_dir.path().to_path_buf())
                 .with_hub(Some(client)),
         );
-        let worker = tokio::spawn(super::hub::caller_worker(context));
+        let worker = tokio::spawn(crate::hub_workers::caller_worker(context));
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             while !hub.state().invites.is_empty() {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -1288,7 +1184,7 @@ mod tests {
             test_host(data_dir, Arc::new(std::sync::Mutex::new(Vec::new())))
                 .with_hub(Some(hub.client(data_dir))),
         );
-        tokio::spawn(super::hub::host_worker(
+        tokio::spawn(crate::hub_workers::host_worker(
             administration.clone(),
             Arc::clone(&page),
         ));
@@ -2040,8 +1936,10 @@ mod tests {
             state.add_invite(&own, &ana, "accepted")
         };
         approve(directory.path(), &id, "ana#0007");
-        let worker =
-            tokio::spawn(super::hub::host_worker(administration, Arc::new(host)));
+        let worker = tokio::spawn(crate::hub_workers::host_worker(
+            administration,
+            Arc::new(host),
+        ));
         wait_for_delivery(&hub, &id).await;
         worker.abort();
 
@@ -2690,14 +2588,15 @@ mod tests {
         let host =
             test_host(directory.path(), Arc::new(std::sync::Mutex::new(Vec::new())));
         let longest = format!("{}#0001", "a".repeat(32));
-        let (line, _) = super::host::sign_invite(
+        let (line, _) = crate::invites::sign_direct_invite(
             &administration,
-            &host,
+            &crate::invites::DirectInviteSigning::from_page(&host),
             &longest,
             &longest,
             &iroh::SecretKey::generate().public().to_string(),
             30,
             "friends",
+            aether_store::AuditActor::Ui,
         )
         .expect("the invite must sign");
         assert!(line.len() + "bundle=".len() + 2 <= 8 * 1024, "{}", line.len());
