@@ -6,9 +6,10 @@ defmodule AetherHub.Contacts do
 
   import Ecto.Query
 
-  alias AetherHub.{Account, Contact, Invite, Presence, Repo}
+  alias AetherHub.{Account, Contact, Invite, Presence, Protocol, Repo}
 
-  @seen_step AetherHub.Protocol.limit(:last_seen_step_seconds)
+  @seen_step Protocol.limit(:last_seen_step_seconds)
+  @origin_request Protocol.invite_origin(:request)
 
   @doc "The contacts of `account`, with their presence."
   def list(%Account{endpoint: endpoint}) do
@@ -41,9 +42,11 @@ defmodule AetherHub.Contacts do
 
   @doc "Removes the contact pair between `account` and `contact`."
   def delete(%Account{endpoint: endpoint}, contact) do
-    case delete_between(endpoint, contact) do
-      0 -> {:error, :not_found}
-      _ -> :ok
+    with :ok <- Protocol.validate_endpoint(contact) do
+      case delete_between(endpoint, contact) do
+        0 -> {:error, :not_found}
+        _ -> :ok
+      end
     end
   end
 
@@ -68,7 +71,7 @@ defmodule AetherHub.Contacts do
   def add(%Invite{sender_endpoint: sender, receiver_endpoint: receiver, origin: origin}) do
     pairs =
       case origin do
-        "request" ->
+        @origin_request ->
           [%{owner_endpoint: receiver, contact_endpoint: sender}]
 
         _ ->

@@ -9,6 +9,7 @@ defmodule AetherHub.Accounts do
   alias AetherHub.{Protocol, Repo, Versions}
 
   @kinds Protocol.kinds()
+  @service Protocol.kind(:service)
   @account_keys ["name", "kind", "searchable"]
 
   def get(endpoint), do: Repo.get(Account, endpoint)
@@ -63,14 +64,14 @@ defmodule AetherHub.Accounts do
   end
 
   defp claim(endpoint, body) do
-    kind = Map.get(body, "kind", "personal")
+    kind = Map.get(body, "kind", Protocol.default_kind())
     searchable = Map.get(body, "searchable", false)
 
     cond do
       not Map.has_key?(body, "name") ->
         {:error, :invalid}
 
-      kind == "service" and searchable ->
+      kind == @service and searchable ->
         {:error, :invalid}
 
       # The type of an agent does not change, also after a deletion.
@@ -103,7 +104,7 @@ defmodule AetherHub.Accounts do
       Map.get(body, "kind", account.kind) != account.kind ->
         {:error, :invalid}
 
-      account.kind == "service" and searchable ->
+      account.kind == @service and searchable ->
         {:error, :invalid}
 
       name != account.name ->
@@ -176,7 +177,8 @@ defmodule AetherHub.Accounts do
   exist for it alone.
   """
   def block(%Account{endpoint: endpoint}, blocked) do
-    if Regex.match?(Protocol.regex(:endpoint), blocked) and blocked != endpoint do
+    with :ok <- Protocol.validate_endpoint(blocked),
+         false <- blocked == endpoint do
       Repo.atomic(fn ->
         with {:error, reason} <- Blocks.put(endpoint, blocked), do: Repo.rollback(reason)
         Invites.delete_between(endpoint, blocked)
@@ -192,7 +194,8 @@ defmodule AetherHub.Accounts do
         error -> error
       end
     else
-      {:error, :invalid}
+      {:error, :invalid} -> {:error, :invalid}
+      true -> {:error, :invalid}
     end
   end
 
@@ -201,7 +204,11 @@ defmodule AetherHub.Accounts do
     with {:ok, other} <- Invites.block_target(account, id), do: block(account, other)
   end
 
-  def unblock(%Account{endpoint: endpoint}, blocked), do: Blocks.delete(endpoint, blocked)
+  def unblock(%Account{endpoint: endpoint}, blocked) do
+    with :ok <- Protocol.validate_endpoint(blocked),
+         :ok <- Blocks.delete(endpoint, blocked),
+         do: :ok
+  end
 
   def blocks(%Account{endpoint: endpoint}), do: {:ok, %{"blocks" => Blocks.list(endpoint)}}
 end

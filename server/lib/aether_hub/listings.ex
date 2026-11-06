@@ -28,6 +28,7 @@ defmodule AetherHub.Listings do
   @max_query Protocol.limit(:agents_max_query_chars)
   @max_words Protocol.limit(:agents_max_words)
   @min_word Protocol.limit(:agents_min_word_chars)
+  @service Protocol.kind(:service)
 
   ## The listing of this node
 
@@ -35,7 +36,7 @@ defmodule AetherHub.Listings do
   Keeps the listing in `body` for the service agent `account`, and updates
   the search index in the same transaction.
   """
-  def put(%Account{kind: "service", endpoint: endpoint} = account, body) do
+  def put(%Account{kind: @service, endpoint: endpoint} = account, body) do
     with {:ok, text, bytes, signature, expires_at} <- signed_body(endpoint, body),
          {:ok, fields} <- parse(bytes, Account.full_name(account)) do
       Repo.atomic(fn ->

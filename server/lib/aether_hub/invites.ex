@@ -35,6 +35,20 @@ defmodule AetherHub.Invites do
   @max_wait Protocol.limit(:max_wait_seconds)
   @max_open_requests Protocol.limit(:max_open_requests)
   @max_listed_requests Protocol.limit(:max_listed_requests)
+  @personal Protocol.kind(:personal)
+  @service Protocol.kind(:service)
+  @origin_invite Protocol.invite_origin(:invite)
+  @origin_request Protocol.invite_origin(:request)
+  @status_pending Protocol.invite_status(:pending)
+  @status_requested Protocol.invite_status(:requested)
+  @status_accepted Protocol.invite_status(:accepted)
+  @status_delivered Protocol.invite_status(:delivered)
+  @role_sender Protocol.invite_role(:sender)
+  @role_receiver Protocol.invite_role(:receiver)
+  @statuses_with_receiver_endpoint Enum.map(
+                                     ~w(requested accepted delivered)a,
+                                     &Protocol.invite_status/1
+                                   )
 
   ## Making rows
 
@@ -43,11 +57,11 @@ defmodule AetherHub.Invites do
       when is_binary(to) and is_integer(days) and days in @days do
     Repo.atomic(fn ->
       # A service agent gets access only by request.
-      if me.kind == "service", do: Repo.rollback(:forbidden)
+      if me.kind == @service, do: Repo.rollback(:forbidden)
 
       receiver =
         case Names.find(to) do
-          {:ok, %Account{kind: "personal"} = receiver} -> receiver
+          {:ok, %Account{kind: @personal} = receiver} -> receiver
           # The same answer as for an unknown name: an invite does not
           # show that an unlisted service agent exists.
           {:ok, _service} -> Repo.rollback(:not_found)
@@ -55,7 +69,7 @@ defmodule AetherHub.Invites do
         end
 
       if receiver.endpoint == me.endpoint, do: Repo.rollback(:invalid)
-      insert(me, receiver, days, me.endpoint, "invite")
+      insert(me, receiver, days, me.endpoint, @origin_invite)
     end)
     |> Versions.notify()
   end
@@ -73,7 +87,7 @@ defmodule AetherHub.Invites do
     Repo.atomic(fn ->
       service =
         case Names.find(to) do
-          {:ok, %Account{kind: "service"} = service} -> service
+          {:ok, %Account{kind: @service} = service} -> service
           {:ok, _personal} -> Repo.rollback(:not_found)
           {:error, reason} -> Repo.rollback(reason)
         end
@@ -89,7 +103,7 @@ defmodule AetherHub.Invites do
 
         nil ->
           if open_requests(me.endpoint) >= @max_open_requests, do: Repo.rollback(:limit)
-          {row, touched} = insert(service, me, days, me.endpoint, "request")
+          {row, touched} = insert(service, me, days, me.endpoint, @origin_request)
           {{row, :created}, touched}
       end
     end)
@@ -114,7 +128,9 @@ defmodule AetherHub.Invites do
 
   defp open_requests(requester) do
     Repo.aggregate(
-      from(i in open(), where: i.receiver_endpoint == ^requester and i.origin == "request"),
+      from(i in open(),
+        where: i.receiver_endpoint == ^requester and i.origin == ^@origin_request
+      ),
       :count
     )
   end
@@ -126,8 +142,8 @@ defmodule AetherHub.Invites do
   defp insert(sender, receiver, days, asker, origin) do
     {status, target, maker} =
       case origin do
-        "invite" -> {"pending", receiver.endpoint, sender.endpoint}
-        "request" -> {"requested", sender.endpoint, receiver.endpoint}
+        @origin_invite -> {@status_pending, receiver.endpoint, sender.endpoint}
+        @origin_request -> {@status_requested, sender.endpoint, receiver.endpoint}
       end
 
     Repo.delete_all(
@@ -162,8 +178,10 @@ defmodule AetherHub.Invites do
     case approve_days(body) do
       {:ok, days} ->
         transition(account, id, fn invite, role ->
-          if role != "sender" or invite.status != "requested", do: Repo.rollback(:forbidden)
-          Ecto.Changeset.change(invite, status: "accepted", days: days || invite.days)
+          if role != @role_sender or invite.status != @status_requested,
+            do: Repo.rollback(:forbidden)
+
+          Ecto.Changeset.change(invite, status: @status_accepted, days: days || invite.days)
         end)
 
       :error ->
@@ -181,16 +199,18 @@ defmodule AetherHub.Invites do
 
   def accept(%Account{} = account, id) do
     transition(account, id, fn invite, role ->
-      if role != "receiver" or invite.status != "pending", do: Repo.rollback(:forbidden)
-      Ecto.Changeset.change(invite, status: "accepted")
+      if role != @role_receiver or invite.status != @status_pending, do: Repo.rollback(:forbidden)
+      Ecto.Changeset.change(invite, status: @status_accepted)
     end)
   end
 
   def deliver(%Account{} = account, id, %{"bundle" => bundle}) when is_binary(bundle) do
     if String.starts_with?(bundle, @bundle_prefix) and byte_size(bundle) <= @bundle_max do
       transition(account, id, fn invite, role ->
-        if role != "sender" or invite.status != "accepted", do: Repo.rollback(:forbidden)
-        Ecto.Changeset.change(invite, status: "delivered", bundle: bundle)
+        if role != @role_sender or invite.status != @status_accepted,
+          do: Repo.rollback(:forbidden)
+
+        Ecto.Changeset.change(invite, status: @status_delivered, bundle: bundle)
       end)
     else
       {:error, :invalid}
@@ -203,7 +223,7 @@ defmodule AetherHub.Invites do
     Repo.atomic(fn ->
       invite = open!(endpoint, id)
       invite = invite |> change.(role(invite, endpoint)) |> Repo.update!()
-      if invite.status == "delivered", do: Contacts.add(invite)
+      if invite.status == @status_delivered, do: Contacts.add(invite)
       touched = sides(invite)
       Versions.bump(touched)
       {json(invite, endpoint), touched}
@@ -235,10 +255,10 @@ defmodule AetherHub.Invites do
   """
   def block_target(%Account{endpoint: endpoint}, id) do
     case Repo.one(from i in open(), where: i.id == ^id) do
-      %Invite{origin: "invite", receiver_endpoint: ^endpoint, hidden_from: nil} = invite ->
+      %Invite{origin: @origin_invite, receiver_endpoint: ^endpoint, hidden_from: nil} = invite ->
         {:ok, invite.sender_endpoint}
 
-      %Invite{origin: "request", sender_endpoint: ^endpoint, hidden_from: nil} = invite ->
+      %Invite{origin: @origin_request, sender_endpoint: ^endpoint, hidden_from: nil} = invite ->
         {:ok, invite.receiver_endpoint}
 
       _ ->
@@ -311,7 +331,7 @@ defmodule AetherHub.Invites do
   defp limit_requests(rows, endpoint) do
     {waiting, others} =
       Enum.split_with(rows, fn {i, _from, _to} ->
-        i.status == "requested" and i.sender_endpoint == endpoint
+        i.status == @status_requested and i.sender_endpoint == endpoint
       end)
 
     waiting =
@@ -394,7 +414,7 @@ defmodule AetherHub.Invites do
       )
 
   defp role(invite, endpoint),
-    do: if(invite.sender_endpoint == endpoint, do: "sender", else: "receiver")
+    do: if(invite.sender_endpoint == endpoint, do: @role_sender, else: @role_receiver)
 
   defp json(invite, endpoint) do
     names =
@@ -409,7 +429,7 @@ defmodule AetherHub.Invites do
 
   defp json(invite, from, to, endpoint) do
     role = role(invite, endpoint)
-    delivered = invite.status == "delivered"
+    delivered = invite.status == @status_delivered
 
     %{
       "id" => invite.id,
@@ -420,13 +440,13 @@ defmodule AetherHub.Invites do
       "status" => invite.status,
       "origin" => invite.origin,
       "receiverEndpoint" =>
-        if(role == "sender" and invite.status in ["requested", "accepted", "delivered"],
+        if(role == @role_sender and invite.status in @statuses_with_receiver_endpoint,
           do: invite.receiver_endpoint
         ),
-      "bundle" => if(role == "receiver" and delivered, do: invite.bundle),
+      "bundle" => if(role == @role_receiver and delivered, do: invite.bundle),
       # The receiver checks the line against the endpoint that sent it. It
       # does not learn that endpoint before the host acts.
-      "senderEndpoint" => if(role == "receiver" and delivered, do: invite.sender_endpoint),
+      "senderEndpoint" => if(role == @role_receiver and delivered, do: invite.sender_endpoint),
       "createdAt" => invite.created_at
     }
   end
