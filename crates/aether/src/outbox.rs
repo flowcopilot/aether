@@ -26,21 +26,13 @@ use crate::{
     },
 };
 
-/// The longest time that a task waits for its agent.
 pub const MAX_WAIT: Duration = Duration::from_hours(7 * 24);
-/// How often the node reads the presence of its contacts while tasks wait.
 pub const PRESENCE_INTERVAL: Duration = Duration::from_secs(60);
-/// How long one attempt follows a task that the agent works on.
 pub const ATTEMPT_WINDOW: Duration = Duration::from_secs(25);
-/// How often one attempt asks the agent for news of its task.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(1);
-/// How long a claimed task stays with one process.
 pub const LEASE: Duration = Duration::from_secs(90);
-/// The most attempts that run at the same time.
 pub const MAX_PARALLEL: usize = 4;
-/// How long the node keeps a task after it ends.
 pub const RETENTION: Duration = Duration::from_hours(7 * 24);
-/// How often the node tries an agent that its hub shows as offline.
 pub const OFFLINE_PROBE: Duration = Duration::from_mins(30);
 
 const UNREACHABLE: &str = "the agent cannot be reached; it may be offline";
@@ -426,14 +418,12 @@ fn is_replay(result: &Result<Vec<Frame>, TransportError>) -> bool {
 /// The node store of one round, shared by its attempts.
 type SharedStore = Arc<Mutex<NodeStore>>;
 
-/// Runs `work` off the async runtime.
 async fn off_runtime<R: Send + 'static>(
     work: impl FnOnce() -> Result<R, OutboxError> + Send + 'static,
 ) -> Result<R, OutboxError> {
     tokio::task::spawn_blocking(work).await.map_err(|_| OutboxError::Unavailable)?
 }
 
-/// Runs `work` on `store` off the async runtime.
 async fn with_store<R: Send + 'static>(
     store: &SharedStore,
     work: impl FnOnce(&mut NodeStore) -> Result<R, OutboxError> + Send + 'static,

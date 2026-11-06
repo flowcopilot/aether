@@ -894,9 +894,6 @@ mod tests {
 
         // Queuing and confirming the grant change only after the workspace
         // change fully applied (rather than queuing both up front) matters:
-        // confirming against a base revision some other change already
-        // moved past is exactly what the policy-revision staleness check
-        // added earlier this phase must reject.
         let grant_response = McpServer::socket(socket.clone())
             .change(Parameters(ChangeArguments {
                 change: {

@@ -485,8 +485,6 @@ pub(super) struct DiscardForm {
     id: String,
 }
 
-/// Removes an access request that the person's agent prepared. Nothing is
-/// sent.
 #[page(POST "/requests/discard")]
 pub(super) async fn discard_request(
     cx: &Cx,

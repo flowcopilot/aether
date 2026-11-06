@@ -33,7 +33,6 @@ const CACHE_SECONDS: i64 = 5 * 60;
 /// The shortest time between two fetches for one issuer, so an unknown
 /// `kid` cannot make the node fetch on every request.
 const REFETCH_SECONDS: i64 = 30;
-/// The most issuers the cache holds.
 const MAX_CACHED_ISSUERS: usize = 1024;
 /// The clock skew §3.2 allows.
 const SKEW_SECONDS: i64 = 30;

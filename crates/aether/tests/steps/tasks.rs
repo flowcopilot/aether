@@ -205,7 +205,6 @@ impl fmt::Debug for State {
     }
 }
 
-/// Runs blocking work off the cucumber task, and passes its panic on.
 async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
     match tokio::task::spawn_blocking(work).await {
         Ok(value) => value,
@@ -213,7 +212,6 @@ async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) 
     }
 }
 
-/// Runs a command to completion off the cucumber task.
 async fn run(mut command: Command) -> Output {
     blocking(move || command.output().expect("aether must start")).await
 }

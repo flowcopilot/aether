@@ -222,7 +222,6 @@ where
         &self.grants
     }
 
-    /// Whether the grant `id` was there.
     pub fn remove_grant(&mut self, id: &GrantId) -> bool {
         let before = self.grants.len();
         self.grants.retain(|grant| grant.id != *id);

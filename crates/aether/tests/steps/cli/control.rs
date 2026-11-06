@@ -12,11 +12,8 @@ use crate::{common::aether_command, steps::World};
 
 #[derive(Debug, Default)]
 pub struct State {
-    /// The signed record to publish or to redeem a token with.
     record: Option<PathBuf>,
-    /// The verifying key of the agent that publishes to the directory.
     agent_key: Option<PathBuf>,
-    /// The file with a managed invitation token.
     token: Option<PathBuf>,
 }
 

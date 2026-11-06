@@ -406,7 +406,6 @@ pub enum TransportError {
 
 /// The checks every exchange shares: a count within bounds, one version,
 /// one exchange and scope, and a well-formed task id on every frame.
-/// Returns the first frame.
 pub(crate) fn validate_header(frames: &[Frame]) -> Result<&Frame, TransportError> {
     let Some((first, _)) = frames.split_first() else {
         return Err(TransportError::InvalidOrder);
@@ -435,7 +434,6 @@ pub(crate) fn validate_header(frames: &[Frame]) -> Result<&Frame, TransportError
     Ok(first)
 }
 
-/// Whether `frames` are events closed by one result or error.
 pub(crate) fn events_then_outcome(frames: &[Frame]) -> bool {
     frames.split_last().is_some_and(|(last, events)| {
         matches!(last.kind, FrameKind::Result | FrameKind::Error)

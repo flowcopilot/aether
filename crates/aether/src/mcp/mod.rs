@@ -68,13 +68,12 @@ pub const CALLER_TOOLS: [&str; 7] = [
 
 /// The longest part of an answer in one tool result, in bytes.
 pub(crate) const ANSWER_CHUNK: usize = 32 * 1024;
-/// The default wait of `aether.task.send`.
 pub(crate) const SEND_WAIT: Duration = Duration::from_secs(20);
 
 /// The longest task text `aether.task.send` accepts, in bytes.
 pub(crate) const MAX_TASK_TEXT: usize = 16 * 1024;
 
-/// How long `aether.agents.list` waits for the hub's presence.
+/// How long hub presence and `people.find` wait for the hub.
 pub(crate) const PRESENCE_WAIT: std::time::Duration = std::time::Duration::from_secs(4);
 
 /// How long a find tool waits for the hub.

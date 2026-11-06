@@ -287,7 +287,6 @@ impl CodexAppServer {
     }
 }
 
-/// The `initialize` request of every app-server session.
 fn initialize_params() -> Value {
     json!({
         "clientInfo": {"name": "aether", "title": "Aether", "version": env!("CARGO_PKG_VERSION")},

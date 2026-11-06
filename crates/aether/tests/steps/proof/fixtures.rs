@@ -24,7 +24,6 @@ use crate::common::{
 pub const CALLER: &str = "caller";
 pub const CALLER_ENDPOINT: &str = "caller-endpoint";
 
-/// Runs blocking work off the task that polls the scenarios.
 pub async fn blocking<R, F>(work: F) -> R
 where
     R: Send + 'static,

@@ -64,7 +64,6 @@ const UI_HARDENING: crate::https::Hardening = crate::https::Hardening {
 /// opens the activity stream.
 const ADMIN_JAVASCRIPT: &str = "document.addEventListener('click',async event=>{const button=event.target.closest('[data-copy-text]');if(!button)return;const label=button.querySelector('[data-copy-label]')||button;const text=label.textContent;try{await navigator.clipboard.writeText(button.dataset.copyText);label.textContent='Copied'}catch{label.textContent='Select and copy'}setTimeout(()=>{label.textContent=text},1600)});const status=document.getElementById('activity-status');if(status){const events=new EventSource('/events');events.addEventListener('ready',()=>{status.textContent='Activity updates are connected.'});events.addEventListener('audit',event=>{status.textContent=JSON.parse(event.data).entry});events.addEventListener('task',event=>{const task=JSON.parse(event.data);status.textContent=`Task ${task.taskId}: ${task.event}`});events.onerror=()=>{status.textContent='Activity updates will retry.'}}if(document.querySelector('[data-hub-waiting]')){const reload=()=>{const active=document.activeElement;if(active&&active.matches('input,select,textarea')&&active.value){setTimeout(reload,4000);return}location.assign('/')};setTimeout(reload,4000)}const dots=document.querySelectorAll('[data-presence]');if(dots.length){const update=async()=>{try{const answer=await fetch('/hub/presence');if(!answer.ok)return;const presence=await answer.json();for(const dot of dots){const online=presence[dot.dataset.presence];dot.dataset.state=online===undefined?'unknown':online?'online':'offline';dot.querySelector('[data-presence-label]').textContent=online===undefined?'':online?'Online':'Offline'}}catch{}};update();setInterval(update,15000)}";
 
-// -- Bridging a topcoat `Router` into the existing axum + TLS server --
 //
 // topcoat has no TLS of its own; its docs point at fronting it with a
 // reverse proxy. Here the "reverse proxy" is the axum server this module
@@ -87,9 +86,7 @@ fn ui_service(router: TopcoatRouter) -> UiService {
 /// headers every response carries, success or error alike. topcoat's
 /// `Router::handle` already turns a handler `Err` into a concrete
 /// `Response` (its own status-code mapping), so by the time a response
-/// reaches this function there is no error case left to special-case: this
-/// single conversion point is what `into_axum` was in the hand-rolled
-/// version.
+/// reaches this function there is no error case left to special-case.
 fn into_axum_response(response: topcoat::router::response::Response) -> AxumResponse {
     let mut response = response.map(axum::body::Body::new);
     let headers = response.headers_mut();
@@ -105,8 +102,6 @@ fn into_axum_response(response: topcoat::router::response::Response) -> AxumResp
     response
 }
 
-// -- App context: the values every topcoat handler reaches for --
-
 /// The loopback port this admin UI is bound to, so the host-check layer can
 /// reject a request that names a different port (or host) even though it
 /// physically arrived on the loopback interface.
@@ -118,9 +113,8 @@ struct Managed(bool);
 /// The single admin session this process trusts, recorded the way
 /// topcoat's session docs ask: topcoat carries the token, the application
 /// owns the record. This admin UI has no login step and no user account —
-/// whichever browser first loads the page is trusted, the same way the
-/// hand-rolled version minted one session at process start — so there is
-/// exactly one slot rather than a table keyed by token hash.
+/// whichever browser first loads the page is trusted, so there is exactly
+/// one slot rather than a table keyed by token hash.
 struct AdminSession {
     hash: TokenHash,
     expires_at: SystemTime,
@@ -160,8 +154,7 @@ impl AdminSessionSlot {
 
 /// Maps a one-time opaque token to the real (possibly sensitive) pending
 /// change id, so the rendered page never carries the real id — see
-/// `pending_changes_show_no_secret_value`. Rebuilt on every home-page
-/// render, exactly as the hand-rolled `LocalUi::confirmations` was.
+/// `pending_changes_show_no_secret_value`. Rebuilt on every home-page render.
 struct AdminConfirmations(Mutex<BTreeMap<String, String>>);
 
 impl AdminConfirmations {
@@ -195,9 +188,6 @@ fn confirmation_token() -> TopcoatResult<String> {
     Ok(hex::encode(bytes))
 }
 
-// -- Layers: the transport-level concerns topcoat's own docs say belong
-// here rather than in a page or route function --
-
 /// Rejects a request whose `Host` header does not name this exact loopback
 /// address. This is independent of topcoat's own `OriginPolicy` (which the
 /// router applies to every request before any layer runs, and which only
@@ -224,8 +214,7 @@ async fn enforce_loopback_host(
 
 /// Requires a valid admin session. Combined with topcoat's default
 /// `OriginPolicy` (same-origin only for anything but `GET`/`HEAD`/
-/// `OPTIONS`), this replaces the hand-rolled hidden `csrf` field entirely:
-/// there is no longer a second secret to compare, because the origin check
+/// `OPTIONS`), so there is no separate CSRF token: the origin check
 /// and the session cookie (`HttpOnly`, so no script on any origin can read
 /// it to forge the header) already establish both "this request came from
 /// our own page" and "this browser holds our session".
@@ -248,8 +237,7 @@ async fn require_admin_session(cx: &Cx) -> TopcoatResult<()> {
 
 /// Establishes (or slides the expiry of) the one admin session this process
 /// trusts. There is no login form: whichever browser first loads the page
-/// is the operator, exactly as the hand-rolled version minted its one
-/// session at process start rather than on a credential check.
+/// is the operator.
 async fn ensure_admin_session(cx: &Cx) -> TopcoatResult<()> {
     let sessions = app_context::<Arc<AdminSessionSlot>>(cx);
     if let Some(hash) = session::token_hash(cx).await?
@@ -264,8 +252,6 @@ async fn ensure_admin_session(cx: &Cx) -> TopcoatResult<()> {
     sessions.store(session);
     Ok(())
 }
-
-// -- Layout and pages --
 
 #[layout("/")]
 async fn root_layout(slot: Slot<'_>) -> TopcoatResult<impl View> {
@@ -598,8 +584,6 @@ impl ActivityFeed {
         }
     }
 }
-
-// -- Assembly --
 
 /// Everything the admin UI needs: the finished topcoat `Router` and the two
 /// handles tests use to reach into its app context (production code only
@@ -2860,8 +2844,6 @@ mod tests {
         (directory, admin_ui, administration)
     }
 
-    /// Queues a low-risk `Directory` change directly against `administration`,
-    /// the same way `add_pending` on the old hand-rolled `LocalUi` did.
     fn add_pending(administration: &SharedAdministration, id: &str, url: &str) {
         administration
             .lock()
@@ -3343,8 +3325,6 @@ mod tests {
 
     #[tokio::test]
     async fn cross_origin_post_cannot_confirm_a_change() {
-        // Exercises topcoat's default `OriginPolicy`, which now does the
-        // job the hand-rolled `Origin` header check used to do.
         let (_directory, admin_ui, _administration) = admin_ui_with_directory_applier();
         let application = app(admin_ui);
         let home = get(application.clone(), "/").await;
@@ -3638,10 +3618,6 @@ mod tests {
         );
     }
 
-    /// A stand-in for the direct field access the hand-rolled `LocalUi`
-    /// gave tests. The confirmation map is now private application state
-    /// behind topcoat's app context, so a test recovers the live token the
-    /// same way a browser would: by parsing it out of the rendered page.
     fn extract_confirm_token(body: &str) -> Option<&str> {
         let (_, rest) = body.split_once("name=\"id\" value=\"")?;
         let (token, _) = rest.split_once('"')?;
