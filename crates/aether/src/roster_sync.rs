@@ -43,16 +43,11 @@ pub fn apply_managed_change(
 }
 
 #[allow(clippy::result_unit_err)]
-fn cache_wire_directory_record(
+pub fn cache_wire_directory_record(
     store: &NodeStore,
     record: &WireRecord,
 ) -> Result<(), ()> {
     store
-        .cache_directory_record(&aether_store::SignedRecord {
-            scope_id: record.scope_id.clone(),
-            agent_id: record.agent_id.clone(),
-            record: serde_json::to_vec(record).map_err(|_| ())?,
-            expires_at: i64::try_from(record.expires_at).map_err(|_| ())?,
-        })
+        .cache_directory_record(&record.signed_store_record().map_err(|_| ())?)
         .map_err(|_| ())
 }
