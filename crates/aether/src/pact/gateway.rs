@@ -78,7 +78,7 @@ pub trait PactNode: Send + Sync {
 
     /// Whether the live policy still holds the Aether grant `grant_id`.
     /// Revoking it in the admin UI revokes the delegation.
-    fn has_grant(&self, grant_id: &str) -> bool;
+    fn has_grant(&self, grant_id: &str) -> Result<bool, NodeUnavailable>;
 
     /// The ids of tasks as they change.
     fn subscribe_events(&self) -> broadcast::Receiver<String>;
@@ -105,8 +105,9 @@ where
         self.task_snapshot(task_id)
     }
 
-    fn has_grant(&self, grant_id: &str) -> bool {
-        Self::has_grant(self, &aether_core::GrantId::new(grant_id)).unwrap_or(false)
+    fn has_grant(&self, grant_id: &str) -> Result<bool, NodeUnavailable> {
+        Self::has_grant(self, &aether_core::GrantId::new(grant_id))
+            .map_err(|_| NodeUnavailable)
     }
 
     fn subscribe_events(&self) -> broadcast::Receiver<String> {
@@ -535,6 +536,10 @@ const fn internal(message: &'static str) -> Failure {
     Failure::A2a(A2aError::Internal, message)
 }
 
+/// The node could not read its own policy.
+#[derive(Debug)]
+pub struct NodeUnavailable;
+
 const fn oauth_store_error() -> Failure {
     Failure::OAuth(OAuthError::ServerError, "The gateway store failed")
 }
@@ -951,7 +956,7 @@ impl Gateway {
             caller,
             at,
             GrantBinding::Delegation { brand_user: &claims.sub },
-            self.node.has_grant(&grant.grant_id),
+            self.node.has_grant(&grant.grant_id).map_err(|_| oauth_store_error())?,
         );
         Ok(live.then_some(Delegation { claims }))
     }
@@ -1333,7 +1338,7 @@ impl Gateway {
             caller,
             now,
             GrantBinding::Redeem,
-            self.node.has_grant(&grant.grant_id),
+            self.node.has_grant(&grant.grant_id).map_err(|_| oauth_store_error())?,
         ) {
             Ok(grant)
         } else {

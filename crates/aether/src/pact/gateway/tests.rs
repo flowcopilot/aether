@@ -20,8 +20,8 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 use super::{
-    DELEGATION_HEADER, Failure, Gateway, GrantType, OAuthError, PactNode, Route,
-    approved_grant, caller_endpoint_id, rfc3339, route, router,
+    DELEGATION_HEADER, Failure, Gateway, GrantType, NodeUnavailable, OAuthError,
+    PactNode, Route, approved_grant, caller_endpoint_id, rfc3339, route, router,
 };
 use crate::{
     execution::Task,
@@ -45,6 +45,7 @@ const BRAND: &str = "https://node.example/a2a/review";
 #[derive(Default)]
 struct FakeNode {
     grants: Mutex<BTreeSet<String>>,
+    policy_unreadable: std::sync::atomic::AtomicBool,
     admitted: Mutex<Vec<(Request, String, Task)>>,
 }
 
@@ -71,8 +72,11 @@ impl PactNode for FakeNode {
         Ok((TaskState::Succeeded, Some(format!("answer {turns}"))))
     }
 
-    fn has_grant(&self, grant_id: &str) -> bool {
-        self.grants.lock().expect("lock").contains(grant_id)
+    fn has_grant(&self, grant_id: &str) -> Result<bool, NodeUnavailable> {
+        if self.policy_unreadable.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(NodeUnavailable);
+        }
+        Ok(self.grants.lock().expect("lock").contains(grant_id))
     }
 
     /// No events: each task here ends at once.
@@ -649,6 +653,27 @@ async fn a_delegated_turn_runs_codex_and_carries_a_signed_receipt() {
         task.remote_text
     );
     assert!(task.remote_text.ends_with("And lib.rs?"));
+}
+
+#[tokio::test]
+async fn an_unreadable_policy_during_a_refresh_is_a_server_error() {
+    let fixture = fixture();
+    let tokens = fixture.delegate("u").await;
+    let refresh = tokens["refresh_token"].as_str().expect("refresh token").to_owned();
+    fixture.node.policy_unreadable.store(true, std::sync::atomic::Ordering::SeqCst);
+    let token = fixture.agent.token_for("u");
+    let refreshed = fixture
+        .call(
+            Method::POST,
+            "/a2a/review/oauth/token",
+            Some(&token),
+            None,
+            &format!(
+                "grant_type=refresh_token&refresh_token={refresh}&client_id={ISSUER}"
+            ),
+        )
+        .await;
+    assert_eq!(refreshed.body["error"], "server_error");
 }
 
 #[tokio::test]

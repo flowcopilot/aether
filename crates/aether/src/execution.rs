@@ -162,7 +162,7 @@ impl<P: Agent> Executor<P> {
         {
             return Err(ExecutionError::Limits);
         }
-        if task.workspace_id.contains("..") || task.workspace_id.starts_with('/') {
+        if !aether_core::WorkspaceId::allows_path_token(&task.workspace_id) {
             return Err(ExecutionError::Path);
         }
         let workspace = self.workspace.path()?;

@@ -324,7 +324,7 @@ mod tests {
                 &socket,
                 &Request::Change {
                     change: Box::new(crate::admin::ChangeRequest::Limit {
-                        id: "queue_global".to_owned(),
+                        id: aether_core::limits::QueueLimitId::Global,
                         limit: 2,
                     }),
                     dry_run: false,

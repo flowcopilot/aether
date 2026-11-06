@@ -11,7 +11,7 @@ use super::{
     grant::{GrantSignError, pact_grant_record, sign_aether_grant},
     jwks::PaIdentity,
 };
-use crate::admin::SharedAdministration;
+use crate::admin::{GrantApplicator, GrantApplyError};
 
 pub type SharedPactStore = Arc<Mutex<PactStore>>;
 
@@ -104,11 +104,11 @@ impl PactConsent {
         Ok(Some((device, brand)))
     }
 
-    pub fn approve(
+    pub fn approve<G: GrantApplicator + ?Sized>(
         &self,
         user_code: &str,
         chosen: &[String],
-        administration: &SharedAdministration,
+        grants: &G,
     ) -> Result<Vec<String>, ConsentError> {
         let (device, brand) =
             self.pending_device(user_code)?.ok_or(ConsentError::NotPending)?;
@@ -136,14 +136,9 @@ impl PactConsent {
                 }
             })?;
         let grant_id = grant.id.as_str().to_owned();
-        let change = crate::admin::ChangeRequest::Grant { id: grant_id.clone(), grant }
-            .into_change()
-            .map_err(|_| ConsentError::Refused)?;
-        administration
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .apply(&change, aether_store::AuditActor::Ui)
-            .map_err(|_| ConsentError::Refused)?;
+        grants.apply_signed_grant(grant).map_err(|error| match error {
+            GrantApplyError::Refused => ConsentError::Refused,
+        })?;
         let record = pact_grant_record(
             &grant_id,
             &brand.id,
@@ -153,10 +148,7 @@ impl PactConsent {
             at,
         );
         if self.store().approve_device(&device.user_code, &record, at).is_err() {
-            let _ = administration
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .revoke(&grant_id, aether_store::AuditActor::Ui);
+            let _ = grants.revoke_signed_grant(&grant_id);
             return Err(ConsentError::NotPending);
         }
         Ok(granted)

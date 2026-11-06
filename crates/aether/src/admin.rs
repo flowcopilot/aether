@@ -51,7 +51,7 @@ pub enum ChangeRequest {
     Grant { id: String, grant: Grant },
     Directory { id: String, url: String },
     Capability { id: String, capability: String },
-    Limit { id: String, limit: u32 },
+    Limit { id: aether_core::limits::QueueLimitId, limit: u32 },
 }
 
 impl<'de> Deserialize<'de> for ChangeRequest {
@@ -78,7 +78,11 @@ impl<'de> Deserialize<'de> for ChangeRequest {
             Raw::Capability { id, capability } => {
                 Ok(Self::Capability { id, capability })
             }
-            Raw::Limit { id, limit } => Ok(Self::Limit { id, limit }),
+            Raw::Limit { id, limit } => {
+                let id = aether_core::limits::QueueLimitId::parse(&id)
+                    .ok_or_else(|| serde::de::Error::custom("unknown limit id"))?;
+                Ok(Self::Limit { id, limit })
+            }
         }
     }
 }
@@ -113,7 +117,7 @@ impl Serialize for ChangeRequest {
                 Raw::Capability { id, capability }.serialize(serializer)
             }
             Self::Limit { id, limit } => {
-                Raw::Limit { id, limit: *limit }.serialize(serializer)
+                Raw::Limit { id: id.as_str(), limit: *limit }.serialize(serializer)
             }
         }
     }
@@ -182,10 +186,14 @@ impl ChangeRequest {
             }
             ChangeKind::Directory => Ok(Self::Directory { id, url: value }),
             ChangeKind::Capability => Ok(Self::Capability { id, capability: value }),
-            ChangeKind::Limit => value
-                .parse::<u32>()
-                .map(|limit| Self::Limit { id, limit })
-                .map_err(|_| AdminError::InvalidField("limit")),
+            ChangeKind::Limit => {
+                let limit_id = aether_core::limits::QueueLimitId::parse(&id)
+                    .ok_or(AdminError::InvalidField("id"))?;
+                value
+                    .parse::<u32>()
+                    .map(|limit| Self::Limit { id: limit_id, limit })
+                    .map_err(|_| AdminError::InvalidField("limit"))
+            }
         }
     }
 
@@ -195,8 +203,8 @@ impl ChangeRequest {
             Self::Workspace { id, .. }
             | Self::Grant { id, .. }
             | Self::Directory { id, .. }
-            | Self::Capability { id, .. }
-            | Self::Limit { id, .. } => id,
+            | Self::Capability { id, .. } => id,
+            Self::Limit { id, .. } => id.as_str(),
         }
     }
 
@@ -256,13 +264,59 @@ pub struct Administration {
 
 pub type SharedAdministration = Arc<Mutex<Administration>>;
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
+pub enum GrantApplyError {
+    #[error("the node refused the grant")]
+    Refused,
+}
+
+pub trait GrantApplicator: Send + Sync {
+    fn apply_signed_grant(
+        &self,
+        grant: aether_core::Grant,
+    ) -> Result<(), GrantApplyError>;
+    fn revoke_signed_grant(&self, grant_id: &str) -> Result<(), GrantApplyError>;
+}
+
+impl GrantApplicator for SharedAdministration {
+    fn apply_signed_grant(
+        &self,
+        grant: aether_core::Grant,
+    ) -> Result<(), GrantApplyError> {
+        use std::sync::PoisonError;
+        let id = grant.id.as_str().to_owned();
+        let change = ChangeRequest::Grant { id, grant }
+            .into_change()
+            .map_err(|_| GrantApplyError::Refused)?;
+        self.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .apply_now(&change, aether_store::AuditActor::Ui)
+            .map_err(|_| GrantApplyError::Refused)
+    }
+
+    fn revoke_signed_grant(&self, grant_id: &str) -> Result<(), GrantApplyError> {
+        use std::sync::PoisonError;
+        self.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .revoke_inner(grant_id, aether_store::AuditActor::Ui)
+            .map_err(|_| GrantApplyError::Refused)
+    }
+}
+
 /// The running node that `Administration` applies changes to.
 pub trait LiveNode: Send + Sync {
     fn cancel_task(&self, task_id: &str) -> Result<(), AdminError>;
 
-    fn queue_limit(&self, id: &str) -> Result<u32, AdminError>;
+    fn queue_limit(
+        &self,
+        id: aether_core::limits::QueueLimitId,
+    ) -> Result<u32, AdminError>;
 
-    fn set_queue_limit(&self, id: &str, limit: u32) -> Result<(), AdminError>;
+    fn set_queue_limit(
+        &self,
+        id: aether_core::limits::QueueLimitId,
+        limit: u32,
+    ) -> Result<(), AdminError>;
 
     /// Takes the requested workspace id and path together so the node can
     /// check the id against a policy-approved set before switching to the
@@ -421,12 +475,19 @@ pub mod test_support {
             self.change(format!("cancel {task_id}"))
         }
 
-        fn queue_limit(&self, _id: &str) -> Result<u32, AdminError> {
+        fn queue_limit(
+            &self,
+            _id: aether_core::limits::QueueLimitId,
+        ) -> Result<u32, AdminError> {
             self.queue_limit.ok_or(AdminError::InvalidField("id"))
         }
 
-        fn set_queue_limit(&self, id: &str, limit: u32) -> Result<(), AdminError> {
-            self.change(format!("limit {id} {limit}"))
+        fn set_queue_limit(
+            &self,
+            id: aether_core::limits::QueueLimitId,
+            limit: u32,
+        ) -> Result<(), AdminError> {
+            self.change(format!("limit {} {limit}", id.as_str()))
         }
 
         fn apply_workspace(&self, id: &str, path: &str) -> Result<(), AdminError> {
@@ -619,7 +680,7 @@ impl Administration {
         let live = self.live.as_ref();
         match &change.request {
             ChangeRequest::Limit { id, limit } => {
-                live.map_or(Ok(()), |live| live.set_queue_limit(id, *limit))
+                live.map_or(Ok(()), |live| live.set_queue_limit(*id, *limit))
             }
             ChangeRequest::Workspace { id, path } => {
                 live.map_or(Ok(()), |live| live.apply_workspace(id, path))?;
@@ -657,7 +718,7 @@ impl Administration {
         match &change.request {
             ChangeRequest::Limit { id, limit } => {
                 !self.live.as_ref().is_some_and(|live| {
-                    live.queue_limit(id).is_ok_and(|current| *limit <= current)
+                    live.queue_limit(*id).is_ok_and(|current| *limit <= current)
                 })
             }
             ChangeRequest::Grant { grant, .. } => !direct_invite_grant(grant),
@@ -971,7 +1032,11 @@ mod tests {
             Err(AdminError::InvalidField("url"))
         ));
         assert!(matches!(
-            ChangeRequest::Limit { id: "limit".to_owned(), limit: 0 }.into_change(),
+            ChangeRequest::Limit {
+                id: aether_core::limits::QueueLimitId::Global,
+                limit: 0,
+            }
+            .into_change(),
             Err(AdminError::InvalidField("limit"))
         ));
     }
@@ -994,7 +1059,7 @@ mod tests {
         administration.set_live(node.clone());
         administration
             .submit(
-                &limit_change("queue_global", 2),
+                &limit_change(aether_core::limits::QueueLimitId::Global, 2),
                 aether_store::AuditActor::Mcp,
                 false,
             )
@@ -1009,7 +1074,7 @@ mod tests {
         administration.set_live(Arc::new(FakeNode::default().with_queue_limit(1)));
         administration
             .submit(
-                &limit_change("queue_global", 2),
+                &limit_change(aether_core::limits::QueueLimitId::Global, 2),
                 aether_store::AuditActor::Mcp,
                 false,
             )
@@ -1027,7 +1092,7 @@ mod tests {
         let (_directory, mut administration) = in_temp_dir();
         administration
             .submit(
-                &limit_change("queue_global", 2),
+                &limit_change(aether_core::limits::QueueLimitId::Global, 2),
                 aether_store::AuditActor::Mcp,
                 false,
             )
@@ -1043,7 +1108,7 @@ mod tests {
         administration.set_live(Arc::new(FakeNode::default()));
         administration
             .submit(
-                &limit_change("queue_per_peer", 2),
+                &limit_change(aether_core::limits::QueueLimitId::PerPeer, 2),
                 aether_store::AuditActor::Mcp,
                 false,
             )
@@ -1064,9 +1129,12 @@ mod tests {
         administration.set_live(node.clone());
         administration
             .submit(
-                &ChangeRequest::Limit { id: "queue_global".to_owned(), limit: 2 }
-                    .into_change()
-                    .expect("limit change must parse"),
+                &ChangeRequest::Limit {
+                    id: aether_core::limits::QueueLimitId::Global,
+                    limit: 2,
+                }
+                .into_change()
+                .expect("limit change must parse"),
                 aether_store::AuditActor::Mcp,
                 false,
             )
@@ -1481,7 +1549,7 @@ mod tests {
         administration.set_live(node.clone());
         administration
             .submit(
-                &limit_change("queue_global", 2),
+                &limit_change(aether_core::limits::QueueLimitId::Global, 2),
                 aether_store::AuditActor::Mcp,
                 false,
             )
@@ -1489,7 +1557,7 @@ mod tests {
         node.fail_with(AdminError::InvalidField("limit"));
         assert_eq!(
             administration.submit(
-                &limit_change("queue_global", 5),
+                &limit_change(aether_core::limits::QueueLimitId::Global, 5),
                 aether_store::AuditActor::Mcp,
                 false
             ),
@@ -1516,7 +1584,7 @@ mod tests {
         administration.set_live(node);
         assert_eq!(
             administration.submit(
-                &limit_change("queue_per_peer", 4),
+                &limit_change(aether_core::limits::QueueLimitId::PerPeer, 4),
                 aether_store::AuditActor::Mcp,
                 false
             ),
@@ -1538,8 +1606,11 @@ mod tests {
         (directory, Administration::with_store(store))
     }
 
-    fn limit_change(id: &str, limit: u32) -> crate::admin::Change {
-        ChangeRequest::Limit { id: id.to_owned(), limit }
+    fn limit_change(
+        id: aether_core::limits::QueueLimitId,
+        limit: u32,
+    ) -> crate::admin::Change {
+        ChangeRequest::Limit { id, limit }
             .into_change()
             .expect("limit change must parse")
     }

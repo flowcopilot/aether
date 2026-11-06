@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use aether_core::{Scope, ScopeId, ScopeKind};
+use aether_core::{Scope, ScopeId, ScopeKind, limits::QueueLimitId};
 use aether_store::{NodeStore, QueueLimits, StoreError};
 use hex::FromHex;
 use serde::{Deserialize, Serialize};
@@ -312,9 +312,9 @@ pub fn save_policy_settings(
     };
     keep(&store, &serde_json::to_string(&policy).map_err(|_| PolicyError::Invalid)?)?;
     // Older live admin changes must not override the new saved limits.
-    for id in ["queue_global", "queue_per_peer"] {
+    for id in [QueueLimitId::Global, QueueLimitId::PerPeer] {
         store
-            .remove_applied_change(aether_store::ChangeKind::Limit, id)
+            .remove_applied_change(aether_store::ChangeKind::Limit, id.as_str())
             .map_err(|_| PolicyError::Read)?;
     }
     Ok(())
@@ -343,22 +343,22 @@ pub fn queue_limits(data_dir: &Path) -> Result<Option<QueueLimits>, PolicyError>
         return Ok(None);
     };
     Ok(Some(QueueLimits {
-        global: stored_limit(&store, "queue_global", policy.queue_global)?,
-        per_peer: stored_limit(&store, "queue_per_peer", policy.queue_per_peer)?,
+        global: stored_limit(&store, QueueLimitId::Global, policy.queue_global)?,
+        per_peer: stored_limit(&store, QueueLimitId::PerPeer, policy.queue_per_peer)?,
     }))
 }
 
 pub(crate) fn stored_limit(
     store: &NodeStore,
-    id: &str,
+    id: QueueLimitId,
     fallback: usize,
 ) -> Result<usize, PolicyError> {
-    match store.applied_change(aether_store::ChangeKind::Limit, id) {
-        Ok(Some(value)) => value
-            .parse::<usize>()
-            .ok()
-            .filter(|value| *value > 0)
-            .ok_or_else(|| PolicyError::InvalidField(format!("admin.limit.{id}"))),
+    match store.applied_change(aether_store::ChangeKind::Limit, id.as_str()) {
+        Ok(Some(value)) => {
+            value.parse::<usize>().ok().filter(|value| *value > 0).ok_or_else(|| {
+                PolicyError::InvalidField(format!("admin.limit.{}", id.as_str()))
+            })
+        }
         Ok(None) => Ok(fallback),
         Err(_) => Err(PolicyError::Invalid),
     }
