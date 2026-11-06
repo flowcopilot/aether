@@ -1,20 +1,25 @@
-#![allow(clippy::redundant_pub_crate)]
 use std::io;
 
 use rmcp::model::{CallToolResult, ContentBlock};
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::json;
 
-use super::args::AuditField;
 use crate::admin::AuditEntry;
 
-pub(crate) fn no_node(error: &io::Error) -> bool {
+#[derive(Debug, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditField {
+    Actor,
+    Action,
+    Result,
+}
+
+pub fn no_node(error: &io::Error) -> bool {
     matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused)
 }
 
-pub(crate) fn audit_item(
-    fields: &[AuditField],
-    entry: &AuditEntry,
-) -> serde_json::Value {
+pub fn audit_item(fields: &[AuditField], entry: &AuditEntry) -> serde_json::Value {
     let mut item = serde_json::Map::new();
     for field in fields {
         let (key, value) = match field {
@@ -27,10 +32,10 @@ pub(crate) fn audit_item(
     serde_json::Value::Object(item)
 }
 
-pub(crate) fn tool_success(message: impl Into<String>) -> CallToolResult {
+pub fn tool_success(message: impl Into<String>) -> CallToolResult {
     CallToolResult::success(vec![ContentBlock::text(message)])
 }
 
-pub(crate) fn tool_error(message: impl Into<String>) -> CallToolResult {
+pub fn tool_error(message: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(message)])
 }

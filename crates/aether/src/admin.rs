@@ -253,6 +253,12 @@ pub struct AuditEntry {
     pub result: String,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum AdminStoreAccess {
+    Ready,
+    Unavailable,
+}
+
 pub struct Administration {
     revision: std::sync::atomic::AtomicU64,
     store: NodeStore,
@@ -834,6 +840,16 @@ impl Administration {
         valid(task_id, "task_id")?;
         self.live.as_ref().ok_or(AdminError::Task)?.cancel_task(task_id)
     }
+
+    #[must_use]
+    pub fn store_access(&self) -> AdminStoreAccess {
+        if self.store.audit_records_page(0, 1).is_ok() {
+            AdminStoreAccess::Ready
+        } else {
+            AdminStoreAccess::Unavailable
+        }
+    }
+
     #[must_use]
     pub fn audit(&self) -> Vec<String> {
         self.audit_entries().into_iter().map(|entry| entry.result).collect()

@@ -24,9 +24,10 @@ use super::{
     AdminConfirmations, Managed, Page, Tab, ensure_admin_session, node_header,
 };
 use crate::{
-    admin::SharedAdministration,
+    admin::{AdminStoreAccess, SharedAdministration},
     admin_components::page_title,
     components::{
+        alert::{AlertVariant, alert, alert_description, alert_title},
         button::{ButtonSize, ButtonVariant, button, button_variants},
         input::input,
         label::label,
@@ -57,10 +58,11 @@ pub(super) async fn dashboard(
         .flatten();
 
     let administration = app_context::<SharedAdministration>(cx);
-    let (pending, configured, summary, members) = {
+    let (store_access, pending, configured, summary, members) = {
         let administration =
             administration.lock().unwrap_or_else(PoisonError::into_inner);
         (
+            administration.store_access(),
             administration.pending(),
             administration.configured_change_counts(),
             administration.node_summary(),
@@ -96,9 +98,18 @@ pub(super) async fn dashboard(
                 "Review local permissions, tasks and pending changes."
             )
 
+            if matches!(store_access, AdminStoreAccess::Unavailable) {
+                alert(variant: AlertVariant::Destructive, attrs: attributes! { role="alert" },
+                    alert_title("Administration store is unavailable")
+                    alert_description("This node cannot read its local administration database. Fix the data directory and reload.")
+                )
+            }
+
             <section id="pending" class="flex scroll-mt-6 flex-col gap-3">
                 <h2 class="text-xl font-semibold tracking-tight">"Pending changes"</h2>
-                if tokens.is_empty() {
+                if matches!(store_access, AdminStoreAccess::Unavailable) {
+                    <p class="text-muted-foreground">"Pending changes cannot be loaded."</p>
+                } else if tokens.is_empty() {
                     <p class="text-muted-foreground">"No changes need confirmation."</p>
                 } else {
                     <ul class="flex flex-col gap-2">
@@ -124,14 +135,18 @@ pub(super) async fn dashboard(
 
             <section id="overview" class="flex scroll-mt-6 flex-col gap-3">
             <h2 class="text-xl font-semibold tracking-tight">"Overview"</h2>
-            <dl class="grid grid-cols-2 gap-px overflow-hidden rounded-xl border border-border bg-border sm:grid-cols-3">
-                count(id: "agents", name: "Agents", value: summary.agents, unit: "known agents")
-                count(id: "capabilities", name: "Capabilities", value: capabilities, unit: "configured capabilities")
-                count(id: "directories", name: "Directories", value: directories, unit: "configured directories")
-                count(id: "connections", name: "Connections", value: summary.active_connections, unit: "active connections")
-                count(id: "grant-count", name: "Permissions", value: grants, unit: "configured grants")
-                count(id: "workspaces", name: "Workspaces", value: workspaces, unit: "configured workspaces")
-            </dl>
+            if matches!(store_access, AdminStoreAccess::Unavailable) {
+                <p class="text-muted-foreground">"Overview counts cannot be loaded."</p>
+            } else {
+                <dl class="grid grid-cols-2 gap-px overflow-hidden rounded-xl border border-border bg-border sm:grid-cols-3">
+                    count(id: "agents", name: "Agents", value: summary.agents, unit: "known agents")
+                    count(id: "capabilities", name: "Capabilities", value: capabilities, unit: "configured capabilities")
+                    count(id: "directories", name: "Directories", value: directories, unit: "configured directories")
+                    count(id: "connections", name: "Connections", value: summary.active_connections, unit: "active connections")
+                    count(id: "grant-count", name: "Permissions", value: grants, unit: "configured grants")
+                    count(id: "workspaces", name: "Workspaces", value: workspaces, unit: "configured workspaces")
+                </dl>
+            }
             </section>
 
             <section id="permissions" class="flex scroll-mt-6 flex-col gap-3">
@@ -187,9 +202,13 @@ pub(super) async fn dashboard(
 
             <section id="tasks" class="flex scroll-mt-6 flex-col gap-3">
                 <h2 class="text-xl font-semibold tracking-tight">"Tasks"</h2>
-                <p class="text-muted-foreground">
-                    (summary.tasks) " stored tasks. " (summary.queued_tasks) " tasks are waiting."
-                </p>
+                if matches!(store_access, AdminStoreAccess::Unavailable) {
+                    <p class="text-muted-foreground">"Task counts cannot be loaded."</p>
+                } else {
+                    <p class="text-muted-foreground">
+                        (summary.tasks) " stored tasks. " (summary.queued_tasks) " tasks are waiting."
+                    </p>
+                }
                 <form method="post" action="/cancel" class="flex flex-wrap items-end gap-2">
                     <div class="flex min-w-64 flex-1 flex-col gap-1.5">
                         label(attrs: attributes! { for="task_id" }, "Task ID")
@@ -209,7 +228,9 @@ pub(super) async fn dashboard(
             if managed {
                 <section id="members" class="flex flex-col gap-2">
                     <h2 class="text-xl font-semibold tracking-tight">"Members"</h2>
-                    if members.is_empty() {
+                    if matches!(store_access, AdminStoreAccess::Unavailable) {
+                        <p class="text-muted-foreground">"Members cannot be loaded."</p>
+                    } else if members.is_empty() {
                         <p class="text-muted-foreground">"No members are listed."</p>
                     } else {
                         <ul class="flex flex-col gap-2">

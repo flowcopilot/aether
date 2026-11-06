@@ -16,9 +16,8 @@ use crate::admin::{AuditEntry, ChangeRequest};
 use crate::hub_client::HubClient;
 use crate::outbox::{self, Courier};
 
-pub(crate) mod args;
 pub(crate) mod support;
-mod tools;
+pub(crate) mod tools;
 
 use support::{no_node, tool_error, tool_success};
 
