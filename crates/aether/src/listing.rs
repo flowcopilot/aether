@@ -277,16 +277,7 @@ pub(crate) const fn hub_publish_message(error: HubPublishError) -> &'static str 
         HubPublishError::Hub(crate::hub_client::HubError::Invalid) => {
             "The hub refused the listing. Check the text of your agent's card."
         }
-        HubPublishError::Hub(crate::hub_client::HubError::OldHub) => {
-            "This hub is older than this node. Ask its operator to update it."
-        }
-        HubPublishError::Hub(crate::hub_client::HubError::OldNode) => {
-            "This node is older than the hub. Update Aether."
-        }
-        HubPublishError::Hub(crate::hub_client::HubError::RateLimited) => {
-            "Too many requests. Wait a minute and try again."
-        }
-        HubPublishError::Hub(_) => "The hub cannot be reached now. Try again later.",
+        HubPublishError::Hub(error) => crate::hub_membership::hub_message(error),
     }
 }
 

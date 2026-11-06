@@ -359,10 +359,7 @@ fn ok(status: StatusCode, body: Value) -> Response {
 /// The signed target as Plug reads it: the path, and `?` with the query
 /// only when the query string is not empty.
 fn target(uri: &Uri) -> String {
-    match uri.query() {
-        Some(query) if !query.is_empty() => format!("{}?{query}", uri.path()),
-        _ => uri.path().to_owned(),
-    }
+    protocol::hub_sign_target(uri.path(), uri.query())
 }
 
 /// The endpoint that signed the request, when the signature verifies.

@@ -2,8 +2,6 @@
 
 use aether_core::AccessMode;
 use reqwest::Url;
-use serde::{Deserialize, Serialize};
-
 /// The id of the scope every PACT task runs in.
 pub const SCOPE_ID: &str = "pact";
 /// The only Brand user (decision of 7 October 2026: the node owner).
@@ -15,35 +13,6 @@ pub enum PactConfigError {
     Field(&'static str),
     #[error("pact.brands[{0}] is invalid")]
     Brand(usize),
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PactFile {
-    public_url: String,
-    audience: String,
-    #[serde(default)]
-    allow_insecure_local_issuers: bool,
-    brands: Vec<BrandFile>,
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct BrandFile {
-    id: String,
-    name: String,
-    description: String,
-    capability: String,
-    workspace: String,
-    access_mode: String,
-    scope: ScopeFile,
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ScopeFile {
-    id: String,
-    description: String,
 }
 
 /// The gateway's configuration.
@@ -74,7 +43,7 @@ pub struct Brand {
     pub scope_description: String,
 }
 
-impl PactFile {
+impl crate::policy::PactPolicySection {
     pub fn parse(
         self,
         max_context_tokens: u32,
@@ -200,7 +169,8 @@ impl PactConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{PactConfigError, PactFile};
+    use super::PactConfigError;
+    use crate::policy::PactPolicySection as PactFile;
 
     fn file(change: impl FnOnce(&mut serde_json::Value)) -> serde_json::Value {
         let mut value = serde_json::json!({

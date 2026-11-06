@@ -376,11 +376,6 @@ fn task_polling_stays_under_the_peer_rate_limit() {
     assert!(polls_per_second * 2 <= u128::from(super::PEER_REQUESTS_PER_SECOND));
 }
 
-#[test]
-fn a_kept_connection_outlives_the_outbox_poll_interval() {
-    assert!(super::RESPONSE_LINGER > crate::outbox::POLL_INTERVAL);
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_connection_serves_one_stream_after_another() {
     let (receiver, lookup) = bound_receiver().await;

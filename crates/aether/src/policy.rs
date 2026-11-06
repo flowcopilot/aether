@@ -105,7 +105,36 @@ pub(crate) struct PolicyFile {
     /// The PACT gateway (see `docs/pact.md`). Absent: the node
     /// has no PACT scope and `--pact-port` is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) pact: Option<crate::pact::config::PactFile>,
+    pub(crate) pact: Option<PactPolicySection>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PactPolicySection {
+    pub(crate) public_url: String,
+    pub(crate) audience: String,
+    #[serde(default)]
+    pub(crate) allow_insecure_local_issuers: bool,
+    pub(crate) brands: Vec<PactPolicyBrand>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PactPolicyBrand {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) capability: String,
+    pub(crate) workspace: String,
+    pub(crate) access_mode: String,
+    pub(crate) scope: PactPolicyBrandScope,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PactPolicyBrandScope {
+    pub(crate) id: String,
+    pub(crate) description: String,
 }
 
 /// The adapter of a node's agent. Each data directory has one agent.
@@ -196,7 +225,7 @@ impl PolicyFile {
     fn direct(workspace: PathBuf) -> Self {
         Self {
             scope: Some(ScopeFile {
-                id: crate::direct::SCOPE.to_owned(),
+                id: ScopeKind::Direct.as_str().to_owned(),
                 kind: ScopeKind::Direct.as_str().to_owned(),
             }),
             scopes: None,
@@ -442,6 +471,37 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{AgentAdapter, PolicyFile, PolicySandbox};
+
+    #[test]
+    fn a_policy_file_with_a_pact_section_still_loads() {
+        let source = br#"{
+            "scope": { "id": "direct", "kind": "direct" },
+            "workspace": "/tmp/w",
+            "maxContextTokens": 4000,
+            "maxSeconds": 120,
+            "queueGlobal": 1,
+            "queuePerPeer": 1,
+            "pact": {
+                "publicUrl": "http://127.0.0.1:8080",
+                "audience": "http://127.0.0.1:8080",
+                "allowInsecureLocalIssuers": true,
+                "brands": [{
+                    "id": "review",
+                    "name": "Code review",
+                    "description": "Reviews code.",
+                    "capability": "review",
+                    "workspace": "workspace",
+                    "accessMode": "read_only",
+                    "scope": { "id": "review:read_only", "description": "Review code" }
+                }]
+            }
+        }"#;
+        let policy = PolicyFile::parse(source).expect("policy must decode");
+        let pact = policy.pact.expect("pact section must be present");
+        assert_eq!(pact.public_url, "http://127.0.0.1:8080");
+        assert_eq!(pact.brands.len(), 1);
+        assert_eq!(pact.brands[0].scope.id, "review:read_only");
+    }
 
     #[test]
     fn a_switch_to_a_connected_adapter_removes_the_codex_settings() {

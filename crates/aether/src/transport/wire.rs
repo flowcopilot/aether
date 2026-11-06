@@ -33,7 +33,8 @@ pub(crate) const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 /// and finished a response, for the peer's next stream or its close. It is
 /// not a read or write budget like `STREAM_TIMEOUT`. A client that polls a
 /// task keeps its connection and opens one stream for each poll, so this is
-/// longer than the poll interval of the outbox (`outbox::POLL_INTERVAL`).
+/// longer than a one-second poll interval so polling clients can reuse the
+/// connection between polls.
 /// A client that sends one request closes within microseconds of reading
 /// its response, and the handler stops at once. The wait only bounds how
 /// long a handler holds its `MAX_CONNECTIONS` permit for a peer that stops

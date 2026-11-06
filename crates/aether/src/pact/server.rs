@@ -85,7 +85,12 @@ pub async fn serve(
             loop {
                 interval.tick().await;
                 let gateway = Arc::clone(&gateway);
-                let _ = tokio::task::spawn_blocking(move || gateway.maintain()).await;
+                if tokio::task::spawn_blocking(move || gateway.maintain())
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!("pact maintenance task failed");
+                }
             }
         }
     });
