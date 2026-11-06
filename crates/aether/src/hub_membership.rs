@@ -11,7 +11,7 @@ use crate::hub_client::{HubClient, HubError, Invite, Role, Status};
 
 /// How long the node keeps the approval of an invite: as long as the hub
 /// keeps the invite.
-pub const APPROVAL_SECONDS: i64 = 7 * 24 * 60 * 60;
+pub const APPROVAL_SECONDS: i64 = crate::hub_client::protocol::INVITE_SECONDS;
 
 /// What a hub error means for the person who asked.
 pub const fn hub_message(error: HubError) -> &'static str {

@@ -21,7 +21,8 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::{Value, json};
 use tokio::sync::Notify;
 
-use super::{HubClient, MAX_WAIT_SECONDS, protocol};
+use super::protocol::MAX_WAIT_SECONDS;
+use super::{AgentKind, AgentRow, HubClient, protocol};
 
 /// One request as the hub received it.
 #[derive(Debug, Clone)]
@@ -66,8 +67,7 @@ pub struct TestOwnerLink {
 pub struct HubState {
     /// Handle by endpoint ID.
     pub accounts: BTreeMap<String, String>,
-    /// The agent type by endpoint ID; `personal` when absent.
-    pub kinds: BTreeMap<String, String>,
+    pub kinds: BTreeMap<String, AgentKind>,
     /// The personal agents that name search finds.
     pub searchable: BTreeSet<String>,
     /// (owner, blocked) endpoint pairs.
@@ -157,8 +157,8 @@ impl HubState {
         self.accounts.get(endpoint).cloned().unwrap_or_default()
     }
 
-    fn kind(&self, endpoint: &str) -> String {
-        self.kinds.get(endpoint).cloned().unwrap_or_else(|| "personal".to_owned())
+    fn kind(&self, endpoint: &str) -> AgentKind {
+        self.kinds.get(endpoint).copied().unwrap_or(AgentKind::Personal)
     }
 
     fn account_json(&self, endpoint: &str) -> Value {
@@ -174,7 +174,11 @@ impl HubState {
         let personal_side = link.personal == asker;
         json!({
             "id": link.id,
-            "role": if personal_side { "personal" } else { "service" },
+            "role": if personal_side {
+                AgentKind::Personal.as_str()
+            } else {
+                AgentKind::Service.as_str()
+            },
             "service": self.handle(&link.service),
             "personal": self.handle(&link.personal),
             "expiresAt": link.expires_at,
@@ -296,14 +300,18 @@ impl TestHub {
         signer: &Path,
         handle: &str,
         bytes: &[u8],
-    ) -> super::AgentRow {
-        let endpoint = crate::direct::endpoint_id(host).expect("endpoint");
+    ) -> AgentRow {
+        let endpoint = crate::data_dir::DataDir::new(host)
+            .endpoint_key()
+            .expect("key")
+            .public()
+            .to_string();
         let key = crate::data_dir::DataDir::new(signer).endpoint_key().expect("key");
         let expires_at = now().saturating_add(3600);
-        let row = super::AgentRow {
+        let row = AgentRow {
             handle: handle.to_owned(),
             listing: URL_SAFE_NO_PAD.encode(bytes),
-            signature: crate::listing::sign(&key, bytes, expires_at),
+            signature: protocol::sign_listing(&key, bytes, expires_at),
             expires_at,
             online: false,
             contact: false,
@@ -312,7 +320,7 @@ impl TestHub {
         };
         let mut state = self.state();
         state.add_account(&endpoint, handle);
-        state.kinds.insert(endpoint.clone(), "service".to_owned());
+        state.kinds.insert(endpoint.clone(), AgentKind::Service);
         state.listings.insert(
             endpoint,
             json!({
@@ -368,7 +376,7 @@ fn authenticate(
     body: &[u8],
 ) -> Option<String> {
     let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
-    let endpoint = header("x-aether-endpoint")?;
+    let endpoint = header(protocol::ENDPOINT_HEADER)?;
     let time = header("x-aether-time")?;
     let signature = URL_SAFE_NO_PAD.decode(header("x-aether-signature")?).ok()?;
     let signature = iroh::Signature::from_bytes(&signature.try_into().ok()?);
@@ -491,16 +499,21 @@ fn route(
         }
         ("PUT", ["v1", "account"]) => {
             let existing = state.accounts.contains_key(endpoint);
-            let kind = body["kind"].as_str().map(str::to_owned);
-            if kind.as_deref().is_some_and(|kind| {
-                !["personal", "service"].contains(&kind)
-                    || (existing && kind != state.kind(endpoint))
-            }) {
+            let kind = match body.get("kind") {
+                None => None,
+                Some(value) => {
+                    let Some(parsed) = value.as_str().and_then(AgentKind::parse) else {
+                        return error(StatusCode::BAD_REQUEST, "invalid");
+                    };
+                    Some(parsed)
+                }
+            };
+            if kind.is_some_and(|kind| existing && kind != state.kind(endpoint)) {
                 return error(StatusCode::BAD_REQUEST, "invalid");
             }
             let kind = kind.unwrap_or_else(|| state.kind(endpoint));
             if let Some(searchable) = body["searchable"].as_bool() {
-                if searchable && kind == "service" {
+                if searchable && kind == AgentKind::Service {
                     return error(StatusCode::BAD_REQUEST, "invalid");
                 }
                 if searchable {
@@ -691,6 +704,9 @@ fn route(
             ok(StatusCode::OK, json!({ "blocks": blocks }))
         }
         ("DELETE", ["v1", "blocks", blocked]) => {
+            if blocked.parse::<iroh::EndpointId>().is_err() {
+                return error(StatusCode::BAD_REQUEST, "invalid");
+            }
             if state.blocks.remove(&(endpoint.to_owned(), (*blocked).to_owned())) {
                 StatusCode::NO_CONTENT.into_response()
             } else {
@@ -764,7 +780,7 @@ fn route(
         }
         ("PUT", ["v1", "listing"]) => {
             let handle = state.handle(endpoint);
-            let valid = state.kind(endpoint) == "service"
+            let valid = state.kind(endpoint) == AgentKind::Service
                 && body.as_object().is_some_and(|object| {
                     object.len() == 4 && object.get("listed") == Some(&json!(true))
                 })
@@ -774,7 +790,7 @@ fn route(
                     body["expiresAt"].as_u64(),
                 ) {
                     (Some(text), Some(signature), Some(expires_at)) => {
-                        crate::listing::verify(
+                        protocol::verify_listing(
                             text,
                             signature,
                             endpoint,
@@ -782,7 +798,8 @@ fn route(
                             now(),
                         )
                         .is_ok()
-                            && crate::listing::parse(text, &handle).is_ok()
+                            && protocol::listing_bytes_match_handle(text, &handle)
+                                .is_ok()
                     }
                     _ => false,
                 };
@@ -853,7 +870,7 @@ fn route(
         ("GET", ["v1", "people", name, number]) => {
             let handle = format!("{name}#{number}");
             match state.accounts.iter().find(|(person, held)| {
-                **held == handle && state.kind(person) == "personal"
+                **held == handle && state.kind(person) == AgentKind::Personal
             }) {
                 Some((person, _)) => {
                     ok(StatusCode::OK, state.person_json(endpoint, person))
@@ -877,7 +894,7 @@ fn route(
             ok(StatusCode::OK, json!({ "people": people }))
         }
         ("POST", ["v1", "owner-links"]) => {
-            if state.kind(endpoint) != "personal" {
+            if state.kind(endpoint) != AgentKind::Personal {
                 return error(StatusCode::FORBIDDEN, "forbidden");
             }
             let (Some(service_handle), Some(expires_at), Some(signature)) = (
@@ -892,7 +909,7 @@ fn route(
                 .iter()
                 .find(|(service, handle)| {
                     handle.as_str() == service_handle
-                        && state.kind(service) == "service"
+                        && state.kind(service) == AgentKind::Service
                 })
                 .map(|(service, _)| service.clone())
             else {

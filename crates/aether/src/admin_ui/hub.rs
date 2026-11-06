@@ -332,7 +332,7 @@ pub(super) async fn error_line(text: String) -> TopcoatResult<impl View> {
 #[component]
 async fn service_agents(links: Vec<OwnerLink>) -> TopcoatResult<impl View> {
     let links: Vec<OwnerLink> =
-        links.into_iter().filter(|link| link.role == "personal").collect();
+        links.into_iter().filter(|link| link.role == AgentKind::Personal).collect();
     Ok(view! {
         <section class="flex flex-col gap-3 rounded-xl border border-border bg-background px-6 py-5" aria-label="Your service agents">
             <h2 class="text-[15px] font-semibold">"Your service agents"</h2>
@@ -382,7 +382,7 @@ async fn service_agents(links: Vec<OwnerLink>) -> TopcoatResult<impl View> {
 #[component]
 async fn owner_claims(links: Vec<OwnerLink>) -> TopcoatResult<impl View> {
     let links: Vec<OwnerLink> =
-        links.into_iter().filter(|link| link.role == "service").collect();
+        links.into_iter().filter(|link| link.role == AgentKind::Service).collect();
     Ok(view! {
         <section class="flex flex-col gap-3 rounded-xl border border-border bg-background px-6 py-5" aria-label="Owner">
             <h2 class="text-[15px] font-semibold">"Owner"</h2>
@@ -1057,7 +1057,9 @@ async fn confirm_claim(
     let links = hub.owner_links().await.map_err(hub_message)?;
     let (personal, expires_at) = links
         .into_iter()
-        .find(|link| link.id == id && link.role == "service" && !link.confirmed)
+        .find(|link| {
+            link.id == id && link.role == AgentKind::Service && !link.confirmed
+        })
         .and_then(|link| {
             link.personal_endpoint
                 .filter(|endpoint| endpoint.parse::<iroh::EndpointId>().is_ok())

@@ -65,14 +65,9 @@ pub fn valid_full_name(full_name: &str) -> bool {
 
 #[must_use]
 pub fn split_full_name(full_name: &str) -> Option<(&str, u16)> {
-    let (name, number) = full_name.split_once('#')?;
-    if number.len() != NAME_NUMBER_DIGITS
-        || !number.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return None;
-    }
-    let number = number.parse::<u16>().ok()?;
-    (number != 0 && valid_name_part(name)).then_some((name, number))
+    let (name, _) = full_name.split_once('#')?;
+    let parsed = FullName::parse(full_name)?;
+    Some((name, parsed.number()))
 }
 
 #[cfg(test)]

@@ -12,17 +12,20 @@ use serde::{Deserialize, Serialize};
 pub mod full_name;
 pub mod node_hub;
 pub mod protocol;
+mod types;
 
 pub use self::full_name::{
     FullName, split_full_name, valid_full_name, valid_name_part,
 };
 pub use self::node_hub::{NodeHub, hub_client as configured_hub_client};
-
-/// The public hub that a node uses when nothing else is set.
-pub const DEFAULT_HUB_URL: &str = "https://aether-hub.tudorandrei.xyz";
-
-/// The setting value that turns the hub off.
-pub const HUB_OFF: &str = "off";
+pub use self::protocol::{
+    DEFAULT_HUB_URL, HUB_OFF, INVITE_SECONDS, MAX_WAIT_SECONDS, PROTOCOL_HEADER,
+    PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
+};
+pub use self::types::{
+    Account, AgentKind, AgentRow, Block, Contact, HeldListing, HubError, Invite,
+    Invites, Origin, OwnerLink, PersonRow, Role, Status,
+};
 
 /// The hub a node uses: `flag` (`--hub-url` or `AETHER_HUB_URL`), else the
 /// one set on the page, else [`DEFAULT_HUB_URL`]. `None` when the chosen
@@ -32,9 +35,10 @@ pub fn resolve_url(flag: Option<&str>, stored: Option<String>) -> Option<String>
     let url = flag
         .map(str::to_owned)
         .or(stored)
-        .unwrap_or_else(|| DEFAULT_HUB_URL.to_owned());
+        .unwrap_or_else(|| protocol::DEFAULT_HUB_URL.to_owned());
     let url = url.trim();
-    (!url.is_empty() && url != HUB_OFF).then(|| url.trim_end_matches('/').to_owned())
+    (!url.is_empty() && url != protocol::HUB_OFF)
+        .then(|| url.trim_end_matches('/').to_owned())
 }
 
 /// The hub setting for a hub URL an owner typed: [`HUB_OFF`] when it is
@@ -47,10 +51,10 @@ pub fn resolve_url(flag: Option<&str>, stored: Option<String>) -> Option<String>
 pub fn hub_setting(url: &str) -> Result<Option<String>, HubError> {
     let url = url.trim().trim_end_matches('/');
     if url.is_empty() {
-        return Ok(Some(HUB_OFF.to_owned()));
+        return Ok(Some(protocol::HUB_OFF.to_owned()));
     }
     parse_origin(url)?;
-    Ok((url != DEFAULT_HUB_URL).then(|| url.to_owned()))
+    Ok((url != protocol::DEFAULT_HUB_URL).then(|| url.to_owned()))
 }
 
 /// Keeps `stored` as the hub of the node at `data_dir`. A name belongs to
@@ -71,314 +75,10 @@ pub fn set_hub_url(
         })
 }
 
-/// The longest long poll the hub accepts, in seconds.
-pub const MAX_WAIT_SECONDS: u64 = 30;
-
-/// The header that names the hub protocol of this node. It is not in the
-/// signed message: it only lets a hub refuse a node that is too old.
-pub const PROTOCOL_HEADER: &str = "x-aether-protocol";
-/// The hub protocol that this node speaks.
-pub const PROTOCOL_VERSION: &str = "2";
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
-pub enum HubError {
-    #[error("hub URL must be an HTTPS origin, or HTTP on a loopback address")]
-    InvalidUrl,
-    #[error("the hub cannot be reached")]
-    Unreachable,
-    #[error("the hub refused the signature")]
-    Unauthorized,
-    #[error("this node has no name on the hub")]
-    NoAccount,
-    #[error("the hub refused the request")]
-    Forbidden,
-    #[error("the hub does not know this name or invite")]
-    NotFound,
-    #[error("this name belongs to someone else")]
-    Taken,
-    #[error("the hub refused the request as invalid")]
-    Invalid,
-    #[error("too many requests to the hub")]
-    RateLimited,
-    #[error("the hub returned an unexpected answer")]
-    Unexpected,
-    #[error("this hub is older than this node")]
-    OldHub,
-    #[error("this node is older than the hub")]
-    OldNode,
-    #[error("a hub limit is reached")]
-    Limit,
-}
-
-/// The type of the agent of a hub account. It does not change.
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AgentKind {
-    /// Stands for one person; friends that the person invites send it tasks.
-    #[default]
-    Personal,
-    /// Offers a service; strangers ask for access, and the owner approves.
-    Service,
-}
-
-impl AgentKind {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Personal => "personal",
-            Self::Service => "service",
-        }
-    }
-
-    #[must_use]
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "personal" => Some(Self::Personal),
-            "service" => Some(Self::Service),
-            _ => None,
-        }
-    }
-}
-
-/// This node's name on the hub.
-#[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
-pub struct Account {
-    /// The full name, such as `ana#0042`.
-    pub handle: String,
-    pub endpoint: String,
-    /// A protocol 2 hub always sends it; the default only lets a reply parse.
-    #[serde(default)]
-    pub kind: AgentKind,
-    #[serde(default)]
-    pub searchable: bool,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Role {
-    Sender,
-    Receiver,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Status {
-    Pending,
-    /// A request that waits for the service agent's owner.
-    Requested,
-    Accepted,
-    Delivered,
-    /// A status from a newer hub. A page does not show it, and no worker
-    /// acts on it.
-    #[serde(other)]
-    Unknown,
-}
-
-/// How a hub row started.
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Origin {
-    /// A host offered access to a name.
-    #[default]
-    Invite,
-    /// A node asked a listed service agent for access. The service is the
-    /// sender, because it signs the line.
-    Request,
-    /// An origin from a newer hub. No worker acts on it.
-    #[serde(other)]
-    Unknown,
-}
-
-/// One open invite that this node sent or received. `from` and `to` are
-/// full names, such as `ana#0042`.
-#[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Invite {
-    pub id: String,
-    pub from: String,
-    pub to: String,
-    pub role: Role,
-    pub days: u64,
-    pub status: Status,
-    #[serde(default)]
-    pub origin: Origin,
-    #[serde(default)]
-    pub receiver_endpoint: Option<String>,
-    #[serde(default)]
-    pub bundle: Option<String>,
-    /// The endpoint that sent the line, for the receiver of a delivered
-    /// invite only.
-    #[serde(default)]
-    pub sender_endpoint: Option<String>,
-    pub created_at: u64,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
-pub struct Invites {
-    pub version: u64,
-    pub invites: Vec<Invite>,
-}
-
-/// A node this node is connected with, and whether it is online.
-#[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Contact {
-    /// The full name, such as `ana#0042`.
-    pub handle: String,
-    pub endpoint: String,
-    pub online: bool,
-}
-
-#[derive(Deserialize)]
-struct Contacts {
-    contacts: Vec<Contact>,
-}
-
-/// An endpoint that this node blocked, with its current full name, or
-/// `None` when it has no account now.
-#[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
-pub struct Block {
-    pub endpoint: String,
-    pub handle: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct Blocks {
-    blocks: Vec<Block>,
-}
-
-#[derive(Serialize)]
-struct ClaimBody<'a> {
-    name: &'a str,
-    /// Only on the first claim: the hub sets the type once.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    kind: Option<AgentKind>,
-}
-
-#[derive(Serialize)]
-struct SearchBody {
-    searchable: bool,
-}
-
-/// The public listing of this service agent, as the hub keeps it.
-#[derive(Debug, Clone, Eq, PartialEq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HeldListing {
-    pub listed: bool,
-    /// The base64url text of the listing bytes, exactly as the node sent it.
-    pub listing: String,
-    /// The unpadded base64url signature of the endpoint key.
-    pub signature: String,
-    /// Unix time.
-    pub expires_at: u64,
-}
-
-/// One listed service agent from a search or a lookup.
-#[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentRow {
-    /// The full name, such as `law#0042`.
-    pub handle: String,
-    /// The base64url listing text, exactly as the service node sent it.
-    pub listing: String,
-    pub signature: String,
-    pub expires_at: u64,
-    pub online: bool,
-    #[serde(default)]
-    pub contact: bool,
-    /// Only for a contact of this node.
-    #[serde(default)]
-    pub endpoint: Option<String>,
-    /// The full name of the owner's personal agent, when the two linked.
-    #[serde(default)]
-    pub owner: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct AgentRows {
-    agents: Vec<AgentRow>,
-}
-
-/// One personal agent from a lookup or a name search.
-#[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
-pub struct PersonRow {
-    /// The full name, such as `ana#0042`.
-    pub handle: String,
-    #[serde(default)]
-    pub contact: bool,
-    /// Only for a contact of this node.
-    #[serde(default)]
-    pub online: Option<bool>,
-    /// Only for a contact of this node.
-    #[serde(default)]
-    pub endpoint: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct PersonRows {
-    people: Vec<PersonRow>,
-}
-
-/// An owner link or claim between a service agent and the personal agent of
-/// its owner, as one side sees it.
-#[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OwnerLink {
-    pub id: String,
-    /// `personal` or `service`: the side of this node.
-    pub role: String,
-    /// The full name of the service agent.
-    pub service: String,
-    /// The full name of the personal agent.
-    pub personal: String,
-    pub expires_at: u64,
-    pub confirmed: bool,
-    /// For the service side only.
-    #[serde(default)]
-    pub personal_endpoint: Option<String>,
-    /// For the personal side, once the link is active.
-    #[serde(default)]
-    pub service_endpoint: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct OwnerLinks {
-    links: Vec<OwnerLink>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct OwnerClaimBody<'a> {
-    service: &'a str,
-    expires_at: u64,
-    signature: &'a str,
-}
-
-#[derive(Serialize)]
-struct SignatureBody<'a> {
-    signature: &'a str,
-}
-
-#[derive(Deserialize)]
-struct HubInfo {
-    protocol: u64,
-}
-
-#[derive(Serialize)]
-struct InviteBody<'a> {
-    to: &'a str,
-    days: u64,
-}
-
-#[derive(Serialize)]
-struct ApproveBody {
-    days: u64,
-}
-
-#[derive(Serialize)]
-struct BundleBody<'a> {
-    bundle: &'a str,
-}
+use types::{
+    AgentRows, ApproveBody, Blocks, BundleBody, ClaimBody, Contacts, HubInfo,
+    InviteBody, OwnerClaimBody, OwnerLinks, PersonRows, SearchBody, SignatureBody,
+};
 
 #[derive(Clone)]
 pub struct HubClient {
@@ -398,7 +98,7 @@ impl HubClient {
         let client = Client::builder()
             .redirect(Policy::none())
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(MAX_WAIT_SECONDS + 15))
+            .timeout(Duration::from_secs(protocol::MAX_WAIT_SECONDS + 15))
             .build()
             .map_err(|_| HubError::InvalidUrl)?;
         Ok(Self { client, origin, key, protocol: std::sync::Arc::default() })
@@ -581,7 +281,7 @@ impl HubClient {
         wait: Duration,
     ) -> Result<Invites, HubError> {
         let after = after.map(|version| version.to_string());
-        let wait = wait.as_secs().min(MAX_WAIT_SECONDS).to_string();
+        let wait = wait.as_secs().min(protocol::MAX_WAIT_SECONDS).to_string();
         let query = match &after {
             Some(after) => vec![("after", after.as_str()), ("wait", wait.as_str())],
             None => Vec::new(),
@@ -731,7 +431,7 @@ impl HubClient {
         let mut request = self
             .client
             .request(method, url)
-            .header(PROTOCOL_HEADER, PROTOCOL_VERSION)
+            .header(protocol::PROTOCOL_HEADER, protocol::PROTOCOL_VERSION_HEADER)
             .header(protocol::ENDPOINT_HEADER, self.endpoint_id())
             .header(protocol::TIME_HEADER, time)
             .header(
@@ -862,8 +562,8 @@ mod tests {
 
     use super::{
         DEFAULT_HUB_URL, HubError, Invites, NodeHub, Origin, PROTOCOL_HEADER,
-        PROTOCOL_VERSION, Status, parse_origin, protocol, request_url, resolve_url,
-        signed_target, status_error, test_hub::TestHub,
+        PROTOCOL_VERSION_HEADER, Status, parse_origin, protocol, request_url,
+        resolve_url, signed_target, status_error, test_hub::TestHub,
     };
 
     #[test]
@@ -971,7 +671,7 @@ mod tests {
         for request in &requests {
             assert_eq!(
                 request.headers.get(PROTOCOL_HEADER).map(String::as_str),
-                Some(PROTOCOL_VERSION),
+                Some(PROTOCOL_VERSION_HEADER),
                 "{}",
                 request.target
             );
@@ -1085,10 +785,6 @@ mod tests {
                 br#"{"error":"upgrade_required"}"#
             ),
             HubError::OldNode
-        );
-        assert_eq!(
-            status_error(StatusCode::CONFLICT, br#"{"error":"taken"}"#),
-            HubError::Taken
         );
     }
 }

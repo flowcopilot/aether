@@ -7,30 +7,27 @@
 //! bytes with its endpoint key, and the hub returns them exactly as sent, so
 //! a reader can check them against the endpoint that it gets later.
 
-use std::{collections::BTreeSet, str::FromStr, time::Duration};
+use std::time::Duration;
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::{
-    agent_card::{
-        CardSettings, MAX_DESCRIPTION, MAX_SKILL_DESCRIPTION, MAX_SKILL_NAME, MAX_TAG,
-        MAX_TAGS,
-    },
-    untrusted,
+use crate::{agent_card::CardSettings, untrusted};
+
+pub use crate::hub_client::protocol::{
+    MAX_LISTING_BYTES, MAX_LISTING_DAYS, MAX_LISTING_DESCRIPTION as MAX_DESCRIPTION,
+    MAX_LISTING_SKILL_DESCRIPTION as MAX_SKILL_DESCRIPTION,
+    MAX_LISTING_SKILL_ID as MAX_SKILL_ID, MAX_LISTING_SKILL_NAME as MAX_SKILL_NAME,
+    MAX_LISTING_SKILLS as MAX_SKILLS, MAX_LISTING_TAG as MAX_TAG,
+    MAX_LISTING_TAGS as MAX_TAGS,
 };
 
 /// How long a new listing stays on the hub. The hub accepts 30 days at most.
-pub const LISTING_LIFETIME: Duration = Duration::from_hours(30 * 24);
+pub const LISTING_LIFETIME: Duration =
+    Duration::from_hours(MAX_LISTING_DAYS.saturating_mul(24));
 /// A listing with less time left than this is signed again.
 pub const RENEW_BEFORE: Duration = Duration::from_hours(7 * 24);
-/// The most bytes of the listing that the hub keeps.
-pub const MAX_LISTING_BYTES: usize = 8 * 1024;
-/// The most skills of a listing.
-pub const MAX_SKILLS: usize = 5;
-/// The most characters of a skill ID, from `[a-z0-9-]`.
-const MAX_SKILL_ID: usize = 64;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
 pub enum ListingError {
@@ -107,17 +104,21 @@ pub fn listing_bytes(settings: &CardSettings, full_name: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-/// The message that the endpoint key signs.
-fn message(endpoint: &str, expires_at: u64, bytes: &[u8]) -> String {
-    crate::hub_client::protocol::listing_message(endpoint, expires_at, bytes)
+const fn wire_error(error: crate::hub_client::protocol::ListingWireError) -> ListingError {
+    match error {
+        crate::hub_client::protocol::ListingWireError::Invalid => ListingError::Invalid,
+        crate::hub_client::protocol::ListingWireError::Signature => {
+            ListingError::Signature
+        }
+        crate::hub_client::protocol::ListingWireError::Expired => ListingError::Expired,
+    }
 }
 
 /// The signature of `bytes` until `expires_at` by the endpoint `key`, as
 /// unpadded base64url.
 #[must_use]
 pub fn sign(key: &iroh::SecretKey, bytes: &[u8], expires_at: u64) -> String {
-    let message = message(&key.public().to_string(), expires_at, bytes);
-    URL_SAFE_NO_PAD.encode(key.sign(message.as_bytes()).to_bytes())
+    crate::hub_client::protocol::sign_listing(key, bytes, expires_at)
 }
 
 /// Checks that the endpoint `endpoint` signed the listing `text` until
@@ -129,22 +130,10 @@ pub fn verify(
     expires_at: u64,
     at: u64,
 ) -> Result<(), ListingError> {
-    if expires_at <= at {
-        return Err(ListingError::Expired);
-    }
-    let bytes = URL_SAFE_NO_PAD.decode(text).map_err(|_| ListingError::Invalid)?;
-    let signature: [u8; 64] = URL_SAFE_NO_PAD
-        .decode(signature)
-        .ok()
-        .and_then(|signature| signature.try_into().ok())
-        .ok_or(ListingError::Signature)?;
-    let key =
-        iroh::PublicKey::from_str(endpoint).map_err(|_| ListingError::Signature)?;
-    key.verify(
-        message(endpoint, expires_at, &bytes).as_bytes(),
-        &iroh::Signature::from_bytes(&signature),
+    crate::hub_client::protocol::verify_listing(
+        text, signature, endpoint, expires_at, at,
     )
-    .map_err(|_| ListingError::Signature)
+    .map_err(wire_error)
 }
 
 /// How long an owner link lasts. The hub accepts 365 days at most.
@@ -201,21 +190,11 @@ pub fn sign_owner_confirm(
 /// The listing in `text` (base64url) when it passes the hub's rules and
 /// names `handle`. Every text is cleaned for display.
 pub fn parse(text: &str, handle: &str) -> Result<Listing, ListingError> {
+    crate::hub_client::protocol::listing_bytes_match_handle(text, handle)
+        .map_err(wire_error)?;
     let bytes = URL_SAFE_NO_PAD.decode(text).map_err(|_| ListingError::Invalid)?;
-    if bytes.len() > MAX_LISTING_BYTES {
-        return Err(ListingError::Invalid);
-    }
     let raw: RawListing =
         serde_json::from_slice(&bytes).map_err(|_| ListingError::Invalid)?;
-    let ids: BTreeSet<&String> = raw.skills.iter().map(|skill| &skill.id).collect();
-    let valid = raw.name == handle
-        && valid_text(&raw.description, MAX_DESCRIPTION)
-        && (1..=MAX_SKILLS).contains(&raw.skills.len())
-        && ids.len() == raw.skills.len()
-        && raw.skills.iter().all(valid_skill);
-    if !valid {
-        return Err(ListingError::Invalid);
-    }
     Ok(Listing {
         name: untrusted::single_line(&raw.name, raw.name.chars().count()),
         description: untrusted::single_line(&raw.description, MAX_DESCRIPTION),
@@ -237,34 +216,6 @@ pub fn parse(text: &str, handle: &str) -> Result<Listing, ListingError> {
             })
             .collect(),
     })
-}
-
-fn valid_skill(skill: &RawSkill) -> bool {
-    let tags: BTreeSet<&String> = skill.tags.iter().collect();
-    valid_word(&skill.id, MAX_SKILL_ID)
-        && valid_text(&skill.name, MAX_SKILL_NAME)
-        && valid_text(&skill.description, MAX_SKILL_DESCRIPTION)
-        && (1..=MAX_TAGS).contains(&skill.tags.len())
-        && tags.len() == skill.tags.len()
-        && skill.tags.iter().all(|tag| valid_word(tag, MAX_TAG))
-}
-
-/// The hub's text rule: 1 to `max_chars` characters, not only white space,
-/// with no control, bidirectional or zero-width characters.
-fn valid_text(text: &str, max_chars: usize) -> bool {
-    !text.trim().is_empty()
-        && text.chars().count() <= max_chars
-        && !text
-            .chars()
-            .any(|character| character.is_control() || untrusted::hidden(character))
-}
-
-/// 1 to `max` characters of `[a-z0-9-]`.
-fn valid_word(word: &str, max: usize) -> bool {
-    (1..=max).contains(&word.len())
-        && word.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
-        })
 }
 
 pub mod settings {
