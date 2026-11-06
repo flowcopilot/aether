@@ -1,66 +1,279 @@
-/* Audioflow's reading palette and self-hosted type, adapted for Aether. */
+/* The Aether node UI's design system, mapped onto Starlight.
+
+   The token values are copied from `crates/aether/styles.css`; the rules
+   behind them are in the root `DESIGN.md`. Keep the two in step: change a
+   value there first, then here. Starlight puts its dark scheme on `:root`
+   and its light scheme on `[data-theme='light']`, so the node UI's `.dark`
+   values sit on `:root` below. */
+
 :root {
-  --sl-font: 'Bricolage Grotesque Variable', system-ui, sans-serif;
-  --sl-font-mono: 'IBM Plex Mono', ui-monospace, monospace;
-  --sl-color-accent-low: #2a1a46;
-  --sl-color-accent: #9a6fd6;
-  --sl-color-accent-high: #e3d6f7;
-  --sl-color-white: #ffffff;
-  --sl-color-gray-1: #ece9f5;
-  --sl-color-gray-2: #c9c3dc;
-  --sl-color-gray-3: #9890b3;
-  --sl-color-gray-4: #5f5880;
-  --sl-color-gray-5: #3b3457;
-  --sl-color-gray-6: #261f3d;
-  --sl-color-black: #19132b;
-  --sl-content-width: 48rem;
-  --sl-text-body: 1.0625rem;
+  --canvas: oklch(0.16 0.008 165);
+  --background: oklch(0.2 0.009 165);
+  --foreground: oklch(0.94 0.005 165);
+  --muted: oklch(0.27 0.01 165);
+  --muted-foreground: oklch(0.72 0.012 165);
+  --primary: oklch(0.78 0.08 185);
+  --primary-foreground: oklch(0.2 0.03 185);
+  --success: oklch(0.78 0.1 160);
+  --warning: oklch(0.8 0.1 80);
+  --destructive: oklch(0.68 0.17 28);
+  --border: oklch(0.32 0.01 165);
+  --ring: oklch(0.78 0.08 185);
+  --shadow-xs: 0 1px 2px oklch(0 0 0 / 35%);
+  --shadow-sm: 0 1px 2px oklch(0 0 0 / 35%), 0 8px 24px -6px oklch(0 0 0 / 40%);
 }
+
 :root[data-theme='light'] {
-  --sl-color-accent-low: #e7defa;
-  --sl-color-accent: #5b2e91;
-  --sl-color-accent-high: #2e1452;
-  --sl-color-white: #1d1638;
-  --sl-color-gray-1: #2b2447;
-  --sl-color-gray-2: #463e66;
-  --sl-color-gray-3: #6b6585;
-  --sl-color-gray-4: #9e98b5;
-  --sl-color-gray-5: #d9d4ea;
-  --sl-color-gray-6: #ebe8f5;
-  --sl-color-gray-7: #f6f4fc;
-  --sl-color-black: #fbfaff;
+  --canvas: oklch(0.955 0.005 165);
+  --background: oklch(0.99 0.002 165);
+  --foreground: oklch(0.22 0.008 165);
+  --muted: oklch(0.925 0.007 165);
+  --muted-foreground: oklch(0.46 0.012 165);
+  --primary: oklch(0.43 0.07 185);
+  --primary-foreground: oklch(0.99 0.004 185);
+  --success: oklch(0.46 0.09 160);
+  --warning: oklch(0.47 0.09 80);
+  --destructive: oklch(0.48 0.15 30);
+  --border: oklch(0.88 0.008 165);
+  --ring: oklch(0.43 0.07 185);
+  --shadow-xs: 0 1px 2px oklch(0.25 0.02 165 / 10%);
+  --shadow-sm: 0 1px 2px oklch(0.25 0.02 165 / 7%), 0 8px 24px -6px oklch(0.25 0.02 165 / 12%);
 }
-.site-title { font-weight: 750; letter-spacing: -0.02em; }
-.sl-markdown-content :is(h1, h2, h3), h1#_top {
+
+/* Starlight's scale, in terms of the tokens. These resolve per element, so
+   one mapping serves both schemes. */
+:root,
+:root[data-theme='light'] {
+  --sl-font: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --sl-font-mono: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+
+  --sl-color-white: var(--foreground);
+  --sl-color-gray-1: var(--foreground);
+  --sl-color-gray-2: color-mix(in oklch, var(--foreground) 82%, var(--muted-foreground));
+  --sl-color-gray-3: var(--muted-foreground);
+  --sl-color-gray-4: color-mix(in oklch, var(--muted-foreground) 55%, var(--border));
+  --sl-color-gray-5: var(--border);
+  --sl-color-gray-6: var(--muted);
+  --sl-color-gray-7: var(--background);
+  --sl-color-black: var(--canvas);
+
+  --sl-color-accent-low: color-mix(in oklch, var(--primary) 14%, var(--background));
+  --sl-color-accent: var(--primary);
+  --sl-color-accent-high: var(--primary);
+
+  --sl-color-text: var(--foreground);
+  --sl-color-text-accent: var(--primary);
+  --sl-color-text-invert: var(--primary-foreground);
+  --sl-color-bg: var(--canvas);
+  --sl-color-bg-nav: var(--canvas);
+  --sl-color-bg-sidebar: var(--canvas);
+  --sl-color-bg-inline-code: var(--muted);
+  --sl-color-bg-accent: var(--primary);
+  --sl-color-hairline-light: var(--border);
+  --sl-color-hairline: var(--border);
+  --sl-color-hairline-shade: var(--border);
+  --sl-color-backdrop-overlay: oklch(0.16 0.008 165 / 60%);
+
+  /* Status colours only: note is the accent, tip and success share a hue. */
+  --sl-color-blue: var(--primary);
+  --sl-color-blue-high: var(--primary);
+  --sl-color-blue-low: color-mix(in oklch, var(--primary) 8%, var(--background));
+  --sl-color-purple: var(--success);
+  --sl-color-purple-high: var(--success);
+  --sl-color-purple-low: color-mix(in oklch, var(--success) 8%, var(--background));
+  --sl-color-green: var(--success);
+  --sl-color-green-high: var(--success);
+  --sl-color-green-low: color-mix(in oklch, var(--success) 8%, var(--background));
+  --sl-color-orange: var(--warning);
+  --sl-color-orange-high: var(--warning);
+  --sl-color-orange-low: color-mix(in oklch, var(--warning) 8%, var(--background));
+  --sl-color-red: var(--destructive);
+  --sl-color-red-high: var(--destructive);
+  --sl-color-red-low: color-mix(in oklch, var(--destructive) 8%, var(--background));
+
+  --sl-shadow-sm: var(--shadow-xs);
+  --sl-shadow-md: var(--shadow-sm);
+  --sl-shadow-lg: var(--shadow-sm);
+
+  /* Headline 30px, section 20px, title 18px, card title 15px; prose at the
+     16px lead size, code at 13px. */
+  --sl-text-body: 1rem;
+  --sl-text-code: 0.8125rem;
+  --sl-text-h1: 1.875rem;
+  --sl-text-h2: 1.25rem;
+  --sl-text-h3: 1.125rem;
+  --sl-text-h4: 0.9375rem;
+  --sl-text-h5: 0.875rem;
+  --sl-line-height: 1.7;
+  --sl-line-height-headings: 1.4;
+  --sl-content-width: 46rem;
+}
+
+body {
+  background: var(--canvas);
+  color: var(--foreground);
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+::selection { background: color-mix(in oklch, var(--primary) 22%, transparent); }
+
+:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
+/* The header: "Aether" in 16px semibold, led by the hub mark. */
+.site-title {
+  gap: 0.625rem;
+  color: var(--foreground);
+  font-size: 1rem;
+  font-weight: 600;
   letter-spacing: -0.025em;
-  font-stretch: 88%;
+}
+.site-title::before {
+  content: '';
+  flex: none;
+  width: 14px;
+  height: 14px;
+  box-sizing: border-box;
+  border: 1px solid color-mix(in oklch, var(--foreground) 50%, transparent);
+  border-radius: 9999px;
+  background:
+    conic-gradient(#5ad1ff, #9b7bff, #ff6bd5, #ffb86b, #7effa8, #5ad1ff) content-box;
+  padding: 2px;
+}
+
+/* Search is an outline control: paper, hairline, 8px, control shadow. */
+site-search button[data-open-modal] {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--background);
+  box-shadow: var(--shadow-xs);
+  color: var(--muted-foreground);
+}
+site-search button[data-open-modal]:hover {
+  background: color-mix(in oklch, var(--foreground) 5%, var(--background));
+  color: var(--foreground);
+}
+
+/* The current page reads like the node UI's current tab: ink text and a
+   2px teal line, not a filled block. */
+.sidebar-content a {
+  border-radius: 6px;
+  font-size: 0.875rem;
+}
+.sidebar-content a:hover { background: color-mix(in oklch, var(--foreground) 5%, transparent); }
+.sidebar-content a[aria-current='page'],
+.sidebar-content a[aria-current='page']:hover,
+.sidebar-content a[aria-current='page']:focus {
+  background: color-mix(in oklch, var(--foreground) 5%, transparent);
+  box-shadow: inset 2px 0 0 var(--primary);
+  border-radius: 0 6px 6px 0;
+  color: var(--foreground);
+}
+.sidebar-content .group-label .large {
+  color: var(--muted-foreground);
+  font-size: 0.75rem;
+  font-weight: 500;
+  letter-spacing: 0;
+}
+
+/* Right-hand table of contents. */
+starlight-toc a[aria-current='true'] { color: var(--primary); }
+
+/* Prose. */
+h1#_top {
+  font-size: 1.875rem;
+  line-height: 2.25rem;
+  font-weight: 600;
+  letter-spacing: -0.025em;
   text-wrap: balance;
 }
-h1#_top { font-size: clamp(2.5rem, 5vw, 3.5rem); line-height: 1.1; }
-.sl-markdown-content { line-height: 1.75; }
-.sl-markdown-content p { max-width: 72ch; }
-.sl-markdown-content a { text-underline-offset: 0.2em; }
-.sl-markdown-content table { font-size: 0.9375rem; }
-::selection { background: var(--sl-color-accent-low); color: var(--sl-color-accent-high); }
-:focus-visible { outline: 2px solid var(--sl-color-accent); outline-offset: 4px; }
-* { scrollbar-color: var(--sl-color-gray-4) var(--sl-color-black); }
-.aether-paths { margin-block: 1.75rem 3rem; border-block: 1px solid var(--sl-color-hairline); }
-.sl-markdown-content .aether-path {
+.sl-markdown-content :is(h2, h3, h4) {
+  color: var(--foreground);
+  font-weight: 600;
+  text-wrap: balance;
+}
+.sl-markdown-content :is(h2, h3) { letter-spacing: -0.025em; }
+.sl-markdown-content h2 { margin-top: 2.5rem; }
+.sl-markdown-content p { max-width: 70ch; text-wrap: pretty; }
+.sl-markdown-content a:not(:where(.not-content *)) {
+  color: var(--primary);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.sl-markdown-content a:not(:where(.not-content *)):hover { text-decoration-thickness: 2px; }
+.sl-markdown-content :not(pre) > code {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.0625rem 0.3125rem;
+  font-size: 0.8125rem;
+}
+.sl-markdown-content :is(th, td) { border-bottom: 1px solid var(--border); }
+.sl-markdown-content table { font-size: 0.875rem; }
+.sl-markdown-content th {
+  color: var(--muted-foreground);
+  font-size: 0.75rem;
+  font-weight: 500;
+}
+.sl-markdown-content hr { border-color: var(--border); }
+
+/* Asides are tinted boxes on the hairline, like the node UI's notices. */
+.starlight-aside {
+  border: 1px solid color-mix(in oklch, var(--sl-color-asides-border) 35%, var(--border));
+  border-radius: 8px;
+  color: var(--foreground);
+}
+.starlight-aside__title { font-size: 0.875rem; }
+
+/* The router on the home page: two cards, the node UI's raised surface. */
+.aether-paths {
   display: grid;
-  grid-template-columns: 1fr 1.2fr;
-  gap: 0.75rem 2rem;
-  padding: 1.75rem 0;
-  color: inherit;
+  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+  gap: 1rem;
+  margin-block: 1.5rem 2.5rem;
+}
+.sl-markdown-content .aether-paths > * { margin: 0; }
+.sl-markdown-content a.aether-path {
+  display: flex;
+  flex-direction: column;
+  gap: 0.375rem;
+  padding: 1.5rem;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--background);
+  box-shadow: var(--shadow-sm);
+  color: var(--foreground);
   text-decoration: none;
 }
-.aether-path + .aether-path { border-top: 1px solid var(--sl-color-hairline); }
-.aether-path-title { font-size: 1.5rem; font-weight: 650; line-height: 1.25; letter-spacing: -0.02em; }
-.aether-path-body { color: var(--sl-color-gray-2); font-size: 1rem; }
-.aether-path:hover .aether-path-title { color: var(--sl-color-accent-high); text-decoration: underline; text-underline-offset: 0.2em; }
-@media (max-width: 40rem) {
-  .sl-markdown-content .aether-path { grid-template-columns: 1fr; gap: 0.75rem; }
-  h1#_top { font-size: 2.5rem; }
+.aether-path-title {
+  font-size: 1.125rem;
+  font-weight: 600;
+  line-height: 1.75rem;
+  text-wrap: pretty;
 }
+.aether-path-body {
+  color: var(--muted-foreground);
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+}
+.sl-markdown-content a.aether-path:hover {
+  border-color: color-mix(in oklch, var(--primary) 45%, var(--border));
+}
+.sl-markdown-content a.aether-path:hover .aether-path-title {
+  color: var(--primary);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+* { scrollbar-color: var(--border) transparent; }
+
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after { scroll-behavior: auto !important; animation: none !important; transition: none !important; }
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    animation: none !important;
+    transition: none !important;
+  }
 }

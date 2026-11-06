@@ -36,12 +36,25 @@ export default defineConfig({
     description: 'Share your personal AI agent with people you trust.',
     favicon: '/favicon.svg',
     social: [{ icon: 'github', label: 'GitHub', href: repo }],
-    customCss: [
-      '@fontsource-variable/bricolage-grotesque/standard.css',
-      '@fontsource/ibm-plex-mono/400.css',
-      '@fontsource/ibm-plex-mono/600.css',
-      './src/styles/docs.css',
-    ],
+    customCss: ['./src/styles/docs.css'],
+    // Code blocks take the node UI's tokens: 8px corners and a hairline.
+    expressiveCode: {
+      styleOverrides: {
+        borderRadius: '8px',
+        borderColor: 'var(--border)',
+        codeFontFamily: 'var(--__sl-font-mono)',
+        codeFontSize: '0.8125rem',
+        uiFontFamily: 'var(--__sl-font)',
+        frames: {
+          shadowColor: 'transparent',
+          editorActiveTabIndicatorTopColor: 'var(--primary)',
+          terminalTitlebarBackground: 'var(--muted)',
+          terminalTitlebarBorderBottomColor: 'var(--border)',
+          editorTabBarBackground: 'var(--muted)',
+          editorTabBarBorderBottomColor: 'var(--border)',
+        },
+      },
+    },
     sidebar: [
       { label: 'Start here', items: [
         { label: 'Introduction', slug: '' },
