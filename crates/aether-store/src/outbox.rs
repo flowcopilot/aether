@@ -403,7 +403,7 @@ mod tests {
     }
 
     fn sent_store(name: &str) -> (NodeStore, PathBuf) {
-        let database = path(name);
+        let database = crate::test_support::path(name);
         (NodeStore::open(&database).expect("store must open"), database)
     }
 

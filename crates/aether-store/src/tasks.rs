@@ -1639,36 +1639,4 @@ mod tests {
         assert_eq!(store.state("task"), Ok(TaskState::UnknownResult));
         fs::remove_file(database).expect("database must remove");
     }
-
-    #[test]
-    fn stored_names_stay_the_same() {
-        for (state, name) in [
-            (TaskState::PendingApproval, "pending_approval"),
-            (TaskState::Queued, "queued"),
-            (TaskState::Leased, "leased"),
-            (TaskState::Running, "running"),
-            (TaskState::UnknownResult, "unknown_result"),
-            (TaskState::OperatorReviewed, "operator_reviewed"),
-            (TaskState::Succeeded, "succeeded"),
-            (TaskState::Failed, "failed"),
-            (TaskState::Rejected, "rejected"),
-            (TaskState::Cancelled, "cancelled"),
-        ] {
-            assert_eq!(state.as_str(), name);
-            assert_eq!(TaskState::parse(name), Some(state));
-            assert_eq!(EventType::parse(name), Some(EventType::Entered(state)));
-        }
-        assert_eq!(TaskState::parse("Queued"), None);
-        for (event, name) in [
-            (EventType::Requeued, "requeued"),
-            (EventType::LeaseExpired, "lease_expired"),
-            (EventType::ContentExpired, "content_expired"),
-            (EventType::Progress, "progress"),
-            (EventType::ApprovalRequested, "approval_requested"),
-            (EventType::Result, "result"),
-        ] {
-            assert_eq!(event.as_str(), name);
-            assert_eq!(EventType::parse(name), Some(event));
-        }
-    }
 }

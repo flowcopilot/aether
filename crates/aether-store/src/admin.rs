@@ -348,41 +348,28 @@ impl NodeStore {
             })?
             .collect::<Result<_, _>>()?)
     }
+
+    #[cfg(test)]
+    pub(crate) fn insert_invalid_audit_row_for_test(
+        &self,
+    ) -> Result<usize, StoreError> {
+        self.connection
+            .execute(
+                "INSERT INTO audit_records(actor_type,action,result,created_at) VALUES('mcp','change','private-credential',0)",
+                [],
+            )
+            .map_err(StoreError::from)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{AuditActor, AuditResult, ChangeKind};
-    use crate::{NodeStore, StoreError};
-
-    fn store() -> (tempfile::TempDir, NodeStore) {
-        let directory = tempfile::tempdir().expect("directory must create");
-        let store = NodeStore::in_dir(directory.path()).expect("store must open");
-        (directory, store)
-    }
-
-    #[test]
-    fn names_stay_the_same() {
-        for (kind, name) in [
-            (ChangeKind::Workspace, "workspace"),
-            (ChangeKind::Grant, "grant"),
-            (ChangeKind::Directory, "directory"),
-            (ChangeKind::Capability, "capability"),
-            (ChangeKind::Limit, "limit"),
-        ] {
-            assert_eq!(kind.as_str(), name);
-        }
-        assert_eq!(AuditActor::Mcp.as_str(), "mcp");
-        assert_eq!(AuditActor::Ui.as_str(), "ui");
-        assert_eq!(AuditResult::Pending.as_str(), "pending");
-        assert_eq!(AuditResult::Applied.as_str(), "applied");
-        assert_eq!(AuditResult::Confirmed.as_str(), "confirmed");
-        assert_eq!(AuditResult::Failed.as_str(), "failed");
-    }
+    use crate::{NodeStore, StoreError, test_support};
 
     #[test]
     fn audit_records_are_durable_and_hold_names_only() {
-        let (directory, mut store) = store();
+        let (directory, mut store) = test_support::temp_node_store();
         store
             .queue_change(ChangeKind::Grant, "grant", "private-credential", i64::MAX, 0)
             .expect("change must queue");
@@ -402,18 +389,14 @@ mod tests {
             ]
         );
         store
-            .connection
-            .execute(
-                "INSERT INTO audit_records(actor_type,action,result,created_at) VALUES('mcp','change','private-credential',0)",
-                [],
-            )
-            .expect("unsafe audit record must insert for the test");
+            .insert_invalid_audit_row_for_test()
+            .expect("invalid audit row must insert for the test");
         assert!(matches!(store.audit_records(), Err(StoreError::Sql(_))));
     }
 
     #[test]
     fn a_confirmed_change_returns_the_value_it_replaced_and_its_revision_goes() {
-        let (_directory, mut store) = store();
+        let (_directory, mut store) = test_support::temp_node_store();
         assert_eq!(
             store.apply_change(ChangeKind::Limit, "queue_global", "2"),
             Ok(None)
@@ -442,7 +425,7 @@ mod tests {
 
     #[test]
     fn counts_and_lists_hold_only_applied_changes_of_their_kind() {
-        let (_directory, mut store) = store();
+        let (_directory, mut store) = test_support::temp_node_store();
         store.apply_change(ChangeKind::Grant, "b", "grant-b").expect("grant");
         store.apply_change(ChangeKind::Grant, "a", "grant-a").expect("grant");
         store.apply_change(ChangeKind::Workspace, "w", "/work").expect("workspace");

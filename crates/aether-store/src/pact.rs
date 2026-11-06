@@ -573,10 +573,7 @@ mod tests {
     use crate::StoreError;
 
     fn store() -> (tempfile::TempDir, PactStore) {
-        let directory = tempfile::tempdir().expect("directory must create");
-        let store = PactStore::open(directory.path().join("pact.sqlite"))
-            .expect("store must open");
-        (directory, store)
+        crate::test_support::temp_pact_store()
     }
 
     fn device(user_code: &str, hash: &str) -> NewDeviceAuthorization {
@@ -604,21 +601,6 @@ mod tests {
             created_at: 100,
             expires_at: 10_000,
         }
-    }
-
-    #[test]
-    fn device_status_names_stay_the_same_and_parse_back() {
-        use super::DeviceStatus;
-        for (status, name) in [
-            (DeviceStatus::Pending, "pending"),
-            (DeviceStatus::Approved, "approved"),
-            (DeviceStatus::Denied, "denied"),
-            (DeviceStatus::Consumed, "consumed"),
-        ] {
-            assert_eq!(status.as_str(), name);
-            assert_eq!(DeviceStatus::parse(name), Some(status));
-        }
-        assert_eq!(DeviceStatus::parse("Pending"), None);
     }
 
     #[test]

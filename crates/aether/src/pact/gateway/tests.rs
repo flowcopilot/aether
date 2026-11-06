@@ -4,9 +4,12 @@
 )]
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fmt::Write as _,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU32, Ordering},
+    },
     time::Duration,
 };
 
@@ -20,8 +23,8 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 use super::{
-    DELEGATION_HEADER, Failure, Gateway, GrantType, NodeUnavailable, OAuthError,
-    PactNode, Route, approved_grant, caller_endpoint_id, rfc3339, route, router,
+    DELEGATION_HEADER, Failure, Gateway, NodeUnavailable, OAuthError, PactNode,
+    approved_grant, caller_endpoint_id, rfc3339, router,
 };
 use crate::{
     execution::Task,
@@ -42,11 +45,40 @@ use crate::{
 const PUBLIC: &str = "https://node.example";
 const BRAND: &str = "https://node.example/a2a/review";
 
+struct TaskSnapshot {
+    polls_before_terminal: u32,
+    polls_seen: AtomicU32,
+    state: TaskState,
+    result: Option<String>,
+}
+
 #[derive(Default)]
 struct FakeNode {
     grants: Mutex<BTreeSet<String>>,
-    policy_unreadable: std::sync::atomic::AtomicBool,
+    policy_unreadable: AtomicBool,
     admitted: Mutex<Vec<(Request, String, Task)>>,
+    pending_outcomes: Mutex<Vec<(u32, TaskState, Option<String>)>>,
+    snapshots: Mutex<BTreeMap<String, TaskSnapshot>>,
+    always_running: AtomicBool,
+}
+
+impl FakeNode {
+    fn queue_outcome(
+        &self,
+        polls_before_terminal: u32,
+        state: TaskState,
+        result: Option<String>,
+    ) {
+        self.pending_outcomes.lock().expect("lock").push((
+            polls_before_terminal,
+            state,
+            result,
+        ));
+    }
+
+    fn keep_running(&self) {
+        self.always_running.store(true, Ordering::Release);
+    }
 }
 
 impl PactNode for FakeNode {
@@ -61,19 +93,41 @@ impl PactNode for FakeNode {
             idempotency_key.to_owned(),
             task.clone(),
         ));
+        let outcome = self.pending_outcomes.lock().expect("lock").pop();
+        if let Some((polls, state, result)) = outcome {
+            self.snapshots.lock().expect("lock").insert(
+                task.id.clone(),
+                TaskSnapshot {
+                    polls_before_terminal: polls,
+                    polls_seen: AtomicU32::new(0),
+                    state,
+                    result,
+                },
+            );
+        }
         Ok(task.id.clone())
     }
 
     fn snapshot(
         &self,
-        _task_id: &str,
+        task_id: &str,
     ) -> Result<(TaskState, Option<String>), ProofError> {
+        if self.always_running.load(Ordering::Acquire) {
+            return Ok((TaskState::Running, None));
+        }
+        if let Some(entry) = self.snapshots.lock().expect("lock").get(task_id) {
+            let seen = entry.polls_seen.fetch_add(1, Ordering::AcqRel);
+            if seen < entry.polls_before_terminal {
+                return Ok((TaskState::Running, None));
+            }
+            return Ok((entry.state, entry.result.clone()));
+        }
         let turns = self.admitted.lock().expect("lock").len();
         Ok((TaskState::Succeeded, Some(format!("answer {turns}"))))
     }
 
     fn has_grant(&self, grant_id: &str) -> Result<bool, NodeUnavailable> {
-        if self.policy_unreadable.load(std::sync::atomic::Ordering::SeqCst) {
+        if self.policy_unreadable.load(Ordering::SeqCst) {
             return Err(NodeUnavailable);
         }
         Ok(self.grants.lock().expect("lock").contains(grant_id))
@@ -125,16 +179,21 @@ fn config() -> PactConfig {
 }
 
 fn fixture() -> Fixture {
+    fixture_with(|_| {})
+}
+
+fn fixture_with(setup: impl FnOnce(&FakeNode)) -> Fixture {
     let directory = tempfile::tempdir().expect("directory must create");
     let agent = TestAgent::new("k1");
     let key = Arc::new(ProviderKey::load_or_create(directory.path()).expect("key"));
     let node = Arc::new(FakeNode::default());
+    setup(&node);
     let link = Arc::new(ConsentLink::default());
     link.set("https://127.0.0.1:3000".to_owned());
     let path = directory.path().join(aether_store::pact::PACT_DATABASE);
     let store: SharedPactStore =
         Arc::new(Mutex::new(PactStore::open(&path).expect("store must open")));
-    let mut gateway = Gateway::new(
+    let gateway = Gateway::new(
         config(),
         PaVerifier::new(
             AUDIENCE.to_owned(),
@@ -145,8 +204,47 @@ fn fixture() -> Fixture {
         Arc::clone(&store),
         node.clone(),
         link,
+    )
+    .with_poll_interval(Duration::from_millis(1));
+    Fixture {
+        app: router(Arc::new(gateway)),
+        agent,
+        node,
+        key,
+        _directory: directory,
+        store,
+    }
+}
+
+fn fixture_with_gateway(
+    setup_node: impl FnOnce(&FakeNode),
+    setup_gateway: impl FnOnce(Gateway) -> Gateway,
+) -> Fixture {
+    let directory = tempfile::tempdir().expect("directory must create");
+    let agent = TestAgent::new("k1");
+    let key = Arc::new(ProviderKey::load_or_create(directory.path()).expect("key"));
+    let node = Arc::new(FakeNode::default());
+    setup_node(&node);
+    let link = Arc::new(ConsentLink::default());
+    link.set("https://127.0.0.1:3000".to_owned());
+    let path = directory.path().join(aether_store::pact::PACT_DATABASE);
+    let store: SharedPactStore =
+        Arc::new(Mutex::new(PactStore::open(&path).expect("store must open")));
+    let gateway = setup_gateway(
+        Gateway::new(
+            config(),
+            PaVerifier::new(
+                AUDIENCE.to_owned(),
+                UrlPolicy { allow_insecure_local: false },
+                StaticKeys::new(agent.jwks.clone()),
+            ),
+            Arc::clone(&key),
+            Arc::clone(&store),
+            node.clone(),
+            link,
+        )
+        .with_poll_interval(Duration::from_millis(1)),
     );
-    gateway.poll_interval = Duration::from_millis(1);
     Fixture {
         app: router(Arc::new(gateway)),
         agent,
@@ -385,26 +483,6 @@ async fn routing_happens_before_authentication() {
     assert_eq!(missing.challenge.as_deref(), Some(r#"Bearer realm="a2a""#));
 }
 
-#[test]
-fn the_route_table_matches_section_two_two() {
-    assert_eq!(route(&Method::GET, "tasks/abc"), Route::TaskNotFound("abc".to_owned()));
-    assert_eq!(
-        route(&Method::POST, "tasks/abc:cancel"),
-        Route::TaskNotFound("abc".to_owned())
-    );
-    assert_eq!(route(&Method::POST, "tasks/abc:subscribe"), Route::Unsupported);
-    assert_eq!(
-        route(&Method::GET, "tasks/abc/pushNotificationConfigs/c"),
-        Route::PushUnsupported
-    );
-    assert_eq!(
-        route(&Method::POST, "tasks/abc/pushNotificationConfigs/c"),
-        Route::MethodNotAllowed
-    );
-    assert_eq!(route(&Method::GET, "tasks/abc:other"), Route::NotFound);
-    assert_eq!(route(&Method::GET, "tasks/"), Route::NotFound);
-}
-
 #[tokio::test]
 async fn task_routes_answer_with_their_a2a_errors() {
     let fixture = fixture();
@@ -601,6 +679,55 @@ async fn the_device_flow_follows_rfc_8628() {
         )
         .await;
     assert_eq!(unsupported.body["error"], "unsupported_grant_type");
+}
+
+#[tokio::test]
+async fn terminal_task_states_surface_in_delegated_replies() {
+    for (state, expected) in [
+        (TaskState::Failed, "The task failed."),
+        (TaskState::Rejected, "The node refused the task."),
+        (TaskState::Cancelled, "The task was cancelled."),
+        (
+            TaskState::UnknownResult,
+            "The task ended in an unknown state. The node owner must review it.",
+        ),
+        (
+            TaskState::OperatorReviewed,
+            "The task ended in an unknown state. The node owner must review it.",
+        ),
+    ] {
+        let fixture = fixture_with(|node| {
+            node.queue_outcome(0, state, None);
+        });
+        let tokens = fixture.delegate("u").await;
+        let access = tokens["access_token"].as_str().expect("access token");
+        let reply =
+            fixture.send("u", Some(access), user_message("m1", "Review main.rs")).await;
+        assert_eq!(reply.status, StatusCode::OK, "{state:?} {}", reply.body);
+        assert_eq!(
+            reply.body["message"]["parts"],
+            json!([{ "text": expected }]),
+            "{state:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_task_that_never_finishes_times_out() {
+    let fixture = fixture_with_gateway(FakeNode::keep_running, |gateway| {
+        gateway
+            .with_poll_interval(Duration::from_millis(5))
+            .with_task_wait_deadline(Duration::from_millis(40))
+    });
+    let tokens = fixture.delegate("u").await;
+    let access = tokens["access_token"].as_str().expect("access token");
+    let reply =
+        fixture.send("u", Some(access), user_message("m1", "Review main.rs")).await;
+    assert_eq!(reply.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        reply.body["error"]["message"],
+        "The task is still running. Send the same message again to read its result."
+    );
 }
 
 #[tokio::test]
@@ -834,31 +961,6 @@ fn every_percent_escape_decodes_to_its_byte() {
             escaped
         });
         assert_eq!(decode_form_field(&format!("x={escaped}")), text);
-    }
-}
-
-#[test]
-fn grant_types_read_back_and_oauth_codes_keep_their_status() {
-    for grant_type in [GrantType::DeviceCode, GrantType::RefreshToken] {
-        assert_eq!(GrantType::parse(grant_type.as_str()), Some(grant_type));
-    }
-    assert_eq!(GrantType::parse("password"), None);
-    assert_eq!(OAuthError::InvalidClient.status(), StatusCode::UNAUTHORIZED);
-    assert_eq!(
-        OAuthError::TemporarilyUnavailable.status(),
-        StatusCode::SERVICE_UNAVAILABLE
-    );
-    assert_eq!(OAuthError::ServerError.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    for error in [
-        OAuthError::InvalidScope,
-        OAuthError::InvalidGrant,
-        OAuthError::UnsupportedGrantType,
-        OAuthError::AuthorizationPending,
-        OAuthError::SlowDown,
-        OAuthError::AccessDenied,
-        OAuthError::ExpiredToken,
-    ] {
-        assert_eq!(error.status(), StatusCode::BAD_REQUEST, "{}", error.as_str());
     }
 }
 

@@ -352,12 +352,16 @@ mod tests {
         build, build_node_environment, load_or_create_service, prepare_codex_home,
     };
     use crate::agent::codex::MAX_ENVIRONMENT;
-    use crate::identity::{
-        AccessInput, GrantInput, GrantRecord, encode_grant, sign_access, signed_grant,
-    };
     use crate::{
         identity::NODE_ISSUER,
         policy::{AgentAdapter, PolicyError, PolicyFile},
+    };
+    use crate::{
+        identity::{
+            AccessInput, GrantInput, GrantRecord, encode_grant, sign_access,
+            signed_grant,
+        },
+        test_support::{signed_test_grant, test_signing_key},
     };
 
     #[test]
@@ -366,25 +370,11 @@ mod tests {
         let root = directory.path().to_path_buf();
         let workspace = root.join("workspace");
         fs::create_dir_all(&workspace).expect("workspace must create");
-        let key = SigningKey::from_bytes(&[9; 32]);
-        let now = SystemTime::now();
-        let grant = signed_grant(
-            &key,
-            GrantInput {
-                id: GrantId::new("grant"),
-                issuer_agent_id: AgentId::new("issuer"),
-                subject_agent_id: AgentId::new("caller"),
-                subject_endpoint_id: EndpointId::new("endpoint"),
-                scope_id: ScopeId::new("direct"),
-                capabilities: BTreeSet::from([CapabilityId::new("review")]),
-                workspaces: BTreeSet::from([WorkspaceId::new("workspace")]),
-                access_mode: AccessMode::ReadOnly,
-                approval_rule: ApprovalRule::Automatic,
-                issued_at: now - Duration::from_secs(1),
-                expires_at: now + Duration::from_secs(60),
-                nonce: [3; 32],
-            },
-        );
+        let key = test_signing_key();
+        let grant = signed_test_grant(&key, |input| {
+            input.subject_agent_id = AgentId::new("caller");
+            input.nonce = [3; 32];
+        });
         let policy = policy(&workspace, &grant, key.verifying_key().to_bytes());
         let path = root.join("policy.json");
         fs::write(&path, serde_json::to_vec(&policy).expect("policy must encode"))
@@ -432,13 +422,24 @@ mod tests {
             .expect("policy must encode"),
         )
         .expect("policy must write");
-        let Err(error) = load_service(&path, &path, "codex".into()) else {
+        let Err(error) =
+            load_or_create_service(&path, directory.path(), "codex".into(), None)
+        else {
             panic!("policy with a string limit must fail");
         };
         assert_eq!(error, PolicyError::InvalidField("maxContextTokens".to_owned()));
     }
 
-    /// The node of the policy file at `path`, read again on each call.
+    #[test]
+    fn the_public_loader_imports_a_policy_file_on_first_start() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let root = directory.path().to_path_buf();
+        let path = minimal_policy(&root);
+        let service = load_or_create_service(&path, &root, "codex".into(), None)
+            .expect("policy must load through the public path");
+        assert!(service.queue_limits().expect("limits").global >= 1);
+    }
+
     fn load_service(
         path: &std::path::Path,
         data_dir: &std::path::Path,
@@ -451,7 +452,11 @@ mod tests {
         PolicyError,
     > {
         let source = fs::read(path).map_err(|_| PolicyError::Read)?;
-        build(PolicyFile::parse(&source)?, data_dir, codex_binary)
+        build(
+            PolicyFile::parse(&source)?,
+            data_dir,
+            codex_binary,
+        )
     }
 
     fn minimal_policy(root: &std::path::Path) -> PathBuf {
