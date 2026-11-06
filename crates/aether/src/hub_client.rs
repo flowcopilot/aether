@@ -384,14 +384,6 @@ impl HubClient {
         self.send(Method::DELETE, &path, &[], None).await.map(drop)
     }
 
-    pub async fn delete_contact(&self, endpoint: &str) -> Result<(), HubError> {
-        let endpoint =
-            endpoint.parse::<iroh::EndpointId>().map_err(|_| HubError::Invalid)?;
-        self.require_protocol_2().await?;
-        let path = format!("/v1/contacts/{endpoint}");
-        self.send(Method::DELETE, &path, &[], None).await.map(drop)
-    }
-
     pub async fn remove(&self, id: &str) -> Result<(), HubError> {
         let path = format!("/v1/invites/{}", segment(id)?);
         self.send(Method::DELETE, &path, &[], None).await.map(drop)
