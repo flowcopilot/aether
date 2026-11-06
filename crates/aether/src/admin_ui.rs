@@ -675,7 +675,7 @@ impl PageContext {
         self
     }
 
-    pub(super) fn agent_name(&self) -> String {
+    pub(crate) fn agent_name(&self) -> String {
         crate::invites::invite_agent_name(&self.data_dir, self.name.as_deref())
     }
 
