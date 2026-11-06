@@ -40,12 +40,12 @@ impl NodeHub {
     pub fn client(&self) -> Result<Option<HubClient>, HubError> {
         let stored =
             setting::<Hub>(&self.data_dir).map_err(|_| HubError::Unexpected)?;
-        if let Some(client) = self
+        let cached = self
             .slot()
             .as_ref()
             .filter(|state| state.stored == stored)
-            .and_then(|state| state.client.clone())
-        {
+            .and_then(|state| state.client.clone());
+        if let Some(client) = cached {
             return Ok(Some(client));
         }
         let client = match resolve_url(self.flag.as_deref(), stored.clone()) {

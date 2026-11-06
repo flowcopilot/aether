@@ -1,14 +1,11 @@
 use std::{path::PathBuf, process::ExitCode, sync::Arc};
 
-use hex::FromHex;
-
 use usage_rs::{Args, Cli, Subcommands};
 mod node_commands;
 use node_commands::{
-    cache_directory_record, cache_wire_directory_record, cached_directory_record,
-    cached_managed_member, managed_request, read_authorization, read_directory_record,
-    read_verifying_key, run_direct, run_directory, run_invite, run_managed, run_record,
-    sync_directory,
+    cache_directory_record, cached_directory_record, managed_request,
+    read_authorization, read_verifying_key, run_direct, run_directory, run_invite,
+    run_managed, run_record,
 };
 
 #[derive(Cli)]
@@ -951,7 +948,7 @@ mod tests {
         time::{Duration, SystemTime},
     };
 
-    use super::{
+    use super::node_commands::{
         cache_directory_record, cached_directory_record, cached_managed_member,
     };
     use aether::node_runtime::{
