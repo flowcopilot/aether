@@ -1,7 +1,7 @@
 defmodule AetherHub.Features.ListingsTest do
-  use AetherHub.Feature, file: "listings.feature", async: true
+  use AetherHub.Feature, file: "listings.feature", async: false
 
-  alias AetherHub.{Listing, Repo}
+  alias AetherHub.{Clock, Listing, Repo}
 
   defp search(asker, q),
     do: AetherHub.HubRequests.field(asker, "/v1/agents", "agents", "q=#{q}", nil)
@@ -19,19 +19,19 @@ defmodule AetherHub.Features.ListingsTest do
       )
 
   defp bad_signature(service, bytes, "that expired a second ago"),
-    do: put_listing(service, bytes, expires_at: System.system_time(:second) - 1)
+    do: put_listing(service, bytes, expires_at: Clock.now() - 1)
 
   defp bad_signature(service, bytes, "that expires in 31 days"),
-    do: put_listing(service, bytes, expires_at: System.system_time(:second) + 31 * 86_400)
+    do: put_listing(service, bytes, expires_at: Clock.now() + 31 * 86_400)
 
   defp bad_signature(service, bytes, "that expires in 30 days"),
-    do: put_listing(service, bytes, expires_at: System.system_time(:second) + 30 * 86_400)
+    do: put_listing(service, bytes, expires_at: Clock.now() + 30 * 86_400)
 
   defp bad_signature(service, bytes, "marked as not listed"),
     do: put_listing(service, bytes, body: %{"listed" => false})
 
   defp bad_signature(service, bytes, "with the expiry as text"),
-    do: put_listing(service, bytes, body: %{"expiresAt" => "#{System.system_time(:second) + 60}"})
+    do: put_listing(service, bytes, body: %{"expiresAt" => "#{Clock.now() + 60}"})
 
   defp bad_signature(service, bytes, "with a malformed signature"),
     do: put_listing(service, bytes, body: %{"signature" => "AAAA"})
@@ -215,9 +215,11 @@ defmodule AetherHub.Features.ListingsTest do
   defstep ~r/^(?<name>\w+) has a listing that a person can find$/, %{name: name}, state do
     service = actor(state, name)
     marker = unique_name()
+
     assert put_listing(service, listing(service, description: marker)).status == 200
-    id = Repo.get_by!(Listing, endpoint: service.endpoint).id
     assert [_] = search(claimed_node(), marker)
+    id = Repo.get_by!(Listing, endpoint: service.endpoint).id
+
     {:ok, %{marker: marker, listing_id: id}}
   end
 

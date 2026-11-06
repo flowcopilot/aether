@@ -1,7 +1,7 @@
 defmodule AetherHub.Features.DirectoryTest do
   use AetherHub.Feature, file: "directory.feature", async: true
 
-  alias AetherHub.Contract
+  alias AetherHub.{Clock, Contract}
 
   defp public(path, ip \\ unique_ip()), do: public_request(:get, path, ip)
 
@@ -123,7 +123,9 @@ defmodule AetherHub.Features.DirectoryTest do
 
   defstep ~r/^a visitor reads the directory as many times as the limit allows$/, _, _state do
     ip = unique_ip()
-    {limit, _seconds} = AetherHub.RateLimit.limit(:directory_ip)
+    {limit, seconds} = AetherHub.RateLimit.limit(:directory_ip)
+    Clock.set(div(Clock.now(), seconds) * seconds)
+
     {:ok, %{ip: ip, statuses: for(_ <- 1..limit, do: public("/directory.json", ip).status)}}
   end
 
@@ -132,6 +134,7 @@ defmodule AetherHub.Features.DirectoryTest do
   end
 
   defstep ~r/^a visitor from another address reads the directory$/, _, _state do
+    Clock.set(nil)
     {:ok, %{conn: directory()}}
   end
 end

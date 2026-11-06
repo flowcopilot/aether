@@ -27,6 +27,7 @@ config :aether_hub, AetherHub.Repo,
 config :aether_hub,
   port: port,
   start_server: config_env() != :test,
+  schedule_sweep: config_env() != :test,
   # The proxies whose `x-forwarded-for` header names the client, as CIDR
   # ranges. Behind a proxy, set it before the deploy: without it, every
   # client has the proxy's address.

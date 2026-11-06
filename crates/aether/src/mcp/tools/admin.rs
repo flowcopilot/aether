@@ -119,12 +119,23 @@ impl McpServer {
             }),
             Err(_) => return tool_error("the node policy is unavailable"),
         };
-        tool_success(json!({
-            "policy": policy,
-            "relayUrl": crate::settings::setting::<crate::transport::relay::Relay>(data_dir).ok().flatten(),
-            "hubUrl": self.node_hub(data_dir).resolve_url().ok().flatten(),
-            "policyChangesNeedRestart": true,
-        }).to_string())
+        let Ok(relay_url) =
+            crate::settings::setting::<crate::transport::relay::Relay>(data_dir)
+        else {
+            return tool_error("the node relay setting is unavailable");
+        };
+        let Ok(hub_url) = self.node_hub(data_dir).resolve_url() else {
+            return tool_error("the node hub setting is unavailable");
+        };
+        tool_success(
+            json!({
+                "policy": policy,
+                "relayUrl": relay_url,
+                "hubUrl": hub_url,
+                "policyChangesNeedRestart": true,
+            })
+            .to_string(),
+        )
     }
 
     #[tool(
@@ -968,6 +979,17 @@ mod tests {
         assert_eq!(tool.name, "aether.change");
         assert_eq!(tool.input_schema.get("additionalProperties"), Some(&false.into()));
         assert!(tool.input_schema.get("properties").is_some());
+        let variants = tool.input_schema["$defs"]["ChangeRequest"]["oneOf"]
+            .as_array()
+            .expect("each change type must be in the schema");
+        let types: Vec<&str> = variants
+            .iter()
+            .map(|variant| {
+                assert_eq!(variant["additionalProperties"], false);
+                variant["properties"]["type"]["const"].as_str().expect("type tag")
+            })
+            .collect();
+        assert_eq!(types, ["workspace", "grant", "directory", "capability", "limit"]);
         let tool = McpServer::cancel_tool_attr();
         assert_eq!(tool.name, "aether.task.cancel");
         assert_eq!(tool.input_schema.get("additionalProperties"), Some(&false.into()));

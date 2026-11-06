@@ -244,7 +244,7 @@ defmodule AetherHub.HubSteps do
   def seen_at(node, time), do: at(time, fn -> request(node, "GET", "/v1/account") end)
 
   defstep ~r/^(?<who>\w+) was last (?:seen|online) long ago$/, %{who: who}, state do
-    long_ago = System.system_time(:second) - 3_600
+    long_ago = Clock.now() - 3_600
     seen_at(actor(state, who), long_ago)
     {:ok, %{seen_at: long_ago}}
   end

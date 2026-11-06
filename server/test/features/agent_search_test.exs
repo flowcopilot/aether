@@ -1,7 +1,7 @@
 defmodule AetherHub.Features.AgentSearchTest do
   use AetherHub.Feature, file: "agent-search.feature", async: true
 
-  alias AetherHub.Contract
+  alias AetherHub.{Clock, Contract}
 
   # The scenario's own word. Every listing and every search in a scenario has it.
   defp word(state), do: state[:word] || unique_name()
@@ -141,6 +141,8 @@ defmodule AetherHub.Features.AgentSearchTest do
   end
 
   defstep ~r/^the person searches 30 times$/, _, %{asker: asker} do
+    {_limit, seconds} = AetherHub.RateLimit.limit(:search)
+    Clock.set(div(Clock.now(), seconds) * seconds)
     {:ok, %{statuses: for(_ <- 1..30, do: search(asker, "q=law").status)}}
   end
 
