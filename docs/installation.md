@@ -1,7 +1,10 @@
 # Install Aether
 
-Aether runs on Linux and macOS. A host also needs an agent. See
-[Configuration](configuration.md) for agent setup.
+Aether runs on Linux and macOS. A host also needs an agent. Agents installing
+Aether for their user should start with the
+[agent installation router](onboarding/agent.md#choose-your-agent-route)
+for Codex, Claude Code, Hermes Agent, OpenClaw, or Grok Bot. See
+[Configuration](configuration.md) for adapter settings.
 
 The release workflow builds these packages:
 

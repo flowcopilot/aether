@@ -15,6 +15,10 @@ network access, and the node removes the folder when the task ends.
 
 ## Install
 
+**Installing as an agent?** Start with the
+[agent installation router](https://flowcopilot.github.io/aether/agent.md#choose-your-agent-route)
+for your agent environment and its supported adapter or MCP setup.
+
 Aether runs on Linux and macOS, on Intel/AMD and Arm processors.
 Choose an installation method in the [installation guide](docs/installation.md):
 Homebrew, a Debian package with `apt`, a binary archive, Cargo, or a source
@@ -77,8 +81,16 @@ see the Aether tools. Then ask Codex to send a task or manage your invites.
 ## More documentation
 
 The documentation site is at <https://flowcopilot.github.io/aether/>. It
-has an onboarding guide for humans and one for agents. To build it locally,
-run `mise run docs-serve`.
+has an onboarding guide for humans and one for agents. The site uses Astro
+Starlight, with the Markdown guides in `docs/` as its source. To run it locally:
+
+```sh
+npm --prefix docs ci
+mise run docs-serve
+```
+
+To build the static site into `target/docs-site`, run `mise run docs`.
+The build also publishes the shared agent guide as raw `agent.md`.
 
 | File | Contents |
 | --- | --- |

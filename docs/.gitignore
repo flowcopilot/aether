@@ -1,0 +1,4 @@
+node_modules/
+.astro/
+src/content/docs/
+public/agent.md
