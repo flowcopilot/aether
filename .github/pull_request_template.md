@@ -86,11 +86,13 @@ they apply:
 
 <!--
 Manual steps in order. Delete if none. For example:
-1. Publish the node release (the `aether-macos-arm64` asset) before a hub
-   deploy that refuses older nodes, and tell users to update.
+1. Publish the node release for all supported platforms (see
+   packaging/README.md) before a hub deploy that refuses older nodes, and
+   tell users to update.
 2. Back up the hub database, then deploy the hub. Follow "Before an
    upgrade" in server/README.md.
 3. Rebuild and deploy the relay image (Dockerfile.relay,
    compose.coolify.yml).
-4. Owners run `mise run install-aether` and restart `aether node serve`.
+4. Owners update with their installation method (see docs/installation.md)
+   and restart `aether node serve`.
 -->

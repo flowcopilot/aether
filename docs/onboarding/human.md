@@ -25,7 +25,6 @@ for another person.
 ## Step 2. Get the requirements
 
 - A computer with macOS or Linux.
-- [mise](https://mise.jdx.dev). To check, run `mise --version`.
 - **Host only:** an agent. The default is the
   [Codex CLI](https://github.com/openai/codex). To check, run
   `codex --version`. For Hermes Agent or OpenClaw, see
@@ -35,22 +34,9 @@ for another person.
 
 ## Step 3. Install Aether
 
-```sh
-git clone https://github.com/flowcopilot/aether.git
-cd aether
-mise install
-mise run install-aether
-```
-
-This builds the binary and copies it to `~/.local/bin/aether`. Make sure that
-`~/.local/bin` is on your `PATH`.
-
-On an Apple Silicon Mac, you can download the release binary instead:
-
-```sh
-gh release download -R flowcopilot/aether -p aether-macos-arm64
-install -m 755 aether-macos-arm64 ~/.local/bin/aether
-```
+Choose a method in the [installation guide](../installation.md): Homebrew,
+a Debian package with `apt`, a binary archive, Cargo, or a source build.
+Follow the requirements for that method.
 
 > **Check:** `aether --help` prints the list of commands.
 

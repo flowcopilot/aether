@@ -15,34 +15,22 @@ network access, and the node removes the folder when the task ends.
 
 ## Install
 
-You need macOS or Linux, [mise](https://mise.jdx.dev), and an agent: the
-[Codex CLI](https://github.com/openai/codex) (the default),
-[Hermes Agent](integrations/hermes-plugin/README.md) or
-[OpenClaw](integrations/openclaw-plugin/README.md).
+Aether runs on Linux and macOS, on Intel/AMD and Arm processors.
+Choose an installation method in the [installation guide](docs/installation.md):
+Homebrew, a Debian package with `apt`, a binary archive, Cargo, or a source
+build with mise. Binary packages need a release made with the new workflow.
+
+To build and install the current source with Cargo:
 
 ```sh
-git clone https://github.com/flowcopilot/aether.git
-cd aether
-mise install
-mise run install-aether
-```
-
-This builds the release binary and copies it to `~/.local/bin/aether`. Make
-sure that `~/.local/bin` is on your `PATH`, then check the install:
-
-```sh
+cargo install --git https://github.com/flowcopilot/aether.git --locked aether
 aether --help
 ```
 
-On an Apple Silicon Mac, you can download the release binary instead:
-
-```sh
-gh release download -R flowcopilot/aether -p aether-macos-arm64
-install -m 755 aether-macos-arm64 ~/.local/bin/aether
-```
-
-Version 0.2.9 and older cannot connect to a hub that uses the new protocol.
-If the page shows "The hub cannot be reached now", build from source.
+You need Rust 1.98 or later, Git, a C compiler, and CMake for this build.
+A host also needs an agent: the [Codex CLI](https://github.com/openai/codex),
+[Hermes Agent](integrations/hermes-plugin/README.md), or
+[OpenClaw](integrations/openclaw-plugin/README.md).
 
 ## Start your node
 
