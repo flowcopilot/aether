@@ -9,6 +9,7 @@
 
 # Guides
 
+- [Installation](installation.md)
 - [Using Aether](usage.md)
 - [Configuration](configuration.md)
 - [The PACT gateway](pact.md)
