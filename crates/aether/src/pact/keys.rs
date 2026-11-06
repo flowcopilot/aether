@@ -13,7 +13,6 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Serialize, de::DeserializeOwned};
 
-/// The file name of the key in the node's data directory.
 pub const KEY_FILE: &str = "pact-signing.key";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]

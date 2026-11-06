@@ -185,7 +185,6 @@ impl State {
         self.agent.as_ref().expect("a proof node must run")
     }
 
-    /// Runs blocking work with the node, off the scenario task.
     async fn with_node<R, F>(&self, work: F) -> R
     where
         R: Send + 'static,
@@ -246,7 +245,6 @@ fn admit_task(
 }
 
 /// Admits a task as an Iroh caller and polls its state until the task ends.
-/// Returns the final state and, for a success, the result.
 fn submit_and_wait(
     node: &Node,
     request: &Request,
@@ -274,7 +272,6 @@ fn submit_and_wait(
     }
 }
 
-/// The caller's review task `task`, sent with key `key`.
 fn submit_review(node: &Node, claim: &Claim) -> Outcome {
     submit_and_wait(node, &request(&scope("direct")), claim, "key", &task("task"))
 }

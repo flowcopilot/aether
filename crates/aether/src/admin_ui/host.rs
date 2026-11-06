@@ -52,34 +52,23 @@ pub(super) struct NewInvitation {
 /// What the last form on this screen asks the page to show.
 #[derive(Clone, Default)]
 pub(super) struct Notice {
-    /// The invite form refused its input, and why.
     invite_error: String,
-    /// The folder form refused its input, and why.
     workspace_error: String,
-    /// The relay form refused its input, and why.
     relay_error: String,
-    /// The grant whose revocation waits for a second click.
     confirm_revoke: String,
-    /// A hub form refused its input, and why.
     hub_error: String,
-    /// The hub setting form refused its input, and why.
     hub_setting_error: String,
     group_error: String,
-    /// The card form refused its input, and why.
     card_error: String,
-    /// The card was saved.
     card_saved: bool,
-    /// The listing form failed, and why.
     listing_error: String,
 }
 
 impl Notice {
-    /// The notice after a hub form, with its refusals if there are any.
     pub(super) fn hub(error: String, setting_error: String) -> Self {
         Self { hub_error: error, hub_setting_error: setting_error, ..Self::default() }
     }
 
-    /// The notice after the listing form, with its refusal if there is one.
     pub(super) fn listing(error: String) -> Self {
         Self { listing_error: error, ..Self::default() }
     }

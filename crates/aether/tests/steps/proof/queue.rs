@@ -33,7 +33,6 @@ impl fmt::Debug for State {
 }
 
 impl State {
-    /// Runs blocking work with the store, off the scenario task.
     async fn with_store<R, F>(&self, work: F) -> R
     where
         R: Send + 'static,

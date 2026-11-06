@@ -132,7 +132,6 @@ impl HubClient {
             .collect()
     }
 
-    /// The hub's origin, without the final `/`.
     #[must_use]
     pub fn url(&self) -> String {
         self.origin.as_str().trim_end_matches('/').to_owned()
@@ -214,7 +213,6 @@ impl HubClient {
         parse(&self.send(Method::PUT, "/v1/listing", &[], Some(body)).await?)
     }
 
-    /// The listing of this node on the hub, or `None` when it has none.
     pub async fn listing(&self) -> Result<Option<HeldListing>, HubError> {
         self.require_protocol_2().await?;
         match self.send(Method::GET, "/v1/listing", &[], None).await {
@@ -224,13 +222,11 @@ impl HubClient {
         }
     }
 
-    /// Stops the listing of this node.
     pub async fn delete_listing(&self) -> Result<(), HubError> {
         self.require_protocol_2().await?;
         self.send(Method::DELETE, "/v1/listing", &[], None).await.map(drop)
     }
 
-    /// The listed service agents that match the words of `query`.
     pub async fn find_agents(
         &self,
         query: &str,
@@ -244,22 +240,18 @@ impl HubClient {
         parse::<AgentRows>(&body).map(|rows| rows.agents)
     }
 
-    /// The listed service agent with the full name `full_name`.
     pub async fn agent(&self, full_name: &str) -> Result<AgentRow, HubError> {
         let path = name_path("/v1/agents", full_name)?;
         self.require_protocol_2().await?;
         parse(&self.send(Method::GET, &path, &[], None).await?)
     }
 
-    /// The personal agent with the full name `full_name`.
     pub async fn person(&self, full_name: &str) -> Result<PersonRow, HubError> {
         let path = name_path("/v1/people", full_name)?;
         self.require_protocol_2().await?;
         parse(&self.send(Method::GET, &path, &[], None).await?)
     }
 
-    /// The personal agents that opted in to name search and whose name
-    /// starts with `prefix`.
     pub async fn find_people(&self, prefix: &str) -> Result<Vec<PersonRow>, HubError> {
         self.require_protocol_2().await?;
         let body = self.send(Method::GET, "/v1/people", &[("q", prefix)], None).await?;
@@ -307,7 +299,6 @@ impl HubClient {
         parse(&self.send(Method::POST, "/v1/owner-links", &[], Some(body)).await?)
     }
 
-    /// The owner links and claims of this node, on either side.
     pub async fn owner_links(&self) -> Result<Vec<OwnerLink>, HubError> {
         self.require_protocol_2().await?;
         let body = self.send(Method::GET, "/v1/owner-links", &[], None).await?;
@@ -326,7 +317,6 @@ impl HubClient {
         parse(&self.send(Method::POST, &path, &[], Some(body)).await?)
     }
 
-    /// Removes the owner link or claim `id`.
     pub async fn delete_owner_link(&self, id: &str) -> Result<(), HubError> {
         let path = format!("/v1/owner-links/{}", segment(id)?);
         self.require_protocol_2().await?;
@@ -344,7 +334,6 @@ impl HubClient {
         parse(&self.send(Method::POST, "/v1/requests", &[], Some(body)).await?)
     }
 
-    /// The service agent approves the request `id` for `days` days.
     pub async fn approve(&self, id: &str, days: u64) -> Result<Invite, HubError> {
         let path = format!("/v1/invites/{}/approve", segment(id)?);
         self.require_protocol_2().await?;
@@ -369,7 +358,6 @@ impl HubClient {
         parse(&self.send(Method::POST, &path, &[], Some(body)).await?)
     }
 
-    /// The nodes this node is connected with through the hub.
     pub async fn contacts(&self) -> Result<Vec<Contact>, HubError> {
         let body = self.send(Method::GET, "/v1/contacts", &[], None).await?;
         parse::<Contacts>(&body).map(|contacts| contacts.contacts)
@@ -383,14 +371,12 @@ impl HubClient {
         self.send(Method::POST, &path, &[], None).await.map(drop)
     }
 
-    /// The endpoints that this node blocked.
     pub async fn blocks(&self) -> Result<Vec<Block>, HubError> {
         self.require_protocol_2().await?;
         let body = self.send(Method::GET, "/v1/blocks", &[], None).await?;
         parse::<Blocks>(&body).map(|blocks| blocks.blocks)
     }
 
-    /// Removes the block of `endpoint`.
     pub async fn unblock(&self, endpoint: &str) -> Result<(), HubError> {
         let endpoint =
             endpoint.parse::<iroh::EndpointId>().map_err(|_| HubError::Invalid)?;
@@ -399,7 +385,6 @@ impl HubClient {
         self.send(Method::DELETE, &path, &[], None).await.map(drop)
     }
 
-    /// Removes an invite: a decline, a cancel, or the end of a delivery.
     pub async fn remove(&self, id: &str) -> Result<(), HubError> {
         let path = format!("/v1/invites/{}", segment(id)?);
         self.send(Method::DELETE, &path, &[], None).await.map(drop)

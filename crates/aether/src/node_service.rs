@@ -164,7 +164,6 @@ where
         self.node.scope_id_for_kind(kind)
     }
 
-    /// The executor's live workspace path.
     pub fn current_workspace(&self) -> Result<PathBuf, ProofError> {
         self.node.workspace()
     }

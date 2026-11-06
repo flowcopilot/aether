@@ -315,7 +315,6 @@ where
         Ok(())
     }
 
-    /// The executor's live workspace path.
     pub fn workspace(&self) -> Result<PathBuf, ProofError> {
         self.workspace.path().map_err(|_| ProofError::Queue)
     }
@@ -386,7 +385,6 @@ where
         Ok(self.policy.lock().map_err(|_| ProofError::Queue)?.remove_grant(id))
     }
 
-    /// The grants the node admits requests under.
     pub fn grants(&self) -> Result<Vec<aether_core::Grant>, ProofError> {
         Ok(self.policy.lock().map_err(|_| ProofError::Queue)?.grants().to_vec())
     }
@@ -463,7 +461,6 @@ where
         Ok(())
     }
 
-    /// Stores an admitted task in the queue and wakes the scheduler.
     fn enqueue(
         &self,
         request: &Request,

@@ -1115,7 +1115,6 @@ pub(super) struct UnblockForm {
     endpoint: String,
 }
 
-/// Removes a block.
 #[page(POST "/hub/unblock")]
 pub(super) async fn unblock(
     cx: &Cx,
@@ -1235,7 +1234,6 @@ pub(super) async fn hub_url(
     Ok(view! { screen(setting_error: setting_error) })
 }
 
-/// Whether each contact on the hub is online, by endpoint ID, for the
 /// presence dots. Empty without a hub or an answer.
 #[route(GET "/hub/presence")]
 pub(super) async fn presence(cx: &Cx) -> TopcoatResult<impl IntoResponse> {

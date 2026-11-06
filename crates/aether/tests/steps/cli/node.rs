@@ -21,13 +21,9 @@ const EXPIRED_TASK_ID: &str = "00000000-0000-4000-8000-000000000042";
 
 #[derive(Debug, Default)]
 pub struct State {
-    /// The `HOME` of the node.
     home: Option<PathBuf>,
-    /// The owner's Codex login file.
     owner_auth: Option<PathBuf>,
-    /// The port that the node reports for peers.
     port: Option<u16>,
-    /// The URL of the owner page.
     owner_page: Option<String>,
     /// An old `policy.json` and the node data directory that imports it.
     policy_file: Option<PathBuf>,

@@ -25,24 +25,18 @@ use crate::common::{ServerProcess, aether_command, read_event};
 
 #[derive(Debug, Default)]
 pub struct State {
-    /// The temporary directory that holds every file of the scenario.
     root: Option<TempDir>,
-    /// The output of the last command that ran to completion.
     output: Option<Output>,
     /// A running `node serve` or `node admin`.
     node: Option<Process>,
     /// A running control service.
     control: Option<Control>,
-    /// The state of the node feature files.
     node_files: node::State,
-    /// The state of the direct contact and record feature files.
     contacts: contacts::State,
-    /// The state of the directory and managed feature files.
     roster: control::State,
 }
 
 impl State {
-    /// The scenario's temporary directory. The first call creates it.
     fn root(&mut self) -> PathBuf {
         self.root
             .get_or_insert_with(|| tempfile::tempdir().expect("directory must create"))
@@ -151,14 +145,12 @@ impl Control {
     }
 }
 
-/// Runs `command` to completion off the scenario task.
 async fn run(mut command: Command) -> Output {
     tokio::task::spawn_blocking(move || command.output().expect("aether must start"))
         .await
         .expect("command task must finish")
 }
 
-/// Runs `blocking` off the scenario task, for store and file work.
 async fn blocking<T: Send + 'static>(
     blocking: impl FnOnce() -> T + Send + 'static,
 ) -> T {

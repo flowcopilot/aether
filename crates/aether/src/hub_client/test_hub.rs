@@ -68,7 +68,6 @@ pub struct HubState {
     /// Handle by endpoint ID.
     pub accounts: BTreeMap<String, String>,
     pub kinds: BTreeMap<String, AgentKind>,
-    /// The personal agents that name search finds.
     pub searchable: BTreeSet<String>,
     /// (owner, blocked) endpoint pairs.
     pub blocks: BTreeSet<(String, String)>,
@@ -78,9 +77,7 @@ pub struct HubState {
     pub invites: Vec<TestInvite>,
     /// (owner, contact) endpoint pairs.
     pub contacts: BTreeSet<(String, String)>,
-    /// The endpoints that count as online.
     pub online: BTreeSet<String>,
-    /// The listing of each service agent, as the hub returns it.
     pub listings: BTreeMap<String, Value>,
     pub owner_links: Vec<TestOwnerLink>,
     pub requests: Vec<Recorded>,

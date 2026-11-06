@@ -329,15 +329,12 @@ pub trait LiveNode: Send + Sync {
     /// path — see `NodeService::approved_workspace`.
     fn apply_workspace(&self, id: &str, path: &str) -> Result<(), AdminError>;
 
-    /// The workspace path.
     fn workspace(&self) -> Option<String>;
 
     fn apply_grant(&self, id: &str, grant: &str) -> Result<(), AdminError>;
 
-    /// Removes a grant, by id.
     fn revoke_grant(&self, id: &str) -> Result<(), AdminError>;
 
-    /// The grants the node admits requests under.
     fn grants(&self) -> Vec<aether_core::Grant>;
 
     /// Triggers a real publish/renew of the node's already-configured,
@@ -587,7 +584,6 @@ impl Administration {
         result
     }
 
-    /// Applies later changes to `live`, the running node.
     pub fn set_live(&mut self, live: Arc<dyn LiveNode>) {
         self.live = Some(live);
     }
@@ -739,10 +735,6 @@ impl Administration {
     }
 
     fn confirm_pending(&mut self, id: &str) -> Result<(), AdminError> {
-        // Fetched regardless of expiry so `confirm_pending_change` below is
-        // the single place that classifies "expired" versus "never existed"
-        // — a change type is still needed to apply an expired one live and
-        // report a specific `Expired` error rather than a generic one.
         let pending = self.store.pending_change_ignoring_expiry(id).map_err(
             |error| match error {
                 StoreError::NotFound => AdminError::ConfirmationRequired,
@@ -775,14 +767,11 @@ impl Administration {
         }
     }
 
-    /// The running node's workspace path; none without a running node.
     #[must_use]
     pub fn current_workspace(&self) -> Option<String> {
         self.live.as_ref().and_then(|live| live.workspace())
     }
 
-    /// The grants the running node admits requests under; empty without a
-    /// running node.
     #[must_use]
     pub fn grants(&self) -> Vec<aether_core::Grant> {
         self.live.as_ref().map_or_else(Vec::new, |live| live.grants())

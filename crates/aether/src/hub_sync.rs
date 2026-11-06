@@ -12,7 +12,6 @@ use crate::{
     hub_client::{Invite, Origin, Role, Status},
 };
 
-/// What the host does with one hub row.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum HostStep {
     /// Nothing now: the row is not ready, or this page never sent it.
@@ -82,7 +81,6 @@ pub fn host_step(
     }
 }
 
-/// What the caller does with one hub row.
 #[derive(Debug, Clone)]
 pub enum CallerStep {
     /// Nothing: the row has no line for this node yet.
