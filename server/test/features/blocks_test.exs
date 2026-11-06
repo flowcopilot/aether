@@ -7,20 +7,10 @@ defmodule AetherHub.Features.BlocksTest do
 
   defp invite_id(%{invite_id: id}), do: id
 
-  defstep ~r/^(?<who>\w+) invites (?<other>\w+)$/, %{who: who, other: other}, state do
-    conn = invite(actor(state, who), actor(state, other))
-    answers = state |> Map.get(:answers, %{}) |> Map.put(who, conn)
-    {:ok, %{conn: conn, answers: answers}}
-  end
-
   defstep ~r/^(?<who>\w+) invited (?<other>\w+)$/, %{who: who, other: other}, state do
     conn = invite(actor(state, who), actor(state, other))
     assert conn.status == 201
     {:ok, %{invite_id: json(conn)["id"]}}
-  end
-
-  defstep ~r/^(?<who>\w+) has no invites$/, %{who: who}, state do
-    assert invites(actor(state, who))["invites"] == []
   end
 
   defstep ~r/^the answer to (?<blocked>\w+) looks like the answer to (?<other>\w+)$/,
@@ -105,6 +95,12 @@ defmodule AetherHub.Features.BlocksTest do
   defstep ~r/^(?<who>\w+) unblocks (?<other>\w+)$/, %{who: who, other: other}, state do
     conn = request(actor(state, who), "DELETE", "/v1/blocks/#{actor(state, other).endpoint}")
     {:ok, %{conn: conn}}
+  end
+
+  defstep ~r/^(?<who>\w+) unblocks (?<target>a key that is bad)$/,
+          %{who: who, target: _target},
+          state do
+    {:ok, %{conn: request(actor(state, who), "DELETE", "/v1/blocks/not-an-endpoint")}}
   end
 
   defstep ~r/^(?<who>\w+) has blocked the key of (?<other>\w+)$/,

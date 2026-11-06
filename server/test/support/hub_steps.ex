@@ -9,9 +9,9 @@ defmodule AetherHub.HubSteps do
   import ExUnit.Assertions
   import AetherHub.TestClient
 
-  alias AetherHub.{Clock, Sweeper}
+  alias AetherHub.{Clock, Contract, Sweeper}
 
-  @bundle "aether-invite:signed-line"
+  @bundle Contract.get(["limits", "invitePrefix"]) <> "signed-line"
 
   ## Actors
 
@@ -118,8 +118,27 @@ defmodule AetherHub.HubSteps do
   def invite(from, to),
     do: request(from, "POST", "/v1/invites", %{"to" => to.handle, "days" => 7})
 
+  defstep ~r/^(?<who>\w+) invites (?<other>\w+)$/, %{who: who, other: other}, state do
+    conn = invite(actor(state, who), actor(state, other))
+    answers = state |> Map.get(:answers, %{}) |> Map.put(who, conn)
+
+    {:ok,
+     %{
+       conn: conn,
+       answers: answers,
+       invite_id: if(conn.status == 201, do: json(conn)["id"])
+     }}
+  end
+
+  defstep ~r/^(?<who>\w+) has no invites$/, %{who: who}, state do
+    assert invites(actor(state, who))["invites"] == []
+  end
+
   @doc "The invite list of `node`, decoded."
   def invites(node), do: json(request(node, "GET", "/v1/invites"))
+
+  @doc "GET `path` with an optional query map or string."
+  def http_get(node, path, query \\ nil), do: AetherHub.HubRequests.get(node, path, query)
 
   @doc "The contact list of `node`. It asserts that the hub answers 200."
   def contacts(node) do

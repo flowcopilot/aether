@@ -6,7 +6,7 @@ defmodule AetherHub.Features.AgentSearchTest do
   # The scenario's own word. Every listing and every search in a scenario has it.
   defp word(state), do: state[:word] || unique_name()
 
-  defp search(asker, query), do: request(asker, "GET", "/v1/agents?" <> query)
+  defp search(asker, query), do: http_get(asker, "/v1/agents", query)
 
   defp searcher(_state, "a person"), do: claimed_node()
   defp searcher(state, name), do: actor(state, name)

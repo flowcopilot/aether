@@ -7,7 +7,7 @@ defmodule AetherHub.Features.AccessRequestsTest do
     request(requester, "POST", "/v1/requests", %{"to" => service.handle, "days" => days})
   end
 
-  defp list(node), do: json(request(node, "GET", "/v1/invites"))
+  defp list(node), do: json(http_get(node, "/v1/invites"))
 
   defp requests(node), do: list(node)["invites"]
 

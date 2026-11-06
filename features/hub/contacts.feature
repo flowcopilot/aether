@@ -50,6 +50,11 @@ Feature: Contacts
     When alice removes bob from her contacts
     Then the hub answers 404 with the error "not_found"
 
+  Scenario: A node cannot remove a contact with a bad key
+    Given alice has a name
+    When alice removes a contact with a bad key
+    Then the hub answers 400
+
   Scenario: A node without an account has no contact list
     Given zed is a new node
     When zed reads his contacts

@@ -3,7 +3,8 @@ defmodule AetherHub.Features.ListingsTest do
 
   alias AetherHub.{Listing, Repo}
 
-  defp search(asker, q), do: json(request(asker, "GET", "/v1/agents?q=#{q}"))["agents"]
+  defp search(asker, q),
+    do: AetherHub.HubRequests.field(asker, "/v1/agents", "agents", "q=#{q}", nil)
 
   defp search_rows(id),
     do: Repo.query!("SELECT COUNT(*) FROM listing_search WHERE rowid = ?1", [id]).rows
