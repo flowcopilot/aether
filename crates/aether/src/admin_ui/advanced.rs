@@ -187,11 +187,11 @@ pub(super) async fn dashboard(
                             </div>
                             <div class="flex flex-col gap-1.5">
                                 label(attrs: attributes! { for="queue_global" }, "Max waiting tasks")
-                                input(attrs: attributes! { id="queue_global" name="queue_global" type="number" min="1" required="" value=(policy.queue_global.to_string()) })
+                                input(attrs: attributes! { id="queue_global" name="queue_global" type="number" min="1" required="" value=(policy.queue.get(aether_core::limits::QueueLimitId::Global).to_string()) })
                             </div>
                             <div class="flex flex-col gap-1.5">
                                 label(attrs: attributes! { for="queue_per_peer" }, "Max waiting tasks per person")
-                                input(attrs: attributes! { id="queue_per_peer" name="queue_per_peer" type="number" min="1" required="" value=(policy.queue_per_peer.to_string()) })
+                                input(attrs: attributes! { id="queue_per_peer" name="queue_per_peer" type="number" min="1" required="" value=(policy.queue.get(aether_core::limits::QueueLimitId::PerPeer).to_string()) })
                             </div>
                         </div>
                         button(variant: ButtonVariant::Primary, attrs: attributes! { type="submit" class="w-fit" }, "Save task policy")
@@ -354,8 +354,10 @@ pub(super) async fn save_policy(
         workspace: PathBuf::from(form.workspace),
         max_context_tokens: form.max_context_tokens,
         max_seconds: form.max_seconds,
-        queue_global: form.queue_global,
-        queue_per_peer: form.queue_per_peer,
+        queue: crate::policy::QueuePolicyLimits::new(
+            form.queue_global,
+            form.queue_per_peer,
+        ),
     };
     app_context::<SharedAdministration>(cx)
         .lock()

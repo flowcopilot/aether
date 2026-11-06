@@ -39,6 +39,8 @@ pub enum ConsentError {
     Refused,
     #[error("the decision cannot be stored")]
     Store,
+    #[error("the grant was applied but could not be rolled back")]
+    RollbackFailed,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -148,7 +150,9 @@ impl PactConsent {
             at,
         );
         if self.store().approve_device(&device.user_code, &record, at).is_err() {
-            let _ = grants.revoke_signed_grant(&grant_id);
+            if grants.revoke_signed_grant(&grant_id).is_err() {
+                return Err(ConsentError::RollbackFailed);
+            }
             return Err(ConsentError::NotPending);
         }
         Ok(granted)

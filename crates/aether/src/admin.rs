@@ -335,7 +335,7 @@ pub trait LiveNode: Send + Sync {
 
     fn revoke_grant(&self, id: &str) -> Result<(), AdminError>;
 
-    fn grants(&self) -> Vec<aether_core::Grant>;
+    fn grants(&self) -> Result<Vec<aether_core::Grant>, AdminError>;
 
     /// Triggers a real publish/renew of the node's already-configured,
     /// already-pinned directory record. The node itself is responsible for
@@ -517,13 +517,14 @@ pub mod test_support {
             self.change(format!("revoke {id}"))
         }
 
-        fn grants(&self) -> Vec<aether_core::Grant> {
+        fn grants(&self) -> Result<Vec<aether_core::Grant>, AdminError> {
             let revoked = self.revoked();
-            self.granted()
+            Ok(self
+                .granted()
                 .iter()
                 .filter_map(|grant| crate::identity::decode_grant(grant).ok())
                 .filter(|grant| !revoked.iter().any(|id| id == grant.id.as_str()))
-                .collect()
+                .collect())
         }
 
         fn renew_directory(&self, url: &str) -> Result<(), AdminError> {
@@ -772,9 +773,11 @@ impl Administration {
         self.live.as_ref().and_then(|live| live.workspace())
     }
 
-    #[must_use]
-    pub fn grants(&self) -> Vec<aether_core::Grant> {
-        self.live.as_ref().map_or_else(Vec::new, |live| live.grants())
+    pub fn grants(&self) -> Result<Vec<aether_core::Grant>, AdminError> {
+        match self.live.as_ref() {
+            Some(live) => live.grants(),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// Revokes grant `id` for the local operator. The stored copy goes, a

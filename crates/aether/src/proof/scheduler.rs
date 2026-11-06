@@ -167,7 +167,7 @@ where
 
     fn prepare_execution(&self) -> Result<Option<ExecutionBundle>, ProofError> {
         let _dispatch_guard =
-            self.dispatch_serial.lock().map_err(|_| ProofError::Queue)?;
+            self.dispatch_serial.lock().map_err(|_| ProofError::Internal)?;
         let execution_id = Uuid::new_v4().to_string();
         let leased = self.store.call({
             let execution_id = execution_id.clone();

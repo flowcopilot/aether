@@ -263,7 +263,7 @@ fn submit_and_wait(
             | TaskState::Running => {
                 // A task that never ends fails the scenario with this error.
                 if Instant::now() >= deadline {
-                    return Err(ProofError::Queue);
+                    return Err(ProofError::Internal);
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }

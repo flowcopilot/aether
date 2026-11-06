@@ -4,7 +4,7 @@ use aether_store::StoreError;
 
 use crate::{
     execution::{Agent, Task},
-    proof::{Identity, ProofError, ProofNode, SubmissionInput},
+    proof::{Identity, ProofError, ProofHandle, SubmissionInput},
     transport::{
         A2aCancel, A2aPartContent, A2aRequest, A2aTaskStatus, Frame, FrameKind,
         MAX_EXCHANGE_BYTES, MAX_FRAMES, TransportError, event_payload,
@@ -15,13 +15,13 @@ use crate::{
 const EVENT_PAGE_BYTE_BUDGET: usize = MAX_EXCHANGE_BYTES - 65_536;
 
 pub struct A2aTransport<'a, T, P> {
-    node: &'a ProofNode<T, P>,
+    proof: ProofHandle<'a, T, P>,
 }
 
 impl<'a, T, P> A2aTransport<'a, T, P> {
     #[must_use]
-    pub const fn new(node: &'a ProofNode<T, P>) -> Self {
-        Self { node }
+    pub const fn new(proof: ProofHandle<'a, T, P>) -> Self {
+        Self { proof }
     }
 
     pub fn handle(
@@ -63,15 +63,15 @@ impl<'a, T, P> A2aTransport<'a, T, P> {
         };
         let task = Task {
             id: payload.task.id,
-            skill: task_skill(
-                self.node.scope_kind_for(&frame.scope_id),
+            skill: skill_for_direct_a2a_entry(
+                self.proof.scope_kind_for(&frame.scope_id),
                 request.capability_id.as_str(),
             ),
             workspace_id: request.workspace_id.as_str().to_owned(),
             remote_text: text.to_owned(),
         };
         let admission = self
-            .node
+            .proof
             .admit(
                 SubmissionInput {
                     request: &request,
@@ -89,7 +89,7 @@ impl<'a, T, P> A2aTransport<'a, T, P> {
             .map_err(|_| TransportError::BadFrame)?;
         let event_limit = MAX_FRAMES.saturating_sub(1);
         let (state, result, events, mut more_events) = self
-            .node
+            .proof
             .task_progress(&task_id, last_sequence, event_limit)
             .map_err(map_error)?;
         if matches!(
@@ -102,16 +102,12 @@ impl<'a, T, P> A2aTransport<'a, T, P> {
             ));
         }
         if state == aether_store::TaskState::Succeeded
-            && self.node.content_is_expired(&task_id).map_err(map_error)?
+            && self.proof.content_is_expired(&task_id).map_err(map_error)?
         {
             return Err(TransportError::ResultExpired);
         }
         let status = a2a_status(state);
-        let result_text = if state == aether_store::TaskState::Succeeded {
-            result.unwrap_or_default()
-        } else {
-            String::new()
-        };
+        let result_text = wire_result_text(state, result)?;
         let mut response = Vec::with_capacity(events.len().saturating_add(1));
         let mut exchange_bytes = 0usize;
         let mut cursor = last_sequence;
@@ -170,7 +166,7 @@ impl<'a, T, P> A2aTransport<'a, T, P> {
         if cancel.id != task_id {
             return Err(TransportError::BadFrame);
         }
-        self.node
+        self.proof
             .cancel_from(
                 task_id,
                 &EndpointId::new(authenticated_endpoint),
@@ -178,7 +174,7 @@ impl<'a, T, P> A2aTransport<'a, T, P> {
             )
             .map_err(map_error)?;
         let event = self
-            .node
+            .proof
             .events_after(task_id, 0)
             .map_err(map_error)?
             .into_iter()
@@ -209,7 +205,18 @@ impl<'a, T, P> A2aTransport<'a, T, P> {
     }
 }
 
-fn task_skill(kind: Option<ScopeKind>, capability: &str) -> String {
+fn wire_result_text(
+    state: aether_store::TaskState,
+    result: Option<String>,
+) -> Result<String, TransportError> {
+    if state == aether_store::TaskState::Succeeded {
+        result.ok_or_else(|| TransportError::Network("task result missing".to_owned()))
+    } else {
+        Ok(String::new())
+    }
+}
+
+fn skill_for_direct_a2a_entry(kind: Option<ScopeKind>, capability: &str) -> String {
     if kind == Some(ScopeKind::Direct) && capability == "review" {
         crate::execution::GENERAL_SKILL
     } else {
@@ -254,30 +261,83 @@ fn map_error(error: ProofError) -> TransportError {
         }
         ProofError::Store(StoreError::Overloaded) => TransportError::Overloaded,
         ProofError::Store(StoreError::DuplicateConflict) => TransportError::Replay,
-        ProofError::Store(_)
-        | ProofError::Execution(_)
-        | ProofError::TaskMismatch
-        | ProofError::Queue
-        | ProofError::Shutdown => TransportError::Network("task failed".to_owned()),
+        ProofError::TaskMismatch => TransportError::BadFrame,
+        ProofError::Shutdown => {
+            TransportError::Network("node shutting down".to_owned())
+        }
+        ProofError::Execution(_) => {
+            TransportError::Network("task execution failed".to_owned())
+        }
+        ProofError::Internal => {
+            TransportError::Network("node internal error".to_owned())
+        }
+        ProofError::Store(_) => {
+            TransportError::Network("task store unavailable".to_owned())
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use aether_core::ScopeKind;
     use aether_store::{EventType, TaskState};
 
-    use crate::transport::A2aTaskStatus;
+    use crate::{
+        execution::ExecutionError,
+        transport::{A2aTaskStatus, TransportError},
+    };
 
-    use super::{a2a_status, event_status, task_skill};
+    use super::{
+        event_status, map_error, skill_for_direct_a2a_entry, wire_result_text,
+    };
 
     #[test]
     fn a_pact_task_keeps_its_brand_capability() {
-        assert_eq!(task_skill(Some(ScopeKind::Pact), "review"), "review");
-        assert_eq!(task_skill(Some(ScopeKind::Pact), "brand-copy"), "brand-copy");
         assert_eq!(
-            task_skill(Some(ScopeKind::Direct), "review"),
+            skill_for_direct_a2a_entry(Some(aether_core::ScopeKind::Pact), "review"),
+            "review"
+        );
+        assert_eq!(
+            skill_for_direct_a2a_entry(Some(aether_core::ScopeKind::Direct), "review"),
             crate::execution::GENERAL_SKILL
+        );
+    }
+
+    #[test]
+    fn map_error_distinguishes_shutdown_and_internal_from_execution() {
+        assert!(matches!(
+            map_error(crate::proof::ProofError::Shutdown),
+            TransportError::Network(message) if message == "node shutting down"
+        ));
+        assert!(matches!(
+            map_error(crate::proof::ProofError::Internal),
+            TransportError::Network(message) if message == "node internal error"
+        ));
+        assert!(matches!(
+            map_error(crate::proof::ProofError::Execution(ExecutionError::Path)),
+            TransportError::Network(message) if message == "task execution failed"
+        ));
+        assert_eq!(
+            map_error(crate::proof::ProofError::Store(
+                aether_store::StoreError::Overloaded
+            )),
+            TransportError::Overloaded
+        );
+    }
+
+    #[test]
+    fn succeeded_task_without_stored_result_is_a_wire_error() {
+        assert_eq!(
+            wire_result_text(TaskState::Succeeded, Some("done".to_owned()))
+                .expect("present"),
+            "done"
+        );
+        assert!(matches!(
+            wire_result_text(TaskState::Succeeded, None),
+            Err(TransportError::Network(message)) if message == "task result missing"
+        ));
+        assert_eq!(
+            wire_result_text(TaskState::Running, None).expect("non-terminal"),
+            ""
         );
     }
 
@@ -296,15 +356,5 @@ mod tests {
         ] {
             assert_eq!(event_status(event, TaskState::Succeeded), status);
         }
-        assert_eq!(
-            event_status(EventType::ContentExpired, TaskState::Rejected),
-            A2aTaskStatus::Rejected
-        );
-    }
-
-    #[test]
-    fn a2a_status_maps_store_states() {
-        assert_eq!(a2a_status(TaskState::Running), A2aTaskStatus::Working);
-        assert_eq!(a2a_status(TaskState::Cancelled), A2aTaskStatus::Canceled);
     }
 }

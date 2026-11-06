@@ -195,25 +195,30 @@ fn handle(
     };
     match request {
         Request::Audit => Response::Audit { entries: administration.audit_entries() },
-        Request::DirectGrants => Response::DirectGrants {
-            grants: administration
-                .grants()
-                .into_iter()
-                .filter(|grant| {
-                    grant.scope_id.as_str() == crate::direct::SCOPE
-                        && grant.expires_at > std::time::SystemTime::now()
-                })
-                .map(|grant| DirectGrantInfo {
-                    id: grant.id.as_str().to_owned(),
-                    agent: grant.subject_agent_id.as_str().to_owned(),
-                    endpoint_id: grant.subject_endpoint_id.as_str().to_owned(),
-                    expires_at: aether_core::time::unix_timestamp(grant.expires_at)
-                        .unwrap_or(i64::MAX),
-                })
-                .collect(),
+        Request::DirectGrants => match administration.grants() {
+            Ok(grants) => Response::DirectGrants {
+                grants: grants
+                    .into_iter()
+                    .filter(|grant| {
+                        grant.scope_id.as_str() == crate::direct::SCOPE
+                            && grant.expires_at > std::time::SystemTime::now()
+                    })
+                    .map(|grant| DirectGrantInfo {
+                        id: grant.id.as_str().to_owned(),
+                        agent: grant.subject_agent_id.as_str().to_owned(),
+                        endpoint_id: grant.subject_endpoint_id.as_str().to_owned(),
+                        expires_at: aether_core::time::unix_timestamp(grant.expires_at)
+                            .unwrap_or(i64::MAX),
+                    })
+                    .collect(),
+            },
+            Err(_) => Response::Error { code: "unavailable".to_owned() },
         },
         Request::RevokeGrant { id } => {
-            if !administration.grants().iter().any(|grant| {
+            let Ok(grants) = administration.grants() else {
+                return Response::Error { code: "unavailable".to_owned() };
+            };
+            if !grants.iter().any(|grant| {
                 grant.id.as_str() == id
                     && grant.scope_id.as_str() == crate::direct::SCOPE
             }) {
@@ -271,10 +276,10 @@ fn handle(
                 settings.max_seconds = value;
             }
             if let Some(value) = queue_global {
-                settings.queue_global = value;
+                settings.queue.set(aether_core::limits::QueueLimitId::Global, value);
             }
             if let Some(value) = queue_per_peer {
-                settings.queue_per_peer = value;
+                settings.queue.set(aether_core::limits::QueueLimitId::PerPeer, value);
             }
             if dry_run {
                 match crate::policy::validate_policy_settings(&settings) {
