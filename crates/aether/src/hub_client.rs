@@ -9,7 +9,14 @@ use std::time::{Duration, SystemTime};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use reqwest::{Client, Method, StatusCode, Url, redirect::Policy};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+pub mod full_name;
+pub mod node_hub;
+pub mod protocol;
+
+pub use self::full_name::{
+    FullName, split_full_name, valid_full_name, valid_name_part,
+};
+pub use self::node_hub::{NodeHub, hub_client as configured_hub_client};
 
 /// The public hub that a node uses when nothing else is set.
 pub const DEFAULT_HUB_URL: &str = "https://aether-hub.tudorandrei.xyz";
@@ -373,53 +380,6 @@ struct BundleBody<'a> {
     bundle: &'a str,
 }
 
-/// One hub client, kept while the resolved hub URL stays the same, so that
-/// each call does not build a new HTTP client.
-#[derive(Clone, Default)]
-pub struct HubCache(std::sync::Arc<std::sync::Mutex<Option<(String, HubClient)>>>);
-
-impl HubCache {
-    /// The client for the hub at `url` that signs with the key in
-    /// `data_dir`. A new URL builds a new client.
-    pub fn client(
-        &self,
-        url: &str,
-        data_dir: &std::path::Path,
-    ) -> Result<HubClient, HubError> {
-        let cached = self
-            .slot()
-            .as_ref()
-            .filter(|(cached, _)| cached == url)
-            .map(|(_, client)| client.clone());
-        if let Some(client) = cached {
-            return Ok(client);
-        }
-        let client = HubClient::for_data_dir(url, data_dir)?;
-        *self.slot() = Some((url.to_owned(), client.clone()));
-        Ok(client)
-    }
-
-    fn slot(&self) -> std::sync::MutexGuard<'_, Option<(String, HubClient)>> {
-        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// [`HubClient::configured`], from the cache.
-    #[must_use]
-    pub fn configured(
-        &self,
-        flag: Option<&str>,
-        data_dir: &std::path::Path,
-    ) -> Option<HubClient> {
-        let url = resolve_url(
-            flag,
-            crate::settings::setting::<crate::hub_client::settings::Hub>(data_dir)
-                .ok()
-                .flatten(),
-        )?;
-        self.client(&url, data_dir).ok()
-    }
-}
-
 #[derive(Clone)]
 pub struct HubClient {
     client: Client,
@@ -454,20 +414,6 @@ impl HubClient {
             .endpoint_key()
             .map_err(|_| HubError::Unexpected)?;
         Self::new(origin, key)
-    }
-
-    /// The hub that a node at `data_dir` uses: `flag` (`--hub-url` or
-    /// `AETHER_HUB_URL`), else the one set on the page, else the public hub.
-    /// `None` when the hub is off.
-    #[must_use]
-    pub fn configured(flag: Option<&str>, data_dir: &std::path::Path) -> Option<Self> {
-        let url = resolve_url(
-            flag,
-            crate::settings::setting::<crate::hub_client::settings::Hub>(data_dir)
-                .ok()
-                .flatten(),
-        )?;
-        Self::for_data_dir(&url, data_dir).ok()
     }
 
     /// Whether each contact is online, by endpoint ID. Empty when the hub
@@ -774,16 +720,24 @@ impl HubClient {
             .ok_or(HubError::Unexpected)?
             .to_string();
         let signature = self.key.sign(
-            signed_message(method.as_str(), &signed_target(&url), &time, &body)
-                .as_bytes(),
+            protocol::hub_request_message(
+                method.as_str(),
+                &signed_target(&url),
+                &time,
+                &body,
+            )
+            .as_bytes(),
         );
         let mut request = self
             .client
             .request(method, url)
             .header(PROTOCOL_HEADER, PROTOCOL_VERSION)
-            .header("x-aether-endpoint", self.endpoint_id())
-            .header("x-aether-time", time)
-            .header("x-aether-signature", URL_SAFE_NO_PAD.encode(signature.to_bytes()));
+            .header(protocol::endpoint_header(), self.endpoint_id())
+            .header(protocol::time_header(), time)
+            .header(
+                protocol::signature_header(),
+                URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+            );
         if !body.is_empty() {
             request = request.header("content-type", "application/json").body(body);
         }
@@ -822,38 +776,23 @@ fn signed_target(url: &Url) -> String {
     }
 }
 
-/// The text that the hub verifies the signature against.
-fn signed_message(
-    method: &str,
-    path_and_query: &str,
-    time: &str,
-    body: &[u8],
-) -> String {
-    format!(
-        "aether-hub/v1\n{method}\n{path_and_query}\n{time}\n{}",
-        hex::encode(Sha256::digest(body))
-    )
-}
-
 fn status_error(status: StatusCode, body: &[u8]) -> HubError {
     #[derive(Deserialize)]
     struct ErrorBody {
         error: String,
     }
     let code = serde_json::from_slice::<ErrorBody>(body).map(|body| body.error).ok();
-    match (status, code.as_deref()) {
-        (StatusCode::UNAUTHORIZED, _) => HubError::Unauthorized,
-        (StatusCode::FORBIDDEN, Some("no_account")) => HubError::NoAccount,
-        (StatusCode::FORBIDDEN, _) => HubError::Forbidden,
-        (StatusCode::NOT_FOUND, _) => HubError::NotFound,
-        (StatusCode::CONFLICT, Some("limit")) => HubError::Limit,
-        (StatusCode::CONFLICT, _) => HubError::Taken,
-        (StatusCode::BAD_REQUEST | StatusCode::PAYLOAD_TOO_LARGE, _) => {
-            HubError::Invalid
-        }
-        (StatusCode::TOO_MANY_REQUESTS, _) => HubError::RateLimited,
-        (StatusCode::UPGRADE_REQUIRED, _) => HubError::OldNode,
-        _ => HubError::Unexpected,
+    match protocol::wire_error(status.as_u16(), code.as_deref()) {
+        protocol::HubWireError::Invalid => HubError::Invalid,
+        protocol::HubWireError::Unauthorized => HubError::Unauthorized,
+        protocol::HubWireError::NoAccount => HubError::NoAccount,
+        protocol::HubWireError::Forbidden => HubError::Forbidden,
+        protocol::HubWireError::NotFound => HubError::NotFound,
+        protocol::HubWireError::Taken => HubError::Taken,
+        protocol::HubWireError::Limit => HubError::Limit,
+        protocol::HubWireError::RateLimited => HubError::RateLimited,
+        protocol::HubWireError::OldNode => HubError::OldNode,
+        protocol::HubWireError::Unexpected => HubError::Unexpected,
     }
 }
 
@@ -910,40 +849,6 @@ fn parse_origin(origin: &str) -> Result<Url, HubError> {
     Ok(url)
 }
 
-/// Whether `name` can be the name part of a hub name:
-/// `^[a-z0-9][a-z0-9._-]{0,31}$`.
-#[must_use]
-pub fn valid_name_part(name: &str) -> bool {
-    let bytes = name.as_bytes();
-    (1..=32).contains(&bytes.len())
-        && bytes
-            .first()
-            .is_some_and(|first| first.is_ascii_lowercase() || first.is_ascii_digit())
-        && bytes.iter().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._-".contains(byte)
-        })
-}
-
-/// The name and the number of a full hub name such as `ana#0042`. The hub
-/// never gives `0000`.
-#[must_use]
-pub fn split_full_name(full_name: &str) -> Option<(&str, u16)> {
-    let (name, number) = full_name.split_once('#')?;
-    (valid_name_part(name)
-        && number.len() == 4
-        && number.bytes().all(|byte| byte.is_ascii_digit()))
-    .then(|| number.parse::<u16>().ok())
-    .flatten()
-    .filter(|number| *number != 0)
-    .map(|number| (name, number))
-}
-
-/// Whether `full_name` is a full hub name such as `ana#0042`.
-#[must_use]
-pub fn valid_full_name(full_name: &str) -> bool {
-    split_full_name(full_name).is_some()
-}
-
 #[cfg(test)]
 pub(crate) mod test_hub;
 
@@ -956,21 +861,22 @@ mod tests {
     use reqwest::StatusCode;
 
     use super::{
-        DEFAULT_HUB_URL, HubError, Invites, Origin, PROTOCOL_HEADER, PROTOCOL_VERSION,
-        Status, parse_origin, request_url, resolve_url, signed_message, signed_target,
-        split_full_name, status_error, test_hub::TestHub, valid_full_name,
-        valid_name_part,
+        DEFAULT_HUB_URL, HubError, Invites, NodeHub, Origin, PROTOCOL_HEADER,
+        PROTOCOL_VERSION, Status, parse_origin, protocol, request_url, resolve_url,
+        signed_target, status_error, test_hub::TestHub,
     };
 
     #[test]
-    fn the_hub_cache_follows_a_changed_url() {
+    fn the_node_hub_cache_follows_a_changed_url() {
+        use crate::hub_client::settings::Hub;
+        use crate::settings::store_setting;
+
         let directory = tempfile::tempdir().expect("directory must create");
-        let cache = super::HubCache::default();
-        for url in ["https://one.example", "https://one.example", "https://two.example"]
-        {
-            let client =
-                cache.client(url, directory.path()).expect("client must build");
-            assert_eq!(client.url(), url);
+        let hub = NodeHub::new(directory.path().to_path_buf(), None);
+        for url in ["https://one.example", "https://two.example"] {
+            store_setting::<Hub>(directory.path(), &Some(url.to_owned()))
+                .expect("store");
+            assert_eq!(hub.client().expect("hub").expect("url").url(), url);
         }
     }
 
@@ -1102,7 +1008,12 @@ mod tests {
     #[test]
     fn the_signed_message_names_the_request_and_hashes_the_body() {
         assert_eq!(
-            signed_message("GET", "/v1/invites?after=3&wait=25", "1760000000", b""),
+            protocol::hub_request_message(
+                "GET",
+                "/v1/invites?after=3&wait=25",
+                "1760000000",
+                b"",
+            ),
             "aether-hub/v1\nGET\n/v1/invites?after=3&wait=25\n1760000000\n\
              e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
@@ -1125,15 +1036,6 @@ mod tests {
                 Some(HubError::InvalidUrl),
                 "{origin}"
             );
-        }
-    }
-
-    #[test]
-    fn a_name_part_is_short_lowercase_and_starts_with_a_letter_or_digit() {
-        assert!(valid_name_part("bob"));
-        assert!(valid_name_part("0x.b_o-b"));
-        for name in ["", "Bob", "-bob", "bob smith", "bob#0042", &"b".repeat(33)] {
-            assert!(!valid_name_part(name), "{name}");
         }
     }
 
@@ -1161,18 +1063,6 @@ mod tests {
                 br#"{"name":"law-firm"}"#.to_vec()
             ]
         );
-    }
-
-    #[test]
-    fn a_full_name_splits_into_name_and_number() {
-        assert_eq!(split_full_name("ana#0042"), Some(("ana", 42)));
-        assert_eq!(split_full_name("a.b-c#9999"), Some(("a.b-c", 9999)));
-        for bad in
-            ["ana", "ana#42", "ana#00042", "ana#0000", "Ana#0042", "ana#00a2", "#0042"]
-        {
-            assert_eq!(split_full_name(bad), None, "{bad}");
-            assert!(!valid_full_name(bad));
-        }
     }
 
     #[test]

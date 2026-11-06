@@ -12,7 +12,6 @@ use std::{collections::BTreeSet, str::FromStr, time::Duration};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sha2::{Digest, Sha256};
 
 use crate::{
     agent_card::{
@@ -110,10 +109,7 @@ pub fn listing_bytes(settings: &CardSettings, full_name: &str) -> Vec<u8> {
 
 /// The message that the endpoint key signs.
 fn message(endpoint: &str, expires_at: u64, bytes: &[u8]) -> String {
-    format!(
-        "aether-listing/v1\n{endpoint}\ntrue\n{expires_at}\n{}",
-        hex::encode(Sha256::digest(bytes))
-    )
+    crate::hub_client::protocol::listing_message(endpoint, expires_at, bytes)
 }
 
 /// The signature of `bytes` until `expires_at` by the endpoint `key`, as
@@ -162,14 +158,18 @@ pub fn owner_claim_message(
     service_handle: &str,
     expires_at: u64,
 ) -> String {
-    format!("aether-owner/v1\nclaim\n{personal}\n{service_handle}\n{expires_at}")
+    crate::hub_client::protocol::owner_claim_message(
+        personal,
+        service_handle,
+        expires_at,
+    )
 }
 
 /// The message that the service agent `service` signs to confirm the claim
 /// of the personal agent `personal` until `expires_at`.
 #[must_use]
 pub fn owner_confirm_message(service: &str, personal: &str, expires_at: u64) -> String {
-    format!("aether-owner/v1\nconfirm\n{service}\n{personal}\n{expires_at}")
+    crate::hub_client::protocol::owner_confirm_message(service, personal, expires_at)
 }
 
 /// The claim of the personal agent with the endpoint `key` for the service

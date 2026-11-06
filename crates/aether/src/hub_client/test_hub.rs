@@ -21,7 +21,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::{Value, json};
 use tokio::sync::Notify;
 
-use super::{HubClient, MAX_WAIT_SECONDS, signed_message};
+use super::{HubClient, MAX_WAIT_SECONDS, protocol};
 
 /// One request as the hub received it.
 #[derive(Debug, Clone)]
@@ -373,7 +373,8 @@ fn authenticate(
     let signature = URL_SAFE_NO_PAD.decode(header("x-aether-signature")?).ok()?;
     let signature = iroh::Signature::from_bytes(&signature.try_into().ok()?);
     let key = iroh::PublicKey::from_str(endpoint).ok()?;
-    let message = signed_message(method.as_str(), &target(uri), time, body);
+    let message =
+        protocol::hub_request_message(method.as_str(), &target(uri), time, body);
     key.verify(message.as_bytes(), &signature).ok()?;
     Some(endpoint.to_owned())
 }
@@ -896,11 +897,8 @@ fn route(
             else {
                 return error(StatusCode::NOT_FOUND, "not_found");
             };
-            let message = crate::listing::owner_claim_message(
-                endpoint,
-                service_handle,
-                expires_at,
-            );
+            let message =
+                protocol::owner_claim_message(endpoint, service_handle, expires_at);
             if !signed(endpoint, &message, signature) {
                 return error(StatusCode::BAD_REQUEST, "invalid");
             }
@@ -939,7 +937,7 @@ fn route(
             if link.confirmed {
                 return error(StatusCode::FORBIDDEN, "forbidden");
             }
-            let message = crate::listing::owner_confirm_message(
+            let message = protocol::owner_confirm_message(
                 endpoint,
                 &link.personal,
                 link.expires_at,

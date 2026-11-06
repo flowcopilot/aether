@@ -28,7 +28,7 @@ impl Setting for Hub {
 }
 
 /// This node's name on its hub, as the hub last gave it, if it passes
-/// [`crate::direct::valid_name`]. `None` forgets it, for example when the
+/// [`crate::hub_client::valid_full_name`]. `None` forgets it, for example when the
 /// node moves to another hub.
 pub struct HubName;
 
@@ -41,7 +41,7 @@ impl Setting for HubName {
     }
 
     fn decode(stored: String) -> Result<Self::Value, StoreError> {
-        Ok(Some(stored).filter(|name| crate::direct::valid_name(name)))
+        Ok(Some(stored).filter(|name| crate::hub_client::valid_full_name(name)))
     }
 
     fn encode(value: &Self::Value) -> Result<Option<String>, StoreError> {
