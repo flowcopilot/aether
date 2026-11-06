@@ -6,7 +6,7 @@ use topcoat::{
     view::{View, component, view},
 };
 
-use super::{Page, caller};
+use super::{Page, shared};
 use crate::admin::SharedAdministration;
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -28,13 +28,13 @@ pub(super) async fn node_header(cx: &Cx, current: Tab) -> TopcoatResult<impl Vie
     let data_dir = page_data_dir(cx);
     let drafts = page.as_ref().filter(|page| page.caller).map_or(0, |page| {
         let now = aether_core::time::now_seconds();
-        caller::request_drafts_of(&page.data_dir, now).len()
+        shared::request_drafts_of(&page.data_dir, now).len()
     });
     let pending = app_context::<SharedAdministration>(cx)
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .pending()
-        .len();
+        .map_or(0, |pending| pending.len());
     let relay_host = page.as_ref().filter(|page| page.host_ui).map(|page| {
         page.relay_url().map(|url| {
             reqwest::Url::parse(&url)

@@ -9,6 +9,13 @@ use super::{HubClient, HubError, hub_setting, resolve_url, settings::Hub};
 use crate::settings::setting;
 
 #[derive(Clone)]
+pub enum HubAccess {
+    Off,
+    Ready(Box<HubClient>),
+    Unavailable,
+}
+
+#[derive(Clone)]
 struct HubState {
     stored: Option<String>,
     client: Option<HubClient>,
@@ -73,6 +80,20 @@ impl NodeHub {
     fn slot(&self) -> MutexGuard<'_, Option<HubState>> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
+
+    #[must_use]
+    pub fn access(&self) -> HubAccess {
+        match self.client() {
+            Ok(Some(client)) => HubAccess::Ready(Box::new(client)),
+            Ok(None) => HubAccess::Off,
+            Err(_) => HubAccess::Unavailable,
+        }
+    }
+}
+
+#[must_use]
+pub fn hub_access(hub: &NodeHub) -> HubAccess {
+    hub.access()
 }
 
 impl Default for NodeHub {

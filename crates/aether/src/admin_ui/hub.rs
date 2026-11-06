@@ -23,8 +23,8 @@ use topcoat::{
 };
 
 use super::{
-    Page, PageContext, caller::caller_screen, hub_form_screen, layout::page_data_dir,
-    require_admin_session,
+    Page, PageContext, hub_form_screen, layout::page_data_dir, require_admin_session,
+    shared,
 };
 use crate::hub_client::protocol::{DEFAULT_ACCESS_DAYS, OFFER_DAYS};
 use aether_store::{ApprovalKind, ApprovalSide, HubApproval};
@@ -39,7 +39,7 @@ use crate::{
         Account, AgentKind, Block, DEFAULT_HUB_URL, HubClient, HubError, Invite,
         Origin, OwnerLink, Role, Status, valid_full_name, valid_name_part,
     },
-    hub_membership::{APPROVAL_SECONDS, accept, hub_message, keep_hub_name, offer},
+    hub_membership::{APPROVAL_SECONDS, hub_message, keep_hub_name, offer},
 };
 
 /// How long a page waits for the hub before it shows the page without it.
@@ -153,7 +153,7 @@ pub(super) async fn hub_section(
     let service =
         account.as_ref().is_some_and(|account| account.kind == AgentKind::Service);
     let queue = page_data_dir(cx)
-        .map(|data_dir| super::listing::queue_text(&data_dir))
+        .map(|data_dir| shared::queue_text(&data_dir))
         .unwrap_or_default();
     let sender = role == Role::Sender;
     let requests =
@@ -208,7 +208,7 @@ pub(super) async fn hub_section(
                         </p>
                     </div>
                     if relay_missing {
-                        super::host::relay_notice()
+                        shared::relay_notice()
                     }
                     if unreachable {
                         <p class="text-sm text-muted-foreground" role="status">
@@ -798,27 +798,6 @@ pub(super) async fn invite_by_name(
 #[serde(deny_unknown_fields)]
 pub(super) struct InviteIdForm {
     id: String,
-}
-
-/// Accepts an invite. The host's node then sends the access by itself.
-#[page(POST "/hub/accept")]
-pub(super) async fn accept_invite(
-    cx: &Cx,
-    Form(form): Form<InviteIdForm>,
-) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let Page(Some(page)) = app_context::<Page>(cx) else {
-        return Err(bad_request("this node cannot accept invites").into());
-    };
-    if !page.caller {
-        return Err(bad_request("this node cannot accept invites").into());
-    }
-    let hub = page_hub(cx)?;
-    let error = match accept(&hub, &page.data_dir, &form.id).await {
-        Ok(_) => "",
-        Err(error) => hub_message(error),
-    };
-    Ok(view! { caller_screen(hub_error: error.to_owned()) })
 }
 
 #[derive(Deserialize)]

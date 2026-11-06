@@ -70,7 +70,20 @@ pub(super) async fn dashboard(
             administration.managed_members(),
         )
     };
-    let tokens = app_context::<Arc<AdminConfirmations>>(cx).reset(pending)?;
+    let store_unavailable = matches!(store_access, AdminStoreAccess::Unavailable)
+        || pending.is_err()
+        || configured.is_err()
+        || summary.is_err()
+        || members.is_err();
+    let pending = pending.unwrap_or_default();
+    let configured = configured.unwrap_or_default();
+    let summary = summary.unwrap_or_default();
+    let members = members.unwrap_or_default();
+    let tokens = if store_unavailable {
+        Vec::new()
+    } else {
+        app_context::<Arc<AdminConfirmations>>(cx).reset(pending)?
+    };
     let Managed(managed) = *app_context::<Managed>(cx);
 
     let applied = |kind| configured.get(&kind).copied().unwrap_or(0);
@@ -99,7 +112,7 @@ pub(super) async fn dashboard(
                 "Review local permissions, tasks and pending changes."
             )
 
-            if matches!(store_access, AdminStoreAccess::Unavailable) {
+            if store_unavailable {
                 alert(variant: AlertVariant::Destructive, attrs: attributes! { role="alert" },
                     alert_title("Administration store is unavailable")
                     alert_description("This node cannot read its local administration database. Fix the data directory and reload.")
@@ -108,7 +121,7 @@ pub(super) async fn dashboard(
 
             <section id="pending" class="flex scroll-mt-6 flex-col gap-3">
                 <h2 class="text-xl font-semibold tracking-tight">"Pending changes"</h2>
-                if matches!(store_access, AdminStoreAccess::Unavailable) {
+                if store_unavailable {
                     <p class="text-muted-foreground">"Pending changes cannot be loaded."</p>
                 } else if tokens.is_empty() {
                     <p class="text-muted-foreground">"No changes need confirmation."</p>
@@ -136,7 +149,7 @@ pub(super) async fn dashboard(
 
             <section id="overview" class="flex scroll-mt-6 flex-col gap-3">
             <h2 class="text-xl font-semibold tracking-tight">"Overview"</h2>
-            if matches!(store_access, AdminStoreAccess::Unavailable) {
+            if store_unavailable {
                 <p class="text-muted-foreground">"Overview counts cannot be loaded."</p>
             } else {
                 <dl class="grid grid-cols-2 gap-px overflow-hidden rounded-xl border border-border bg-border sm:grid-cols-3">
@@ -203,7 +216,7 @@ pub(super) async fn dashboard(
 
             <section id="tasks" class="flex scroll-mt-6 flex-col gap-3">
                 <h2 class="text-xl font-semibold tracking-tight">"Tasks"</h2>
-                if matches!(store_access, AdminStoreAccess::Unavailable) {
+                if store_unavailable {
                     <p class="text-muted-foreground">"Task counts cannot be loaded."</p>
                 } else {
                     <p class="text-muted-foreground">
@@ -229,7 +242,7 @@ pub(super) async fn dashboard(
             if managed {
                 <section id="members" class="flex flex-col gap-2">
                     <h2 class="text-xl font-semibold tracking-tight">"Members"</h2>
-                    if matches!(store_access, AdminStoreAccess::Unavailable) {
+                    if store_unavailable {
                         <p class="text-muted-foreground">"Members cannot be loaded."</p>
                     } else if members.is_empty() {
                         <p class="text-muted-foreground">"No members are listed."</p>

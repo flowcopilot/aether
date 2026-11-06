@@ -1,6 +1,7 @@
 use std::{
     future::Future,
-    sync::{Arc, PoisonError},
+    path::Path,
+    sync::{Arc, Mutex, PoisonError},
     time::Duration,
 };
 
@@ -9,39 +10,64 @@ use aether_store::AuditActor;
 
 use crate::{
     admin::SharedAdministration,
-    admin_ui::PageContext,
-    hub_client::{HubClient, Invite},
+    hub_client::{HubAccess, HubClient, Invite},
     hub_sync::{HostStep, caller_step, host_step},
     invites::{DirectInviteSigning, sign_direct_invite},
+    node_serve_context::NodeServeContext,
 };
 
 const RETRY_WAIT: Duration = Duration::from_secs(5);
 const POLL_WAIT: Duration = Duration::from_secs(25);
 
+enum HubPoll {
+    Ready(Box<HubClient>),
+    Off,
+    Unavailable,
+}
+
+fn hub_poll(ctx: &NodeServeContext) -> HubPoll {
+    match ctx.hub.access() {
+        HubAccess::Ready(client) => HubPoll::Ready(client),
+        HubAccess::Off => HubPoll::Off,
+        HubAccess::Unavailable => HubPoll::Unavailable,
+    }
+}
+
 async fn follow<C, F, Fut>(current: C, mut act: F)
 where
-    C: Fn() -> Option<HubClient>,
+    C: Fn() -> HubPoll,
     F: FnMut(HubClient, Vec<Invite>) -> Fut,
     Fut: Future<Output = ()>,
 {
     let mut version = None;
     let mut followed = String::new();
     loop {
-        let Some(hub) = current() else {
-            version = None;
-            tokio::time::sleep(RETRY_WAIT).await;
-            continue;
-        };
-        if hub.url() != followed {
-            followed = hub.url();
-            version = None;
-        }
-        if let Ok(list) = hub.invites(version, POLL_WAIT).await {
-            version = Some(list.version);
-            act(hub, list.invites).await;
-        } else {
-            version = None;
-            tokio::time::sleep(RETRY_WAIT).await;
+        match current() {
+            HubPoll::Unavailable => {
+                println!(
+                    "{}",
+                    serde_json::json!({ "event": "hub_access_unavailable" })
+                );
+                version = None;
+                tokio::time::sleep(RETRY_WAIT).await;
+            }
+            HubPoll::Off => {
+                version = None;
+                tokio::time::sleep(RETRY_WAIT).await;
+            }
+            HubPoll::Ready(hub) => {
+                if hub.url() != followed {
+                    followed = hub.url();
+                    version = None;
+                }
+                if let Ok(list) = hub.invites(version, POLL_WAIT).await {
+                    version = Some(list.version);
+                    act(*hub, list.invites).await;
+                } else {
+                    version = None;
+                    tokio::time::sleep(RETRY_WAIT).await;
+                }
+            }
         }
     }
 }
@@ -55,12 +81,13 @@ enum HostAction {
 
 fn host_action(
     administration: &SharedAdministration,
-    page: &PageContext,
+    data_dir: &Path,
+    hub_sign: &Mutex<()>,
     store: &crate::hub_store::HubStore,
     invite: &Invite,
     own_name: Option<&str>,
 ) -> HostAction {
-    let _sign = page.hub_sign().lock().unwrap_or_else(PoisonError::into_inner);
+    let _sign = hub_sign.lock().unwrap_or_else(PoisonError::into_inner);
     let Ok(approval) = store.approval(&invite.id) else {
         return HostAction::Failed;
     };
@@ -80,7 +107,7 @@ fn host_action(
             let (Some(own_name), Some(approval)) = (own_name, approval.as_ref()) else {
                 return HostAction::Skip;
             };
-            let signing = DirectInviteSigning::from_page(page);
+            let signing = DirectInviteSigning::for_data_dir(data_dir);
             let Ok((line, grant_id)) = sign_direct_invite(
                 administration,
                 &signing,
@@ -105,99 +132,127 @@ fn host_action(
     }
 }
 
-pub async fn host_worker(administration: SharedAdministration, page: Arc<PageContext>) {
-    let current = {
-        let page = Arc::clone(&page);
-        move || page.current_hub()
-    };
-    follow(current, |hub, invites| {
-        let administration = administration.clone();
-        let page = Arc::clone(&page);
-        async move {
-            let Ok(store) = crate::hub_store::HubStore::open(&page.data_dir) else {
-                println!("{}", serde_json::json!({ "event": "hub_store_unavailable" }));
-                return;
-            };
-            if store.clear_expired_approvals(now()).is_err() {
-                println!("{}", serde_json::json!({ "event": "hub_store_unavailable" }));
-                return;
-            }
-            let own_name = crate::settings::setting::<
-                crate::hub_client::settings::HubName,
-            >(&page.data_dir)
-            .ok()
-            .flatten();
-            for invite in invites {
-                let line = match host_action(
-                    &administration,
-                    &page,
-                    &store,
-                    &invite,
-                    own_name.as_deref(),
-                ) {
-                    HostAction::Skip => continue,
-                    HostAction::Refuse => {
-                        log("hub_invite_refused", &invite);
-                        let _ = hub.remove(&invite.id).await;
-                        continue;
+pub async fn host_worker(
+    administration: SharedAdministration,
+    ctx: Arc<NodeServeContext>,
+) {
+    follow(
+        {
+            let ctx = Arc::clone(&ctx);
+            move || hub_poll(&ctx)
+        },
+        {
+            let ctx = Arc::clone(&ctx);
+            move |hub, invites| {
+                let administration = administration.clone();
+                let ctx = Arc::clone(&ctx);
+                async move {
+                    let Ok(store) = crate::hub_store::HubStore::open(&ctx.data_dir)
+                    else {
+                        println!(
+                            "{}",
+                            serde_json::json!({ "event": "hub_store_unavailable" })
+                        );
+                        return;
+                    };
+                    if store.clear_expired_approvals(now()).is_err() {
+                        println!(
+                            "{}",
+                            serde_json::json!({ "event": "hub_store_unavailable" })
+                        );
+                        return;
                     }
-                    HostAction::Failed => {
-                        log("hub_invite_failed", &invite);
-                        continue;
+                    let own_name = crate::settings::setting::<
+                        crate::hub_client::settings::HubName,
+                    >(&ctx.data_dir)
+                    .ok()
+                    .flatten();
+                    for invite in invites {
+                        let line = match host_action(
+                            &administration,
+                            &ctx.data_dir,
+                            &ctx.hub_sign,
+                            &store,
+                            &invite,
+                            own_name.as_deref(),
+                        ) {
+                            HostAction::Skip => continue,
+                            HostAction::Refuse => {
+                                log("hub_invite_refused", &invite);
+                                let _ = hub.remove(&invite.id).await;
+                                continue;
+                            }
+                            HostAction::Failed => {
+                                log("hub_invite_failed", &invite);
+                                continue;
+                            }
+                            HostAction::Deliver(line) => line,
+                        };
+                        match hub.deliver(&invite.id, &line).await {
+                            Ok(_) => log("hub_invite_delivered", &invite),
+                            Err(_) => log("hub_invite_failed", &invite),
+                        }
                     }
-                    HostAction::Deliver(line) => line,
-                };
-                match hub.deliver(&invite.id, &line).await {
-                    Ok(_) => log("hub_invite_delivered", &invite),
-                    Err(_) => log("hub_invite_failed", &invite),
                 }
             }
-        }
-    })
+        },
+    )
     .await;
 }
 
-pub async fn caller_worker(page: Arc<PageContext>) {
-    let current = {
-        let page = Arc::clone(&page);
-        move || page.current_hub()
-    };
-    follow(current, |hub, invites| {
-        let page = Arc::clone(&page);
-        async move {
-            let Ok(store) = crate::hub_store::HubStore::open(&page.data_dir) else {
-                println!("{}", serde_json::json!({ "event": "hub_store_unavailable" }));
-                return;
-            };
-            for invite in invites {
-                let Ok(approval) = store.approval(&invite.id) else {
-                    continue;
-                };
-                match caller_step(&invite, approval.as_ref()) {
-                    crate::hub_sync::CallerStep::Skip => continue,
-                    crate::hub_sync::CallerStep::Import(bundle) => {
-                        match crate::direct::import_bundle(&page.data_dir, &bundle) {
-                            Ok(_) => log("hub_invite_kept", &invite),
-                            Err(error) => {
-                                log_reason(
-                                    "hub_invite_refused",
-                                    &invite,
-                                    &error.to_string(),
-                                );
+pub async fn caller_worker(ctx: Arc<NodeServeContext>) {
+    follow(
+        {
+            let ctx = Arc::clone(&ctx);
+            move || hub_poll(&ctx)
+        },
+        {
+            let ctx = Arc::clone(&ctx);
+            move |hub, invites| {
+                let ctx = Arc::clone(&ctx);
+                async move {
+                    let Ok(store) = crate::hub_store::HubStore::open(&ctx.data_dir)
+                    else {
+                        println!(
+                            "{}",
+                            serde_json::json!({ "event": "hub_store_unavailable" })
+                        );
+                        return;
+                    };
+                    for invite in invites {
+                        let Ok(approval) = store.approval(&invite.id) else {
+                            continue;
+                        };
+                        match caller_step(&invite, approval.as_ref()) {
+                            crate::hub_sync::CallerStep::Skip => continue,
+                            crate::hub_sync::CallerStep::Import(bundle) => {
+                                match crate::direct::import_bundle(
+                                    &ctx.data_dir,
+                                    &bundle,
+                                ) {
+                                    Ok(_) => log("hub_invite_kept", &invite),
+                                    Err(error) => {
+                                        log_reason(
+                                            "hub_invite_refused",
+                                            &invite,
+                                            &error.to_string(),
+                                        );
+                                    }
+                                }
+                            }
+                            crate::hub_sync::CallerStep::Refuse(reason) => {
+                                log_reason("hub_invite_refused", &invite, reason);
                             }
                         }
+                        let _ = store.remove_approval(&invite.id);
+                        if hub.remove(&invite.id).await.is_err() {
+                            log("hub_invite_failed", &invite);
+                        }
                     }
-                    crate::hub_sync::CallerStep::Refuse(reason) => {
-                        log_reason("hub_invite_refused", &invite, reason);
-                    }
-                }
-                let _ = store.remove_approval(&invite.id);
-                if hub.remove(&invite.id).await.is_err() {
-                    log("hub_invite_failed", &invite);
                 }
             }
-        }
-    })
+        },
+    )
     .await;
 }
 
@@ -218,4 +273,31 @@ fn log_reason(event: &str, invite: &Invite, reason: &str) {
             "reason": reason,
         })
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::hub_poll;
+    use crate::{
+        hub_client::{HubAccess, node_hub::NodeHub},
+        node_serve_context::NodeServeContext,
+    };
+
+    #[test]
+    fn hub_poll_reports_unavailable_when_the_store_cannot_be_read() {
+        let directory = tempfile::tempdir().expect("directory");
+        aether_store::NodeStore::in_dir(directory.path()).expect("store");
+        std::fs::write(directory.path().join("node.sqlite"), b"not sqlite")
+            .expect("break store");
+        let ctx = NodeServeContext {
+            data_dir: directory.path().to_path_buf(),
+            hub: Arc::new(NodeHub::new(directory.path().to_path_buf(), None)),
+            hub_sign: Arc::new(Mutex::new(())),
+            caller: false,
+        };
+        assert!(matches!(hub_poll(&ctx), super::HubPoll::Unavailable));
+        assert!(matches!(ctx.hub.access(), HubAccess::Unavailable));
+    }
 }

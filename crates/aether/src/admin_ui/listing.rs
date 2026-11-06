@@ -3,42 +3,15 @@
 //! agent or stops the listing.
 
 use aether_core::time::now_seconds;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use serde::Deserialize;
 use topcoat::{
     Result as TopcoatResult,
-    context::{Cx, app_context},
-    router::{content::Form, error::bad_request, page},
     view::{View, attributes, component, view},
 };
 
-use super::{Page, host, require_admin_session};
-use crate::{
-    components::button::{ButtonSize, ButtonVariant, button},
-    hub_client::{AgentKind, HubError},
-    listing::{HubPublishError, publish_to_hub, stop_hub_listing},
-};
-
-/// The text about the shared task queue.
-pub(super) fn queue_text(data_dir: &Path) -> String {
-    match crate::policy::queue_limits(data_dir) {
-        Ok(Some(limits)) => {
-            let tasks = if limits.global == 1 {
-                "1 waiting task".to_owned()
-            } else {
-                format!("{} waiting tasks", limits.global)
-            };
-            format!(
-                "Your agent keeps {tasks} in all and {} for each person. People who get access by request share these places.",
-                limits.per_peer
-            )
-        }
-        Ok(None) => "This node has no task policy yet. Start `aether node serve` once."
-            .to_owned(),
-        Err(_) => "The task limits of this node cannot be read.".to_owned(),
-    }
-}
+use super::shared;
+use crate::components::button::{ButtonSize, ButtonVariant, button};
 
 /// The listing section of a service agent's page.
 #[component]
@@ -58,7 +31,7 @@ pub(super) async fn listing_section(
             .flatten()
             .filter(|state| state.listed && state.expires_at > now)
             .map(|state| state.expires_at.saturating_sub(now).div_ceil(24 * 60 * 60));
-    let queue = queue_text(&data_dir);
+    let queue = shared::queue_text(&data_dir);
     let status = match days_left {
         Some(1) => {
             "Listed. The listing ends in 1 day unless this page renews it.".to_owned()
@@ -127,48 +100,5 @@ pub(super) async fn listing_section(
                 </div>
             </div>
         </section>
-    })
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct ListingForm {
-    action: String,
-}
-
-/// Lists this service agent on the hub, or stops the listing.
-#[page(POST "/listing/publish")]
-pub(super) async fn publish_listing(
-    cx: &Cx,
-    Form(form): Form<ListingForm>,
-) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let Page(Some(page)) = app_context::<Page>(cx) else {
-        return Err(bad_request("this node has no listing").into());
-    };
-    if crate::settings::setting::<crate::hub_client::settings::AgentKind>(
-        &page.data_dir,
-    )
-    .ok()
-    .flatten()
-        != Some(AgentKind::Service)
-    {
-        return Err(bad_request("only a service agent has a public listing").into());
-    }
-    let result = match (form.action.as_str(), page.current_hub()) {
-        (_, None) => Err(HubPublishError::Hub(HubError::Unreachable)),
-        ("list", Some(hub)) => {
-            publish_to_hub(&page.data_dir, &hub, now_seconds()).await.map(drop)
-        }
-        ("stop", Some(hub)) => stop_hub_listing(&page.data_dir, &hub).await,
-        _ => return Err(bad_request("unknown listing action").into()),
-    };
-    let error = result
-        .err()
-        .map(crate::listing::hub_publish_message)
-        .unwrap_or_default()
-        .to_owned();
-    Ok(view! {
-        host::host_screen(notice: host::Notice::listing(error))
     })
 }

@@ -194,7 +194,10 @@ fn handle(
         return Response::Error { code: "unavailable".to_owned() };
     };
     match request {
-        Request::Audit => Response::Audit { entries: administration.audit_entries() },
+        Request::Audit => match administration.audit_entries() {
+            Ok(entries) => Response::Audit { entries },
+            Err(_) => Response::Error { code: "unavailable".to_owned() },
+        },
         Request::DirectGrants => match administration.grants() {
             Ok(grants) => Response::DirectGrants {
                 grants: grants

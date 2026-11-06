@@ -1,4 +1,4 @@
-use std::{path::Path, sync::Arc};
+use std::path::Path;
 
 use aether_store::AuditActor;
 
@@ -13,25 +13,26 @@ pub struct DirectInviteSigning {
 impl DirectInviteSigning {
     #[must_use]
     pub fn for_data_dir(data_dir: &Path) -> Self {
-        Self {
-            data_dir: data_dir.to_path_buf(),
-            relay_url:
-                crate::settings::setting::<crate::transport::relay::ActiveRelay>(
-                    data_dir,
-                )
-                .ok()
-                .flatten(),
-        }
+        Self::for_data_dir_with_relay(data_dir, None)
     }
 
     #[must_use]
-    pub fn from_page(page: &crate::admin_ui::PageContext) -> Self {
-        Self { data_dir: page.data_dir.clone(), relay_url: page.relay_url() }
+    pub fn for_data_dir_with_relay(
+        data_dir: &Path,
+        relay_fallback: Option<String>,
+    ) -> Self {
+        let stored =
+            crate::settings::setting::<crate::transport::relay::ActiveRelay>(data_dir)
+                .ok()
+                .flatten();
+        Self { data_dir: data_dir.to_path_buf(), relay_url: stored.or(relay_fallback) }
     }
 
     fn relay_url(&self) -> Option<String> {
         crate::settings::setting::<crate::transport::relay::ActiveRelay>(&self.data_dir)
-            .unwrap_or_else(|_| self.relay_url.clone())
+            .ok()
+            .flatten()
+            .or_else(|| self.relay_url.clone())
     }
 }
 
@@ -120,34 +121,9 @@ pub fn sign_direct_invite(
     .map_err(|error| internal(&error))
 }
 
-pub fn host_page_context(
-    data_dir: std::path::PathBuf,
-    invite_name: Option<String>,
-    relay_url: Option<String>,
-    switch_relay: crate::admin_ui::RelaySwitcher,
-    hub_flag: Option<String>,
-    hub: Option<crate::hub_client::HubClient>,
-    task_folder_mode: bool,
-) -> Arc<crate::admin_ui::PageContext> {
-    Arc::new(
-        crate::admin_ui::PageContext::host(
-            data_dir,
-            invite_name,
-            relay_url,
-            switch_relay,
-            hub_flag,
-        )
-        .with_hub(hub)
-        .with_caller(true)
-        .with_task_folder_mode(task_folder_mode),
-    )
-}
-
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use super::{host_page_context, invite_agent_name};
+    use super::invite_agent_name;
 
     #[test]
     fn invite_agent_name_matches_the_host_page() {
@@ -158,22 +134,10 @@ mod tests {
             &"page-name".to_owned(),
         )
         .expect("host name must store");
-        let switch: crate::admin_ui::RelaySwitcher =
-            Arc::new(|_, _| Box::pin(async { Ok(()) }));
-        let page = host_page_context(
-            data_dir.clone(),
-            Some("flag-name".to_owned()),
-            None,
-            switch,
-            None,
-            None,
-            false,
+        assert_eq!(
+            invite_agent_name(&data_dir, Some("flag-name")),
+            invite_agent_name(&data_dir, Some("flag-name"))
         );
-        assert_eq!(page.agent_name(), invite_agent_name(&data_dir, Some("flag-name")));
-        let switch: crate::admin_ui::RelaySwitcher =
-            Arc::new(|_, _| Box::pin(async { Ok(()) }));
-        let page =
-            host_page_context(data_dir.clone(), None, None, switch, None, None, false);
-        assert_eq!(page.agent_name(), invite_agent_name(&data_dir, None));
+        assert_eq!(invite_agent_name(&data_dir, None), "page-name");
     }
 }

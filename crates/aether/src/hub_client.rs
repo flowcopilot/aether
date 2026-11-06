@@ -18,7 +18,9 @@ mod types;
 pub use self::full_name::{
     FullName, split_full_name, valid_full_name, valid_name_part,
 };
-pub use self::node_hub::{NodeHub, hub_client as configured_hub_client};
+pub use self::node_hub::{
+    HubAccess, NodeHub, hub_access, hub_client as configured_hub_client,
+};
 pub use self::protocol::{
     DEFAULT_HUB_URL, HUB_OFF, INVITE_SECONDS, MAX_WAIT_SECONDS, PROTOCOL_HEADER,
     PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
