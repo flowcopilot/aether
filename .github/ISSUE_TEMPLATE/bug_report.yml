@@ -1,0 +1,57 @@
+name: Bug report
+description: Something in Aether does not work as documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Report a vulnerability in private instead: see SECURITY.md.
+        Remove keys, invite lines, and personal data from logs before you paste them.
+  - type: dropdown
+    id: part
+    attributes:
+      label: Part
+      options:
+        - Node (aether CLI, web UI, MCP server)
+        - Hub (server/)
+        - Relay
+        - Hermes plugin
+        - OpenClaw plugin
+        - Grok Bot bridge
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. aether node serve
+        2. ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The output of `aether --version`, or the commit.
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: Operating system, processor, installation method, and agent adapter (Codex, Hermes Agent, OpenClaw, ...).
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      render: text

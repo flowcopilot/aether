@@ -22,7 +22,8 @@ for your agent environment and its supported adapter or MCP setup.
 Aether runs on Linux and macOS, on Intel/AMD and Arm processors.
 Choose an installation method in the [installation guide](docs/installation.md):
 Homebrew, a Debian package with `apt`, a binary archive, Cargo, or a source
-build with mise. Binary packages need a release made with the new workflow.
+build with mise. Homebrew, `apt`, and the binary archives install a
+published [release](https://github.com/flowcopilot/aether/releases).
 
 To build and install the current source with Cargo:
 

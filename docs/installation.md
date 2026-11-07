@@ -15,8 +15,9 @@ The release workflow builds these packages:
 
 Windows is not supported. The node and its agent adapters use Unix sockets.
 
-The commands below need a release made with the new release workflow.
-For an older release, use the source build at the end of this page.
+The commands below install a published release from the
+[release page](https://github.com/flowcopilot/aether/releases). If the page
+has no release yet, use the source build at the end of this page.
 
 ## Homebrew
 

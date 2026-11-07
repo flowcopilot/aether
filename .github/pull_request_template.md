@@ -38,7 +38,8 @@ left out on purpose.
 ## Evidence
 
 <!--
-This repository has no CI. List each check that you ran and its result,
+CI checks commit messages and builds the release binaries, but it does
+not run the tests. List each check that you ran and its result,
 then list what stays unchecked and why (for example, Docker or Elixir is
 not available). Run the checks for the parts that you changed:
 - Rust: `mise run fmt`, `mise run lint`, and `mise run test`, or
