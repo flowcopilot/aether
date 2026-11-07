@@ -1,0 +1,31 @@
+#:schema https://docs.cocogitto.io/cog-schema.json
+# Cocogitto makes releases from the Conventional Commits on `main`.
+# `.github/workflows/release.yml` runs `cog bump`; see packaging/README.md.
+tag_prefix = "v"
+branch_whitelist = ["main"]
+ignore_merge_commits = true
+
+# The changes these commands make go into the version commit. The workspace
+# version is the only line in Cargo.toml that starts with `version =`.
+pre_bump_hooks = [
+    "sed -i 's/^version = \".*\"$/version = \"{{version}}\"/' Cargo.toml",
+    "cargo update --workspace",
+    "test \"$(python3 scripts/release.py version)\" = {{version}}",
+]
+
+post_bump_hooks = [
+    "git push origin HEAD:main",
+    "git push origin v{{version}}",
+]
+
+[commit_types]
+chore = { omit_from_changelog = true }
+style = { omit_from_changelog = true }
+test = { omit_from_changelog = true }
+
+[changelog]
+path = "CHANGELOG.md"
+template = "remote"
+remote = "github.com"
+owner = "flowcopilot"
+repository = "aether"

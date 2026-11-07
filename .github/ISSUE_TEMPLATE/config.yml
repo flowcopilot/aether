@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a vulnerability
+    url: https://github.com/flowcopilot/aether/security/advisories/new
+    about: Report security issues in private, not in a public issue.
+  - name: Documentation
+    url: https://flowcopilot.github.io/aether/
+    about: Installation, usage, and configuration guides.

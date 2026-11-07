@@ -2,16 +2,30 @@
 
 `.github/workflows/release.yml` builds native binaries on Linux and macOS,
 for x86-64 and Arm64. Pull requests that change Rust or packaging files run
-the same build and package checks. A manual run makes CI artifacts without
-publishing a release.
+the same build and package checks, and check that their commits follow
+[Conventional Commits](https://www.conventionalcommits.org/).
 
 ## Make a release
 
-1. Set `workspace.package.version` in `Cargo.toml` and update `Cargo.lock`.
-2. Merge the change after the release workflow passes on the pull request.
-3. Create and push a tag that matches the version, for example `v0.3.1`.
+[Cocogitto](https://docs.cocogitto.io/) makes releases. Its settings are in
+`cog.toml`.
 
-A tag push builds all four binaries with Rust 1.98.0 and `--locked`. Each
+1. Open **Actions**, select **Release binaries**, and select **Run workflow**
+   on `main`.
+2. Leave **Version** empty to calculate the next version from the commits
+   since the last tag: `fix` gives a patch, `feat` gives a minor, and a
+   breaking change (`feat!:` or a `BREAKING CHANGE:` footer) gives a major.
+   Or enter a version, for example `0.3.0`. Enter one for the first release:
+   with no tag yet, Cocogitto counts from 0.0.0.
+
+The `version` job sets `workspace.package.version` in `Cargo.toml` and
+`Cargo.lock`, writes `CHANGELOG.md`, and commits them as
+`chore(version): vX.Y.Z`. It then tags that commit and pushes the commit and
+the tag to `main`. The workflow then builds that tag. If a later job fails,
+the tag stays: fix the cause and release the next patch version, or delete the
+tag and its version commit before you run the workflow again.
+
+The release builds all four binaries with Rust 1.98.0 and `--locked`. Each
 binary must pass `--help` before packaging. CI also installs the binary with Cargo, extracts and runs each
 archive, then installs and runs each Debian package. `dpkg-shlibdeps`
 sets the Debian shared-library requirements from the built binary.
@@ -19,7 +33,7 @@ sets the Debian shared-library requirements from the built binary.
 After all builds pass, CI creates `SHA256SUMS` and `aether.rb`. It then
 publishes a GitHub release with four archives, two Debian packages, the
 formula, and the checksums. The tag must match the Cargo workspace version.
-Only stable versions in the form `MAJOR.MINOR.PATCH` are supported.
+Do not push `v*` tags by hand; the workflow does not start on a tag. Only stable versions in the form `MAJOR.MINOR.PATCH` are supported.
 The workflow does not sign or notarize binaries.
 
 The GitHub release must not already exist. If publication fails, inspect

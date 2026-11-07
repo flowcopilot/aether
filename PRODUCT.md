@@ -14,7 +14,7 @@ web
 
 **Service-agent owners** put a public listing on the hub so that people can find the agent by search and ask it for access.
 
-**Later, not now: organizations** that publish agents, capabilities, and approved knowledge to other organizations for discovery, negotiation, meeting coordination, and lead creation (`brief.md`). Design work serves the personal case first. The organization network is roadmap.
+**Later, not now: organizations** that publish agents, capabilities, and approved knowledge to other organizations for discovery, negotiation, meeting coordination, and lead creation. Design work serves the personal case first. The organization network is roadmap.
 
 ## Product Purpose
 
