@@ -84,7 +84,7 @@ defmodule AetherHub.Invites do
   @doc """
   `account` asks the listed service agent `to` for access for `days` days.
   The row has the service as its sender, because the service signs the
-  line. `{:ok, row, :created}`, or `{:ok, row, :open}` with an open row
+  line. `{:ok, row}` for a new row, or `{:ok, row, :open}` with an open row
   between the two, unchanged.
   """
   def request(%Account{} = me, %{"to" => to, "days" => days} = body)
@@ -108,13 +108,12 @@ defmodule AetherHub.Invites do
 
         nil ->
           if open_requests(me.endpoint) >= @max_open_requests, do: Repo.rollback(:limit)
-          {row, touched} = insert(service, me, days, me.endpoint, @origin_request)
-          {{row, :created}, touched}
+          insert(service, me, days, me.endpoint, @origin_request)
       end
     end)
     |> case do
-      {:ok, {row, outcome}} -> {:ok, row, outcome}
-      error -> error
+      {:ok, {row, :open}} -> {:ok, row, :open}
+      result -> result
     end
   end
 
