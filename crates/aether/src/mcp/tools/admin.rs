@@ -104,9 +104,7 @@ impl McpServer {
         description = "Read the node's saved task policy, relay and hub settings. Task policy changes need a node restart."
     )]
     async fn settings_get(&self) -> CallToolResult {
-        let Ok(data_dir) = self.data_dir() else {
-            return tool_error("this MCP server has no node data directory");
-        };
+        let data_dir = self.data_dir.as_path();
         let policy = match crate::policy::policy_settings(data_dir) {
             Ok(policy) => policy.map(|settings| {
                 json!({
@@ -124,7 +122,7 @@ impl McpServer {
         else {
             return tool_error("the node relay setting is unavailable");
         };
-        let Ok(hub_url) = self.node_hub(data_dir).resolve_url() else {
+        let Ok(hub_url) = self.node_hub().resolve_url() else {
             return tool_error("the node hub setting is unavailable");
         };
         tool_success(
@@ -146,9 +144,7 @@ impl McpServer {
         &self,
         Parameters(arguments): Parameters<PolicyUpdateArguments>,
     ) -> CallToolResult {
-        let Ok(data_dir) = self.data_dir() else {
-            return tool_error("this MCP server has no node data directory");
-        };
+        let data_dir = self.data_dir.as_path();
         if arguments.workspace.is_none()
             && arguments.max_context_tokens.is_none()
             && arguments.max_seconds.is_none()
@@ -202,9 +198,7 @@ impl McpServer {
         &self,
         Parameters(arguments): Parameters<UrlSettingArguments>,
     ) -> CallToolResult {
-        let Ok(data_dir) = self.data_dir() else {
-            return tool_error("this MCP server has no node data directory");
-        };
+        let data_dir = self.data_dir.as_path();
         let url = arguments.url.trim();
         let relay = if url.is_empty() || url == crate::transport::relay::RELAY_OFF {
             None
@@ -278,9 +272,7 @@ impl McpServer {
             Ok(hub) => hub,
             Err(error) => return tool_error(error),
         };
-        let Ok(data_dir) = self.data_dir() else {
-            return tool_error("this MCP server has no node data directory");
-        };
+        let data_dir = self.data_dir.as_path();
         if arguments.dry_run {
             return tool_success("validated");
         }
@@ -360,9 +352,7 @@ impl McpServer {
         &self,
         Parameters(arguments): Parameters<CodeImportArguments>,
     ) -> CallToolResult {
-        let Ok(data_dir) = self.data_dir() else {
-            return tool_error("this MCP server has no node data directory");
-        };
+        let data_dir = self.data_dir.as_path();
         let bundle = match crate::direct::InvitationBundle::decode(&arguments.code) {
             Ok(bundle) => bundle,
             Err(error) => return tool_error(error.to_string()),
@@ -421,9 +411,7 @@ impl McpServer {
         description = "List incoming access groups and their members."
     )]
     async fn groups_list(&self) -> CallToolResult {
-        let Some(data_dir) = &self.caller else {
-            return tool_error("this MCP server has no node data directory");
-        };
+        let data_dir = self.data_dir.as_path();
         match access_groups::list(data_dir) {
             Ok(groups) => tool_success(json!({ "groups": groups.iter().map(|group| json!({
                 "name": group.name,
@@ -547,9 +535,7 @@ impl McpServer {
         &self,
         Parameters(arguments): Parameters<UrlSettingArguments>,
     ) -> CallToolResult {
-        let Ok(data_dir) = self.data_dir() else {
-            return tool_error("this MCP server has no node data directory");
-        };
+        let data_dir = self.data_dir.as_path();
         // `off` turns the hub off here, as an empty URL does.
         let url = arguments.url.trim().trim_end_matches('/');
         let stored = if url == HUB_OFF {
@@ -600,8 +586,7 @@ mod tests {
         let store =
             aether_store::NodeStore::in_dir(directory.path()).expect("store must open");
         drop(store);
-        let server = served(directory.path(), shared_in(directory.path()))
-            .with_caller(directory.path().to_path_buf());
+        let server = served(directory.path(), shared_in(directory.path()));
         let created = server
             .groups_create(Parameters(GroupArguments { name: "work".to_owned() }))
             .await;
@@ -631,8 +616,7 @@ mod tests {
             None,
         )
         .expect("first policy must create");
-        let server =
-            served(&data_dir, shared_in(&data_dir)).with_caller(data_dir.clone());
+        let server = served(&data_dir, shared_in(&data_dir));
         let request = PolicyUpdateArguments {
             workspace: None,
             max_context_tokens: None,
@@ -703,7 +687,7 @@ mod tests {
         ));
         let socket = crate::data_dir::DataDir::new(&data_dir).admin_socket();
         start(&socket, administration.clone()).expect("socket must start");
-        let server = McpServer::socket(socket).with_caller(data_dir.clone());
+        let server = McpServer::new(socket, data_dir.clone(), None, false);
         let endpoint = crate::direct::endpoint_id(caller.path())
             .expect("caller endpoint must create");
         let result = server
@@ -749,8 +733,7 @@ mod tests {
             .expect("grant ID must be listed")
             .to_owned();
         assert_eq!(access["grants"][0]["agent"], "alice");
-        let caller_server = served(caller.path(), shared_in(caller.path()))
-            .with_caller(caller.path().to_path_buf());
+        let caller_server = served(caller.path(), shared_in(caller.path()));
         let imported = caller_server
             .invites_code_import(Parameters(CodeImportArguments { code }))
             .await;
@@ -776,8 +759,7 @@ mod tests {
             &Some(hub.url.clone()),
         )
         .expect("the hub must store");
-        let server = served(directory.path(), shared_in(directory.path()))
-            .with_caller(directory.path().to_path_buf());
+        let server = served(directory.path(), shared_in(directory.path()));
         let claimed = server
             .name_set(Parameters(NameArguments {
                 handle: "ana".to_owned(),
@@ -831,7 +813,7 @@ mod tests {
         administration.lock().expect("administration must lock").set_live(node.clone());
         let socket = crate::data_dir::DataDir::new(&data_dir).admin_socket();
         start(&socket, administration).expect("socket must start");
-        let server = McpServer::socket(socket).with_caller(data_dir.clone());
+        let server = McpServer::new(socket, data_dir.clone(), None, false);
         let result = server
             .settings_set_relay(Parameters(UrlSettingArguments {
                 url: "off".to_owned(),
@@ -849,15 +831,16 @@ mod tests {
         let socket = crate::data_dir::DataDir::new(directory.path()).admin_socket();
         let administration = shared_in(directory.path());
         start(&socket, administration.clone()).expect("socket must start");
-        let response = McpServer::socket(socket.clone())
-            .change(Parameters(ChangeArguments {
-                change: ChangeRequest::Workspace {
-                    id: "workspace".to_owned(),
-                    path: "project".to_owned(),
-                },
-                dry_run: false,
-            }))
-            .await;
+        let response =
+            McpServer::new(socket.clone(), directory.path().to_path_buf(), None, false)
+                .change(Parameters(ChangeArguments {
+                    change: ChangeRequest::Workspace {
+                        id: "workspace".to_owned(),
+                        path: "project".to_owned(),
+                    },
+                    dry_run: false,
+                }))
+                .await;
         assert_eq!(response.is_error, Some(false));
         administration
             .lock()
@@ -885,15 +868,16 @@ mod tests {
         // socket, exactly as a caller connecting over MCP would. It is
         // high-risk, so it lands pending, not applied — an MCP caller
         // cannot lower a change's risk class by confirming its own request.
-        let workspace_response = McpServer::socket(socket.clone())
-            .change(Parameters(ChangeArguments {
-                change: ChangeRequest::Workspace {
-                    id: "workspace".to_owned(),
-                    path: "project".to_owned(),
-                },
-                dry_run: false,
-            }))
-            .await;
+        let workspace_response =
+            McpServer::new(socket.clone(), directory.path().to_path_buf(), None, false)
+                .change(Parameters(ChangeArguments {
+                    change: ChangeRequest::Workspace {
+                        id: "workspace".to_owned(),
+                        path: "project".to_owned(),
+                    },
+                    dry_run: false,
+                }))
+                .await;
         assert_eq!(workspace_response.is_error, Some(false));
         assert!(node.calls().is_empty());
 
@@ -909,15 +893,16 @@ mod tests {
 
         // Queuing and confirming the grant change only after the workspace
         // change fully applied (rather than queuing both up front) matters:
-        let grant_response = McpServer::socket(socket.clone())
-            .change(Parameters(ChangeArguments {
-                change: {
-                    let grant = crate::admin::peer_grant();
-                    ChangeRequest::Grant { id: grant.id.as_str().to_owned(), grant }
-                },
-                dry_run: false,
-            }))
-            .await;
+        let grant_response =
+            McpServer::new(socket.clone(), directory.path().to_path_buf(), None, false)
+                .change(Parameters(ChangeArguments {
+                    change: {
+                        let grant = crate::admin::peer_grant();
+                        ChangeRequest::Grant { id: grant.id.as_str().to_owned(), grant }
+                    },
+                    dry_run: false,
+                }))
+                .await;
         assert_eq!(grant_response.is_error, Some(false));
         assert_eq!(node.calls(), ["workspace workspace project"]);
         administration

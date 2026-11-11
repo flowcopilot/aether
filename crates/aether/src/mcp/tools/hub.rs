@@ -80,9 +80,7 @@ impl McpServer {
             Ok(hub) => hub,
             Err(error) => return tool_error(error),
         };
-        let Ok(data_dir) = self.data_dir() else {
-            return tool_error("this MCP server has no node data directory");
-        };
+        let data_dir = self.data_dir.as_path();
         if arguments.dry_run {
             return tool_success("validated");
         }
@@ -112,9 +110,7 @@ impl McpServer {
         if arguments.dry_run {
             return tool_success("validated");
         }
-        let Ok(data_dir) = self.data_dir() else {
-            return tool_error("this MCP server has no node data directory");
-        };
+        let data_dir = self.data_dir.as_path();
         match crate::hub_membership::accept(&hub, data_dir, &arguments.id).await {
             Ok(invite) => tool_success(
                 json!({"id": invite.id, "status": invite.status}).to_string(),
@@ -154,9 +150,7 @@ impl McpServer {
         &self,
         Parameters(arguments): Parameters<AccessRequestArguments>,
     ) -> CallToolResult {
-        let Some(data_dir) = &self.caller else {
-            return tool_error("this MCP server has no caller data directory");
-        };
+        let data_dir = self.data_dir.as_path();
         let agent = arguments.agent.trim();
         if !crate::hub_client::valid_full_name(agent) {
             return tool_error(
@@ -170,7 +164,7 @@ impl McpServer {
         {
             return tool_error("aether.access.request days must be from 1 to 30");
         }
-        let hub = match self.caller_hub(data_dir) {
+        let hub = match self.caller_hub() {
             Ok(Some(hub)) => hub,
             Ok(None) => {
                 return tool_error("no hub is set, so there are no access requests");
@@ -222,8 +216,7 @@ mod tests {
         let caller = hub_caller(&hub);
         let lawyer = tempfile::tempdir().expect("directory must create");
         list_on_hub(&hub, lawyer.path(), "lawyer#0042", "Reviews contracts");
-        let server = served(caller.path(), shared_in(caller.path()))
-            .with_caller(caller.path().to_path_buf());
+        let server = served(caller.path(), shared_in(caller.path()));
 
         let result = server.access_request(access_arguments("lawyer#0042")).await;
         assert_eq!(result.is_error, Some(false), "{}", decode_text(&result));
@@ -254,8 +247,7 @@ mod tests {
             state.add_account(&"b".repeat(64), "quiet#0001");
             state.kinds.insert("b".repeat(64), crate::hub_client::AgentKind::Service);
         }
-        let server = served(caller.path(), shared_in(caller.path()))
-            .with_caller(caller.path().to_path_buf());
+        let server = served(caller.path(), shared_in(caller.path()));
         for (agent, message) in [
             ("ana#0042", "no listed service agent has this name"),
             ("quiet#0001", "no listed service agent has this name"),
@@ -295,8 +287,7 @@ mod tests {
         let lawyer = tempfile::tempdir().expect("directory must create");
         list_on_hub(&hub, lawyer.path(), "lawyer#0042", "Reviews contracts");
         import_named(caller.path(), lawyer.path(), "lawyer#0042");
-        let server = served(caller.path(), shared_in(caller.path()))
-            .with_caller(caller.path().to_path_buf());
+        let server = served(caller.path(), shared_in(caller.path()));
         let contact = server.access_request(access_arguments("lawyer#0042")).await;
         assert_eq!(decode_text(&contact), "this agent is a contact already");
 
@@ -347,8 +338,7 @@ mod tests {
         let friend_endpoint =
             crate::direct::endpoint_id(friend.path()).expect("endpoint");
         hub.state().add_account(&friend_endpoint, "bob#0042");
-        let host_server = served(host.path(), shared_in(host.path()))
-            .with_caller(host.path().to_path_buf());
+        let host_server = served(host.path(), shared_in(host.path()));
         let offer = |to: &str| InviteNameArguments {
             to: to.to_owned(),
             days: 7,
@@ -371,8 +361,7 @@ mod tests {
         assert_eq!(sent.side, aether_store::ApprovalSide::Sender);
         assert_eq!((sent.peer_name.as_str(), sent.days), ("bob#0042", 7));
 
-        let friend_server = served(friend.path(), shared_in(friend.path()))
-            .with_caller(friend.path().to_path_buf());
+        let friend_server = served(friend.path(), shared_in(friend.path()));
         let accepted = friend_server
             .invites_accept(Parameters(InviteIdArguments {
                 id: id.clone(),

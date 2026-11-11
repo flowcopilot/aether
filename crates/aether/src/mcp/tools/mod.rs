@@ -44,8 +44,13 @@ mod tests {
 
     #[test]
     fn caller_only_lists_exactly_the_caller_tools() {
-        let server = McpServer::socket(std::path::PathBuf::from("admin.sock"))
-            .with_caller_only(true);
+        let directory = tempfile::tempdir().expect("directory must create");
+        let server = McpServer::new(
+            directory.path().join("admin.sock"),
+            directory.path().to_path_buf(),
+            None,
+            true,
+        );
         let mut listed: Vec<String> = server
             .tools()
             .list_all()
@@ -61,7 +66,14 @@ mod tests {
 
     #[test]
     fn every_caller_tool_is_in_the_full_router() {
-        let full = McpServer::socket(std::path::PathBuf::from("admin.sock")).tools();
+        let directory = tempfile::tempdir().expect("directory must create");
+        let full = McpServer::new(
+            directory.path().join("admin.sock"),
+            directory.path().to_path_buf(),
+            None,
+            false,
+        )
+        .tools();
         for name in CALLER_TOOLS {
             assert!(full.has_route(name), "{name} must be a tool of the full router");
         }

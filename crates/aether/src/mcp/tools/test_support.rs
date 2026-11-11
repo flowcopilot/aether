@@ -26,7 +26,7 @@ pub(super) fn served(
 ) -> McpServer {
     let socket = crate::data_dir::DataDir::new(directory).admin_socket();
     start(&socket, administration).expect("socket must start");
-    McpServer::socket(socket)
+    McpServer::new(socket, directory.to_path_buf(), None, false)
 }
 
 pub(super) fn decode(result: &rmcp::model::CallToolResult) -> serde_json::Value {
