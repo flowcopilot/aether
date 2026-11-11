@@ -5,7 +5,7 @@
 //! and the transcript that the tests replay are in `protocol/agent-socket/`.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     io::{self, BufRead, BufReader, Read, Write},
     net::Shutdown,
     os::unix::{
@@ -24,6 +24,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use super::EarlyCancels;
 use crate::execution::{
     Agent, ExecutionError, ExecutionEvent, TurnContext, agent_instructions,
 };
@@ -42,7 +43,7 @@ pub struct ConnectedAgent {
 struct Shared {
     connection: Mutex<Option<Connection>>,
     generation: AtomicU64,
-    early_cancels: Mutex<BTreeSet<String>>,
+    cancels: Mutex<EarlyCancels>,
 }
 
 type Writer = Arc<Mutex<UnixStream>>;
@@ -102,7 +103,7 @@ impl ConnectedAgent {
             shared: Arc::new(Shared {
                 connection: Mutex::new(None),
                 generation: AtomicU64::new(0),
-                early_cancels: Mutex::new(BTreeSet::new()),
+                cancels: Mutex::new(EarlyCancels::default()),
             }),
         };
         let shared = Arc::clone(&agent.shared);
@@ -237,31 +238,33 @@ fn write_line(
     writer.flush().map_err(|_| ExecutionError::Unavailable)
 }
 
-impl Agent for ConnectedAgent {
-    fn start_turn_with_events(
-        &mut self,
+impl ConnectedAgent {
+    fn run_turn(
+        &self,
         ctx: &TurnContext,
         events: &mut dyn FnMut(ExecutionEvent),
     ) -> Result<String, ExecutionError> {
-        if self
-            .shared
-            .early_cancels
-            .lock()
-            .map_err(|_| ExecutionError::Unavailable)?
-            .remove(&ctx.task_id)
-        {
-            return Err(ExecutionError::Cancelled);
-        }
-        let (writer, pending) = self.connection()?;
-        let (sender, receiver) = mpsc::channel();
-        {
-            let mut pending =
-                pending.lock().map_err(|_| ExecutionError::Unavailable)?;
-            if pending.contains_key(&ctx.task_id) {
-                return Err(ExecutionError::Protocol);
+        let (writer, pending, receiver) = {
+            // Held until the turn is pending, so that a cancel either finds
+            // it pending or is kept for this check.
+            let mut cancels =
+                self.shared.cancels.lock().map_err(|_| ExecutionError::Unavailable)?;
+            if cancels.take(&ctx.task_id) {
+                return Err(ExecutionError::Cancelled);
             }
-            pending.insert(ctx.task_id.clone(), sender);
-        }
+            let (writer, pending) = self.connection()?;
+            let (sender, receiver) = mpsc::channel();
+            {
+                let mut pending =
+                    pending.lock().map_err(|_| ExecutionError::Unavailable)?;
+                if pending.contains_key(&ctx.task_id) {
+                    return Err(ExecutionError::Protocol);
+                }
+                pending.insert(ctx.task_id.clone(), sender);
+            }
+            drop(cancels);
+            (writer, pending, receiver)
+        };
         let result = (|| {
             write_line(
                 &writer,
@@ -301,17 +304,31 @@ impl Agent for ConnectedAgent {
         }
         result
     }
+}
+
+impl Agent for ConnectedAgent {
+    fn start_turn_with_events(
+        &mut self,
+        ctx: &TurnContext,
+        events: &mut dyn FnMut(ExecutionEvent),
+    ) -> Result<String, ExecutionError> {
+        let result = self.run_turn(ctx, events);
+        if let Ok(mut cancels) = self.shared.cancels.lock() {
+            cancels.end(&ctx.task_id);
+        }
+        result
+    }
 
     fn cancel(&self, task_id: &str) {
+        let Ok(mut cancels) = self.shared.cancels.lock() else { return };
         if let Ok((writer, pending)) = self.connection()
             && pending.lock().is_ok_and(|pending| pending.contains_key(task_id))
         {
+            drop(cancels);
             let _ = write_line(&writer, &NodeMessage::Cancel { id: task_id });
             return;
         }
-        if let Ok(mut early) = self.shared.early_cancels.lock() {
-            early.insert(task_id.to_owned());
-        }
+        cancels.cancel(task_id);
     }
 }
 
@@ -635,6 +652,34 @@ mod tests {
             agent.start_turn(&turn_ctx("task-early", "hello", deadline)),
             Err(ExecutionError::Cancelled)
         );
+    }
+
+    #[test]
+    fn a_cancel_after_the_turn_ended_is_not_kept_for_a_later_start() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let path = crate::data_dir::DataDir::new(directory.path()).agent_socket();
+        let agent = ConnectedAgent::listen(&path).expect("listen");
+        let mut peer =
+            Peer::attach(&agent, &path, &json!({"type": "ready", "protocol": 1}));
+        peer.stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout must set");
+        let deadline =
+            Instant::now().checked_add(Duration::from_secs(5)).expect("deadline");
+        let answer = |peer: &mut Peer| {
+            let mut runner = agent.clone();
+            let turn = std::thread::spawn(move || {
+                runner.start_turn(&turn_ctx("task-1", "hello", deadline))
+            });
+            assert_eq!(peer.read()["type"], "task");
+            peer.write(&json!({"type": "result", "id": "task-1", "text": "answer"}));
+            turn.join().expect("turn joins")
+        };
+        assert_eq!(answer(&mut peer), Ok("answer".to_owned()));
+        // The node may cancel a task that already ended; that cancel is
+        // not an early one for a turn that starts later.
+        agent.cancel("task-1");
+        assert_eq!(answer(&mut peer), Ok("answer".to_owned()));
     }
 
     #[test]
