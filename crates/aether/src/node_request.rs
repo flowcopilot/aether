@@ -114,7 +114,7 @@ pub async fn send(input: RequestInput) -> Result<Vec<Frame>, RequestError> {
         .and_then(|(store, agent_id)| direct::contact_bundle(store, agent_id).ok());
     let authorization = match (&input.authorization, &bundle) {
         (Some(path), _) => directory_client::read_authorization(path)
-            .map_err(|()| RequestError::AuthorizationInvalid)?,
+            .map_err(|_| RequestError::AuthorizationInvalid)?,
         (None, Some(bundle)) => bundle.authorization.clone(),
         (None, None) => return Err(RequestError::AuthorizationRequired),
     };
