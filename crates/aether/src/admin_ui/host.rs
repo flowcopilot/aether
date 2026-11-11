@@ -1,7 +1,7 @@
 //! The host screen of `node serve --admin-port`: who can use the agent, the
 //! folder it works in, and the form that invites someone.
 
-use std::{sync::PoisonError, time::SystemTime};
+use std::time::SystemTime;
 
 use aether_core::time::now_seconds;
 
@@ -19,11 +19,10 @@ use topcoat::{
 };
 
 use super::{
-    Page, PageContext, ensure_admin_session,
+    Page, PageContext, admin_page, administration, ensure_admin_session,
     hub::{hub_section, hub_setting},
     layout::{Tab, Waiting, node_header},
     listing::listing_section,
-    require_admin_session,
     shared::{self, Notice},
 };
 use crate::access_groups::{self, Action};
@@ -84,9 +83,7 @@ pub(super) async fn host_screen(
     };
     let relay_url = page.relay_url();
     let (grants, last_tasks, folder, pending) = {
-        let administration = app_context::<SharedAdministration>(cx)
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let administration = administration(cx);
         (
             administration.grants().map_err(|_| {
                 internal_server_error(std::io::Error::other("grants unavailable"))
@@ -385,10 +382,7 @@ pub(super) async fn change_group(
     cx: &Cx,
     Form(form): Form<GroupForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let Page(Some(page)) = app_context::<Page>(cx) else {
-        return Err(bad_request("this node has no groups").into());
-    };
+    let page = admin_page(cx, "this node has no groups").await?;
     let action = match form.action.as_str() {
         "create" => Action::Create,
         "add" => Action::Add,
@@ -396,9 +390,7 @@ pub(super) async fn change_group(
         "delete" => Action::Delete,
         _ => return Err(bad_request("this group action is invalid").into()),
     };
-    let peers = app_context::<SharedAdministration>(cx)
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
+    let peers = administration(cx)
         .grants()
         .map_err(|_| bad_request("grants are unavailable"))?
         .into_iter()
@@ -486,10 +478,7 @@ pub(super) async fn relay(
     cx: &Cx,
     Form(form): Form<RelayForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let Page(Some(page)) = app_context::<Page>(cx) else {
-        return Err(bad_request("this node has no relay to change").into());
-    };
+    let page = admin_page(cx, "this node has no relay to change").await?;
     let relay = form.relay_url.trim();
     let relay = (!relay.is_empty()).then(|| relay.to_owned());
     let valid = relay.as_deref().is_none_or(crate::transport::relay::valid_relay_url);
@@ -575,10 +564,7 @@ pub(super) async fn save_card(
     cx: &Cx,
     Form(form): Form<CardForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let Page(Some(page)) = app_context::<Page>(cx) else {
-        return Err(bad_request("this node has no agent card").into());
-    };
+    let page = admin_page(cx, "this node has no agent card").await?;
     let card_input = crate::agent_card::CardInput {
         description: form.description,
         skill_name: form.skill_name,
@@ -864,10 +850,7 @@ pub(super) async fn invite(
     cx: &Cx,
     Form(form): Form<InviteForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let Page(Some(page)) = app_context::<Page>(cx) else {
-        return Err(bad_request("this node cannot invite").into());
-    };
+    let page = admin_page(cx, "this node cannot invite").await?;
     // A code copied from the caller's page may keep its groups of four.
     let endpoint_id = form.endpoint_id.split_whitespace().collect::<String>();
     let refusal = if endpoint_id.parse::<iroh::EndpointId>().is_err() {
@@ -935,14 +918,9 @@ pub(super) async fn revoke(
     cx: &Cx,
     Form(form): Form<RevokeForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let Page(Some(_page)) = app_context::<Page>(cx) else {
-        return Err(bad_request("this node cannot revoke").into());
-    };
+    admin_page(cx, "this node cannot revoke").await?;
     let notice = if form.confirm.as_deref() == Some("yes") {
-        app_context::<SharedAdministration>(cx)
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        administration(cx)
             .revoke(&form.grant_id, aether_store::AuditActor::Ui)
             .map_err(|_| bad_request("the access cannot be revoked"))?;
         Notice::default()
@@ -966,10 +944,7 @@ pub(super) async fn workspace(
     cx: &Cx,
     Form(form): Form<WorkspaceForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let Page(Some(page)) = app_context::<Page>(cx) else {
-        return Err(bad_request("this node has no workspace to change").into());
-    };
+    let page = admin_page(cx, "this node has no workspace to change").await?;
     if page.task_folder_mode {
         return Err(bad_request("task folders do not allow folder changes").into());
     }
@@ -979,9 +954,7 @@ pub(super) async fn workspace(
     }
     .into_change()
     .is_ok_and(|change| {
-        app_context::<SharedAdministration>(cx)
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        administration(cx)
             .apply(&change, aether_store::AuditActor::Ui)
             .map(|_| ())
             .is_ok()
@@ -1005,10 +978,7 @@ pub(super) async fn publish_listing(
     cx: &Cx,
     Form(form): Form<ListingForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let Page(Some(page)) = app_context::<Page>(cx) else {
-        return Err(bad_request("this node has no listing").into());
-    };
+    let page = admin_page(cx, "this node has no listing").await?;
     if crate::settings::setting::<crate::hub_client::settings::AgentKind>(
         &page.data_dir,
     )

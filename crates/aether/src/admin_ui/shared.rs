@@ -88,6 +88,13 @@ impl Notice {
     }
 }
 
+/// A form whose one field names what a button acts on.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct IdForm {
+    pub(super) id: String,
+}
+
 pub(super) fn request_drafts_of(
     data_dir: &Path,
     now: u64,

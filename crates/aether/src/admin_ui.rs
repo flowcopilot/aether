@@ -5,7 +5,7 @@ use std::{
     net::TcpListener,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{Arc, Mutex, PoisonError},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::{Duration, SystemTime},
 };
 
@@ -23,7 +23,7 @@ use topcoat::{
         Body as TopcoatBody, BodyLimit, HeaderValue, Next, Router as TopcoatRouter,
         Slot,
         content::sse::{Event, KeepAlive, Sse, last_event_id},
-        error::{forbidden, internal_server_error},
+        error::{bad_request, forbidden, internal_server_error},
         header, layer, layout, page,
         request::headers,
         response::IntoResponse as TopcoatIntoResponse,
@@ -255,6 +255,24 @@ async fn require_admin_session(cx: &Cx) -> TopcoatResult<()> {
     let valid =
         session::token_hash(cx).await?.is_some_and(|hash| sessions.valid(&hash));
     if valid { Ok(()) } else { Err(forbidden().into()) }
+}
+
+/// Requires the admin session, then the node page of this UI. `refusal` is
+/// the `400` text when the UI has no page.
+async fn admin_page<'cx>(
+    cx: &'cx Cx,
+    refusal: &'static str,
+) -> TopcoatResult<&'cx PageContext> {
+    require_admin_session(cx).await?;
+    let Page(page) = app_context::<Page>(cx);
+    page.as_deref().ok_or_else(|| bad_request(refusal).into())
+}
+
+/// The administration, locked. A panic elsewhere does not lock it out.
+fn administration(cx: &Cx) -> MutexGuard<'_, crate::admin::Administration> {
+    app_context::<SharedAdministration>(cx)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Establishes (or slides the expiry of) the one admin session this process

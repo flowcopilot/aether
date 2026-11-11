@@ -23,12 +23,12 @@ use topcoat::{
 };
 
 use super::{
-    Page, PageContext, UiMode,
+    Page, PageContext, UiMode, admin_page,
     caller::caller_screen,
     host::host_screen,
     layout::page_data_dir,
     require_admin_session,
-    shared::{self, Notice},
+    shared::{self, IdForm, Notice},
 };
 use crate::hub_client::protocol::{DEFAULT_ACCESS_DAYS, OFFER_DAYS};
 use aether_store::{ApprovalKind, ApprovalSide, HubApproval};
@@ -685,9 +685,15 @@ async fn hub_form_screen(cx: &Cx, notice: Notice) -> TopcoatResult<impl View> {
     })
 }
 
-/// The hub of this page's side, and the page to show after a hub form.
-fn page_hub(cx: &Cx) -> TopcoatResult<HubClient> {
+/// Requires the admin session, then the hub of this page.s side.
+async fn admin_hub(cx: &Cx) -> TopcoatResult<HubClient> {
+    require_admin_session(cx).await?;
     current_hub(cx).ok_or_else(|| bad_request("this page has no hub").into())
+}
+
+/// The text a hub form shows for `result`: empty when it worked.
+pub(super) fn hub_failure<T>(result: Result<T, HubError>) -> &'static str {
+    result.err().map(hub_message).unwrap_or_default()
 }
 
 /// The hub of this page's side now, if there is one.
@@ -715,8 +721,7 @@ pub(super) async fn claim_name(
     cx: &Cx,
     Form(form): Form<NameForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let hub = page_hub(cx)?;
+    let hub = admin_hub(cx).await?;
     let data_dir = page_data_dir(cx);
     let name = form.name.trim();
     // A page without a host has only a personal agent.
@@ -772,8 +777,7 @@ pub(super) async fn set_search(
     cx: &Cx,
     Form(form): Form<SearchForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let hub = page_hub(cx)?;
+    let hub = admin_hub(cx).await?;
     let searchable = form.searchable.as_deref() == Some("on");
     let error = match hub.set_searchable(searchable).await {
         Ok(_) => "",
@@ -796,10 +800,7 @@ pub(super) async fn invite_by_name(
     cx: &Cx,
     Form(form): Form<InviteForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let Page(Some(page)) = app_context::<Page>(cx) else {
-        return Err(bad_request("this node cannot invite").into());
-    };
+    let page = admin_page(cx, "this node cannot invite").await?;
     let hub = page.current_hub().ok_or_else(|| bad_request("this node has no hub"))?;
     let to = form.to.trim();
     let error = if !valid_full_name(to) {
@@ -810,12 +811,6 @@ pub(super) async fn invite_by_name(
         offer(&hub, &page.data_dir, to, form.days).await.err().unwrap_or_default()
     };
     Ok(view! { hub_form_screen(notice: Notice::Hub(error.to_owned())) })
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct InviteIdForm {
-    id: String,
 }
 
 #[derive(Deserialize)]
@@ -832,17 +827,10 @@ pub(super) async fn approve_request(
     cx: &Cx,
     Form(form): Form<ApproveForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let Page(Some(page)) = app_context::<Page>(cx) else {
-        return Err(bad_request("this node has no access requests").into());
-    };
+    let page = admin_page(cx, "this node has no access requests").await?;
     let hub = page.current_hub().ok_or_else(|| bad_request("this node has no hub"))?;
     let error = if OFFER_DAYS.contains(&form.days) {
-        approve(&hub, &page.data_dir, &form.id, form.days)
-            .await
-            .err()
-            .map(hub_message)
-            .unwrap_or_default()
+        hub_failure(approve(&hub, &page.data_dir, &form.id, form.days).await)
     } else {
         "Choose how long they can use your agent."
     };
@@ -917,18 +905,11 @@ async fn approve(
 #[page(POST "/hub/block-request")]
 pub(super) async fn block_request(
     cx: &Cx,
-    Form(form): Form<InviteIdForm>,
+    Form(form): Form<IdForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let Page(Some(page)) = app_context::<Page>(cx) else {
-        return Err(bad_request("this node has no access requests").into());
-    };
+    let page = admin_page(cx, "this node has no access requests").await?;
     let hub = page.current_hub().ok_or_else(|| bad_request("this node has no hub"))?;
-    let error = block_requester(&hub, page, &form.id)
-        .await
-        .err()
-        .map(hub_message)
-        .unwrap_or_default();
+    let error = hub_failure(block_requester(&hub, page, &form.id).await);
     Ok(view! { hub_form_screen(notice: Notice::Hub(error.to_owned())) })
 }
 
@@ -980,8 +961,7 @@ pub(super) async fn claim_owner(
     cx: &Cx,
     Form(form): Form<OwnerClaimForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let hub = page_hub(cx)?;
+    let hub = admin_hub(cx).await?;
     let (kind, key) = page_agent(cx, &hub).await?;
     if kind != AgentKind::Personal {
         return Err(bad_request("only a personal agent claims a service agent").into());
@@ -1007,10 +987,9 @@ pub(super) async fn claim_owner(
 #[page(POST "/hub/owner/confirm")]
 pub(super) async fn confirm_owner(
     cx: &Cx,
-    Form(form): Form<InviteIdForm>,
+    Form(form): Form<IdForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let hub = page_hub(cx)?;
+    let hub = admin_hub(cx).await?;
     let (kind, key) = page_agent(cx, &hub).await?;
     if kind != AgentKind::Service {
         return Err(bad_request("only a service agent confirms an owner").into());
@@ -1050,16 +1029,10 @@ async fn confirm_claim(
 #[page(POST "/hub/owner/remove")]
 pub(super) async fn remove_owner(
     cx: &Cx,
-    Form(form): Form<InviteIdForm>,
+    Form(form): Form<IdForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let hub = page_hub(cx)?;
-    let error = hub
-        .delete_owner_link(&form.id)
-        .await
-        .err()
-        .map(hub_message)
-        .unwrap_or_default();
+    let hub = admin_hub(cx).await?;
+    let error = hub_failure(hub.delete_owner_link(&form.id).await);
     Ok(view! { hub_form_screen(notice: Notice::Hub(error.to_owned())) })
 }
 
@@ -1067,12 +1040,10 @@ pub(super) async fn remove_owner(
 #[page(POST "/hub/block")]
 pub(super) async fn block_invite(
     cx: &Cx,
-    Form(form): Form<InviteIdForm>,
+    Form(form): Form<IdForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let hub = page_hub(cx)?;
-    let error =
-        hub.block_invite(&form.id).await.err().map(hub_message).unwrap_or_default();
+    let hub = admin_hub(cx).await?;
+    let error = hub_failure(hub.block_invite(&form.id).await);
     Ok(view! { hub_form_screen(notice: Notice::Hub(error.to_owned())) })
 }
 
@@ -1087,10 +1058,8 @@ pub(super) async fn unblock(
     cx: &Cx,
     Form(form): Form<UnblockForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let hub = page_hub(cx)?;
-    let error =
-        hub.unblock(&form.endpoint).await.err().map(hub_message).unwrap_or_default();
+    let hub = admin_hub(cx).await?;
+    let error = hub_failure(hub.unblock(&form.endpoint).await);
     if error.is_empty()
         && let Some(store) = page_data_dir(cx)
             .and_then(|data_dir| crate::hub_store::HubStore::open(&data_dir).ok())
@@ -1104,11 +1073,10 @@ pub(super) async fn unblock(
 #[page(POST "/hub/remove")]
 pub(super) async fn remove_invite(
     cx: &Cx,
-    Form(form): Form<InviteIdForm>,
+    Form(form): Form<IdForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let hub = page_hub(cx)?;
-    let error = hub.remove(&form.id).await.err().map(hub_message).unwrap_or_default();
+    let hub = admin_hub(cx).await?;
+    let error = hub_failure(hub.remove(&form.id).await);
     Ok(view! { hub_form_screen(notice: Notice::Hub(error.to_owned())) })
 }
 
@@ -1175,11 +1143,7 @@ pub(super) async fn hub_url(
     cx: &Cx,
     Form(form): Form<HubUrlForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let Page(page) = app_context::<Page>(cx);
-    let Some(page) = page.as_ref() else {
-        return Err(bad_request("this page has no hub").into());
-    };
+    let page = admin_page(cx, "this page has no hub").await?;
     let data_dir = page.data_dir.clone();
     let url = form.hub_url.trim().trim_end_matches('/');
     let chosen = crate::hub_client::hub_setting(url).ok().and_then(|stored| {

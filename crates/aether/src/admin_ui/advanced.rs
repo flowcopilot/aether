@@ -3,10 +3,7 @@
 //! confirmation. `node serve` and `node admin` link to it from their own
 //! screen; a UI with neither a host nor a caller shows it at `/`.
 
-use std::{
-    path::PathBuf,
-    sync::{Arc, PoisonError},
-};
+use std::{path::PathBuf, sync::Arc};
 
 use serde::Deserialize;
 use topcoat::{
@@ -21,11 +18,12 @@ use topcoat::{
 };
 
 use super::{
-    AdminConfirmations, Managed, Page, ensure_admin_session,
+    AdminConfirmations, Managed, Page, administration, ensure_admin_session,
     layout::{Tab, node_header, page_data_dir},
+    shared::IdForm,
 };
 use crate::{
-    admin::{AdminStoreAccess, SharedAdministration},
+    admin::AdminStoreAccess,
     admin_components::page_title,
     components::{
         alert::{AlertVariant, alert, alert_description, alert_title},
@@ -58,10 +56,8 @@ pub(super) async fn dashboard(
         .map_err(internal_server_error)?
         .flatten();
 
-    let administration = app_context::<SharedAdministration>(cx);
     let (store_access, pending, configured, summary, members) = {
-        let administration =
-            administration.lock().unwrap_or_else(PoisonError::into_inner);
+        let administration = administration(cx);
         (
             administration.store_access(),
             administration.pending(),
@@ -299,25 +295,14 @@ fn managed_member_state(member: &ManagedMember) -> &'static str {
     if member.expires_at <= now { "expired" } else { "active" }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct ConfirmForm {
-    id: String,
-}
-
 #[page(POST "/confirm")]
 pub(super) async fn confirm(
     cx: &Cx,
-    Form(form): Form<ConfirmForm>,
+    Form(form): Form<IdForm>,
 ) -> TopcoatResult<impl View> {
     super::require_admin_session(cx).await?;
-    let confirmed =
-        app_context::<Arc<AdminConfirmations>>(cx).confirm(&form.id, |id| {
-            app_context::<SharedAdministration>(cx)
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .confirm_ui(id)
-        });
+    let confirmed = app_context::<Arc<AdminConfirmations>>(cx)
+        .confirm(&form.id, |id| administration(cx).confirm_ui(id));
     if !matches!(confirmed, Some(Ok(()))) {
         return Err(bad_request("this change is no longer available").into());
     }
@@ -336,10 +321,7 @@ pub(super) async fn cancel(
     Form(form): Form<CancelForm>,
 ) -> TopcoatResult<impl View> {
     super::require_admin_session(cx).await?;
-    let result = app_context::<SharedAdministration>(cx)
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .cancel_task(&form.task_id);
+    let result = administration(cx).cancel_task(&form.task_id);
     if result.is_err() {
         return Err(bad_request("the task cannot be cancelled").into());
     }
@@ -372,9 +354,7 @@ pub(super) async fn save_policy(
             form.queue_per_peer,
         ),
     };
-    app_context::<SharedAdministration>(cx)
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
+    administration(cx)
         .save_policy_settings(&settings, aether_store::AuditActor::Ui)
         .map_err(|_| {
             bad_request("use an existing absolute folder and limits above zero")

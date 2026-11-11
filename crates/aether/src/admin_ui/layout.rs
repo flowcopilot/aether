@@ -1,13 +1,10 @@
-use std::sync::PoisonError;
-
 use topcoat::{
     Result as TopcoatResult,
     context::{Cx, app_context},
     view::{View, component, view},
 };
 
-use super::{Page, PageContext, UiMode, shared};
-use crate::admin::SharedAdministration;
+use super::{Page, PageContext, UiMode, administration, shared};
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(super) enum Tab {
@@ -37,11 +34,7 @@ impl Waiting {
             let now = aether_core::time::now_seconds();
             shared::request_drafts_of(&page.data_dir, now).len()
         });
-        let pending = app_context::<SharedAdministration>(cx)
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .pending()
-            .map_or(0, |pending| pending.len());
+        let pending = administration(cx).pending().map_or(0, |pending| pending.len());
         Self { drafts, pending }
     }
 }

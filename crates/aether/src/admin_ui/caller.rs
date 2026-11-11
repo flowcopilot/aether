@@ -18,11 +18,10 @@ use topcoat::{
 };
 
 use super::{
-    Page, ensure_admin_session,
-    hub::{error_line, hub_section, hub_setting},
+    Page, admin_page, ensure_admin_session,
+    hub::{error_line, hub_failure, hub_section, hub_setting},
     layout::{Tab, node_header},
-    require_admin_session,
-    shared::Notice,
+    shared::{IdForm, Notice},
 };
 use crate::{
     admin_components::{
@@ -35,7 +34,7 @@ use crate::{
         input::input,
     },
     hub_client::{HubClient, Role},
-    hub_membership::{accept, hub_message},
+    hub_membership::accept,
 };
 
 /// An agent this computer can use, from its kept invite.
@@ -388,31 +387,19 @@ async fn request_draft(
     })
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct InviteIdForm {
-    id: String,
-}
-
 #[page(POST "/hub/accept")]
 pub(super) async fn accept_invite(
     cx: &Cx,
-    Form(form): Form<InviteIdForm>,
+    Form(form): Form<IdForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let Page(Some(page)) = app_context::<Page>(cx) else {
-        return Err(bad_request("this node cannot accept invites").into());
-    };
+    let page = admin_page(cx, "this node cannot accept invites").await?;
     if !page.mode.calls() {
         return Err(bad_request("this node cannot accept invites").into());
     }
     let Some(hub) = page.current_hub() else {
         return Err(bad_request("this node has no hub").into());
     };
-    let error = match accept(&hub, &page.data_dir, &form.id).await {
-        Ok(_) => "",
-        Err(error) => hub_message(error),
-    };
+    let error = hub_failure(accept(&hub, &page.data_dir, &form.id).await);
     Ok(view! { caller_screen(notice: Notice::Hub(error.to_owned())) })
 }
 
@@ -429,10 +416,7 @@ pub(super) async fn confirm_request(
     cx: &Cx,
     Form(form): Form<ConfirmForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let Page(Some(page)) = app_context::<Page>(cx) else {
-        return Err(bad_request("this node sends no access requests").into());
-    };
+    let page = admin_page(cx, "this node sends no access requests").await?;
     let error = match page.hub_access() {
         super::HubAccess::Ready(hub) => {
             confirm(&hub, &page.data_dir, &form.id, form.days)
@@ -504,21 +488,12 @@ async fn confirm(
     Ok(())
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct DiscardForm {
-    id: String,
-}
-
 #[page(POST "/requests/discard")]
 pub(super) async fn discard_request(
     cx: &Cx,
-    Form(form): Form<DiscardForm>,
+    Form(form): Form<IdForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let Page(Some(page)) = app_context::<Page>(cx) else {
-        return Err(bad_request("this node sends no access requests").into());
-    };
+    let page = admin_page(cx, "this node sends no access requests").await?;
     aether_store::NodeStore::in_dir(&page.data_dir)
         .and_then(|store| store.remove_access_request_draft(&form.id))
         .map_err(internal_server_error)?;
@@ -631,10 +606,7 @@ pub(super) async fn import(
     cx: &Cx,
     Form(form): Form<ImportForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let Page(Some(page)) = app_context::<Page>(cx) else {
-        return Err(bad_request("this page cannot import invitations").into());
-    };
+    let page = admin_page(cx, "this page cannot import invitations").await?;
     let error = match crate::direct::InvitationBundle::decode(&form.bundle) {
         Err(_) => "This is not an Aether invite. Ask for it again and paste all of it.",
         Ok(bundle) => match crate::direct::import_bundle(&page.data_dir, &bundle) {
@@ -669,10 +641,7 @@ pub(super) async fn remove_contact(
     cx: &Cx,
     Form(form): Form<RemoveContactForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let Page(Some(page)) = app_context::<Page>(cx) else {
-        return Err(bad_request("this page has no contacts").into());
-    };
+    let page = admin_page(cx, "this page has no contacts").await?;
     match crate::direct::remove_contact(&page.data_dir, &form.agent) {
         Ok(()) | Err(crate::direct::DirectError::UnknownContact) => {}
         Err(error) => return Err(internal_server_error(error).into()),
