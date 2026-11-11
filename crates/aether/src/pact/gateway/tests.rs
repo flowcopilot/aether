@@ -702,6 +702,30 @@ async fn a_task_that_never_finishes_times_out() {
 }
 
 #[tokio::test]
+async fn a_send_dropped_while_its_task_runs_can_be_retried() {
+    let fixture = fixture_with(FakeNode::keep_running);
+    let started = fixture.send("u", None, user_message("m0", "hello")).await;
+    let context_id = started.body["task"]["contextId"].as_str().expect("context");
+    let tokens = fixture.delegate("u").await;
+    let access = tokens["access_token"].as_str().expect("access token");
+    let mut message = user_message("m1", "Review main.rs");
+    message["contextId"] = context_id.into();
+
+    // The client goes away while the task runs.
+    let dropped = tokio::time::timeout(
+        Duration::from_millis(200),
+        fixture.send("u", Some(access), message.clone()),
+    )
+    .await;
+    assert!(dropped.is_err(), "the task must still be running");
+
+    fixture.node.always_running.store(false, Ordering::Release);
+    let retry = fixture.send("u", Some(access), message).await;
+    assert_eq!(retry.status, StatusCode::OK, "{}", retry.body);
+    assert_eq!(retry.body["message"]["parts"], json!([{ "text": "answer 2" }]));
+}
+
+#[tokio::test]
 async fn a_delegated_turn_runs_codex_and_carries_a_signed_receipt() {
     let fixture = fixture();
     let tokens = fixture.delegate("u").await;

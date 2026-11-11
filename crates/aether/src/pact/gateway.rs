@@ -639,8 +639,7 @@ struct PreparedTask {
 struct PendingTurn {
     brand: Brand,
     caller: PaIdentity,
-    context_id: String,
-    message_id: String,
+    reserved: ReservedMessage,
     delegation: DelegationClaims,
     prepared: PreparedTask,
 }
@@ -650,8 +649,37 @@ impl PendingTurn {
         Turn {
             brand: &self.brand,
             caller: &self.caller,
-            context_id: &self.context_id,
-            message_id: &self.message_id,
+            context_id: &self.reserved.context_id,
+            message_id: &self.reserved.message_id,
+        }
+    }
+}
+
+/// A reserved message that no reply has settled yet. Dropped unsettled,
+/// it forgets the message: the request went away while its task ran (the
+/// client left, or the time limit passed), and a retry with the same id
+/// must run the turn again rather than wait for a reply that never comes.
+/// The task itself is idempotent, so the retry finds the same task.
+struct ReservedMessage {
+    store: SharedPactStore,
+    context_id: String,
+    message_id: String,
+    settled: bool,
+}
+
+impl Drop for ReservedMessage {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        // One small delete, on whichever thread drops the request.
+        let discarded = self
+            .store
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .discard_message(&self.context_id, &self.message_id);
+        if let Err(error) = discarded {
+            tracing::warn!(?error, "pact message discard failed after a dropped send");
         }
     }
 }
@@ -776,10 +804,14 @@ impl Gateway {
             Ok(Err(answered)) => return *answered,
             Err(failure) => return failure.into(),
         };
+        // Dropping `pending` before `finish_send` runs forgets the message.
         let reply = gateway.run_task(&pending).await;
         blocking_response(gateway, move |gateway| {
+            let mut pending = pending;
             let outcome = reply.and_then(|reply| gateway.turn_reply(&pending, reply));
-            gateway.finish_send(&pending.turn(), outcome)
+            let response = gateway.finish_send(&pending.turn(), outcome);
+            pending.reserved.settled = true;
+            response
         })
         .await
     }
@@ -833,8 +865,12 @@ impl Gateway {
         Ok(PendingTurn {
             brand,
             caller,
-            context_id,
-            message_id: message.message_id,
+            reserved: ReservedMessage {
+                store: Arc::clone(&self.store),
+                context_id,
+                message_id: message.message_id,
+                settled: false,
+            },
             delegation,
             prepared,
         })
