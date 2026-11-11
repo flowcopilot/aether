@@ -1,5 +1,5 @@
 import { randomUUID, createHash } from 'node:crypto';
-import { existsSync, readFileSync, openSync, writeFileSync, fsyncSync, closeSync, unlinkSync } from 'node:fs';
+import { existsSync, readFileSync, openSync, writeFileSync, fsyncSync, closeSync, linkSync, unlinkSync } from 'node:fs';
 import { performance } from 'node:perf_hooks';
 import { frameTask, contract } from './node-link.mjs';
 
@@ -13,8 +13,9 @@ export class Mailbox {
   constructor({ marker, send, wake = () => {}, leaseMs = 60_000, taskMs = 120_000, capacity = 32 }) {
     Object.assign(this, { marker, send, wake, leaseMs, taskMs, capacity });
     if (existsSync(marker)) {
-      const saved = JSON.parse(readFileSync(marker, 'utf8'));
-      if (typeof saved.id !== 'string' || typeof saved.lease !== 'string' || typeof saved.claim_id !== 'string') {
+      let saved;
+      try { saved = JSON.parse(readFileSync(marker, 'utf8')); } catch (error) { if (error.code) throw error; }
+      if (typeof saved?.id !== 'string' || typeof saved.lease !== 'string' || typeof saved.claim_id !== 'string') {
         throw new Error('Invalid active-claim marker; verify the old Bot is stopped before removing it');
       }
       this.active = { ...saved, stopped: true };
@@ -74,13 +75,21 @@ export class Mailbox {
     const task = this.pending.values().next().value;
     if (!task) return { status: 'empty' };
     const active = { ...task, claim_id, lease: randomUUID(), leaseUntil: performance.now() + this.leaseMs, stopped: false };
-    // Exclusive creation fences concurrent bridge processes. Sync before exposing
-    // work so a crash/restart cannot silently assign overlapping work.
-    const fd = openSync(this.marker, 'wx', 0o600);
+    // The marker is written and synced under a private name, then linked into
+    // place: linking fails if the marker exists, which fences concurrent bridge
+    // processes, and a failed write never leaves a partial marker behind.
+    // Sync before exposing work so a crash/restart cannot assign overlapping work.
+    const temp = `${this.marker}.${process.pid}.${active.lease}.tmp`;
     try {
-      writeFileSync(fd, JSON.stringify({ id: active.id, claim_id, lease: active.lease }));
-      fsyncSync(fd);
-    } finally { closeSync(fd); }
+      const fd = openSync(temp, 'wx', 0o600);
+      try {
+        writeFileSync(fd, JSON.stringify({ id: active.id, claim_id, lease: active.lease }));
+        fsyncSync(fd);
+      } finally { closeSync(fd); }
+      linkSync(temp, this.marker);
+    } finally {
+      try { unlinkSync(temp); } catch {}
+    }
     this.active = active;
     this.pending.delete(task.id);
     return this.assignment();
