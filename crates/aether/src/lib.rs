@@ -48,7 +48,6 @@ pub mod pact;
 mod pinned_json;
 pub mod policy;
 pub mod proof;
-pub mod roster_sync;
 pub mod settings;
 mod signed;
 #[cfg(test)]

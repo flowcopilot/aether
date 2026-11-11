@@ -224,16 +224,28 @@ pub async fn sync_managed(
     let mut store = aether_store::NodeStore::in_dir(data_dir).map_err(|_| ())?;
     let mut cursor = store.managed_cursor(control, scope_id).map_err(|_| ())?;
     let mut changes = 0usize;
-    let control = control.to_owned();
     loop {
         let events = client.events_after(scope_id, cursor).await.map_err(|_| ())?;
         if events.is_empty() {
             return Ok((cursor, changes));
         }
         // `events_after` refuses a page whose cursors do not climb past
-        // `cursor`, so each event moves the cursor forward.
+        // `cursor`, and an event whose member does not match its type, so
+        // each event moves the cursor forward and needs no further check.
         for event in events {
-            crate::roster_sync::apply_managed_change(&mut store, &control, &event)?;
+            match event.event {
+                ManagedEventType::Joined => {
+                    let member = event.member.as_ref().ok_or(())?;
+                    store.apply_managed_member(control, event.cursor, member)
+                }
+                ManagedEventType::Revoked => store.revoke_managed_member(
+                    control,
+                    event.cursor,
+                    &event.scope_id,
+                    &event.agent_id,
+                ),
+            }
+            .map_err(|_| ())?;
             cursor = event.cursor;
             changes = changes.checked_add(1).ok_or(())?;
         }

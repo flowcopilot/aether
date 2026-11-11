@@ -224,13 +224,18 @@ pub fn cache_directory_record(
     record: &crate::discovery::Record,
 ) -> Result<(), ()> {
     let store = aether_store::NodeStore::in_dir(data_dir).map_err(|_| ())?;
-    crate::roster_sync::cache_wire_directory_record(
-        &store,
-        &WireRecord::from_record(record),
-    )
+    cache_wire_directory_record(&store, &WireRecord::from_record(record))
 }
 
-pub use crate::roster_sync::cache_wire_directory_record;
+#[allow(clippy::result_unit_err)]
+pub fn cache_wire_directory_record(
+    store: &aether_store::NodeStore,
+    record: &WireRecord,
+) -> Result<(), ()> {
+    store
+        .cache_directory_record(&record.signed_store_record().map_err(|_| ())?)
+        .map_err(|_| ())
+}
 
 #[allow(clippy::result_unit_err)]
 pub async fn sync_directory(
@@ -243,26 +248,30 @@ pub async fn sync_directory(
     let store = aether_store::NodeStore::in_dir(data_dir).map_err(|_| ())?;
     let mut cursor = store.directory_cursor(directory, &trusted_key).map_err(|_| ())?;
     let mut records = 0usize;
-    let directory = directory.to_owned();
     loop {
         let changes = client.events_after(cursor).await.map_err(|_| ())?;
         if changes.is_empty() {
             return Ok((cursor, records));
         }
         // `events_after` refuses a page whose cursors do not climb past
-        // `cursor`, so each change moves the cursor forward.
+        // `cursor`, and an event whose record does not match its type, so
+        // each change moves the cursor forward and needs no further check.
         for change in changes {
-            if matches!(
-                change.event,
-                aether_store::DirectoryEventType::Published
-                    | aether_store::DirectoryEventType::Renewed
-            ) {
-                records = records.checked_add(1).ok_or(())?;
+            match change.event {
+                DirectoryEventType::Published | DirectoryEventType::Renewed => {
+                    let record = change.record.as_ref().ok_or(())?;
+                    cache_wire_directory_record(&store, record)?;
+                    records = records.checked_add(1).ok_or(())?;
+                }
+                DirectoryEventType::Revoked => {
+                    store
+                        .mark_directory_record_stale(&change.scope_id, &change.agent_id)
+                        .map_err(|_| ())?;
+                }
             }
-            crate::roster_sync::apply_directory_change(&store, &change)?;
             cursor = change.cursor;
             store
-                .advance_directory_cursor(&directory, &trusted_key, cursor)
+                .advance_directory_cursor(directory, &trusted_key, cursor)
                 .map_err(|_| ())?;
         }
     }
