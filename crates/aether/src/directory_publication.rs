@@ -21,13 +21,12 @@ pub struct DirectoryPublication {
     directory: String,
     client: DirectoryClient,
     signing_key: SigningKey,
-    agent_id: String,
-    address: String,
-    scope: String,
     // An admin-triggered capability change (see `publish_with_capability`)
-    // updates this on success, so a later periodic renewal keeps the newly
-    // approved capability.
-    capability: Mutex<String>,
+    // updates the capability on success, so a later periodic renewal keeps
+    // the newly approved capability.
+    record: Mutex<PublicationRecord>,
+    // A copy of the record's ttl, which never changes, so reading it does
+    // not wait for the lock.
     ttl: u64,
 }
 
@@ -85,11 +84,8 @@ impl DirectoryPublication {
             directory,
             client,
             signing_key,
-            agent_id: record.agent_id,
-            address: record.address,
-            scope: record.scope,
-            capability: Mutex::new(record.capability),
             ttl: record.ttl,
+            record: Mutex::new(record),
         })
     }
 
@@ -115,8 +111,11 @@ impl DirectoryPublication {
         &self,
         endpoint_id: &str,
     ) -> Result<WireRecord, PublicationError> {
-        let capability = self.capability.lock().map_err(|_| PublicationError)?.clone();
-        self.publish(endpoint_id, capability).await
+        let signed = {
+            let record = self.record.lock().map_err(|_| PublicationError)?;
+            signed_record(&self.signing_key, &record, &record.capability, endpoint_id)?
+        };
+        self.publish(&signed).await
     }
 
     /// Publishes the record with `capability` in place of the current one,
@@ -132,28 +131,20 @@ impl DirectoryPublication {
         endpoint_id: &str,
         capability: String,
     ) -> Result<(), PublicationError> {
-        self.publish(endpoint_id, capability.clone()).await?;
-        *self.capability.lock().map_err(|_| PublicationError)? = capability;
+        let signed = {
+            let record = self.record.lock().map_err(|_| PublicationError)?;
+            signed_record(&self.signing_key, &record, &capability, endpoint_id)?
+        };
+        self.publish(&signed).await?;
+        self.record.lock().map_err(|_| PublicationError)?.capability = capability;
         Ok(())
     }
 
     async fn publish(
         &self,
-        endpoint_id: &str,
-        capability: String,
+        record: &WireRecord,
     ) -> Result<WireRecord, PublicationError> {
-        let record = signed_record(
-            &self.signing_key,
-            &PublicationRecord {
-                agent_id: self.agent_id.clone(),
-                address: self.address.clone(),
-                scope: self.scope.clone(),
-                capability,
-                ttl: self.ttl,
-            },
-            endpoint_id,
-        )?;
-        self.client.publish(&record).await.map_err(|_| PublicationError)
+        self.client.publish(record).await.map_err(|_| PublicationError)
     }
 }
 
@@ -171,12 +162,14 @@ pub fn signed_node_record(
 ) -> Result<WireRecord, PublicationError> {
     let signing_key =
         DataDir::new(data_dir).discovery_key().map_err(|_| PublicationError)?;
-    signed_record(&signing_key, record, endpoint_id)
+    signed_record(&signing_key, record, &record.capability, endpoint_id)
 }
 
+/// `record` signed with `capability` in place of its own.
 fn signed_record(
     signing_key: &SigningKey,
     record: &PublicationRecord,
+    capability: &str,
     endpoint_id: &str,
 ) -> Result<WireRecord, PublicationError> {
     let expires_at = std::time::SystemTime::now()
@@ -188,7 +181,7 @@ fn signed_record(
         endpoint_id.to_owned(),
         vec![record.address.clone()],
         record.scope.clone(),
-        vec![record.capability.clone()],
+        vec![capability.to_owned()],
         expires_at,
     );
     Ok(WireRecord::from_record(&record))
