@@ -997,7 +997,21 @@ pub(super) async fn publish_listing(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use axum::http::StatusCode;
+
     use super::GroupAction;
+    use crate::admin::test_support::shared_in;
+    use crate::admin_ui::{
+        UiOptions, build_admin_ui,
+        test_support::{
+            PORT, app, form_value, get, get_with, host_ui, host_ui_with_mode,
+            input_value, post, session, session_cookie_pair, test_administration,
+            test_host, test_host_page,
+        },
+    };
+    use aether_store::{NodeStore, QueueLimits, TaskInput};
 
     #[test]
     fn a_group_action_value_reads_back_as_its_action() {
@@ -1011,5 +1025,501 @@ mod tests {
             assert_eq!(serde_json::from_value::<GroupAction>(value).ok(), Some(action));
         }
         assert!(serde_json::from_value::<GroupAction>("rename".into()).is_err());
+    }
+
+    #[tokio::test]
+    async fn the_owner_edits_the_agent_card_on_the_host_page() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let (admin_ui, _) = host_ui(directory.path());
+        let application = app(admin_ui);
+        let cookie = session(&application).await;
+        let home = get_with(application.clone(), "/", &cookie).await;
+        assert!(home.body.contains("Your agent's card"));
+        assert!(home.body.contains("It is never public."));
+        let saved = post(
+            application.clone(),
+            "/card",
+            Some(&cookie),
+            "description=Legal+help.&skill_name=Legal+questions&skill_description=Answers+one+question.&tags=law%2C+contracts",
+        )
+        .await;
+        assert_eq!(saved.status, StatusCode::OK, "{}", saved.body);
+        assert!(saved.body.contains("Card version 2."));
+        let card = crate::agent_card::settings(directory.path());
+        assert_eq!(card.tags, ["law", "contracts"]);
+
+        let refused = post(
+            application.clone(),
+            "/card",
+            Some(&cookie),
+            "description=&skill_name=Legal+questions&skill_description=Answers.&tags=law",
+        )
+        .await;
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+        assert!(refused.body.contains("role=\"alert\""));
+        assert_eq!(crate::agent_card::settings(directory.path()), card);
+    }
+
+    #[tokio::test]
+    async fn the_host_sets_the_relay_from_the_page() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let switches = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let options = UiOptions {
+            page: Some(Arc::new(test_host(directory.path(), Arc::clone(&switches)))),
+            ..UiOptions::default()
+        };
+        let application =
+            app(build_admin_ui(shared_in(directory.path()), options, PORT));
+        let cookie = session(&application).await;
+        let relay = |value: &str| {
+            let application = application.clone();
+            let cookie = cookie.clone();
+            let form = form_value("relay_url", value);
+            async move { post(application, "/relay", Some(&cookie), &form).await }
+        };
+
+        let response = relay("https://relay.example.com/").await;
+        assert_eq!(response.status, StatusCode::OK, "{}", response.body);
+        assert!(response.body.contains("Reachable through relay.example.com"));
+        assert_eq!(
+            crate::settings::setting::<crate::transport::relay::Relay>(
+                directory.path()
+            )
+            .ok()
+            .flatten()
+            .as_deref(),
+            Some("https://relay.example.com/")
+        );
+
+        // A relay that does not answer leaves the node where it was.
+        let response = relay("https://down.test").await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        assert!(response.body.contains("The relay did not answer."));
+        assert!(response.body.contains("Reachable through relay.example.com"));
+
+        let response = relay("not a url").await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        assert!(response.body.contains("This is not a relay URL."));
+
+        // Empty means the local network only, and nothing to start with.
+        let response = relay("").await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert!(response.body.contains("No relay yet"));
+        assert_eq!(
+            crate::settings::setting::<crate::transport::relay::Relay>(
+                directory.path()
+            )
+            .ok()
+            .flatten(),
+            None
+        );
+
+        assert_eq!(
+            switches.lock().expect("switches must lock").as_slice(),
+            [
+                (
+                    Some("https://relay.test".to_owned()),
+                    Some("https://relay.example.com/".to_owned())
+                ),
+                (
+                    Some("https://relay.example.com/".to_owned()),
+                    Some("https://down.test".to_owned())
+                ),
+                (Some("https://relay.example.com/".to_owned()), None),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_invitation_applies_a_grant_and_the_host_sees_the_agent_answer() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let (admin_ui, node) = host_ui(directory.path());
+        let application = app(admin_ui);
+        let home = get(application.clone(), "/").await;
+        assert!(home.body.contains("Invite someone"));
+        // Each field's label names its control.
+        assert!(home.body.contains("for=\"endpoint_id\""));
+        assert!(!home.body.contains("r#for"));
+        let cookie = session_cookie_pair(
+            home.set_cookie.as_deref().expect("home page must set a cookie"),
+        );
+        let friend = iroh::SecretKey::generate().public().to_string();
+        // A code copied from the caller's page keeps its groups of four.
+        let grouped = crate::admin_components::grouped(&friend);
+        let response = post(
+            application.clone(),
+            "/invite",
+            Some(cookie),
+            &format!("friend_name=ana&{}&days=7", form_value("endpoint_id", &grouped)),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK);
+        let line = input_value(&response.body, "invite-line");
+        assert_eq!(
+            input_value(&response.body, "invite-command"),
+            format!("aether node direct import '{line}'")
+        );
+        let bundle =
+            crate::direct::InvitationBundle::decode(&line).expect("bundle must decode");
+        assert_eq!(bundle.format, crate::direct::BUNDLE_FORMAT_V2);
+        assert_eq!(bundle.relay_url.as_deref(), Some("https://relay.test"));
+        let invitation =
+            bundle.invitation.to_invitation().expect("invitation must verify");
+        assert_eq!(invitation.agent_id, "tudor");
+        let card = crate::agent_card::validate(
+            bundle.agent_card.as_deref().expect("a v2 line has a card").as_bytes(),
+            &invitation.agent_id,
+            &invitation.endpoint_id,
+        )
+        .expect("the card must be valid");
+        assert_eq!(card.name, invitation.agent_id);
+        assert_eq!(bundle.authorization.caller_agent_id, "ana");
+        assert_eq!(bundle.authorization.capability_id, crate::execution::GENERAL_SKILL);
+        assert_eq!(bundle.authorization.claim.subject_endpoint_id, friend);
+        let issuer = crate::data_dir::DataDir::new(directory.path())
+            .issuer_key()
+            .expect("issuer key must load");
+        {
+            let applied = node.granted();
+            let grant = crate::identity::decode_grant(
+                applied.first().expect("the grant must reach the node"),
+            )
+            .expect("grant must parse");
+            assert_eq!(grant.signing_key, issuer.verifying_key().to_bytes());
+            assert_eq!(grant.subject_endpoint_id.as_str(), friend);
+            assert_eq!(
+                grant.capabilities,
+                std::collections::BTreeSet::from([aether_core::CapabilityId::new(
+                    crate::execution::GENERAL_SKILL
+                )])
+            );
+        }
+        let mut store = NodeStore::in_dir(directory.path()).expect("store must open");
+        assert_eq!(
+            store
+                .applied_changes(aether_store::ChangeKind::Grant)
+                .expect("grants must read")
+                .len(),
+            1
+        );
+        store
+            .put_scope(crate::direct::SCOPE, aether_core::ScopeKind::Direct)
+            .expect("scope must store");
+        store
+            .admit(
+                &TaskInput {
+                    request: aether_core::Request {
+                        task_id: aether_core::TaskId::new("greeting"),
+                        id: aether_core::RequestId::new("greeting-request"),
+                        caller_agent_id: aether_core::AgentId::new("ana"),
+                        caller_endpoint_id: aether_core::EndpointId::new(friend),
+                        scope_id: aether_core::ScopeId::new(crate::direct::SCOPE),
+                        capability_id: aether_core::CapabilityId::new("review"),
+                        workspace_id: aether_core::WorkspaceId::new("workspace"),
+                        access_mode: aether_core::AccessMode::ReadOnly,
+                    },
+                    idempotency_key: "greeting-key".to_owned(),
+                    request_fingerprint: "greeting-fingerprint".to_owned(),
+                    skill: "review".to_owned(),
+                    remote_text: "Greet Bob".to_owned(),
+                },
+                QueueLimits { global: 1, per_peer: 1 },
+            )
+            .expect("task must admit");
+        store.lease_next("worker", "execution", i64::MAX).expect("task must lease");
+        store.mark_running("greeting", "execution").expect("task must run");
+        store
+            .mark_succeeded("greeting", "execution", "Hello, Bob. <ready>", i64::MAX)
+            .expect("task must finish");
+        let response = get(application, "/").await;
+        assert!(response.body.contains("Read answer"));
+        assert!(response.body.contains("Greet Bob"));
+        assert!(response.body.contains("Hello, Bob. &lt;ready&gt;"));
+    }
+
+    #[tokio::test]
+    async fn a_revoked_friend_leaves_the_list_and_the_revocation_is_stored() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let (admin_ui, node) = host_ui(directory.path());
+        let application = app(admin_ui);
+        let home = get(application.clone(), "/").await;
+        assert!(home.body.contains("Nobody has access."));
+        let cookie = session_cookie_pair(
+            home.set_cookie.as_deref().expect("home page must set a cookie"),
+        )
+        .to_owned();
+        let friend = iroh::SecretKey::generate().public().to_string();
+        let invited = post(
+            application.clone(),
+            "/invite",
+            Some(&cookie),
+            &format!("friend_name=ana&endpoint_id={friend}&days=7"),
+        )
+        .await;
+        assert!(
+            invited.body.contains("aria-label=\"Revoke ana\""),
+            "ana must be listed"
+        );
+        assert!(invited.body.contains("No tasks yet"));
+        let grant_id = crate::identity::decode_grant(
+            node.granted().first().expect("grant must exist"),
+        )
+        .expect("grant must parse")
+        .id;
+        let store = NodeStore::in_dir(directory.path()).expect("store must open");
+        // The first click only asks.
+        let asked = post(
+            application.clone(),
+            "/revoke",
+            Some(&cookie),
+            &format!("grant_id={}", grant_id.as_str()),
+        )
+        .await;
+        assert_eq!(asked.status, StatusCode::OK);
+        assert!(asked.body.contains("Revoke ana's access?"), "{}", asked.body);
+        assert_eq!(store.grant_revoked(grant_id.as_str()), Ok(false));
+        let response = post(
+            application,
+            "/revoke",
+            Some(&cookie),
+            &format!("grant_id={}&confirm=yes", grant_id.as_str()),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert!(response.body.contains("Nobody has access."));
+        assert_eq!(store.grant_revoked(grant_id.as_str()), Ok(true));
+        assert!(
+            store
+                .applied_changes(aether_store::ChangeKind::Grant)
+                .expect("grants")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_host_changes_the_agent_workspace() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let (admin_ui, _) = host_ui(directory.path());
+        let application = app(admin_ui);
+        let home = get(application.clone(), "/").await;
+        assert!(home.body.contains("value=\"/start\""));
+        let cookie = session_cookie_pair(
+            home.set_cookie.as_deref().expect("home page must set a cookie"),
+        )
+        .to_owned();
+        let project = directory.path().join("project");
+        std::fs::create_dir_all(&project).expect("project must create");
+        let project = project.to_str().expect("path must be UTF-8");
+        let response = post(
+            application.clone(),
+            "/workspace",
+            Some(&cookie),
+            &form_value("path", project),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert!(response.body.contains(project), "the page must show the new path");
+        let missing = directory.path().join("missing");
+        let response = post(
+            application,
+            "/workspace",
+            Some(&cookie),
+            &form_value("path", missing.to_str().expect("path must be UTF-8")),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn task_folder_page_refuses_folder_changes() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let (admin_ui, _) = host_ui_with_mode(directory.path(), true);
+        let application = app(admin_ui);
+        let home = get(application.clone(), "/").await;
+        assert!(home.body.contains("Each task runs in a new empty folder"));
+        assert!(!home.body.contains("Change folder"));
+        let cookie = session_cookie_pair(
+            home.set_cookie.as_deref().expect("home page must set a cookie"),
+        )
+        .to_owned();
+        let response = post(
+            application,
+            "/workspace",
+            Some(&cookie),
+            &form_value("path", directory.path().to_str().expect("path must be UTF-8")),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn host_page_creates_and_deletes_an_incoming_group() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let (admin_ui, _) = host_ui(directory.path());
+        let application = app(admin_ui);
+        let home = get(application.clone(), "/").await;
+        let cookie = session_cookie_pair(
+            home.set_cookie.as_deref().expect("home page must set a cookie"),
+        )
+        .to_owned();
+        let created = post(
+            application.clone(),
+            "/groups",
+            Some(&cookie),
+            "action=create&group=work",
+        )
+        .await;
+        assert_eq!(created.status, StatusCode::OK);
+        assert!(created.body.contains("work"));
+        let endpoint = iroh::SecretKey::generate().public().to_string();
+        let invited = post(
+            application.clone(),
+            "/invite",
+            Some(&cookie),
+            &format!("friend_name=ana&endpoint_id={endpoint}&days=7"),
+        )
+        .await;
+        assert_eq!(invited.status, StatusCode::OK);
+        let added = post(
+            application.clone(),
+            "/groups",
+            Some(&cookie),
+            &format!("action=add&group=work&endpoint_id={endpoint}"),
+        )
+        .await;
+        assert_eq!(added.status, StatusCode::OK);
+        assert!(
+            crate::access_groups::list(directory.path())
+                .expect("groups must list")
+                .iter()
+                .any(|group| group.name == "work"
+                    && group.members.iter().any(|member| member.agent_id == "ana"))
+        );
+        let removed = post(
+            application.clone(),
+            "/groups",
+            Some(&cookie),
+            &format!("action=remove&group=work&agent=ana&endpoint_id={endpoint}"),
+        )
+        .await;
+        assert_eq!(removed.status, StatusCode::OK);
+        assert!(
+            crate::access_groups::list(directory.path())
+                .expect("groups must list")
+                .iter()
+                .any(|group| group.name == "work" && group.members.is_empty())
+        );
+        let deleted =
+            post(application, "/groups", Some(&cookie), "action=delete&group=work")
+                .await;
+        assert_eq!(deleted.status, StatusCode::OK);
+        assert!(
+            crate::access_groups::list(directory.path())
+                .expect("groups must list")
+                .iter()
+                .all(|group| group.name != "work")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_invitation_needs_the_session_and_a_real_endpoint_id() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let (admin_ui, node) = host_ui(directory.path());
+        let application = app(admin_ui);
+        let friend = iroh::SecretKey::generate().public().to_string();
+        let form = format!("friend_name=ana&endpoint_id={friend}&days=7");
+        let response = post(application.clone(), "/invite", None, &form).await;
+        assert_eq!(response.status, StatusCode::FORBIDDEN);
+        let home = get(application.clone(), "/").await;
+        let cookie = session_cookie_pair(
+            home.set_cookie.as_deref().expect("home page must set a cookie"),
+        );
+        let response = post(
+            application,
+            "/invite",
+            Some(cookie),
+            "friend_name=ana&endpoint_id=not-a-key&days=7",
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        assert!(response.body.contains("This is not a connect code."));
+        assert!(node.granted().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_card_names_the_hub_name_when_the_node_has_one() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let (administration, _) = test_administration(directory.path());
+        let options = UiOptions {
+            page: Some(Arc::new(test_host_page(
+                directory.path().to_path_buf(),
+                Some("server".to_owned()),
+                None,
+                Arc::new(|_, _| Box::pin(async { Ok(()) })),
+                None,
+            ))),
+            ..UiOptions::default()
+        };
+        crate::settings::store_setting::<crate::hub_client::settings::HubName>(
+            directory.path(),
+            &Some("tudor#0042".to_owned()),
+        )
+        .expect("hub name must store");
+        let host = app(build_admin_ui(administration, options, PORT));
+        let cookie = session(&host).await;
+        let friend = iroh::SecretKey::generate().public().to_string();
+        let response = post(
+            host,
+            "/invite",
+            Some(&cookie),
+            &format!("friend_name=ana&endpoint_id={friend}&days=7"),
+        )
+        .await;
+        let line = input_value(&response.body, "invite-line");
+        let bundle = crate::direct::InvitationBundle::decode(&line).expect("bundle");
+        let card: serde_json::Value = serde_json::from_str(
+            bundle.agent_card.as_deref().expect("a v2 line has a card"),
+        )
+        .expect("the card is JSON");
+        assert_eq!(card["name"], "tudor#0042");
+        assert_eq!(bundle.invitation.agent_id, "tudor#0042");
+    }
+
+    #[test]
+    fn the_longest_card_keeps_the_invite_line_under_the_hub_limit() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        crate::agent_card::save_settings(
+            directory.path(),
+            &crate::agent_card::CardInput {
+                description: "d".repeat(crate::agent_card::MAX_DESCRIPTION),
+                skill_name: "n".repeat(crate::agent_card::MAX_SKILL_NAME),
+                skill_description: "s".repeat(crate::agent_card::MAX_SKILL_DESCRIPTION),
+                tags: (0..crate::agent_card::MAX_TAGS)
+                    .map(|index| {
+                        format!("{index}{}", "t".repeat(crate::agent_card::MAX_TAG - 1))
+                    })
+                    .collect(),
+            },
+        )
+        .expect("the longest card must save");
+        let (administration, _) = test_administration(directory.path());
+        let host =
+            test_host(directory.path(), Arc::new(std::sync::Mutex::new(Vec::new())));
+        let longest = format!("{}#0001", "a".repeat(32));
+        let (line, _) = crate::invites::sign_direct_invite(
+            &administration,
+            &crate::invites::DirectInviteSigning::for_data_dir_with_relay(
+                &host.data_dir,
+                host.relay_url(),
+            ),
+            &longest,
+            &longest,
+            &iroh::SecretKey::generate().public().to_string(),
+            30,
+            "friends",
+            aether_store::AuditActor::Ui,
+        )
+        .expect("the invite must sign");
+        assert!(line.len() + "bundle=".len() + 2 <= 8 * 1024, "{}", line.len());
     }
 }

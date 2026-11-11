@@ -630,7 +630,20 @@ pub(super) async fn remove_contact(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use axum::http::StatusCode;
+
     use super::shell_quote;
+    use crate::admin::test_support::shared_in;
+    use crate::admin_ui::{
+        AdminUi, PageContext, UiOptions, build_admin_ui,
+        test_support::{
+            PORT, app, form_value, get, get_with, host_ui, hub_caller_ui, input_value,
+            post, session, session_cookie_pair,
+        },
+    };
+    use aether_store::NodeStore;
 
     #[test]
     fn a_path_with_a_space_or_a_quote_becomes_one_shell_word() {
@@ -640,5 +653,368 @@ mod tests {
         );
         assert_eq!(shell_quote("/Users/bob/My Files"), "'/Users/bob/My Files'");
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+
+    /// Lists the service agent in `host_dir` on `hub` as `handle`, and
+    /// returns its search row as a stranger gets it.
+    fn listed_service(
+        hub: &crate::hub_client::test_hub::TestHub,
+        host_dir: &std::path::Path,
+        handle: &str,
+    ) -> crate::hub_client::AgentRow {
+        let bytes = crate::listing::listing_bytes(
+            &crate::agent_card::CardSettings::default(),
+            handle,
+        );
+        hub.add_listing(host_dir, host_dir, handle, &bytes)
+    }
+
+    #[tokio::test]
+    async fn confirming_a_request_sends_it_and_records_the_approval() {
+        let caller_dir = tempfile::tempdir().expect("directory must create");
+        let service_dir = tempfile::tempdir().expect("directory must create");
+        let hub = crate::hub_client::test_hub::TestHub::start().await;
+        let page = hub_caller_ui(caller_dir.path(), &hub);
+        let me = crate::direct::endpoint_id(caller_dir.path()).expect("endpoint");
+        hub.state().add_account(&me, "ana#0001");
+        let row = listed_service(&hub, service_dir.path(), "law#0042");
+        let draft =
+            crate::access_requests::draft(caller_dir.path(), "law#0042", &row, 7)
+                .expect("the request must draft");
+        let cookie = session(&page).await;
+        let home = get_with(page.clone(), "/", &cookie).await;
+        for text in [
+            "Requests your agent wants to send",
+            "Requests to confirm",
+            "law#0042",
+            "The agent&#x27;s owner wrote this. Aether did not check it.",
+            "each computer can see the public IP address of the other",
+        ] {
+            assert!(
+                home.body.contains(text)
+                    || home.body.contains(&text.replace("&#x27;", "'")),
+                "{text}: {}",
+                home.body
+            );
+        }
+        assert!(!hub.requests().iter().any(|request| request.target == "/v1/requests"));
+
+        let confirmed = post(
+            page.clone(),
+            "/requests/confirm",
+            Some(&cookie),
+            &format!("id={}&days=30", draft.id),
+        )
+        .await;
+        assert_eq!(confirmed.status, StatusCode::OK, "{}", confirmed.body);
+        assert!(
+            confirmed.body.contains("Waiting for law#0042 to approve"),
+            "{}",
+            confirmed.body
+        );
+        let service = crate::direct::endpoint_id(service_dir.path()).expect("endpoint");
+        let invite = hub
+            .state()
+            .invites
+            .iter()
+            .find(|invite| invite.receiver == me)
+            .cloned()
+            .expect("the hub must have the request");
+        assert_eq!(
+            (
+                invite.sender.as_str(),
+                invite.status.as_str(),
+                invite.origin.as_str(),
+                invite.days
+            ),
+            (service.as_str(), "requested", "request", 30)
+        );
+        let store = NodeStore::in_dir(caller_dir.path()).expect("store");
+        let approval = store
+            .hub_approval(&invite.id)
+            .expect("approval must read")
+            .expect("approval");
+        assert_eq!(approval.side, aether_store::ApprovalSide::Receiver);
+        assert_eq!(approval.kind, aether_store::ApprovalKind::Request);
+        assert_eq!(approval.peer_name, "law#0042");
+        assert_eq!(approval.listing, Some(draft.listing));
+        assert!(store.access_request_drafts(0).expect("drafts").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_sixth_open_request_shows_the_limit_text() {
+        let caller_dir = tempfile::tempdir().expect("directory must create");
+        let hub = crate::hub_client::test_hub::TestHub::start().await;
+        let page = hub_caller_ui(caller_dir.path(), &hub);
+        let me = crate::direct::endpoint_id(caller_dir.path()).expect("endpoint");
+        hub.state().add_account(&me, "ana#0001");
+        let services: Vec<tempfile::TempDir> = (0..6)
+            .map(|_| tempfile::tempdir().expect("directory must create"))
+            .collect();
+        for (index, service) in services.iter().take(5).enumerate() {
+            listed_service(&hub, service.path(), &format!("law{index}#0001"));
+            let endpoint =
+                crate::direct::endpoint_id(service.path()).expect("endpoint");
+            hub.state().add_request(&endpoint, &me, 7);
+        }
+        let sixth = services.last().expect("six services");
+        let row = listed_service(&hub, sixth.path(), "law5#0001");
+        let draft =
+            crate::access_requests::draft(caller_dir.path(), "law5#0001", &row, 7)
+                .expect("the request must draft");
+        let cookie = session(&page).await;
+        let refused = post(
+            page.clone(),
+            "/requests/confirm",
+            Some(&cookie),
+            &format!("id={}&days=7", draft.id),
+        )
+        .await;
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+        assert!(
+            refused.body.contains("You reached a hub limit. Remove an old item first."),
+            "{}",
+            refused.body
+        );
+        assert!(!refused.body.contains("Nobody has this name"));
+    }
+
+    #[tokio::test]
+    async fn discarding_a_request_sends_nothing() {
+        let caller_dir = tempfile::tempdir().expect("directory must create");
+        let service_dir = tempfile::tempdir().expect("directory must create");
+        let hub = crate::hub_client::test_hub::TestHub::start().await;
+        let page = hub_caller_ui(caller_dir.path(), &hub);
+        let me = crate::direct::endpoint_id(caller_dir.path()).expect("endpoint");
+        hub.state().add_account(&me, "ana#0001");
+        let row = listed_service(&hub, service_dir.path(), "law#0042");
+        let draft =
+            crate::access_requests::draft(caller_dir.path(), "law#0042", &row, 7)
+                .expect("the request must draft");
+        let cookie = session(&page).await;
+        let discarded = post(
+            page.clone(),
+            "/requests/discard",
+            Some(&cookie),
+            &format!("id={}", draft.id),
+        )
+        .await;
+        assert_eq!(discarded.status, StatusCode::OK, "{}", discarded.body);
+        assert!(!discarded.body.contains("Requests your agent wants to send"));
+        let store = NodeStore::in_dir(caller_dir.path()).expect("store");
+        assert!(store.access_request_drafts(0).expect("drafts").is_empty());
+        assert!(!hub.requests().iter().any(|request| request.target == "/v1/requests"));
+        assert!(hub.state().invites.is_empty());
+    }
+
+    /// A caller UI over `data_dir`.
+    fn caller_ui(data_dir: &std::path::Path) -> AdminUi {
+        let options = UiOptions {
+            page: Some(Arc::new(PageContext::admin_caller(data_dir.to_path_buf()))),
+            ..UiOptions::default()
+        };
+        build_admin_ui(shared_in(data_dir), options, PORT)
+    }
+
+    /// Creates an invitation on a fresh host for the endpoint `caller_id`.
+    async fn bundle_for(caller_id: &str) -> String {
+        let host_directory = tempfile::tempdir().expect("directory must create");
+        let (host, _) = host_ui(host_directory.path());
+        let host = app(host);
+        let cookie = session(&host).await;
+        let response = post(
+            host,
+            "/invite",
+            Some(&cookie),
+            &format!("friend_name=ana&endpoint_id={caller_id}&days=7"),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK);
+        input_value(&response.body, "invite-line")
+    }
+
+    #[tokio::test]
+    async fn a_caller_imports_an_invitation_and_lists_the_agent() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let caller = caller_ui(directory.path());
+        let caller = app(caller);
+        // One request for both: a page load without the cookie would start a
+        // new session and end this one.
+        let home = get(caller.clone(), "/").await;
+        let cookie = session_cookie_pair(
+            home.set_cookie.as_deref().expect("home must set a cookie"),
+        )
+        .to_owned();
+        let caller_id = crate::data_dir::DataDir::new(directory.path())
+            .endpoint_key()
+            .expect("caller key must load")
+            .public()
+            .to_string();
+        assert!(home.body.contains("Connect to a friend's agent"));
+        // Shown in groups of four; the copy button holds it whole.
+        assert!(home.body.contains(&crate::admin_components::grouped(
+            caller_id.get(..32).expect("an endpoint id has 64 characters")
+        )));
+        assert!(home.body.contains(&format!("data-copy-text=\"{caller_id}\"")));
+        let bundle = bundle_for(&caller_id).await;
+        let response = post(
+            caller.clone(),
+            "/import",
+            Some(&cookie),
+            &form_value("bundle", &bundle),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK, "{}", response.body);
+        assert!(response.body.contains("Agents you can use"));
+        assert!(response.body.contains("Connect another agent"));
+        assert_eq!(
+            input_value(&response.body, "request-0"),
+            "aether node request --scope direct --agent-id tudor --text 'Give me three ideas for a project name'"
+        );
+        let kept = crate::direct::contact_bundle(
+            &crate::direct::open_store(directory.path()).expect("store must open"),
+            "tudor",
+        )
+        .expect("the bundle must be kept");
+        assert_eq!(kept.relay_url.as_deref(), Some("https://relay.test"));
+        // The line was v2: its card is kept apart from the contact.
+        let card = crate::direct::contact_card(
+            &crate::direct::open_store(directory.path()).expect("store must open"),
+            &kept,
+        )
+        .expect("the card must be kept");
+        assert_eq!(card.name, "tudor");
+        assert!(
+            response
+                .body
+                .contains("An agent that does tasks for people its owner invites.")
+        );
+        assert!(response.body.contains("Skill: General tasks"));
+    }
+
+    #[tokio::test]
+    async fn caller_page_shows_a_not_delivered_task_and_an_answer() {
+        let host = tempfile::tempdir().expect("directory must create");
+        let directory = tempfile::tempdir().expect("directory must create");
+        let endpoint = crate::direct::endpoint_id(directory.path()).expect("endpoint");
+        crate::direct::import_bundle(
+            directory.path(),
+            &crate::direct::test_bundle(host.path(), &endpoint, false),
+        )
+        .expect("the contact must import");
+        let now = aether_core::time::unix_timestamp(std::time::SystemTime::now())
+            .expect("time");
+        let store = NodeStore::in_dir(directory.path()).expect("store");
+        let answered = crate::outbox::enqueue(directory.path(), "tudor", "one", now)
+            .expect("task");
+        let lost = crate::outbox::enqueue(directory.path(), "tudor", "two", now)
+            .expect("task");
+        store
+            .record_sent_attempt(
+                &answered.task_id,
+                None,
+                &aether_store::SentAttempt {
+                    state: aether_store::SentState::Answered,
+                    reason: None,
+                    host_state: None,
+                    answer: Some("Three names".to_owned()),
+                    last_event_sequence: 1,
+                    next_attempt_at: now,
+                },
+                now,
+            )
+            .expect("record");
+        store
+            .end_sent_tasks_for_endpoint(
+                &lost.endpoint_id,
+                "the access to this agent ended",
+                now,
+            )
+            .expect("end");
+        let caller = app(caller_ui(directory.path()));
+        let page = get(caller, "/").await;
+        assert!(page.body.contains("Sent tasks"));
+        assert!(page.body.contains("Answered"));
+        assert!(page.body.contains("Three names"));
+        assert!(page.body.contains("Not delivered"));
+        assert!(page.body.contains("the access to this agent ended"));
+    }
+
+    #[tokio::test]
+    async fn a_caller_removes_a_contact_from_the_page() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let caller = app(caller_ui(directory.path()));
+        let cookie = session(&caller).await;
+        let caller_id =
+            crate::direct::endpoint_id(directory.path()).expect("caller key must load");
+        let bundle = bundle_for(&caller_id).await;
+        let imported = post(
+            caller.clone(),
+            "/import",
+            Some(&cookie),
+            &form_value("bundle", &bundle),
+        )
+        .await;
+        assert!(imported.body.contains("Remove tudor"));
+        let removed =
+            post(caller.clone(), "/contacts/remove", Some(&cookie), "agent=tudor")
+                .await;
+        assert_eq!(removed.status, StatusCode::OK, "{}", removed.body);
+        assert!(!removed.body.contains("Agents you can use"));
+        assert!(
+            crate::direct::contact_bundle(
+                &crate::direct::open_store(directory.path()).expect("store must open"),
+                "tudor"
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_caller_refuses_an_invitation_for_another_endpoint() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let caller = caller_ui(directory.path());
+        let caller = app(caller);
+        let cookie = session(&caller).await;
+        let other = iroh::SecretKey::generate().public().to_string();
+        let bundle = bundle_for(&other).await;
+        let response = post(
+            caller.clone(),
+            "/import",
+            Some(&cookie),
+            &form_value("bundle", &bundle),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        assert!(response.body.contains("This invite is for another computer."));
+        let response = post(
+            caller,
+            "/import",
+            Some(&cookie),
+            &form_value("bundle", "{\"format\":\"something-else\"}"),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        assert!(response.body.contains("This is not an Aether invite."));
+        assert!(
+            crate::direct::contact_bundles(
+                &crate::direct::open_store(directory.path()).expect("store must open")
+            )
+            .expect("contacts must list")
+            .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_caller_page_says_when_sent_tasks_cannot_load() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let admin_ui = caller_ui(directory.path());
+        rusqlite::Connection::open(directory.path().join(aether_store::NODE_DATABASE))
+            .expect("database must open")
+            .execute("DROP TABLE sent_tasks", [])
+            .expect("sent tasks must drop");
+        let response = get(app(admin_ui), "/").await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert!(response.body.contains("Sent tasks cannot be loaded."));
     }
 }

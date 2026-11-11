@@ -135,3 +135,23 @@ async fn node_tab(
         </a>
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use axum::http::StatusCode;
+
+    use crate::admin_ui::test_support::{app, get, host_ui};
+
+    #[tokio::test]
+    async fn the_advanced_page_is_served_beside_a_mode_screen() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let (admin_ui, _) = host_ui(directory.path());
+        let response = get(app(admin_ui), "/advanced").await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert!(response.body.contains("Pending changes"));
+        assert!(response.body.contains("href=\"/\""));
+        assert!(response.body.contains("href=\"/advanced\" aria-current=\"page\""));
+        assert!(response.body.contains("href=\"/#invite\""));
+        assert!(response.body.contains("href=\"/#groups\""));
+    }
+}
