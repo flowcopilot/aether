@@ -627,11 +627,11 @@ pub fn access_ends_at(bundle: &InvitationBundle) -> u64 {
     bundle.invitation.expires_at.min(bundle.authorization.claim.expires_at)
 }
 
-/// Sends `request` to the endpoint in `invitation`: through `relay_url` when
-/// one is set, otherwise directly to `address`.
+/// Sends `request` to `endpoint_id`: through `relay_url` when one is set,
+/// otherwise directly to `address`.
 pub async fn send(
     data_dir: &Path,
-    invitation: &WireInvitation,
+    endpoint_id: &str,
     address: Option<&str>,
     relay_url: Option<&str>,
     request: Frame,
@@ -640,20 +640,15 @@ pub async fn send(
         (Some(relay_url), _) => {
             crate::transport::request_once_via_relay(
                 data_dir,
-                &invitation.endpoint_id,
+                endpoint_id,
                 relay_url,
                 request,
             )
             .await
         }
         (None, Some(address)) => {
-            crate::transport::request_once(
-                data_dir,
-                &invitation.endpoint_id,
-                address,
-                request,
-            )
-            .await
+            crate::transport::request_once(data_dir, endpoint_id, address, request)
+                .await
         }
         (None, None) => Err(TransportError::Address),
     }
