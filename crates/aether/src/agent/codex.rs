@@ -832,6 +832,14 @@ mod tests {
         sync::mpsc,
         time::{Duration, Instant},
     };
+
+    /// The test process.s `PATH`, so that a fake app-server finds `sleep`
+    /// wherever this system keeps it.
+    fn test_path() -> BTreeMap<String, String> {
+        std::env::var("PATH")
+            .map(|path| BTreeMap::from([("PATH".to_owned(), path)]))
+            .unwrap_or_default()
+    }
     #[test]
     #[cfg(unix)]
     fn a_task_folder_copies_a_binary_that_the_task_could_change() {
@@ -1093,14 +1101,14 @@ done
         // Like a sandboxed command: a grandchild of the node that outlives
         // nothing but the app-server's own process group.
         let script = format!(
-            "/bin/sleep 60 & echo $! > '{}'; while IFS= read -r line; do :; done",
+            "sleep 60 & echo $! > '{}'; while IFS= read -r line; do :; done",
             pid_file.display()
         );
         let session = super::AppServerSession::spawn(
             std::path::Path::new("sh"),
             &["-c".to_owned(), script],
             Duration::from_secs(5),
-            &BTreeMap::new(),
+            &test_path(),
         )
         .expect("session must start");
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -1188,10 +1196,7 @@ done
         let limits = CodexLimits {
             sandbox: CodexSandbox::WorkspaceWrite,
             allow_network: false,
-            environment: BTreeMap::from([(
-                "PATH".to_owned(),
-                "/usr/bin:/bin".to_owned(),
-            )]),
+            environment: test_path(),
         };
         let script = r#"
 while IFS= read -r request; do
