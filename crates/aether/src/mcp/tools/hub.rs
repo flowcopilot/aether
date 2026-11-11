@@ -8,7 +8,7 @@ use serde_json::json;
 use crate::hub_client::valid_full_name;
 
 use super::super::support::{tool_error, tool_success};
-use super::super::{FIND_WAIT, McpServer, find_error};
+use super::super::{McpServer, find_error, within_find_wait};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -171,17 +171,12 @@ impl McpServer {
             }
             Err(error) => return tool_error(error),
         };
-        let row = match tokio::time::timeout(FIND_WAIT, hub.agent(agent)).await {
-            Ok(Ok(row)) => row,
-            Ok(Err(crate::hub_client::HubError::NotFound)) => {
+        let row = match within_find_wait(hub.agent(agent)).await {
+            Ok(row) => row,
+            Err(crate::hub_client::HubError::NotFound) => {
                 return tool_error("no listed service agent has this name");
             }
-            Ok(Err(error)) => return tool_error(find_error(error)),
-            Err(_) => {
-                return tool_error(find_error(
-                    crate::hub_client::HubError::Unreachable,
-                ));
-            }
+            Err(error) => return tool_error(find_error(error)),
         };
         match crate::access_requests::draft(data_dir, agent, &row, days) {
             Ok(draft) => tool_success(

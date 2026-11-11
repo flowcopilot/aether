@@ -12,7 +12,7 @@ use aether_store::{NodeStore, SentState};
 
 use crate::outbox;
 
-use super::super::support::{tool_error, tool_success};
+use super::super::support::{tool_error, tool_result, tool_success};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -71,9 +71,9 @@ pub struct PeopleFindArguments {
     pub query: String,
 }
 use super::super::{
-    Contacts, ENDED_HINT, FIND_WAIT, MAX_TASK_TEXT, McpServer, READY_HINT, Wake,
-    card_json, find_error, found_agent, found_person, hub_people, parse_cursor,
-    sent_result,
+    Contacts, ENDED_HINT, MAX_TASK_TEXT, McpServer, READY_HINT, Wake, card_json,
+    find_error, found_agent, found_person, hub_people, parse_cursor, sent_result,
+    within_find_wait,
 };
 
 #[tool_router(router = caller_tool_router, vis = "pub(crate)")]
@@ -86,10 +86,7 @@ impl McpServer {
         &self,
         Parameters(arguments): Parameters<CancelArguments>,
     ) -> CallToolResult {
-        match self.cancel_task(&arguments.task_id) {
-            Ok(message) => tool_success(message),
-            Err(message) => tool_error(message),
-        }
+        tool_result(self.cancel_task(&arguments.task_id))
     }
     #[tool(
         name = "aether.agents.list",
@@ -152,16 +149,9 @@ impl McpServer {
             Ok(None) => return tool_error("no hub is set, so there is no search"),
             Err(error) => return tool_error(error),
         };
-        let rows = match tokio::time::timeout(FIND_WAIT, hub.find_agents(query, limit))
-            .await
-        {
-            Ok(Ok(rows)) => rows,
-            Ok(Err(error)) => return tool_error(find_error(error)),
-            Err(_) => {
-                return tool_error(find_error(
-                    crate::hub_client::HubError::Unreachable,
-                ));
-            }
+        let rows = match within_find_wait(hub.find_agents(query, limit)).await {
+            Ok(rows) => rows,
+            Err(error) => return tool_error(find_error(error)),
         };
         let now = aether_core::time::now_seconds();
         let contacts = Contacts::read(data_dir);
@@ -219,24 +209,19 @@ impl McpServer {
             }));
         }
         let note = match self.caller_hub() {
-            Ok(Some(hub)) => {
-                match tokio::time::timeout(FIND_WAIT, hub_people(&hub, &query)).await {
-                    Ok(Ok(rows)) => {
-                        for row in rows {
-                            if let Some(person) =
-                                found_person(&contacts, &row, now, &listed)
-                            {
-                                people.push(person);
-                            }
+            Ok(Some(hub)) => match within_find_wait(hub_people(&hub, &query)).await {
+                Ok(rows) => {
+                    for row in rows {
+                        if let Some(person) =
+                            found_person(&contacts, &row, now, &listed)
+                        {
+                            people.push(person);
                         }
-                        None
                     }
-                    Ok(Err(error)) => Some(find_error(error)),
-                    Err(_) => {
-                        Some(find_error(crate::hub_client::HubError::Unreachable))
-                    }
+                    None
                 }
-            }
+                Err(error) => Some(find_error(error)),
+            },
             Ok(None) => Some("no hub is set: only saved contacts are listed"),
             Err(error) => Some(error),
         };

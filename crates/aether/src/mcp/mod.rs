@@ -429,6 +429,16 @@ const fn find_error(error: crate::hub_client::HubError) -> &'static str {
     }
 }
 
+/// The answer of `search`, or `HubError::Unreachable` when the hub does not
+/// answer within `FIND_WAIT`.
+async fn within_find_wait<T>(
+    search: impl std::future::Future<Output = Result<T, crate::hub_client::HubError>>,
+) -> Result<T, crate::hub_client::HubError> {
+    tokio::time::timeout(FIND_WAIT, search)
+        .await
+        .unwrap_or(Err(crate::hub_client::HubError::Unreachable))
+}
+
 /// The hub rows for `query`: the exact full name, or the people whose name
 /// starts with it. A query that is neither has no hub rows.
 async fn hub_people(

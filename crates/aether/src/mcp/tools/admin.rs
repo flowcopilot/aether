@@ -12,7 +12,7 @@ use crate::hub_client::{AgentKind, HUB_OFF, valid_name_part};
 
 use super::super::McpServer;
 use super::super::support::{
-    AuditField, audit_item, no_node, refused, tool_error, tool_success,
+    AuditField, audit_item, no_node, refused, tool_error, tool_result, tool_success,
 };
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -500,10 +500,7 @@ impl McpServer {
         &self,
         Parameters(arguments): Parameters<ChangeArguments>,
     ) -> CallToolResult {
-        match self.change_request(arguments.change, arguments.dry_run) {
-            Ok(message) => tool_success(message),
-            Err(message) => tool_error(message),
-        }
+        tool_result(self.change_request(arguments.change, arguments.dry_run))
     }
     #[tool(
         name = "aether.settings.set_hub",
