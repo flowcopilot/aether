@@ -289,8 +289,9 @@ defmodule AetherHub.Listings do
       Repo.one(
         from l in live(),
           join: a in Account,
+          as: :account,
           on: a.endpoint == l.endpoint,
-          where: a.name == ^name and a.number == ^number,
+          where: ^Names.named(name, number),
           select: {l, a}
       )
 

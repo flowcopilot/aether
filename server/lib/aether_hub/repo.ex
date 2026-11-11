@@ -7,6 +7,10 @@ defmodule AetherHub.Repo do
   """
   def atomic(fun), do: transact(fn -> {:ok, fun.()} end)
 
+  @doc "Inside `atomic/1`: the value of `{:ok, value}`, or `rollback(reason)` for `{:error, reason}`."
+  def ok!({:ok, value}), do: value
+  def ok!({:error, reason}), do: rollback(reason)
+
   @doc "A new row id: 32 lowercase hex characters."
   def new_id, do: Base.encode16(:crypto.strong_rand_bytes(16), case: :lower)
 end

@@ -65,14 +65,9 @@ defmodule AetherHub.Invites do
       # A service agent gets access only by request.
       if me.kind == @service, do: Repo.rollback(:forbidden)
 
-      receiver =
-        case Names.find(to) do
-          {:ok, %Account{kind: @personal} = receiver} -> receiver
-          # The same answer as for an unknown name: an invite does not
-          # show that an unlisted service agent exists.
-          {:ok, _service} -> Repo.rollback(:not_found)
-          {:error, reason} -> Repo.rollback(reason)
-        end
+      # A service agent gets the answer of an unknown name: an invite does
+      # not show that an unlisted service agent exists.
+      receiver = Repo.ok!(Names.find(to, @personal))
 
       if receiver.endpoint == me.endpoint, do: Repo.rollback(:invalid)
       insert(me, receiver, days, me.endpoint, @origin_invite)
@@ -90,12 +85,7 @@ defmodule AetherHub.Invites do
   def request(%Account{} = me, %{"to" => to, "days" => days} = body)
       when map_size(body) == 2 and is_binary(to) and is_integer(days) and days in @days do
     Versions.commit(fn ->
-      service =
-        case Names.find(to) do
-          {:ok, %Account{kind: @service} = service} -> service
-          {:ok, _personal} -> Repo.rollback(:not_found)
-          {:error, reason} -> Repo.rollback(reason)
-        end
+      service = Repo.ok!(Names.find(to, @service))
 
       if service.endpoint == me.endpoint, do: Repo.rollback(:invalid)
       # An unlisted service agent gets the answer of an unknown name.

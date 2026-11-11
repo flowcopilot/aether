@@ -36,12 +36,7 @@ defmodule AetherHub.OwnerLinks do
     Repo.atomic(fn ->
       if me.kind != @personal, do: Repo.rollback(:forbidden)
 
-      target =
-        case Names.find(service) do
-          {:ok, %Account{kind: @service} = target} -> target
-          {:ok, _personal} -> Repo.rollback(:not_found)
-          {:error, reason} -> Repo.rollback(reason)
-        end
+      target = Repo.ok!(Names.find(service, @service))
 
       message = Signed.owner_claim_message(me.endpoint, service, expires_at)
 
