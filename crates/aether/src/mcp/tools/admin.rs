@@ -270,12 +270,8 @@ impl McpServer {
         // The hub sets the type once: only the first claim names it.
         let kind = match hub.account().await {
             Ok(None) => Some(
-                crate::settings::setting::<crate::hub_client::settings::AgentKind>(
-                    data_dir,
-                )
-                .ok()
-                .flatten()
-                .unwrap_or(AgentKind::Personal),
+                crate::hub_client::settings::agent_kind(data_dir)
+                    .unwrap_or(AgentKind::Personal),
             ),
             Ok(Some(_)) => None,
             Err(error) => return tool_error(error.to_string()),
@@ -745,20 +741,9 @@ mod tests {
         let name =
             decode(&claimed)["name"].as_str().expect("name must return").to_owned();
         assert!(name.starts_with("ana#"));
+        assert_eq!(crate::hub_client::settings::hub_name(directory.path()), Some(name));
         assert_eq!(
-            crate::settings::setting::<crate::hub_client::settings::HubName>(
-                directory.path()
-            )
-            .ok()
-            .flatten(),
-            Some(name)
-        );
-        assert_eq!(
-            crate::settings::setting::<crate::hub_client::settings::AgentKind>(
-                directory.path()
-            )
-            .ok()
-            .flatten(),
+            crate::hub_client::settings::agent_kind(directory.path()),
             Some(crate::hub_client::AgentKind::Personal)
         );
         let changed = server
@@ -768,14 +753,7 @@ mod tests {
             }))
             .await;
         assert_eq!(changed.is_error, Some(false));
-        assert_eq!(
-            crate::settings::setting::<crate::hub_client::settings::HubName>(
-                directory.path()
-            )
-            .ok()
-            .flatten(),
-            None
-        );
+        assert_eq!(crate::hub_client::settings::hub_name(directory.path()), None);
     }
 
     #[tokio::test]

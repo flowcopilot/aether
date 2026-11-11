@@ -62,11 +62,7 @@ pub(super) async fn node_header(
                 .unwrap_or(url)
         })
     });
-    let name = data_dir.as_deref().and_then(|dir| {
-        crate::settings::setting::<crate::hub_client::settings::HubName>(dir)
-            .ok()
-            .flatten()
-    });
+    let name = data_dir.as_deref().and_then(crate::hub_client::settings::hub_name);
     let tabs = mode.is_some();
     let agents_href = if hosts { "/agents" } else { "/" };
     Ok(view! {
