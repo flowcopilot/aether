@@ -7,7 +7,8 @@ use crate::admin::{ApplyOutcome, ChangeRequest, SharedAdministration};
 #[derive(Clone)]
 pub struct DirectInviteSigning {
     pub data_dir: std::path::PathBuf,
-    relay_url: Option<String>,
+    /// The relay for the line when the node keeps no active relay.
+    relay_fallback: Option<String>,
 }
 
 impl DirectInviteSigning {
@@ -21,18 +22,14 @@ impl DirectInviteSigning {
         data_dir: &Path,
         relay_fallback: Option<String>,
     ) -> Self {
-        let stored =
-            crate::settings::setting::<crate::transport::relay::ActiveRelay>(data_dir)
-                .ok()
-                .flatten();
-        Self { data_dir: data_dir.to_path_buf(), relay_url: stored.or(relay_fallback) }
+        Self { data_dir: data_dir.to_path_buf(), relay_fallback }
     }
 
     fn relay_url(&self) -> Option<String> {
         crate::settings::setting::<crate::transport::relay::ActiveRelay>(&self.data_dir)
             .ok()
             .flatten()
-            .or_else(|| self.relay_url.clone())
+            .or_else(|| self.relay_fallback.clone())
     }
 }
 

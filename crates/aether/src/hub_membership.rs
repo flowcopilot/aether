@@ -9,10 +9,6 @@ use aether_store::{ApprovalKind, ApprovalSide, HubApproval, StoreError};
 
 use crate::hub_client::{HubClient, HubError, Invite, Role, Status};
 
-/// How long the node keeps the approval of an invite: as long as the hub
-/// keeps the invite.
-pub const APPROVAL_SECONDS: i64 = crate::hub_client::protocol::INVITE_SECONDS;
-
 /// What a hub error means for the person who asked.
 pub const fn hub_message(error: HubError) -> &'static str {
     match error {
@@ -88,7 +84,7 @@ pub fn new_approval(
         access_group: access_group.to_owned(),
         bundle: None,
         created_at: now,
-        expires_at: now.saturating_add(APPROVAL_SECONDS),
+        expires_at: now.saturating_add(crate::hub_client::protocol::INVITE_SECONDS),
         listing: None,
     }
 }

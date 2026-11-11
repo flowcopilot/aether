@@ -71,7 +71,8 @@ pub fn change(
             if agent.is_none() && endpoint_id.is_none() {
                 return Err("select a person");
             }
-            let identities = if matches!(action, Action::Add) {
+            let add = matches!(action, Action::Add);
+            let identities = if add {
                 peers
                     .iter()
                     .filter(|(name, endpoint)| {
@@ -101,14 +102,10 @@ pub fn change(
             }
             let (agent, endpoint) =
                 identities.into_iter().next().ok_or("select one person")?;
-            let result = match action {
-                Action::Add => store.add_access_group_member(group, &agent, &endpoint),
-                Action::Remove => {
-                    store.remove_access_group_member(group, &agent, &endpoint)
-                }
-                Action::Create | Action::Delete => {
-                    return Err("this group action is invalid");
-                }
+            let result = if add {
+                store.add_access_group_member(group, &agent, &endpoint)
+            } else {
+                store.remove_access_group_member(group, &agent, &endpoint)
             };
             result.map_err(|error| match error {
                 StoreError::NotFound => "the group or person is not in this list",
