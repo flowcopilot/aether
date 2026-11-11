@@ -362,7 +362,25 @@ pub(super) async fn save_policy(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use axum::http::StatusCode;
+
     use super::AdminConfirmations;
+    use crate::admin::{
+        ChangeRequest, shared_with_store,
+        test_support::{FakeNode, shared_in},
+    };
+    use crate::admin_ui::{
+        UiOptions, build_admin_ui,
+        test_support::{
+            PORT, admin_ui_with_directory_applier, app, get, host_ui, post, session,
+            session_cookie_pair,
+        },
+    };
+    use aether_store::{
+        AuditActor, AuditResult, ManagedMember, NodeStore, QueueLimits, TaskInput,
+    };
 
     #[test]
     fn a_failed_confirm_keeps_its_token_and_a_confirmed_one_uses_it_up() {
@@ -383,5 +401,283 @@ mod tests {
         assert_eq!(result, Some(Ok(())));
         assert_eq!(confirmed, ["workspace"]);
         assert_eq!(confirmations.confirm(token, |_| Ok::<(), &str>(())), None);
+    }
+
+    fn managed_options() -> UiOptions {
+        UiOptions { managed: true, ..UiOptions::default() }
+    }
+
+    #[tokio::test]
+    async fn a_ui_without_a_running_node_cannot_invite() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let admin_ui =
+            build_admin_ui(shared_in(directory.path()), UiOptions::default(), PORT);
+        let home = get(app(admin_ui), "/").await;
+        assert!(!home.body.contains("Invite someone"));
+        assert!(home.body.contains("Pending changes"));
+    }
+
+    #[tokio::test]
+    async fn ui_cancellation_uses_the_live_node_callback() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let administration = shared_in(directory.path());
+        let node = Arc::new(FakeNode::default());
+        administration.lock().expect("administration must lock").set_live(node.clone());
+        let admin_ui = build_admin_ui(administration, UiOptions::default(), PORT);
+        let application = app(admin_ui);
+        let home = get(application.clone(), "/").await;
+        let cookie = session_cookie_pair(
+            home.set_cookie.as_deref().expect("home page must set a cookie"),
+        );
+        let response = post(
+            application,
+            "/cancel",
+            Some(cookie),
+            "task_id=00000000-0000-4000-8000-000000000001",
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(node.calls(), ["cancel 00000000-0000-4000-8000-000000000001"]);
+    }
+
+    #[tokio::test]
+    async fn advanced_page_shows_a_store_error_instead_of_empty_counts() {
+        let (directory, admin_ui, _administration) = admin_ui_with_directory_applier();
+        let db_path = directory.path().join(aether_store::NODE_DATABASE);
+        rusqlite::Connection::open(&db_path)
+            .expect("database must open")
+            .execute(
+                "INSERT INTO audit_records(actor_type,action,result,created_at) VALUES('mcp','change','private-credential',0)",
+                [],
+            )
+            .expect("invalid audit row must insert");
+        let response = get(app(admin_ui), "/advanced").await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert!(response.body.contains("Administration store is unavailable"));
+        assert!(response.body.contains("Overview counts cannot be loaded"));
+        assert!(!response.body.contains("0 known agents"));
+    }
+
+    #[tokio::test]
+    async fn advanced_page_saves_task_policy_in_the_node_database() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let data_dir = directory.path().join("node");
+        crate::node_builder::load_or_create_service(
+            &directory.path().join("missing-policy.json"),
+            &data_dir,
+            "codex".into(),
+            None,
+        )
+        .expect("first node policy must create");
+        let (admin_ui, _) = host_ui(&data_dir);
+        let application = app(admin_ui);
+        let cookie = session(&application).await;
+        let mut form =
+            reqwest::Url::parse("http://form.test/").expect("form URL must parse");
+        form.query_pairs_mut()
+            .append_pair(
+                "workspace",
+                &directory.path().join("tasks").display().to_string(),
+            )
+            .append_pair("max_context_tokens", "12000")
+            .append_pair("max_seconds", "90")
+            .append_pair("queue_global", "3")
+            .append_pair("queue_per_peer", "2");
+        let denied = post(
+            application.clone(),
+            "/policy",
+            None,
+            form.query().expect("form must encode"),
+        )
+        .await;
+        assert_eq!(denied.status, StatusCode::FORBIDDEN);
+        let response = post(
+            application.clone(),
+            "/policy",
+            Some(&cookie),
+            form.query().expect("form must encode"),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK, "{}", response.body);
+        assert!(response.body.contains("Policy saved"));
+        let settings = crate::policy::policy_settings(&data_dir)
+            .expect("policy must read")
+            .expect("policy must exist");
+        assert_eq!(settings.max_context_tokens, 12_000);
+        assert_eq!(settings.max_seconds, 90);
+        assert_eq!(settings.queue.global, 3);
+        assert_eq!(settings.queue.per_peer, 2);
+    }
+
+    #[tokio::test]
+    async fn page_shows_durable_change_counts_without_values() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let mut store = NodeStore::in_dir(directory.path()).expect("store must open");
+        store
+            .apply_change(
+                aether_store::ChangeKind::Capability,
+                "review",
+                "private-credential",
+            )
+            .expect("change must apply");
+        store
+            .record_change(AuditActor::Mcp, AuditResult::Applied)
+            .expect("change must record");
+        store
+            .put_scope("scope", aether_core::ScopeKind::Direct)
+            .expect("scope must store");
+        store
+            .admit(
+                &TaskInput {
+                    request: aether_core::Request {
+                        task_id: aether_core::TaskId::new("task"),
+                        id: aether_core::RequestId::new("request"),
+                        caller_agent_id: aether_core::AgentId::new("agent"),
+                        caller_endpoint_id: aether_core::EndpointId::new("endpoint"),
+                        scope_id: aether_core::ScopeId::new("scope"),
+                        capability_id: aether_core::CapabilityId::new("review"),
+                        workspace_id: aether_core::WorkspaceId::new("workspace"),
+                        access_mode: aether_core::AccessMode::ReadOnly,
+                    },
+                    idempotency_key: "key".to_owned(),
+                    request_fingerprint: "fingerprint".to_owned(),
+                    skill: "review".to_owned(),
+                    remote_text: "private task data".to_owned(),
+                },
+                QueueLimits { global: 1, per_peer: 1 },
+            )
+            .expect("task must admit");
+        let admin_ui =
+            build_admin_ui(shared_with_store(store), UiOptions::default(), PORT);
+        let response = get(app(admin_ui), "/").await;
+        assert!(
+            response.body.contains("1 configured capabilities."),
+            "{}",
+            response.body
+        );
+        assert!(response.body.contains("1 stored tasks. 1 tasks are waiting."));
+        assert!(!response.body.contains("private-credential"));
+        assert!(!response.body.contains("private task data"));
+    }
+
+    #[tokio::test]
+    async fn managed_sections_require_a_managed_scope() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let admin_ui =
+            build_admin_ui(shared_in(directory.path()), managed_options(), PORT);
+        let response = get(app(admin_ui), "/").await;
+        assert!(response.body.contains("id=\"members\""));
+        assert!(response.body.contains("id=\"invitations\""));
+    }
+
+    #[tokio::test]
+    async fn managed_page_shows_cached_member_states() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let mut store = NodeStore::in_dir(directory.path()).expect("store must open");
+        for (cursor, agent, endpoint, expires_at) in [
+            (1, "active-agent", "active-endpoint", i64::MAX),
+            (2, "revoked-agent", "revoked-endpoint", i64::MAX),
+            (3, "expired-agent", "expired-endpoint", 1),
+        ] {
+            store
+                .apply_managed_member(
+                    "https://control.test",
+                    cursor,
+                    &ManagedMember {
+                        scope_id: "managed".to_owned(),
+                        agent_id: agent.to_owned(),
+                        endpoint_id: endpoint.to_owned(),
+                        role: "member".to_owned(),
+                        expires_at,
+                        revoked_at: None,
+                    },
+                )
+                .expect("member must store");
+        }
+        store
+            .revoke_managed_member(
+                "https://control.test",
+                4,
+                "managed",
+                "revoked-agent",
+            )
+            .expect("member must revoke");
+        let admin_ui =
+            build_admin_ui(shared_with_store(store), managed_options(), PORT);
+        let response = get(app(admin_ui), "/").await;
+        assert!(response.body.contains("active-agent in managed: active."));
+        assert!(response.body.contains("revoked-agent in managed: revoked."));
+        assert!(response.body.contains("expired-agent in managed: expired."));
+    }
+
+    #[tokio::test]
+    async fn member_names_are_escaped_in_the_page() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let mut store = NodeStore::in_dir(directory.path()).expect("store must open");
+        store
+            .apply_managed_member(
+                "https://control.test",
+                1,
+                &ManagedMember {
+                    scope_id: "managed".to_owned(),
+                    agent_id: "<script>alert(1)</script>".to_owned(),
+                    endpoint_id: "endpoint&id".to_owned(),
+                    role: "member".to_owned(),
+                    expires_at: i64::MAX,
+                    revoked_at: None,
+                },
+            )
+            .expect("member must store");
+        let admin_ui =
+            build_admin_ui(shared_with_store(store), managed_options(), PORT);
+        let response = get(app(admin_ui), "/").await;
+        assert!(response.body.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+        assert!(response.body.contains("endpoint&amp;id"));
+        assert!(!response.body.contains("<script>alert(1)</script>"));
+    }
+
+    #[tokio::test]
+    async fn pending_changes_show_no_secret_value() {
+        let (_directory, admin_ui, administration) = admin_ui_with_directory_applier();
+        administration
+            .lock()
+            .expect("administration must lock")
+            .submit(
+                &{
+                    let grant = crate::admin::peer_grant();
+                    ChangeRequest::Grant { id: grant.id.as_str().to_owned(), grant }
+                }
+                .into_change()
+                .expect("change must parse"),
+                aether_store::AuditActor::Mcp,
+                false,
+            )
+            .expect("change must add");
+        let application = app(admin_ui);
+        let home = get(application.clone(), "/").await;
+        assert!(home.body.contains("Confirm change"));
+        assert!(!home.body.contains("08080808080808080808080808080808"));
+        let token = extract_confirm_token(&home.body)
+            .expect("a confirmation token must render");
+        let cookie = session_cookie_pair(
+            home.set_cookie.as_deref().expect("cookie must be set"),
+        );
+        let response =
+            post(application, "/confirm", Some(cookie), &format!("id={token}")).await;
+        assert!(response.body.contains("No changes need confirmation."));
+        assert_eq!(
+            administration
+                .lock()
+                .expect("administration must unlock")
+                .audit()
+                .expect("audit"),
+            ["pending", "confirmed", "applied"]
+        );
+    }
+
+    fn extract_confirm_token(body: &str) -> Option<&str> {
+        let (_, rest) = body.split_once("name=\"id\" value=\"")?;
+        let (token, _) = rest.split_once('"')?;
+        Some(token)
     }
 }
