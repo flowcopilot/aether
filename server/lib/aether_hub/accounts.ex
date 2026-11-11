@@ -117,7 +117,7 @@ defmodule AetherHub.Accounts do
   end
 
   defp rename(%Account{endpoint: endpoint} = account, name, searchable) do
-    Repo.atomic(fn ->
+    Versions.commit(fn ->
       number = number!(name, endpoint, [account.number | Names.released_numbers(name, endpoint)])
       Names.release(account.name, account.number, endpoint, account.kind)
       end_named_rows(endpoint)
@@ -127,11 +127,8 @@ defmodule AetherHub.Accounts do
         |> Ecto.Changeset.change(name: name, number: number, searchable: searchable)
         |> Repo.update!()
 
-      touched = [endpoint | Invites.counterparts(endpoint)]
-      Versions.bump(touched)
-      {json(renamed), touched}
+      {json(renamed), [endpoint | Invites.counterparts(endpoint)]}
     end)
-    |> Versions.notify()
   end
 
   defp number!(name, endpoint, preferred) do
@@ -152,21 +149,15 @@ defmodule AetherHub.Accounts do
   Its tag stays with the key, with its type; blocks stay too.
   """
   def delete(%Account{endpoint: endpoint} = account) do
-    Repo.atomic(fn ->
+    Versions.commit(fn ->
       touched = Enum.uniq(Invites.counterparts(endpoint) ++ Contacts.of(endpoint))
       Names.release(account.name, account.number, endpoint, account.kind)
       Invites.delete_for(endpoint)
       Contacts.delete_for(endpoint)
       end_named_rows(endpoint)
       Repo.delete!(account)
-      Versions.bump(touched)
       {:ok, touched}
     end)
-    |> Versions.notify()
-    |> case do
-      {:ok, :ok} -> :ok
-      error -> error
-    end
   end
 
   ## Blocks
@@ -179,20 +170,13 @@ defmodule AetherHub.Accounts do
   def block(%Account{endpoint: endpoint}, blocked) do
     with :ok <- Protocol.validate_endpoint(blocked),
          false <- blocked == endpoint do
-      Repo.atomic(fn ->
+      Versions.commit(fn ->
         with {:error, reason} <- Blocks.put(endpoint, blocked), do: Repo.rollback(reason)
         Invites.delete_between(endpoint, blocked)
         Contacts.delete_between(endpoint, blocked)
         OwnerLinks.delete_between(endpoint, blocked)
-        touched = [endpoint, blocked]
-        Versions.bump(touched)
-        {:ok, touched}
+        {:ok, [endpoint, blocked]}
       end)
-      |> Versions.notify()
-      |> case do
-        {:ok, :ok} -> :ok
-        error -> error
-      end
     else
       {:error, :invalid} -> {:error, :invalid}
       true -> {:error, :invalid}

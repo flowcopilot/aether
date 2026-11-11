@@ -55,7 +55,7 @@ defmodule AetherHub.Invites do
   @doc "The personal agent `account` invites the personal agent `to` for `days` days."
   def invite(%Account{} = me, %{"to" => to, "days" => days})
       when is_binary(to) and is_integer(days) and days in @days do
-    Repo.atomic(fn ->
+    Versions.commit(fn ->
       # A service agent gets access only by request.
       if me.kind == @service, do: Repo.rollback(:forbidden)
 
@@ -71,7 +71,6 @@ defmodule AetherHub.Invites do
       if receiver.endpoint == me.endpoint, do: Repo.rollback(:invalid)
       insert(me, receiver, days, me.endpoint, @origin_invite)
     end)
-    |> Versions.notify()
   end
 
   def invite(_account, _body), do: {:error, :invalid}
@@ -84,7 +83,7 @@ defmodule AetherHub.Invites do
   """
   def request(%Account{} = me, %{"to" => to, "days" => days} = body)
       when map_size(body) == 2 and is_binary(to) and is_integer(days) and days in @days do
-    Repo.atomic(fn ->
+    Versions.commit(fn ->
       service =
         case Names.find(to) do
           {:ok, %Account{kind: @service} = service} -> service
@@ -107,7 +106,6 @@ defmodule AetherHub.Invites do
           {{row, :created}, touched}
       end
     end)
-    |> Versions.notify()
     |> case do
       {:ok, {row, outcome}} -> {:ok, row, outcome}
       error -> error
@@ -163,9 +161,7 @@ defmodule AetherHub.Invites do
         hidden_from: Blocks.hidden_from(target, maker)
       })
 
-    touched = sides(invite)
-    Versions.bump(touched)
-    {json(invite, Account.full_name(sender), Account.full_name(receiver), asker), touched}
+    {json(invite, Account.full_name(sender), Account.full_name(receiver), asker), sides(invite)}
   end
 
   ## Moving rows
@@ -220,31 +216,21 @@ defmodule AetherHub.Invites do
   def deliver(_account, _id, _body), do: {:error, :invalid}
 
   defp transition(%Account{endpoint: endpoint}, id, change) do
-    Repo.atomic(fn ->
+    Versions.commit(fn ->
       invite = open!(endpoint, id)
       invite = invite |> change.(role(invite, endpoint)) |> Repo.update!()
       if invite.status == @status_delivered, do: Contacts.add(invite)
-      touched = sides(invite)
-      Versions.bump(touched)
-      {json(invite, endpoint), touched}
+      {json(invite, endpoint), sides(invite)}
     end)
-    |> Versions.notify()
   end
 
   @doc "Either side removes the open row `id`."
   def delete(%Account{endpoint: endpoint}, id) do
-    Repo.atomic(fn ->
+    Versions.commit(fn ->
       invite = open!(endpoint, id)
       Repo.delete!(invite)
-      touched = sides(invite)
-      Versions.bump(touched)
-      {:ok, touched}
+      {:ok, sides(invite)}
     end)
-    |> Versions.notify()
-    |> case do
-      {:ok, :ok} -> :ok
-      error -> error
-    end
   end
 
   @doc """
@@ -375,18 +361,11 @@ defmodule AetherHub.Invites do
 
   @doc "Deletes every expired row and wakes both sides of each."
   def delete_expired do
-    Repo.atomic(fn ->
+    Versions.commit(fn ->
       expired = Repo.all(from i in Invite, where: i.created_at <= ^cutoff())
       Repo.delete_all(from i in Invite, where: i.id in ^Enum.map(expired, & &1.id))
-      touched = Enum.flat_map(expired, &[&1.sender_endpoint, &1.receiver_endpoint])
-      Versions.bump(touched)
-      {:ok, touched}
+      {:ok, Enum.flat_map(expired, &[&1.sender_endpoint, &1.receiver_endpoint])}
     end)
-    |> Versions.notify()
-    |> case do
-      {:ok, :ok} -> :ok
-      error -> error
-    end
   end
 
   ## Helpers
