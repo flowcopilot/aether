@@ -52,9 +52,22 @@ before starting new work. Do not report completion merely because the connector
 is listed. Installation is verified only after these real tool calls succeed.
 
 The MCP command's startup lock is `<data-dir>/grokbot-bridge/runtime.lock`.
-Normal shutdown removes it. After a crash, verify that the old bridge and its
-Aether child are stopped before removing this lock. The separate active-claim
-marker has stricter recovery requirements; keep it until old task work is stopped.
+The first connector process takes it and owns the Aether node. If Grok opens
+the connector again while that process runs, the new process forwards its
+tool calls to the owner over `grokbot-bridge/bridge.sock` instead of starting
+a second node. The owner keeps the node while any connector still uses it;
+when the owner exits, a remaining connector takes over and starts the node again.
+Normal shutdown removes the lock. A lock left by a crashed bridge is taken over
+automatically. On Linux the new bridge first stops the node the crashed bridge
+left running. Elsewhere it reports that node's process ID for you to stop.
+Remove the lock by hand only when the error asks you to, after verifying the
+old bridge and its Aether child are stopped. The separate active-claim marker
+has stricter recovery requirements; keep it until old task work is stopped.
+
+If the bridge exits with `Local Aether node exited`, the text after the colon
+is the node's own last error line. A deleted default task folder
+(`<data-dir>/../tasks`) is made again at startup. A missing custom
+`workspace` in the policy is reported with its path.
 
 ## 3. Connect the owner and receive tasks
 
