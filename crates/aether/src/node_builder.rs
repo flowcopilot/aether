@@ -21,7 +21,7 @@ use crate::{
     data_dir::{DataDir, codex_login},
     execution::{Executor, Limits},
     identity::{NODE_ISSUER, RosterClaims, SignedClaims, decode_grant},
-    node_service::NodeService,
+    node_service::{NodeOptions, NodeService},
     policy::{
         AgentAdapter, PolicyError, PolicyFile, PolicySandbox, decode_key,
         default_sandbox, keep, load_or_create, parse_scopes, stored_queue_limits,
@@ -205,10 +205,7 @@ fn build(
         scopes,
     )
     .map_err(|_| PolicyError::Invalid)?;
-    let mut service = NodeService::new(node);
-    service.set_task_folder_mode(matches!(sandbox, Some(PolicySandbox::TaskFolder)));
-    service.set_agent_adapter(adapter);
-    service.set_pact_config(pact);
+    let task_folder_mode = matches!(sandbox, Some(PolicySandbox::TaskFolder));
     // Fail closed the same way the policy file's own `workspace` field
     // already does: a named-but-missing approved directory is a
     // misconfiguration to catch at startup, not something to silently
@@ -222,7 +219,15 @@ fn build(
                 .map_err(|_| PolicyError::InvalidField("approvedWorkspaces".to_owned()))
         })
         .collect::<Result<BTreeMap<_, _>, _>>()?;
-    service.set_approved_workspaces(approved_workspaces);
+    let service = NodeService::new(
+        node,
+        NodeOptions {
+            approved_workspaces,
+            task_folder_mode,
+            agent_adapter: adapter,
+            pact,
+        },
+    );
     // A validated live workspace or grant change survives only in
     // `configuration`; the node built above always starts from the policy
     // file's baseline. Replay both here so a restart resumes the state the
@@ -232,7 +237,7 @@ fn build(
     // longer verifies (commonly: it expired since it was granted) is
     // skipped rather than blocking startup, since that is its expected
     // eventual lifecycle, not a sign of corruption.
-    if let Some(path) = stored_workspace.filter(|_| !service.task_folder_mode()) {
+    if let Some(path) = stored_workspace.filter(|_| !task_folder_mode) {
         service.apply_workspace(Path::new(&path)).map_err(|_| {
             PolicyError::InvalidField("admin.current.workspace".to_owned())
         })?;
