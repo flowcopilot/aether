@@ -4,8 +4,6 @@
 
 use std::{
     fmt,
-    io::BufReader,
-    process::{ChildStdout, Stdio},
     time::{Duration, SystemTime},
 };
 
@@ -300,9 +298,6 @@ impl Drop for PersonalAgent {
 struct Node {
     /// `None` after the operator stopped it.
     process: Option<ServerProcess>,
-    /// The node's output. It stays open: the node fails when it cannot
-    /// write its events.
-    _output: BufReader<ChildStdout>,
     /// The public PACT address.
     public: String,
     /// The address of the code review offer.
@@ -362,12 +357,11 @@ impl Node {
                 .arg(&node_dir.data_dir)
                 .args(["--port", "0", "--admin-port", "0", "--pact-listen"])
                 .arg(format!("127.0.0.1:{pact_port}"))
-                .env("AETHER_CODEX_BIN", &fake_codex)
-                .stdout(Stdio::piped()),
+                .env("AETHER_CODEX_BIN", &fake_codex),
         );
-        let mut output = process.stdout();
         // The node stops before `pact_listening` when the PACT port is taken.
-        let events = read_events(&mut output, &["pact_listening", "admin_listening"])?;
+        let events =
+            read_events(process.output(), &["pact_listening", "admin_listening"])?;
         let admin = events["admin_listening"]["url"]
             .as_str()
             .expect("admin URL")
@@ -375,7 +369,6 @@ impl Node {
             .to_owned();
         Some(Self {
             process: Some(process),
-            _output: output,
             public,
             brand,
             admin,
@@ -635,12 +628,12 @@ async fn access_refused(world: &mut super::World) {
 
 #[then("the node stops cleanly when the operator interrupts it")]
 async fn node_stops(world: &mut super::World) {
-    let process = world
+    world
         .pact
         .node
         .as_mut()
         .and_then(|node| node.process.take())
-        .expect("a node must run");
-    let status = blocking(move || process.interrupt()).await;
-    assert!(status.success(), "{status}");
+        .expect("a node must run")
+        .stop_cleanly()
+        .await;
 }

@@ -16,9 +16,10 @@ pub use store::{
 };
 
 use std::{
+    fmt,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
-    process::{Child, ChildStdout, Command, ExitStatus, Output},
+    process::{Child, ChildStdout, Command, ExitStatus, Output, Stdio},
 };
 
 use serde_json::Value;
@@ -65,40 +66,88 @@ impl Scratch {
     }
 }
 
-/// A long-running aether process. Dropping it kills the process, so a test
-/// that fails half way does not leave a server running.
-pub struct ServerProcess(Child);
+/// A long-running aether process and its standard output. Dropping it kills
+/// the process, so a test that fails half way does not leave a server
+/// running. The output stays open until the process exits: the process
+/// fails when it cannot write its events.
+pub struct ServerProcess {
+    child: Child,
+    /// `None` only while a blocking read holds it.
+    stdout: Option<BufReader<ChildStdout>>,
+}
+
+impl fmt::Debug for ServerProcess {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("ServerProcess").finish_non_exhaustive()
+    }
+}
 
 impl ServerProcess {
-    /// Starts `command` without the public relay.
+    /// Starts `command` with its output piped and without the public relay.
     pub fn spawn(command: &mut Command) -> Self {
-        command.env("AETHER_RELAY_URL", "off");
-        Self(command.spawn().expect("server process must start"))
+        let mut child = command
+            .env("AETHER_RELAY_URL", "off")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("server process must start");
+        let stdout = child.stdout.take().map(BufReader::new);
+        Self { child, stdout }
     }
 
-    /// Stops the process the way an operator does, with SIGINT, and
-    /// returns its exit status.
-    pub fn interrupt(mut self) -> ExitStatus {
-        let id = self.0.id().to_string();
-        assert!(
-            Command::new("kill")
-                .args(["-INT", &id])
-                .status()
-                .expect("interrupt command must start")
-                .success()
-        );
-        self.0.wait().expect("server process must exit")
+    /// The output, for a step that already runs on a blocking thread.
+    pub const fn output(&mut self) -> &mut BufReader<ChildStdout> {
+        self.stdout.as_mut().expect("output must be readable")
     }
 
-    pub fn stdout(&mut self) -> BufReader<ChildStdout> {
-        BufReader::new(self.0.stdout.take().expect("server output must be piped"))
+    /// Runs `read` on the output on a blocking thread.
+    pub async fn read<T: Send + 'static>(
+        &mut self,
+        read: impl FnOnce(&mut BufReader<ChildStdout>) -> T + Send + 'static,
+    ) -> T {
+        let mut stdout = self.stdout.take().expect("output must be readable");
+        let (stdout, value) = blocking(move || {
+            let value = read(&mut stdout);
+            (stdout, value)
+        })
+        .await;
+        self.stdout = Some(stdout);
+        value
+    }
+
+    /// Reads the next event the process prints, or with a `name`, the next
+    /// event with that name.
+    pub async fn event(&mut self, name: Option<&'static str>) -> Value {
+        self.read(move |stdout| read_event(stdout, name)).await
+    }
+
+    /// Stops the process the way an operator does, with SIGINT, and returns
+    /// its exit status.
+    pub async fn stop(mut self) -> ExitStatus {
+        blocking(move || {
+            let id = self.child.id().to_string();
+            assert!(
+                Command::new("kill")
+                    .args(["-INT", &id])
+                    .status()
+                    .expect("interrupt command must start")
+                    .success()
+            );
+            self.child.wait().expect("server process must exit")
+        })
+        .await
+    }
+
+    /// Stops the process with SIGINT and asserts that it exits cleanly.
+    pub async fn stop_cleanly(self) {
+        let status = self.stop().await;
+        assert!(status.success(), "the process exited with {status}");
     }
 }
 
 impl Drop for ServerProcess {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 

@@ -145,7 +145,7 @@ async fn revoke_record(world: &mut World) {
 async fn restart_control(world: &mut World) {
     let Control { process, url, config, data } =
         world.cli.control.take().expect("a control service must run");
-    assert!(process.interrupt().await.success());
+    process.stop_cleanly().await;
     let port =
         url.rsplit(':').next().expect("control URL must include a port").to_owned();
     let restarted = Control::start(config, data, &port).await;
@@ -157,7 +157,7 @@ async fn restart_control(world: &mut World) {
 #[then("the control service stops cleanly")]
 async fn control_stops(world: &mut World) {
     let control = world.cli.control.take().expect("a control service must run");
-    assert!(control.process.interrupt().await.success());
+    control.process.stop_cleanly().await;
 }
 
 #[then(expr = "the node knows the record of {string} in {string} as expired")]

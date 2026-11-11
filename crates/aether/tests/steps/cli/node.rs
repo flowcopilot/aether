@@ -14,9 +14,8 @@ use aether::admin_socket::{
 use cucumber::{given, then, when};
 use serde_json::json;
 
-use super::Process;
 use crate::{
-    common::{aether_command, blocking, run},
+    common::{ServerProcess, aether_command, blocking, run},
     steps::World,
 };
 
@@ -50,7 +49,7 @@ fn node_serve(world: &World) -> Command {
 
 /// Starts `command` and reads the event that says the node listens for peers.
 async fn start(world: &mut World, mut command: Command) {
-    let mut process = Process::spawn(&mut command);
+    let mut process = ServerProcess::spawn(&mut command);
     let startup = process.event(None).await;
     assert_eq!(startup["event"], "node_listening");
     assert!(
@@ -144,7 +143,7 @@ async fn start_with_invite_name(world: &mut World, name: String) {
 
 #[when("the node stops")]
 async fn node_stops(world: &mut World) {
-    world.cli.node.take().expect("a node must run").interrupt().await;
+    world.cli.node.take().expect("a node must run").stop().await;
 }
 
 #[when("the node is woken to send its outbox")]

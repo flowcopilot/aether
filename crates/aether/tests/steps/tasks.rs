@@ -11,7 +11,7 @@ use std::{
     io::{BufRead, BufReader, Write},
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
-    process::{Child, ChildStdout, Command, Output, Stdio},
+    process::{Child, Command, Output, Stdio},
     sync::Arc,
     thread::JoinHandle,
     time::{Duration, Instant, SystemTime},
@@ -107,8 +107,6 @@ impl Caller {
 /// The `node serve` process of the host.
 struct Host {
     process: ServerProcess,
-    /// Kept open so the node can keep writing its events.
-    _stdout: BufReader<ChildStdout>,
     id: String,
     port: u16,
 }
@@ -128,7 +126,7 @@ struct Listing {
 
 /// A directory (control) service. The process is gone once it stopped.
 struct Directory {
-    process: Option<(ServerProcess, BufReader<ChildStdout>)>,
+    process: Option<ServerProcess>,
     url: String,
     certificate: PathBuf,
 }
@@ -466,8 +464,7 @@ impl State {
                 } else {
                     root.join("no-codex-here")
                 },
-            )
-            .stdout(Stdio::piped());
+            );
         if let Some(home) = &self.owner_codex_home {
             command.env("CODEX_HOME", home);
         }
@@ -492,18 +489,18 @@ impl State {
         }
         let listed = self.listing.is_some();
         let mut process = ServerProcess::spawn(&mut command);
-        let mut output = process.stdout();
-        let (output, id, port, published) = blocking(move || {
-            let (id, port) = read_node_listening(&mut output);
-            let published = listed.then(|| {
-                let published = read_event(&mut output, None);
-                assert_eq!(published["event"], "directory_record_published");
-                published
-            });
-            assert_eq!(read_event(&mut output, None)["event"], "admin_listening");
-            (output, id, port, published)
-        })
-        .await;
+        let (id, port, published) = process
+            .read(move |output| {
+                let (id, port) = read_node_listening(output);
+                let published = listed.then(|| {
+                    let published = read_event(output, None);
+                    assert_eq!(published["event"], "directory_record_published");
+                    published
+                });
+                assert_eq!(read_event(output, None)["event"], "admin_listening");
+                (id, port, published)
+            })
+            .await;
         if let Some(published) = &published {
             let signing_key = published["signing_key"]
                 .as_str()
@@ -513,7 +510,7 @@ impl State {
             self.record_key = Some(record_key);
         }
         self.published = published;
-        self.host = Some(Host { process, _stdout: output, id, port });
+        self.host = Some(Host { process, id, port });
     }
 
     /// `node invite` on the host: the invitation JSON.
@@ -758,11 +755,7 @@ async fn host_stops(world: &mut World) {
     {
         endpoint.close().await;
     }
-    let host = state.host.take().expect("the host node must run");
-    let Host { process, _stdout: output, .. } = host;
-    let status = blocking(move || process.interrupt()).await;
-    drop(output);
-    assert!(status.success(), "the host node exited with {status}");
+    state.host.take().expect("the host node must run").process.stop_cleanly().await;
 }
 
 // Callers.
@@ -1331,23 +1324,20 @@ async fn directory_running(world: &mut World) {
     let config = root.join("control.toml");
     fs::write(&config, format!("data_dir = \"{}\"\n", control_data.display()))
         .expect("control configuration must write");
-    let mut process = ServerProcess::spawn(
-        aether_command()
-            .args(["control", "--config", utf8(&config), "--port", "0"])
-            .stdout(Stdio::piped()),
-    );
-    let mut output = process.stdout();
-    let (output, url) = blocking(move || {
-        read_event(&mut output, None);
-        let url = read_event(&mut output, None)["url"]
-            .as_str()
-            .expect("control URL must be reported")
-            .to_owned();
-        (output, url)
-    })
-    .await;
+    let mut process = ServerProcess::spawn(aether_command().args([
+        "control",
+        "--config",
+        utf8(&config),
+        "--port",
+        "0",
+    ]));
+    process.event(None).await;
+    let url = process.event(None).await["url"]
+        .as_str()
+        .expect("control URL must be reported")
+        .to_owned();
     state.directory = Some(Directory {
-        process: Some((process, output)),
+        process: Some(process),
         url,
         certificate: aether::data_dir::DataDir::new(&control_data)
             .control_certificate(),
@@ -1395,15 +1385,14 @@ async fn record_renewed(world: &mut World) {
 async fn directory_stops(world: &mut World) {
     // The URL and the certificate stay: the caller still names the host by
     // the record it keeps.
-    let (process, output) = world
+    world
         .tasks
         .directory
         .as_mut()
         .and_then(|directory| directory.process.take())
-        .expect("a directory service must run");
-    let status = blocking(move || process.interrupt()).await;
-    drop(output);
-    assert!(status.success(), "the directory service exited with {status}");
+        .expect("a directory service must run")
+        .stop_cleanly()
+        .await;
 }
 
 #[given(expr = "a reader gets {int} record(s) from the directory")]

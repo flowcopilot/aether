@@ -10,26 +10,18 @@ mod help;
 mod mcp;
 mod node;
 
-use std::{
-    fmt,
-    io::BufReader,
-    path::PathBuf,
-    process::{ChildStdout, Command, ExitStatus, Output, Stdio},
-};
+use std::{path::PathBuf, process::Output};
 
 use cucumber::{then, when};
-use serde_json::Value;
 
-use crate::common::{
-    Scratch, ServerProcess, aether_command, blocking, read_event, run, utf8,
-};
+use crate::common::{Scratch, ServerProcess, aether_command, run, utf8};
 
 #[derive(Debug, Default)]
 pub struct State {
     root: Scratch,
     output: Option<Output>,
     /// A running `node serve` or `node admin`.
-    node: Option<Process>,
+    node: Option<ServerProcess>,
     /// A running control service.
     control: Option<Control>,
     node_files: node::State,
@@ -50,7 +42,7 @@ impl State {
         String::from_utf8(self.output().stdout.clone()).expect("output must be UTF-8")
     }
 
-    const fn node(&mut self) -> &mut Process {
+    const fn node(&mut self) -> &mut ServerProcess {
         self.node.as_mut().expect("a node must run")
     }
 
@@ -59,56 +51,10 @@ impl State {
     }
 }
 
-/// A long-running `aether` process with its standard output.
-pub struct Process {
-    server: ServerProcess,
-    stdout: Option<BufReader<ChildStdout>>,
-}
-
-impl fmt::Debug for Process {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("Process").finish_non_exhaustive()
-    }
-}
-
-impl Process {
-    /// Starts `command` with its standard output piped.
-    fn spawn(command: &mut Command) -> Self {
-        let mut server = ServerProcess::spawn(command.stdout(Stdio::piped()));
-        let stdout = Some(server.stdout());
-        Self { server, stdout }
-    }
-
-    /// Reads the next event the process prints, or with a `name`, the next
-    /// event with that name.
-    async fn event(&mut self, name: Option<&'static str>) -> Value {
-        let mut stdout = self.stdout.take().expect("output must be readable");
-        let (stdout, event) = blocking(move || {
-            let event = read_event(&mut stdout, name);
-            (stdout, event)
-        })
-        .await;
-        self.stdout = Some(stdout);
-        event
-    }
-
-    /// Stops the process with SIGINT and returns its exit status. The output
-    /// stays open until the process exits: a closed pipe would make it panic.
-    async fn interrupt(self) -> ExitStatus {
-        let Self { server, stdout } = self;
-        blocking(move || {
-            let status = server.interrupt();
-            drop(stdout);
-            status
-        })
-        .await
-    }
-}
-
 /// A running control service and the address it reports.
 #[derive(Debug)]
 struct Control {
-    process: Process,
+    process: ServerProcess,
     url: String,
     config: PathBuf,
     data: PathBuf,
@@ -117,7 +63,7 @@ struct Control {
 impl Control {
     /// Starts the control service of `config` on `port` and reads its URL.
     async fn start(config: PathBuf, data: PathBuf, port: &str) -> Self {
-        let mut process = Process::spawn(aether_command().args([
+        let mut process = ServerProcess::spawn(aether_command().args([
             "control",
             "--config",
             utf8(&config),

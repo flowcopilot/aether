@@ -7,9 +7,8 @@ use std::{
 
 use cucumber::{given, then, when};
 
-use super::Process;
 use crate::{
-    common::{aether_command, blocking, utf8},
+    common::{ServerProcess, aether_command, blocking, utf8},
     steps::World,
 };
 
@@ -44,7 +43,7 @@ async fn mcp_session(world: &mut World, mut command: Command, requests: String) 
 #[given("a running owner page for a managed scope")]
 async fn running_owner_page(world: &mut World) {
     let data_dir = world.cli.root();
-    let mut process = Process::spawn(aether_command().args([
+    let mut process = ServerProcess::spawn(aether_command().args([
         "node",
         "admin",
         "--managed-scope",
