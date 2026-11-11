@@ -184,37 +184,7 @@ fn fixture() -> Fixture {
 }
 
 fn fixture_with(setup: impl FnOnce(&FakeNode)) -> Fixture {
-    let directory = tempfile::tempdir().expect("directory must create");
-    let agent = TestAgent::new("k1");
-    let key = Arc::new(ProviderKey::load_or_create(directory.path()).expect("key"));
-    let node = Arc::new(FakeNode::default());
-    setup(&node);
-    let link = Arc::new(ConsentLink::default());
-    link.set("https://127.0.0.1:3000".to_owned());
-    let path = directory.path().join(aether_store::pact::PACT_DATABASE);
-    let store: SharedPactStore =
-        Arc::new(Mutex::new(PactStore::open(&path).expect("store must open")));
-    let gateway = Gateway::new(
-        config(),
-        PaVerifier::new(
-            AUDIENCE.to_owned(),
-            UrlPolicy { allow_insecure_local: false },
-            StaticKeys::new(agent.jwks.clone()),
-        ),
-        Arc::clone(&key),
-        Arc::clone(&store),
-        node.clone(),
-        link,
-    )
-    .with_poll_interval(Duration::from_millis(1));
-    Fixture {
-        app: router(Arc::new(gateway)),
-        agent,
-        node,
-        key,
-        _directory: directory,
-        store,
-    }
+    fixture_with_gateway(setup, |gateway| gateway)
 }
 
 fn fixture_with_gateway(
