@@ -45,7 +45,7 @@ use crate::{
         Account, AgentKind, Block, DEFAULT_HUB_URL, HubClient, HubError, Invite,
         Origin, OwnerLink, Role, Status, valid_full_name, valid_name_part,
     },
-    hub_membership::{APPROVAL_SECONDS, hub_message, keep_hub_name, offer},
+    hub_membership::{hub_message, keep_hub_name, new_approval, offer},
 };
 
 /// How long a page waits for the hub before it shows the page without it.
@@ -869,24 +869,27 @@ async fn approve(
     if store.is_blocked(&endpoint).map_err(|_| HubError::Unexpected)? {
         return Err(HubError::Forbidden);
     }
-    let now = now();
+    let approved_days = u32::try_from(days).map_err(|_| HubError::Invalid)?;
     store
         .put_approval(&HubApproval {
-            invite_id: invite.id.clone(),
-            side: ApprovalSide::Sender,
-            kind: ApprovalKind::Request,
-            peer_name: invite.to.clone(),
             peer_endpoint: Some(endpoint),
-            days: u32::try_from(days).map_err(|_| HubError::Invalid)?,
-            access_group: crate::access_groups::REQUESTS_GROUP.to_owned(),
-            bundle: None,
-            created_at: now,
-            expires_at: now.saturating_add(APPROVAL_SECONDS),
-            listing: None,
+            ..new_approval(
+                &invite.id,
+                ApprovalSide::Sender,
+                ApprovalKind::Request,
+                &invite.to,
+                approved_days,
+                crate::access_groups::REQUESTS_GROUP,
+                now(),
+            )
         })
         .map_err(|_| HubError::Unexpected)?;
+    // The approval goes only when the hub refused. After a lost answer the
+    // hub may have accepted the row, and the host signs it only with it.
     if let Err(error) = hub.approve(id, days).await {
-        let _ = store.remove_approval(id);
+        if !error.may_have_applied() {
+            let _ = store.remove_approval(id);
+        }
         return Err(error);
     }
     Ok(())
@@ -1051,13 +1054,18 @@ pub(super) async fn unblock(
     Form(form): Form<UnblockForm>,
 ) -> TopcoatResult<impl View> {
     let hub = admin_hub(cx).await?;
-    let error = hub_failure(hub.unblock(&form.endpoint).await);
-    if error.is_empty()
-        && let Some(store) = page_data_dir(cx)
-            .and_then(|data_dir| crate::hub_store::HubStore::open(&data_dir).ok())
-    {
-        let _ = store.remove_block(&form.endpoint);
-    }
+    // The node's own block goes first: while the hub block stays, the page
+    // lists it, so a failed unblock can be tried again.
+    let kept = page_data_dir(cx).is_some_and(|data_dir| {
+        crate::hub_store::HubStore::open(&data_dir)
+            .and_then(|store| store.remove_block(&form.endpoint))
+            .is_err()
+    });
+    let error = if kept {
+        "This computer could not remove the block. Try again."
+    } else {
+        hub_failure(hub.unblock(&form.endpoint).await)
+    };
     Ok(view! { hub_form_screen(notice: Notice::Hub(error.to_owned())) })
 }
 

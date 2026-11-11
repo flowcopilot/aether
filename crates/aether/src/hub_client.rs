@@ -146,11 +146,7 @@ impl HubClient {
 
     /// This node's name, or `None` before it claims one.
     pub async fn account(&self) -> Result<Option<Account>, HubError> {
-        match self.send(Method::GET, "/v1/account", &[], None).await {
-            Ok(body) => parse(&body).map(Some),
-            Err(HubError::NotFound) => Ok(None),
-            Err(error) => Err(error),
-        }
+        found(self.send(Method::GET, "/v1/account", &[], &[]).await)
     }
 
     /// The hub protocol: `GET /v1/hub`. A hub from before protocol 2 has no
@@ -159,7 +155,7 @@ impl HubClient {
         if let Some(protocol) = self.protocol.get() {
             return Ok(*protocol);
         }
-        match self.send(Method::GET, "/v1/hub", &[], None).await {
+        match self.send(Method::GET, "/v1/hub", &[], &[]).await {
             Ok(body) => {
                 let protocol = parse::<HubInfo>(&body)?.protocol;
                 if protocol >= 2 {
@@ -185,15 +181,13 @@ impl HubClient {
         kind: Option<AgentKind>,
     ) -> Result<Account, HubError> {
         self.require_protocol_2().await?;
-        let body = json(&ClaimBody { name, kind })?;
-        parse(&self.send(Method::PUT, "/v1/account", &[], Some(body)).await?)
+        self.send_json(Method::PUT, "/v1/account", &ClaimBody { name, kind }).await
     }
 
     /// Lets people find this personal agent by name search, or stops it.
     pub async fn set_searchable(&self, searchable: bool) -> Result<Account, HubError> {
         self.require_protocol_2().await?;
-        let body = json(&SearchBody { searchable })?;
-        parse(&self.send(Method::PUT, "/v1/account", &[], Some(body)).await?)
+        self.send_json(Method::PUT, "/v1/account", &SearchBody { searchable }).await
     }
 
     /// Lists this service agent on the hub until `expires_at`, with the
@@ -205,27 +199,23 @@ impl HubClient {
         expires_at: u64,
     ) -> Result<HeldListing, HubError> {
         self.require_protocol_2().await?;
-        let body = json(&HeldListing {
+        let body = HeldListing {
             listed: true,
             listing: text.to_owned(),
             signature: signature.to_owned(),
             expires_at,
-        })?;
-        parse(&self.send(Method::PUT, "/v1/listing", &[], Some(body)).await?)
+        };
+        self.send_json(Method::PUT, "/v1/listing", &body).await
     }
 
     pub async fn listing(&self) -> Result<Option<HeldListing>, HubError> {
         self.require_protocol_2().await?;
-        match self.send(Method::GET, "/v1/listing", &[], None).await {
-            Ok(body) => parse(&body).map(Some),
-            Err(HubError::NotFound) => Ok(None),
-            Err(error) => Err(error),
-        }
+        found(self.send(Method::GET, "/v1/listing", &[], &[]).await)
     }
 
     pub async fn delete_listing(&self) -> Result<(), HubError> {
         self.require_protocol_2().await?;
-        self.send(Method::DELETE, "/v1/listing", &[], None).await.map(drop)
+        self.command(Method::DELETE, "/v1/listing").await
     }
 
     pub async fn find_agents(
@@ -236,7 +226,7 @@ impl HubClient {
         self.require_protocol_2().await?;
         let limit = limit.to_string();
         let body = self
-            .send(Method::GET, "/v1/agents", &[("q", query), ("limit", &limit)], None)
+            .send(Method::GET, "/v1/agents", &[("q", query), ("limit", &limit)], &[])
             .await?;
         parse::<AgentRows>(&body).map(|rows| rows.agents)
     }
@@ -244,26 +234,25 @@ impl HubClient {
     pub async fn agent(&self, full_name: &str) -> Result<AgentRow, HubError> {
         let path = name_path("/v1/agents", full_name)?;
         self.require_protocol_2().await?;
-        parse(&self.send(Method::GET, &path, &[], None).await?)
+        parse(&self.send(Method::GET, &path, &[], &[]).await?)
     }
 
     pub async fn person(&self, full_name: &str) -> Result<PersonRow, HubError> {
         let path = name_path("/v1/people", full_name)?;
         self.require_protocol_2().await?;
-        parse(&self.send(Method::GET, &path, &[], None).await?)
+        parse(&self.send(Method::GET, &path, &[], &[]).await?)
     }
 
     pub async fn find_people(&self, prefix: &str) -> Result<Vec<PersonRow>, HubError> {
         self.require_protocol_2().await?;
-        let body = self.send(Method::GET, "/v1/people", &[("q", prefix)], None).await?;
+        let body = self.send(Method::GET, "/v1/people", &[("q", prefix)], &[]).await?;
         parse::<PersonRows>(&body).map(|rows| rows.people)
     }
 
     /// Offers this node's agent to the person with the full name `to` for
     /// `days` days.
     pub async fn invite(&self, to: &str, days: u64) -> Result<Invite, HubError> {
-        let body = json(&InviteBody { to, days })?;
-        parse(&self.send(Method::POST, "/v1/invites", &[], Some(body)).await?)
+        self.send_json(Method::POST, "/v1/invites", &InviteBody { to, days }).await
     }
 
     /// The open invites. With `after` equal to the hub's current version,
@@ -279,12 +268,12 @@ impl HubClient {
             Some(after) => vec![("after", after.as_str()), ("wait", wait.as_str())],
             None => Vec::new(),
         };
-        parse(&self.send(Method::GET, "/v1/invites", &query, None).await?)
+        parse(&self.send(Method::GET, "/v1/invites", &query, &[]).await?)
     }
 
     pub async fn accept(&self, id: &str) -> Result<Invite, HubError> {
         let path = format!("/v1/invites/{}/accept", segment(id)?);
-        parse(&self.send(Method::POST, &path, &[], None).await?)
+        parse(&self.send(Method::POST, &path, &[], &[]).await?)
     }
 
     /// Claims the service agent `service` as this personal agent's own until
@@ -296,13 +285,13 @@ impl HubClient {
         signature: &str,
     ) -> Result<OwnerLink, HubError> {
         self.require_protocol_2().await?;
-        let body = json(&OwnerClaimBody { service, expires_at, signature })?;
-        parse(&self.send(Method::POST, "/v1/owner-links", &[], Some(body)).await?)
+        let body = OwnerClaimBody { service, expires_at, signature };
+        self.send_json(Method::POST, "/v1/owner-links", &body).await
     }
 
     pub async fn owner_links(&self) -> Result<Vec<OwnerLink>, HubError> {
         self.require_protocol_2().await?;
-        let body = self.send(Method::GET, "/v1/owner-links", &[], None).await?;
+        let body = self.send(Method::GET, "/v1/owner-links", &[], &[]).await?;
         parse::<OwnerLinks>(&body).map(|links| links.links)
     }
 
@@ -314,14 +303,13 @@ impl HubClient {
     ) -> Result<OwnerLink, HubError> {
         let path = format!("/v1/owner-links/{}/confirm", segment(id)?);
         self.require_protocol_2().await?;
-        let body = json(&SignatureBody { signature })?;
-        parse(&self.send(Method::POST, &path, &[], Some(body)).await?)
+        self.send_json(Method::POST, &path, &SignatureBody { signature }).await
     }
 
     pub async fn delete_owner_link(&self, id: &str) -> Result<(), HubError> {
         let path = format!("/v1/owner-links/{}", segment(id)?);
         self.require_protocol_2().await?;
-        self.send(Method::DELETE, &path, &[], None).await.map(drop)
+        self.command(Method::DELETE, &path).await
     }
 
     /// Asks the listed service agent `to` for access for `days` days.
@@ -331,36 +319,31 @@ impl HubClient {
         days: u64,
     ) -> Result<Invite, HubError> {
         self.require_protocol_2().await?;
-        let body = json(&InviteBody { to, days })?;
-        parse(&self.send(Method::POST, "/v1/requests", &[], Some(body)).await?)
+        self.send_json(Method::POST, "/v1/requests", &InviteBody { to, days }).await
     }
 
     pub async fn approve(&self, id: &str, days: u64) -> Result<Invite, HubError> {
         let path = format!("/v1/invites/{}/approve", segment(id)?);
         self.require_protocol_2().await?;
-        let body = json(&ApproveBody { days })?;
-        parse(&self.send(Method::POST, &path, &[], Some(body)).await?)
+        self.send_json(Method::POST, &path, &ApproveBody { days }).await
     }
 
     /// Blocks `endpoint`: the hub removes the open rows and the contact
     /// between the two, and hides the rows that it makes later.
     pub async fn block(&self, endpoint: &str) -> Result<(), HubError> {
-        let endpoint =
-            endpoint.parse::<iroh::EndpointId>().map_err(|_| HubError::Invalid)?;
+        let path = block_path(endpoint)?;
         self.require_protocol_2().await?;
-        let path = format!("/v1/blocks/{endpoint}");
-        self.send(Method::PUT, &path, &[], None).await.map(drop)
+        self.command(Method::PUT, &path).await
     }
 
     /// Gives the signed invite line for an accepted invite.
     pub async fn deliver(&self, id: &str, bundle: &str) -> Result<Invite, HubError> {
         let path = format!("/v1/invites/{}/bundle", segment(id)?);
-        let body = json(&BundleBody { bundle })?;
-        parse(&self.send(Method::POST, &path, &[], Some(body)).await?)
+        self.send_json(Method::POST, &path, &BundleBody { bundle }).await
     }
 
     pub async fn contacts(&self) -> Result<Vec<Contact>, HubError> {
-        let body = self.send(Method::GET, "/v1/contacts", &[], None).await?;
+        let body = self.send(Method::GET, "/v1/contacts", &[], &[]).await?;
         parse::<Contacts>(&body).map(|contacts| contacts.contacts)
     }
 
@@ -369,39 +352,52 @@ impl HubClient {
     pub async fn block_invite(&self, id: &str) -> Result<(), HubError> {
         let path = format!("/v1/invites/{}/block", segment(id)?);
         self.require_protocol_2().await?;
-        self.send(Method::POST, &path, &[], None).await.map(drop)
+        self.command(Method::POST, &path).await
     }
 
     pub async fn blocks(&self) -> Result<Vec<Block>, HubError> {
         self.require_protocol_2().await?;
-        let body = self.send(Method::GET, "/v1/blocks", &[], None).await?;
+        let body = self.send(Method::GET, "/v1/blocks", &[], &[]).await?;
         parse::<Blocks>(&body).map(|blocks| blocks.blocks)
     }
 
     pub async fn unblock(&self, endpoint: &str) -> Result<(), HubError> {
-        let endpoint =
-            endpoint.parse::<iroh::EndpointId>().map_err(|_| HubError::Invalid)?;
+        let path = block_path(endpoint)?;
         self.require_protocol_2().await?;
-        let path = format!("/v1/blocks/{endpoint}");
-        self.send(Method::DELETE, &path, &[], None).await.map(drop)
+        self.command(Method::DELETE, &path).await
     }
 
     pub async fn remove(&self, id: &str) -> Result<(), HubError> {
         let path = format!("/v1/invites/{}", segment(id)?);
-        self.send(Method::DELETE, &path, &[], None).await.map(drop)
+        self.command(Method::DELETE, &path).await
+    }
+
+    /// Sends `body` as JSON and parses the answer.
+    async fn send_json<T: for<'de> Deserialize<'de>>(
+        &self,
+        method: Method,
+        path: &str,
+        body: &(impl Serialize + Sync),
+    ) -> Result<T, HubError> {
+        let body = json(body)?;
+        parse(&self.send(method, path, &[], &body).await?)
+    }
+
+    /// Sends a request with no body and ignores the answer.
+    async fn command(&self, method: Method, path: &str) -> Result<(), HubError> {
+        self.send(method, path, &[], &[]).await.map(drop)
     }
 
     /// Sends one signed request. `query` holds the query pairs; the node
-    /// signs the URL exactly as it sends it.
+    /// signs the URL exactly as it sends it. An empty `body` sends none.
     async fn send(
         &self,
         method: Method,
         path: &str,
         query: &[(&str, &str)],
-        body: Option<Vec<u8>>,
+        body: &[u8],
     ) -> Result<Vec<u8>, HubError> {
         let url = request_url(&self.origin, path, query)?;
-        let body = body.unwrap_or_default();
         let time = aether_core::time::unix_seconds(SystemTime::now())
             .ok_or(HubError::Unexpected)?
             .to_string();
@@ -410,7 +406,7 @@ impl HubClient {
                 method.as_str(),
                 &protocol::hub_sign_target(url.path(), url.query()),
                 &time,
-                &body,
+                body,
             )
             .as_bytes(),
         );
@@ -425,7 +421,8 @@ impl HubClient {
                 URL_SAFE_NO_PAD.encode(signature.to_bytes()),
             );
         if !body.is_empty() {
-            request = request.header("content-type", "application/json").body(body);
+            request =
+                request.header("content-type", "application/json").body(body.to_vec());
         }
         let response = request.send().await.map_err(|_| HubError::Unreachable)?;
         let status = response.status();
@@ -458,18 +455,7 @@ fn status_error(status: StatusCode, body: &[u8]) -> HubError {
         error: String,
     }
     let code = serde_json::from_slice::<ErrorBody>(body).map(|body| body.error).ok();
-    match protocol::wire_error(status.as_u16(), code.as_deref()) {
-        protocol::HubWireError::Invalid => HubError::Invalid,
-        protocol::HubWireError::Unauthorized => HubError::Unauthorized,
-        protocol::HubWireError::NoAccount => HubError::NoAccount,
-        protocol::HubWireError::Forbidden => HubError::Forbidden,
-        protocol::HubWireError::NotFound => HubError::NotFound,
-        protocol::HubWireError::Taken => HubError::Taken,
-        protocol::HubWireError::Limit => HubError::Limit,
-        protocol::HubWireError::RateLimited => HubError::RateLimited,
-        protocol::HubWireError::OldNode => HubError::OldNode,
-        protocol::HubWireError::Unexpected => HubError::Unexpected,
-    }
+    protocol::wire_error(status.as_u16(), code.as_deref())
 }
 
 fn parse<T: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<T, HubError> {
@@ -478,6 +464,24 @@ fn parse<T: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<T, HubError> {
 
 fn json<T: Serialize>(value: &T) -> Result<Vec<u8>, HubError> {
     serde_json::to_vec(value).map_err(|_| HubError::Invalid)
+}
+
+/// `None` for [`HubError::NotFound`], else the parsed answer.
+fn found<T: for<'de> Deserialize<'de>>(
+    answer: Result<Vec<u8>, HubError>,
+) -> Result<Option<T>, HubError> {
+    match answer {
+        Ok(body) => parse(&body).map(Some),
+        Err(HubError::NotFound) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// The path of the block of `endpoint`, which must be an endpoint ID.
+fn block_path(endpoint: &str) -> Result<String, HubError> {
+    let endpoint =
+        endpoint.parse::<iroh::EndpointId>().map_err(|_| HubError::Invalid)?;
+    Ok(format!("/v1/blocks/{endpoint}"))
 }
 
 /// The path `base/{name}/{number}` of the full name `full_name`: two

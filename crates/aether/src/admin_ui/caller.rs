@@ -460,17 +460,16 @@ async fn confirm(
         },
     )?;
     let approval = aether_store::HubApproval {
-        invite_id: invite.id.clone(),
-        side: aether_store::ApprovalSide::Receiver,
-        kind: aether_store::ApprovalKind::Request,
-        peer_name: draft.target_name.clone(),
-        peer_endpoint: None,
-        days: u32::try_from(days).unwrap_or(30),
-        access_group: crate::access_groups::REQUESTS_GROUP.to_owned(),
-        bundle: None,
-        created_at: now,
-        expires_at: now.saturating_add(crate::hub_membership::APPROVAL_SECONDS),
         listing: Some(draft.listing),
+        ..crate::hub_membership::new_approval(
+            &invite.id,
+            aether_store::ApprovalSide::Receiver,
+            aether_store::ApprovalKind::Request,
+            &draft.target_name,
+            u32::try_from(days).unwrap_or(30),
+            crate::access_groups::REQUESTS_GROUP,
+            now,
+        )
     };
     if store.put_approval(&approval).is_err() {
         let _ = hub.remove(&invite.id).await;
