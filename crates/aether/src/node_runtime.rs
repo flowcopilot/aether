@@ -18,7 +18,6 @@ use crate::{
 };
 
 #[derive(Debug, Clone)]
-#[allow(clippy::too_many_arguments)]
 pub struct NodeServeOptions {
     pub policy: PathBuf,
     pub data_dir: PathBuf,
@@ -31,13 +30,7 @@ pub struct NodeServeOptions {
     pub codex_bin: PathBuf,
     pub relay_url: Option<String>,
     pub hub_url: Option<String>,
-    pub directory: Option<String>,
-    pub directory_certificate: Option<PathBuf>,
-    pub agent_id: Option<String>,
-    pub address: Option<String>,
-    pub scope: Option<String>,
-    pub capability: Option<String>,
-    pub directory_record_ttl: Option<u64>,
+    pub publication: PublicationFlags,
     pub invite_name: Option<String>,
 }
 
@@ -61,72 +54,49 @@ impl NodeRunError {
 pub struct BackgroundWorkers {
     directory_renewer: Option<tokio::task::JoinHandle<()>>,
     managed_renewer: Option<tokio::task::JoinHandle<()>>,
-    hub_host: Option<tokio::task::JoinHandle<()>>,
+    hub_host: tokio::task::JoinHandle<()>,
     hub_caller: Option<tokio::task::JoinHandle<()>>,
-    listing: Option<tokio::task::JoinHandle<()>>,
+    listing: tokio::task::JoinHandle<()>,
 }
 
 impl BackgroundWorkers {
     pub async fn shutdown(self) {
         if let Some(handle) = self.directory_renewer {
-            handle.abort();
-            if let Err(error) = handle.await
-                && !error.is_cancelled()
-            {
-                eprintln!(
-                    "{}",
-                    serde_json::json!({
-                        "level": "error",
-                        "event": "directory_renewer_join_failed",
-                        "error": error.to_string(),
-                    })
-                );
-            }
+            stop(handle, "directory_renewer_join_failed").await;
         }
         if let Some(handle) = self.managed_renewer {
-            handle.abort();
-            if let Err(error) = handle.await
-                && !error.is_cancelled()
-            {
-                eprintln!(
-                    "{}",
-                    serde_json::json!({
-                        "level": "error",
-                        "event": "managed_renewer_join_failed",
-                        "error": error.to_string(),
-                    })
-                );
-            }
+            stop(handle, "managed_renewer_join_failed").await;
         }
-        for handle in
-            [self.hub_host, self.hub_caller, self.listing].into_iter().flatten()
+        for handle in [Some(self.hub_host), self.hub_caller, Some(self.listing)]
+            .into_iter()
+            .flatten()
         {
-            handle.abort();
-            if let Err(error) = handle.await
-                && !error.is_cancelled()
-            {
-                eprintln!(
-                    "{}",
-                    serde_json::json!({
-                        "level": "error",
-                        "event": "hub_worker_join_failed",
-                        "error": error.to_string(),
-                    })
-                );
-            }
+            stop(handle, "hub_worker_join_failed").await;
         }
     }
+}
 
-    #[cfg(test)]
-    #[must_use]
-    pub const fn hub_sync_started(&self) -> bool {
-        self.hub_host.is_some()
-    }
+/// Prints the error log line `event`, with `error` when there is one.
+fn log_error(event: &str, error: Option<&dyn std::fmt::Display>) {
+    let line = match error {
+        Some(error) => serde_json::json!({
+            "level": "error",
+            "event": event,
+            "error": error.to_string(),
+        }),
+        None => serde_json::json!({ "level": "error", "event": event }),
+    };
+    eprintln!("{line}");
+}
 
-    #[cfg(test)]
-    #[must_use]
-    pub const fn listing_renewal_started(&self) -> bool {
-        self.listing.is_some()
+/// Aborts the task of `handle` and waits for it; a failure other than the
+/// cancellation is logged as `event`.
+async fn stop(handle: tokio::task::JoinHandle<()>, event: &str) {
+    handle.abort();
+    if let Err(error) = handle.await
+        && !error.is_cancelled()
+    {
+        log_error(event, Some(&error));
     }
 }
 
@@ -146,14 +116,7 @@ pub fn start_background_workers(
                 ))
                 .await;
                 if let Err(error) = publication.renew(&endpoint_id).await {
-                    eprintln!(
-                        "{}",
-                        serde_json::json!({
-                            "level": "error",
-                            "event": "directory_renew_failed",
-                            "error": error.to_string(),
-                        })
-                    );
+                    log_error("directory_renew_failed", Some(&error));
                 }
             }
         })
@@ -169,13 +132,7 @@ pub fn start_background_workers(
                 .await
                 .is_err()
                 {
-                    eprintln!(
-                        "{}",
-                        serde_json::json!({
-                            "level": "error",
-                            "event": "managed_sync_failed",
-                        })
-                    );
+                    log_error("managed_sync_failed", None);
                 }
             }
         })
@@ -191,9 +148,9 @@ pub fn start_background_workers(
     BackgroundWorkers {
         directory_renewer,
         managed_renewer,
-        hub_host: Some(hub_host),
+        hub_host,
         hub_caller,
-        listing: Some(listing),
+        listing,
     }
 }
 
@@ -340,58 +297,45 @@ pub async fn run(options: NodeServeOptions) -> Result<(), NodeRunError> {
             .ok()
             .flatten()
         })
-        .filter(|relay| relay != "off");
+        .filter(|relay| relay != crate::transport::relay::RELAY_OFF);
+    let publication_scope =
+        options.publication.scope.as_deref().unwrap_or_else(|| service.scope_id());
+    if options.publication.directory.is_some()
+        && service.scope_kind_for(publication_scope) != Some(ScopeKind::Directory)
+    {
+        return Err(NodeRunError::Usage(
+            "directory publication requires a directory node scope".to_owned(),
+        ));
+    }
+    let publication = options.publication.complete()?;
     let endpoint =
         transport::bind_node(&options.data_dir, options.port, relay_url.as_deref())
             .await
             .map_err(NodeRunError::Transport)?;
-    if crate::settings::store_setting::<crate::transport::relay::ActiveRelay>(
-        &options.data_dir,
-        &relay_url,
-    )
-    .and_then(|()| {
-        crate::settings::store_setting::<crate::direct::HostName>(
-            &options.data_dir,
-            &options.invite_name.clone().unwrap_or_else(|| {
-                crate::direct::default_agent_name(
-                    &crate::direct::endpoint_id(&options.data_dir).unwrap_or_default(),
-                )
-            }),
-        )
-    })
-    .is_err()
-    {
-        endpoint.close().await;
-        return Err(NodeRunError::Failed("node settings cannot be stored".to_owned()));
-    }
-    live.attach_endpoint(endpoint.clone(), tokio::runtime::Handle::current());
     let bound_port = endpoint
         .addr()
         .ip_addrs()
         .next()
         .map_or(options.port, std::net::SocketAddr::port);
-    let publication_scope =
-        options.scope.as_deref().unwrap_or_else(|| service.scope_id());
-    if options.directory.is_some()
-        && service.scope_kind_for(publication_scope) != Some(ScopeKind::Directory)
-    {
-        endpoint.close().await;
-        return Err(NodeRunError::Usage(
-            "directory publication requires a directory node scope".to_owned(),
-        ));
+    let started = async {
+        store_node_settings(&options, relay_url.as_ref())?;
+        live.attach_endpoint(endpoint.clone(), tokio::runtime::Handle::current());
+        publish(
+            publication,
+            &options.data_dir,
+            endpoint.id().to_string(),
+            bound_port,
+            publication_scope,
+        )
+        .await
     }
-    let Ok(directory_publication) = start_directory_publication(
-        &options,
-        endpoint.id().to_string(),
-        bound_port,
-        publication_scope,
-    )
-    .await
-    else {
-        endpoint.close().await;
-        return Err(NodeRunError::Failed(
-            "directory publication is unavailable".to_owned(),
-        ));
+    .await;
+    let directory_publication = match started {
+        Ok(directory_publication) => directory_publication,
+        Err(error) => {
+            endpoint.close().await;
+            return Err(error);
+        }
     };
     println!(
         "{}",
@@ -549,19 +493,7 @@ pub async fn run(options: NodeServeOptions) -> Result<(), NodeRunError> {
         }
     }
     background.shutdown().await;
-    outbox.abort();
-    if let Err(error) = outbox.await
-        && !error.is_cancelled()
-    {
-        eprintln!(
-            "{}",
-            serde_json::json!({
-                "level": "error",
-                "event": "outbox_join_failed",
-                "error": error.to_string(),
-            })
-        );
-    }
+    stop(outbox, "outbox_join_failed").await;
     service_for_shutdown.shutdown();
     endpoint.close().await;
     result.map_err(NodeRunError::Transport)?;
@@ -569,73 +501,150 @@ pub async fn run(options: NodeServeOptions) -> Result<(), NodeRunError> {
     Ok(())
 }
 
-#[allow(clippy::result_unit_err)]
-pub async fn start_directory_publication(
+/// Keeps the relay this node uses and the name its connect codes carry.
+fn store_node_settings(
     options: &NodeServeOptions,
+    relay_url: Option<&String>,
+) -> Result<(), NodeRunError> {
+    crate::settings::store_setting::<crate::transport::relay::ActiveRelay>(
+        &options.data_dir,
+        &relay_url.cloned(),
+    )
+    .and_then(|()| {
+        crate::settings::store_setting::<crate::direct::HostName>(
+            &options.data_dir,
+            &options.invite_name.clone().unwrap_or_else(|| {
+                crate::direct::default_agent_name(
+                    &crate::direct::endpoint_id(&options.data_dir).unwrap_or_default(),
+                )
+            }),
+        )
+    })
+    .map_err(|_| NodeRunError::Failed("node settings cannot be stored".to_owned()))
+}
+
+/// The flags of a directory record publication. A node publishes its record
+/// when every flag is set; setting only some of them is an error.
+#[derive(Debug, Clone, Default)]
+pub struct PublicationFlags {
+    pub directory: Option<String>,
+    pub directory_certificate: Option<PathBuf>,
+    pub agent_id: Option<String>,
+    pub address: Option<String>,
+    pub scope: Option<String>,
+    pub capability: Option<String>,
+    pub directory_record_ttl: Option<u64>,
+}
+
+/// The settings of a directory record publication: [`PublicationFlags`]
+/// with every flag set.
+struct Publication<'a> {
+    directory: &'a str,
+    certificate: &'a Path,
+    agent_id: &'a str,
+    address: &'a str,
+    scope: &'a str,
+    capability: &'a str,
+    ttl: u64,
+}
+
+fn publication_unavailable() -> NodeRunError {
+    NodeRunError::Failed("directory publication is unavailable".to_owned())
+}
+
+impl PublicationFlags {
+    /// The publication these flags ask for: `None` when no flag is set.
+    fn complete(&self) -> Result<Option<Publication<'_>>, NodeRunError> {
+        match (
+            self.directory.as_deref(),
+            self.directory_certificate.as_deref(),
+            self.agent_id.as_deref(),
+            self.address.as_deref(),
+            self.scope.as_deref(),
+            self.capability.as_deref(),
+            self.directory_record_ttl,
+        ) {
+            (
+                Some(directory),
+                Some(certificate),
+                Some(agent_id),
+                Some(address),
+                Some(scope),
+                Some(capability),
+                Some(ttl),
+            ) => Ok(Some(Publication {
+                directory,
+                certificate,
+                agent_id,
+                address,
+                scope,
+                capability,
+                ttl,
+            })),
+            (None, None, None, None, None, None, None) => Ok(None),
+            _ => Err(publication_unavailable()),
+        }
+    }
+}
+
+/// Publishes the record of `publication`, when there is one, and returns it
+/// with the publication that renews it.
+async fn publish(
+    publication: Option<Publication<'_>>,
+    data_dir: &Path,
     endpoint_id: String,
     bound_port: u16,
     configured_scope: &str,
-) -> Result<Option<(DirectoryPublication, crate::discovery::wire::WireRecord)>, ()> {
-    let (
-        Some(directory),
-        Some(certificate),
-        Some(agent_id),
-        Some(address),
-        Some(scope),
-        Some(capability),
-        Some(ttl),
-    ) = (
-        options.directory.as_ref(),
-        options.directory_certificate.as_ref(),
-        options.agent_id.as_ref(),
-        options.address.as_ref(),
-        options.scope.as_ref(),
-        options.capability.as_ref(),
-        options.directory_record_ttl,
-    )
-    else {
-        if options.directory.is_none()
-            && options.directory_certificate.is_none()
-            && options.agent_id.is_none()
-            && options.address.is_none()
-            && options.scope.is_none()
-            && options.capability.is_none()
-            && options.directory_record_ttl.is_none()
-        {
-            return Ok(None);
-        }
-        return Err(());
+) -> Result<
+    Option<(DirectoryPublication, crate::discovery::wire::WireRecord)>,
+    NodeRunError,
+> {
+    let Some(publication) = publication else {
+        return Ok(None);
     };
+    publish_record(publication, data_dir, endpoint_id, bound_port, configured_scope)
+        .await
+        .map(Some)
+        .ok_or_else(publication_unavailable)
+}
+
+async fn publish_record(
+    publication: Publication<'_>,
+    data_dir: &Path,
+    endpoint_id: String,
+    bound_port: u16,
+    configured_scope: &str,
+) -> Option<(DirectoryPublication, crate::discovery::wire::WireRecord)> {
     if !crate::directory_publication::valid_publication_fields(
-        agent_id,
-        address,
-        scope,
-        capability,
-        ttl,
+        publication.agent_id,
+        publication.address,
+        publication.scope,
+        publication.capability,
+        publication.ttl,
         configured_scope,
     ) {
-        return Err(());
+        return None;
     }
-    let mut address = address.parse::<std::net::SocketAddr>().map_err(|_| ())?;
+    let mut address = publication.address.parse::<std::net::SocketAddr>().ok()?;
     if address.port() == 0 {
         address.set_port(bound_port);
     }
-    let certificate = std::fs::read(certificate).map_err(|_| ())?;
-    let publication = DirectoryPublication::new(
-        directory.clone(),
+    let certificate = std::fs::read(publication.certificate).ok()?;
+    let directory_publication = DirectoryPublication::new(
+        publication.directory.to_owned(),
         &certificate,
-        &options.data_dir,
+        data_dir,
         crate::directory_publication::PublicationRecord {
-            agent_id: agent_id.clone(),
+            agent_id: publication.agent_id.to_owned(),
             address: address.to_string(),
-            scope: scope.clone(),
-            capability: capability.clone(),
-            ttl,
+            scope: publication.scope.to_owned(),
+            capability: publication.capability.to_owned(),
+            ttl: publication.ttl,
         },
     )
-    .map_err(|_| ())?;
-    let record = publication.renew(&endpoint_id).await.map_err(|_| ())?;
-    Ok(Some((publication, record)))
+    .ok()?;
+    let record = directory_publication.renew(&endpoint_id).await.ok()?;
+    Some((directory_publication, record))
 }
 
 #[cfg(test)]
@@ -644,7 +653,7 @@ mod tests {
 
     use std::sync::Mutex;
 
-    use super::start_background_workers;
+    use super::{PublicationFlags, publish, start_background_workers};
     use crate::{
         admin::test_support::shared_in, hub_client::NodeHub,
         node_serve_context::NodeServeContext,
@@ -668,7 +677,41 @@ mod tests {
             None,
             directory.path(),
         );
-        assert!(workers.hub_sync_started());
-        assert!(workers.listing_renewal_started());
+        workers.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn live_publication_rejects_a_scope_outside_the_node_policy() {
+        let flags = PublicationFlags {
+            directory: Some("https://directory.test".to_owned()),
+            directory_certificate: Some("certificate.der".into()),
+            agent_id: Some("agent".to_owned()),
+            address: Some("127.0.0.1:1".to_owned()),
+            scope: Some("other".to_owned()),
+            capability: Some("review".to_owned()),
+            directory_record_ttl: Some(60),
+        };
+        let publication = flags.complete().expect("every flag is set");
+        assert!(
+            publish(
+                publication,
+                std::path::Path::new("node"),
+                "endpoint".to_owned(),
+                1,
+                "directory"
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn publication_flags_must_be_all_set_or_all_unset() {
+        assert!(matches!(PublicationFlags::default().complete(), Ok(None)));
+        let some = PublicationFlags {
+            directory: Some("https://directory.test".to_owned()),
+            ..PublicationFlags::default()
+        };
+        assert!(some.complete().is_err());
     }
 }

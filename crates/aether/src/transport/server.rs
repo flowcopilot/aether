@@ -165,20 +165,32 @@ async fn serve_connected(
     handler: HandlerService,
     limiter: Arc<PeerLimiter>,
 ) -> Result<(), TransportError> {
+    /// Which stream a connection waits for.
+    #[derive(Clone, Copy)]
+    enum Phase {
+        /// The first: the peer connected to send it, so its absence is an
+        /// error.
+        AwaitFirst,
+        /// A next one after a response: the peer may close instead.
+        Linger,
+    }
     let authenticated_endpoint = connection.remote_id().to_string();
-    let mut first = true;
+    let mut phase = Phase::AwaitFirst;
     loop {
-        let wait = if first { STREAM_TIMEOUT } else { RESPONSE_LINGER };
+        let wait = match phase {
+            Phase::AwaitFirst => STREAM_TIMEOUT,
+            Phase::Linger => RESPONSE_LINGER,
+        };
         let (send, receive) =
-            match tokio::time::timeout(wait, connection.accept_bi()).await {
-                Ok(Ok(stream)) => stream,
-                Ok(Err(error)) if first => {
+            match (phase, tokio::time::timeout(wait, connection.accept_bi()).await) {
+                (_, Ok(Ok(stream))) => stream,
+                (Phase::AwaitFirst, Ok(Err(error))) => {
                     return Err(TransportError::Network(error.to_string()));
                 }
-                Err(_) if first => return Err(TransportError::Timeout),
-                Ok(Err(_)) | Err(_) => return Ok(()),
+                (Phase::AwaitFirst, Err(_)) => return Err(TransportError::Timeout),
+                (Phase::Linger, Ok(Err(_)) | Err(_)) => return Ok(()),
             };
-        first = false;
+        phase = Phase::Linger;
         serve_stream(&authenticated_endpoint, send, receive, &handler, &limiter)
             .await?;
     }
@@ -275,18 +287,15 @@ pub(crate) fn error_response(request: &[Frame], error: &TransportError) -> Vec<F
     let Some(request) = request.first() else {
         return Vec::new();
     };
-    vec![Frame {
-        version: 0,
-        kind: FrameKind::Error,
-        exchange_id: request.exchange_id.clone(),
-        scope_id: request.scope_id.clone(),
-        task_id: request.task_id.clone(),
-        payload: payload(A2aError {
+    vec![Frame::reply_to(
+        request,
+        FrameKind::Error,
+        payload(A2aError {
             code: a2a_error_code(error),
             message: a2a_error_message(error).to_owned(),
             data: a2a_error_data(error),
         }),
-    }]
+    )]
 }
 
 // JSON-RPC reserves -32000 through -32099 for implementation-defined server
