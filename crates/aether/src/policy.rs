@@ -263,10 +263,6 @@ impl PolicyFile {
             queue: self.queue,
         }
     }
-
-    pub(crate) const fn queue_limit(&self, id: QueueLimitId) -> usize {
-        self.queue.get(id)
-    }
 }
 
 /// The stored policy of `store`; `None` before the first start.
@@ -402,21 +398,23 @@ pub fn queue_limits(data_dir: &Path) -> Result<Option<QueueLimits>, PolicyError>
     let Some(policy) = stored(&store)? else {
         return Ok(None);
     };
-    Ok(Some(QueueLimits {
-        global: stored_limit(
-            &store,
-            QueueLimitId::Global,
-            policy.queue_limit(QueueLimitId::Global),
-        )?,
-        per_peer: stored_limit(
-            &store,
-            QueueLimitId::PerPeer,
-            policy.queue_limit(QueueLimitId::PerPeer),
-        )?,
-    }))
+    stored_queue_limits(&store, policy.queue).map(Some)
 }
 
-pub(crate) fn stored_limit(
+/// The queue limits of `queue`, with the `admin.limit.*` overrides that
+/// `store` holds.
+pub(crate) fn stored_queue_limits(
+    store: &NodeStore,
+    queue: QueuePolicyLimits,
+) -> Result<QueueLimits, PolicyError> {
+    let limit = |id| stored_limit(store, id, queue.get(id));
+    Ok(QueueLimits {
+        global: limit(QueueLimitId::Global)?,
+        per_peer: limit(QueueLimitId::PerPeer)?,
+    })
+}
+
+fn stored_limit(
     store: &NodeStore,
     id: QueueLimitId,
     fallback: usize,

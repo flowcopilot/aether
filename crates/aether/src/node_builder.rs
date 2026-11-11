@@ -11,7 +11,6 @@ use std::{
 use aether_core::{
     AgentId, Grant, PolicyEngine, Scope, ScopeId, ScopeKind, TrustProvider,
 };
-use aether_store::QueueLimits;
 
 use crate::{
     agent::{
@@ -25,7 +24,7 @@ use crate::{
     node_service::NodeService,
     policy::{
         AgentAdapter, PolicyError, PolicyFile, PolicySandbox, decode_key,
-        default_sandbox, keep, load_or_create, parse_scopes, stored_limit,
+        default_sandbox, keep, load_or_create, parse_scopes, stored_queue_limits,
     },
     proof::ProofNode,
 };
@@ -136,18 +135,7 @@ fn build(
             .ok_or(PolicyError::Invalid)?;
         signed_claims.verify_grant(grant, scope).map_err(|_| PolicyError::Invalid)?;
     }
-    let queue_limits = QueueLimits {
-        global: stored_limit(
-            &store,
-            aether_core::limits::QueueLimitId::Global,
-            queue.get(aether_core::limits::QueueLimitId::Global),
-        )?,
-        per_peer: stored_limit(
-            &store,
-            aether_core::limits::QueueLimitId::PerPeer,
-            queue.get(aether_core::limits::QueueLimitId::PerPeer),
-        )?,
-    };
+    let queue_limits = stored_queue_limits(&store, queue)?;
     let stored_workspace =
         store.current_workspace().map_err(|_| PolicyError::Invalid)?;
     let stored_grants = store
