@@ -165,20 +165,32 @@ async fn serve_connected(
     handler: HandlerService,
     limiter: Arc<PeerLimiter>,
 ) -> Result<(), TransportError> {
+    /// Which stream a connection waits for.
+    #[derive(Clone, Copy)]
+    enum Phase {
+        /// The first: the peer connected to send it, so its absence is an
+        /// error.
+        AwaitFirst,
+        /// A next one after a response: the peer may close instead.
+        Linger,
+    }
     let authenticated_endpoint = connection.remote_id().to_string();
-    let mut first = true;
+    let mut phase = Phase::AwaitFirst;
     loop {
-        let wait = if first { STREAM_TIMEOUT } else { RESPONSE_LINGER };
+        let wait = match phase {
+            Phase::AwaitFirst => STREAM_TIMEOUT,
+            Phase::Linger => RESPONSE_LINGER,
+        };
         let (send, receive) =
-            match tokio::time::timeout(wait, connection.accept_bi()).await {
-                Ok(Ok(stream)) => stream,
-                Ok(Err(error)) if first => {
+            match (phase, tokio::time::timeout(wait, connection.accept_bi()).await) {
+                (_, Ok(Ok(stream))) => stream,
+                (Phase::AwaitFirst, Ok(Err(error))) => {
                     return Err(TransportError::Network(error.to_string()));
                 }
-                Err(_) if first => return Err(TransportError::Timeout),
-                Ok(Err(_)) | Err(_) => return Ok(()),
+                (Phase::AwaitFirst, Err(_)) => return Err(TransportError::Timeout),
+                (Phase::Linger, Ok(Err(_)) | Err(_)) => return Ok(()),
             };
-        first = false;
+        phase = Phase::Linger;
         serve_stream(&authenticated_endpoint, send, receive, &handler, &limiter)
             .await?;
     }
