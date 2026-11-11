@@ -11,7 +11,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         mpsc::{self, Receiver},
     },
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use process_wrap::std::{ChildWrapper, CommandWrap};
@@ -491,10 +491,9 @@ impl Agent for CodexAppServer {
         ctx: &TurnContext,
         events: &mut dyn FnMut(ExecutionEvent),
     ) -> Result<String, ExecutionError> {
-        let timeout = ctx
-            .deadline
-            .checked_duration_since(Instant::now())
-            .ok_or(ExecutionError::Timeout)?;
+        if Instant::now() >= ctx.deadline {
+            return Err(ExecutionError::Timeout);
+        }
         let task_folder = if self.limits.sandbox == CodexSandbox::TaskFolder {
             Some(TaskFolder::create(&ctx.workspace, &ctx.task_id)?)
         } else {
@@ -522,7 +521,7 @@ impl Agent for CodexAppServer {
             ),
         };
         let session =
-            AppServerSession::spawn(&binary, &arguments, timeout, &environment)?;
+            AppServerSession::spawn(&binary, &arguments, ctx.deadline, &environment)?;
         session.request("initialize", &initialize_params())?;
         let thread_id = self.start_thread(&session, &workspace, &ctx.skill)?;
         self.run_turn(&session, &workspace, &ctx.task_id, &thread_id, &ctx.text, events)
@@ -561,8 +560,9 @@ struct AppServerSession {
     child: Box<dyn ChildWrapper>,
     input: Arc<Mutex<ChildStdin>>,
     output: Receiver<Result<Value, ExecutionError>>,
-    timeout: Duration,
-    started_at: Instant,
+    /// The end of the turn, set before the task folder and the process: the
+    /// time they take counts toward the turn.
+    deadline: Instant,
     next_id: Arc<AtomicU64>,
 }
 
@@ -570,7 +570,7 @@ impl AppServerSession {
     fn spawn(
         binary: &Path,
         arguments: &[String],
-        timeout: Duration,
+        deadline: Instant,
         environment: &BTreeMap<String, String>,
     ) -> Result<Self, ExecutionError> {
         let mut command = CommandWrap::with_new(binary, |command| {
@@ -606,8 +606,7 @@ impl AppServerSession {
             child,
             input: Arc::new(Mutex::new(input)),
             output: receiver,
-            timeout,
-            started_at: Instant::now(),
+            deadline,
             next_id: Arc::new(AtomicU64::new(1)),
         })
     }
@@ -728,8 +727,8 @@ impl AppServerSession {
 
     fn receive(&self) -> Result<Value, ExecutionError> {
         let remaining = self
-            .timeout
-            .checked_sub(self.started_at.elapsed())
+            .deadline
+            .checked_duration_since(Instant::now())
             .ok_or(ExecutionError::Timeout)?;
         match self.output.recv_timeout(remaining) {
             Ok(message) => message,
@@ -833,7 +832,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    /// The test process.s `PATH`, so that a fake app-server finds `sleep`
+    /// The test process's `PATH`, so that a fake app-server finds `sleep`
     /// wherever this system keeps it.
     fn test_path() -> BTreeMap<String, String> {
         std::env::var("PATH")
@@ -1082,6 +1081,29 @@ done
 
     #[test]
     #[cfg(unix)]
+    fn a_session_ends_at_the_turn_deadline_set_before_it_started() {
+        // The time before the process starts (the task folder, the binary
+        // copy, the spawn) counts toward the turn: a deadline that passed
+        // by then leaves no time for a request, even one answered at once.
+        let deadline = Instant::now();
+        let session = AppServerSession::spawn(
+            Path::new("sh"),
+            &[
+                "-c".to_owned(),
+                r#"while IFS= read -r request; do printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'; done"#.to_owned(),
+            ],
+            deadline,
+            &BTreeMap::new(),
+        )
+        .expect("session must start");
+        assert_eq!(
+            session.request("initialize", &initialize_params()),
+            Err(ExecutionError::Timeout)
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn dropping_a_session_stops_the_commands_the_app_server_started() {
         use std::{
             process::{Command, Stdio},
@@ -1107,7 +1129,7 @@ done
         let session = super::AppServerSession::spawn(
             std::path::Path::new("sh"),
             &["-c".to_owned(), script],
-            Duration::from_secs(5),
+            Instant::now() + Duration::from_secs(5),
             &test_path(),
         )
         .expect("session must start");
@@ -1418,7 +1440,7 @@ done
         let session = AppServerSession::spawn(
             &binary,
             &arguments,
-            Duration::from_secs(60),
+            Instant::now() + Duration::from_secs(60),
             &environment,
         )
         .expect("app server must start");
