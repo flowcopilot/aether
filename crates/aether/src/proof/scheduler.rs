@@ -36,9 +36,57 @@ enum DispatchBlock {
     Group,
 }
 
+#[derive(Debug, Eq, PartialEq)]
 enum TaskOutcome {
     Succeeded(String),
     Failed,
+}
+
+/// What one run observed, in the terms that decide how it settles.
+struct RunReport {
+    result: Result<String, ExecutionError>,
+    /// The lease renewal failed, so the lease may belong to recovery.
+    renewal_failed: bool,
+    /// A progress event could not be written to the journal.
+    event_error: bool,
+    /// The start closure already rejected the task, so nothing is left to
+    /// settle.
+    settled_at_start: bool,
+}
+
+/// The single store write that ends a run, and the label its error is
+/// logged under.
+#[derive(Debug, Eq, PartialEq)]
+struct Settlement {
+    label: &'static str,
+    outcome: TaskOutcome,
+}
+
+/// Decides how a run settles. `cancelled` reads whether the task was
+/// cancelled; it is consulted only after a renewal failure, where the
+/// process was stopped by the renewal thread or by a cancel.
+fn settlement(run: RunReport, cancelled: impl FnOnce() -> bool) -> Option<Settlement> {
+    let settle = |label, outcome| Some(Settlement { label, outcome });
+    if run.settled_at_start {
+        return None;
+    }
+    if run.renewal_failed {
+        return match run.result {
+            Ok(text) => {
+                settle("late success after renewal loss", TaskOutcome::Succeeded(text))
+            }
+            Err(_) if cancelled() => None,
+            Err(_) => settle("renewal failed", TaskOutcome::Failed),
+        };
+    }
+    if run.event_error {
+        return settle("event journal write", TaskOutcome::Failed);
+    }
+    match run.result {
+        Ok(text) => settle("succeeded", TaskOutcome::Succeeded(text)),
+        Err(ExecutionError::Cancelled) => None,
+        Err(_) => settle("execution failed", TaskOutcome::Failed),
+    }
 }
 
 /// Holds the scheduler's single execution slot for one task. Dropping it
@@ -356,6 +404,7 @@ where
         let start_confirmed = Arc::new(AtomicBool::new(false));
         let confirmed_flag = Arc::clone(&start_confirmed);
         let mut event_error = false;
+        let mut settled_at_start = false;
         let result = executor.lock().map_err(|_| ExecutionError::Unavailable).and_then(
             |mut executor| {
                 executor.execute_with_confirmed_start(
@@ -374,14 +423,13 @@ where
                             })
                             .map_err(|_| ExecutionError::Unavailable)?;
                         if dispatch_ctx.dispatch_allowed(&execution_data).is_err() {
-                            Self::log_store(
-                                "reject at start",
-                                dispatch_ctx.end_leased(
-                                    &dispatch_task_id,
-                                    &start_execution_id,
-                                    NodeStore::mark_rejected,
-                                ),
+                            let rejected = dispatch_ctx.end_leased(
+                                &dispatch_task_id,
+                                &start_execution_id,
+                                NodeStore::mark_rejected,
                             );
+                            settled_at_start = rejected.is_ok();
+                            Self::log_store("reject at start", rejected);
                             return Err(ExecutionError::Unavailable);
                         }
                         start_store
@@ -440,77 +488,29 @@ where
         let _ = renewal.0.send(());
         let _ = renewal.1.join();
         slot.deactivate();
-        let start_confirmed = start_confirmed.load(Ordering::Acquire);
-        if renewal_failed.load(Ordering::Acquire) {
-            if let Ok(late_result) = &result {
-                Self::log_store(
-                    "late success after renewal loss",
-                    self.settle(
-                        &task_id,
-                        &execution_id,
-                        start_confirmed,
-                        TaskOutcome::Succeeded(late_result.clone()),
-                    ),
-                );
-            }
-            if matches!(
-                self.store.call({
-                    let task_id = task_id.clone();
-                    move |store| store.state(&task_id)
-                }),
+        let run = RunReport {
+            result,
+            renewal_failed: renewal_failed.load(Ordering::Acquire),
+            event_error,
+            settled_at_start,
+        };
+        let cancelled = || {
+            let task_id = task_id.clone();
+            matches!(
+                self.store.call(move |store| store.state(&task_id)),
                 Ok(TaskState::Cancelled)
-            ) {
-                return;
-            }
+            )
+        };
+        if let Some(Settlement { label, outcome }) = settlement(run, cancelled) {
             Self::log_store(
-                "renewal failed",
+                label,
                 self.settle(
                     &task_id,
                     &execution_id,
-                    start_confirmed,
-                    TaskOutcome::Failed,
+                    start_confirmed.load(Ordering::Acquire),
+                    outcome,
                 ),
             );
-            self.notify_task(&task_id);
-            return;
-        }
-        if event_error {
-            Self::log_store(
-                "event journal write",
-                self.settle(
-                    &task_id,
-                    &execution_id,
-                    start_confirmed,
-                    TaskOutcome::Failed,
-                ),
-            );
-            self.notify_task(&task_id);
-            return;
-        }
-        match result {
-            Ok(text) => {
-                Self::log_store(
-                    "succeeded",
-                    self.settle(
-                        &task_id,
-                        &execution_id,
-                        start_confirmed,
-                        TaskOutcome::Succeeded(text),
-                    ),
-                );
-            }
-            Err(ExecutionError::Cancelled) => {}
-            Err(_) => {
-                Self::log_store(
-                    "execution failed",
-                    self.settle(
-                        &task_id,
-                        &execution_id,
-                        start_confirmed,
-                        TaskOutcome::Failed,
-                    ),
-                );
-            }
         }
         self.notify_task(&task_id);
     }
@@ -605,6 +605,80 @@ where
         }
         for task_id in recovered {
             self.notify_task(task_id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(result: Result<&str, ExecutionError>) -> RunReport {
+        RunReport {
+            result: result.map(str::to_owned),
+            renewal_failed: false,
+            event_error: false,
+            settled_at_start: false,
+        }
+    }
+
+    fn outcome(run: RunReport, cancelled: bool) -> Option<TaskOutcome> {
+        settlement(run, || cancelled).map(|settlement| settlement.outcome)
+    }
+
+    #[test]
+    fn a_finished_run_settles_from_its_result() {
+        assert_eq!(
+            outcome(run(Ok("done")), false),
+            Some(TaskOutcome::Succeeded("done".to_owned()))
+        );
+        assert_eq!(outcome(run(Err(ExecutionError::Cancelled)), false), None);
+        assert_eq!(
+            outcome(run(Err(ExecutionError::Timeout)), false),
+            Some(TaskOutcome::Failed)
+        );
+    }
+
+    #[test]
+    fn a_journal_error_fails_the_run_whatever_its_result() {
+        for result in [Ok("done"), Err(ExecutionError::Cancelled)] {
+            let report = RunReport { event_error: true, ..run(result) };
+            assert_eq!(outcome(report, false), Some(TaskOutcome::Failed));
+        }
+    }
+
+    #[test]
+    fn a_late_success_after_renewal_loss_settles_only_as_success() {
+        let report = RunReport { renewal_failed: true, ..run(Ok("late")) };
+        assert_eq!(
+            settlement(report, || true),
+            Some(Settlement {
+                label: "late success after renewal loss",
+                outcome: TaskOutcome::Succeeded("late".to_owned()),
+            })
+        );
+    }
+
+    #[test]
+    fn a_renewal_loss_fails_the_run_unless_it_was_cancelled() {
+        let lost = || RunReport {
+            renewal_failed: true,
+            event_error: true,
+            ..run(Err(ExecutionError::Cancelled))
+        };
+        assert_eq!(outcome(lost(), true), None);
+        assert_eq!(outcome(lost(), false), Some(TaskOutcome::Failed));
+    }
+
+    #[test]
+    fn a_run_settled_at_start_is_not_settled_again() {
+        for renewal_failed in [false, true] {
+            let report = RunReport {
+                settled_at_start: true,
+                renewal_failed,
+                ..run(Err(ExecutionError::Unavailable))
+            };
+            assert_eq!(outcome(report, false), None);
         }
     }
 }
