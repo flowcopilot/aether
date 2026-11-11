@@ -159,12 +159,12 @@ impl PactConsent {
     }
 
     pub fn deny(&self, user_code: &str) -> Result<(), ConsentError> {
-        self.store().deny_device(&normalize_user_code(user_code)).map_err(|error| {
-            match error {
+        self.store()
+            .deny_device(&normalize_user_code(user_code), aether_core::time::now())
+            .map_err(|error| match error {
                 aether_store::StoreError::NotFound => ConsentError::NotPending,
                 _ => ConsentError::Store,
-            }
-        })
+            })
     }
 }
 

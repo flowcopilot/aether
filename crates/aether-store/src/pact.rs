@@ -357,11 +357,12 @@ impl PactStore {
         Ok(())
     }
 
-    /// Denies the pending authorization `user_code`.
-    pub fn deny_device(&self, user_code: &str) -> Result<(), StoreError> {
+    /// Denies the pending authorization `user_code`. `NotFound` when it is
+    /// no longer pending, or has expired.
+    pub fn deny_device(&self, user_code: &str, now: i64) -> Result<(), StoreError> {
         let changed = self.connection.execute(
-            "UPDATE pact_device_authorizations SET status=?2 WHERE user_code=?1 AND status=?3",
-            params![user_code, DeviceStatus::Denied, DeviceStatus::Pending],
+            "UPDATE pact_device_authorizations SET status=?2 WHERE user_code=?1 AND status=?3 AND expires_at > ?4",
+            params![user_code, DeviceStatus::Denied, DeviceStatus::Pending, now],
         )?;
         if changed == 1 { Ok(()) } else { Err(StoreError::NotFound) }
     }
@@ -412,17 +413,25 @@ impl PactStore {
                     let slow_down = last_polled_at
                         .is_some_and(|last| now.saturating_sub(last) < interval);
                     transaction.execute(
-                        "UPDATE pact_device_authorizations SET last_polled_at=?2 WHERE device_code_hash=?1",
-                        params![device_code_hash, now],
+                        "UPDATE pact_device_authorizations SET last_polled_at=?2 WHERE device_code_hash=?1 AND status=?3",
+                        params![device_code_hash, now, DeviceStatus::Pending],
                     )?;
                     DevicePoll::Pending { slow_down }
                 }
                 DeviceStatus::Approved => {
-                    transaction.execute(
-                        "UPDATE pact_device_authorizations SET status=?2 WHERE device_code_hash=?1",
-                        params![device_code_hash, DeviceStatus::Consumed],
+                    // Like every transition here, the update names the state
+                    // it leaves, so only one poll can consume an approval.
+                    let consumed = transaction.execute(
+                        "UPDATE pact_device_authorizations SET status=?2 WHERE device_code_hash=?1 AND status=?3 AND expires_at > ?4",
+                        params![
+                            device_code_hash,
+                            DeviceStatus::Consumed,
+                            DeviceStatus::Approved,
+                            now,
+                        ],
                     )?;
                     let grant = grant_id
+                        .filter(|_| consumed == 1)
                         .map(|grant_id| query_grant(&transaction, &grant_id))
                         .transpose()?
                         .flatten();
@@ -771,7 +780,7 @@ mod tests {
         let (_directory, mut store) = store();
         store.create_device_authorization(&device("AAAA-AAAA", "one")).unwrap();
         store.create_device_authorization(&device("BBBB-BBBB", "two")).unwrap();
-        store.deny_device("AAAA-AAAA").unwrap();
+        store.deny_device("AAAA-AAAA", 200).unwrap();
         assert_eq!(
             store.approve_device("AAAA-AAAA", &grant("g1"), 200),
             Err(StoreError::NotFound),
@@ -788,6 +797,19 @@ mod tests {
         );
         assert!(store.grant("g1").unwrap().is_none());
         assert!(store.grant("g2").unwrap().is_none());
+    }
+
+    #[test]
+    fn an_expired_authorization_cannot_be_denied() {
+        let (_directory, mut store) = store();
+        store.create_device_authorization(&device("AAAA-AAAA", "one")).unwrap();
+        assert_eq!(store.deny_device("AAAA-AAAA", 700), Err(StoreError::NotFound));
+        assert_eq!(
+            store
+                .poll_device("one", "review", "https://pa.example", "user-1", 800)
+                .unwrap(),
+            DevicePoll::Expired,
+        );
     }
 
     #[test]

@@ -638,7 +638,7 @@ async fn the_device_flow_follows_rfc_8628() {
     // Another user of the same personal agent cannot use the code.
     assert_eq!(poll("someone-else").await.body["error"], "invalid_grant");
     let user_code = started.body["user_code"].as_str().expect("user code");
-    fixture.store().deny_device(user_code).expect("deny must store");
+    fixture.store().deny_device(user_code, now()).expect("deny must store");
     assert_eq!(poll("u").await.body["error"], "access_denied");
     let unsupported = fixture
         .call(
