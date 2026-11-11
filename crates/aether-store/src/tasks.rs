@@ -957,10 +957,19 @@ fn change(
     next: TaskState,
     event_type: EventType,
 ) -> Result<(), StoreError> {
-    if !state(tx, task_id)?.allows(next) {
+    let current = state(tx, task_id)?;
+    if !current.allows(next) {
         return Err(StoreError::InvalidState);
     }
-    tx.execute("UPDATE tasks SET state=?1 WHERE id=?2", params![next, task_id])?;
+    // Write only over the state just checked, so the guard holds even if
+    // another writer changed the row in between.
+    if tx.execute(
+        "UPDATE tasks SET state=?1 WHERE id=?2 AND state=?3",
+        params![next, task_id, current],
+    )? == 0
+    {
+        return Err(StoreError::InvalidState);
+    }
     event(tx, task_id, event_type)
 }
 
