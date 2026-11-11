@@ -481,7 +481,12 @@ pub fn contacts_by_endpoint(
     Ok(contacts)
 }
 
-/// The kept bundle of the contact named `agent_id`.
+/// The kept bundle of the contact named `agent_id`, expired or not.
+///
+/// It does not check the expiry so that removal, the outbox, which tells an
+/// expired contact from an unknown one, and the contact lists, which show
+/// the days left, see expired contacts too. [`contact_by_name`] is the
+/// checked lookup.
 pub fn contact_bundle(
     store: &NodeStore,
     agent_id: &str,
@@ -535,7 +540,8 @@ pub fn contact_card(
     .ok()
 }
 
-/// Every kept bundle, in name order.
+/// Every kept bundle, in name order, expired or not, as in
+/// [`contact_bundle`].
 pub fn contact_bundles(
     store: &NodeStore,
 ) -> Result<Vec<InvitationBundle>, DirectError> {
