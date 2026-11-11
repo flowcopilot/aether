@@ -22,6 +22,7 @@ use super::{
     hub::{error_line, hub_section, hub_setting},
     layout::{Tab, node_header},
     require_admin_session,
+    shared::Notice,
 };
 use crate::{
     admin_components::{
@@ -49,10 +50,7 @@ struct Contact {
 #[component]
 pub(super) async fn caller_screen(
     cx: &Cx,
-    #[default] error: String,
-    #[default] hub_error: String,
-    #[default] hub_setting_error: String,
-    #[default] request_error: String,
+    #[default] notice: Notice,
 ) -> TopcoatResult<impl View> {
     ensure_admin_session(cx).await?;
     let Page(Some(page)) = app_context::<Page>(cx) else {
@@ -98,9 +96,11 @@ pub(super) async fn caller_screen(
     // person's own agent uses the same contacts as this page.
     let mcp_command = mcp_command(&page.data_dir);
 
+    let error = notice.import_error();
+    let request_error = notice.request_error();
     let code_open = !error.is_empty();
     Ok(view! {
-        if !error.is_empty() || !request_error.is_empty() {
+        if notice.refused() {
             (StatusCode::BAD_REQUEST)
         }
         node_header(current: Tab::Agents)
@@ -125,7 +125,7 @@ pub(super) async fn caller_screen(
                     hub_section(
                         hub: hub.clone(),
                         role: Role::Receiver,
-                        error: hub_error.clone(),
+                        error: notice.hub_error(),
                         if !connected {
                             code_disclosure(endpoint_id: endpoint_id.clone(), error: error.clone(), open: code_open)
                         }
@@ -238,7 +238,7 @@ pub(super) async fn caller_screen(
                 </section>
             }
             <section aria-label="Hub" class="rounded-xl border border-border bg-background px-5">
-                hub_setting(url: hub.as_ref().map(HubClient::url), error: hub_setting_error.clone())
+                hub_setting(url: hub.as_ref().map(HubClient::url), error: notice.hub_setting_error())
             </section>
         </main>
     }
@@ -413,7 +413,7 @@ pub(super) async fn accept_invite(
         Ok(_) => "",
         Err(error) => hub_message(error),
     };
-    Ok(view! { caller_screen(hub_error: error.to_owned()) })
+    Ok(view! { caller_screen(notice: Notice::Hub(error.to_owned())) })
 }
 
 #[derive(Deserialize)]
@@ -445,7 +445,7 @@ pub(super) async fn confirm_request(
             "This node cannot read its hub settings. Fix the data directory and try again."
         }
     };
-    Ok(view! { caller_screen(request_error: error.to_owned()) })
+    Ok(view! { caller_screen(notice: Notice::Request(error.to_owned())) })
 }
 
 /// Sends the draft `id` for `days` days: first to the hub, then the local
@@ -654,7 +654,7 @@ pub(super) async fn import(
             Err(_) => "This invite is not valid or has expired. Ask for a new one.",
         },
     };
-    Ok(view! { caller_screen(error: error.to_owned()) })
+    Ok(view! { caller_screen(notice: Notice::Import(error.to_owned())) })
 }
 
 #[derive(Deserialize)]
@@ -673,11 +673,11 @@ pub(super) async fn remove_contact(
     let Page(Some(page)) = app_context::<Page>(cx) else {
         return Err(bad_request("this page has no contacts").into());
     };
-    let error = match crate::direct::remove_contact(&page.data_dir, &form.agent) {
-        Ok(()) | Err(crate::direct::DirectError::UnknownContact) => "",
+    match crate::direct::remove_contact(&page.data_dir, &form.agent) {
+        Ok(()) | Err(crate::direct::DirectError::UnknownContact) => {}
         Err(error) => return Err(internal_server_error(error).into()),
-    };
-    Ok(view! { caller_screen(error: error.to_owned()) })
+    }
+    Ok(view! { caller_screen() })
 }
 
 #[cfg(test)]

@@ -23,8 +23,10 @@ use topcoat::{
 };
 
 use super::{
-    Page, PageContext, UiMode, hub_form_screen, layout::page_data_dir,
-    require_admin_session, shared,
+    Page, PageContext, UiMode, hub_form_screen,
+    layout::page_data_dir,
+    require_admin_session,
+    shared::{self, Notice},
 };
 use crate::hub_client::protocol::{DEFAULT_ACCESS_DAYS, OFFER_DAYS};
 use aether_store::{ApprovalKind, ApprovalSide, HubApproval};
@@ -738,7 +740,7 @@ pub(super) async fn claim_name(
             }
         }
     };
-    Ok(view! { hub_form_screen(error: error.to_owned()) })
+    Ok(view! { hub_form_screen(notice: Notice::Hub(error.to_owned())) })
 }
 
 #[derive(Deserialize)]
@@ -762,7 +764,7 @@ pub(super) async fn set_search(
         Err(HubError::Invalid) => "Only a personal agent can be found by name search.",
         Err(error) => hub_message(error),
     };
-    Ok(view! { hub_form_screen(error: error.to_owned()) })
+    Ok(view! { hub_form_screen(notice: Notice::Hub(error.to_owned())) })
 }
 
 #[derive(Deserialize)]
@@ -791,7 +793,7 @@ pub(super) async fn invite_by_name(
     } else {
         offer(&hub, &page.data_dir, to, form.days).await.err().unwrap_or_default()
     };
-    Ok(view! { hub_form_screen(error: error.to_owned()) })
+    Ok(view! { hub_form_screen(notice: Notice::Hub(error.to_owned())) })
 }
 
 #[derive(Deserialize)]
@@ -828,7 +830,7 @@ pub(super) async fn approve_request(
     } else {
         "Choose how long they can use your agent."
     };
-    Ok(view! { hub_form_screen(error: error.to_owned()) })
+    Ok(view! { hub_form_screen(notice: Notice::Hub(error.to_owned())) })
 }
 
 /// The open request `id` to this service agent, with the endpoint that
@@ -911,7 +913,7 @@ pub(super) async fn block_request(
         .err()
         .map(hub_message)
         .unwrap_or_default();
-    Ok(view! { hub_form_screen(error: error.to_owned()) })
+    Ok(view! { hub_form_screen(notice: Notice::Hub(error.to_owned())) })
 }
 
 async fn block_requester(
@@ -982,7 +984,7 @@ pub(super) async fn claim_owner(
     } else {
         "Use the full name of the service agent, with the four digits, such as law#0042."
     };
-    Ok(view! { hub_form_screen(error: error.to_owned()) })
+    Ok(view! { hub_form_screen(notice: Notice::Hub(error.to_owned())) })
 }
 
 /// The service agent confirms the claim of its owner's personal agent.
@@ -998,7 +1000,7 @@ pub(super) async fn confirm_owner(
         return Err(bad_request("only a service agent confirms an owner").into());
     }
     let error = confirm_claim(&hub, &key, &form.id).await.err().unwrap_or_default();
-    Ok(view! { hub_form_screen(error: error.to_owned()) })
+    Ok(view! { hub_form_screen(notice: Notice::Hub(error.to_owned())) })
 }
 
 /// Signs the confirm of the open claim `id` with the endpoint `key`.
@@ -1042,7 +1044,7 @@ pub(super) async fn remove_owner(
         .err()
         .map(hub_message)
         .unwrap_or_default();
-    Ok(view! { hub_form_screen(error: error.to_owned()) })
+    Ok(view! { hub_form_screen(notice: Notice::Hub(error.to_owned())) })
 }
 
 /// Blocks the sender of a received invite.
@@ -1055,7 +1057,7 @@ pub(super) async fn block_invite(
     let hub = page_hub(cx)?;
     let error =
         hub.block_invite(&form.id).await.err().map(hub_message).unwrap_or_default();
-    Ok(view! { hub_form_screen(error: error.to_owned()) })
+    Ok(view! { hub_form_screen(notice: Notice::Hub(error.to_owned())) })
 }
 
 #[derive(Deserialize)]
@@ -1079,7 +1081,7 @@ pub(super) async fn unblock(
     {
         let _ = store.remove_block(&form.endpoint);
     }
-    Ok(view! { hub_form_screen(error: error.to_owned()) })
+    Ok(view! { hub_form_screen(notice: Notice::Hub(error.to_owned())) })
 }
 
 /// Declines or cancels an invite.
@@ -1091,7 +1093,7 @@ pub(super) async fn remove_invite(
     require_admin_session(cx).await?;
     let hub = page_hub(cx)?;
     let error = hub.remove(&form.id).await.err().map(hub_message).unwrap_or_default();
-    Ok(view! { hub_form_screen(error: error.to_owned()) })
+    Ok(view! { hub_form_screen(notice: Notice::Hub(error.to_owned())) })
 }
 
 /// Which hub names go through, as a row of the Connection card, and a form
@@ -1180,7 +1182,7 @@ pub(super) async fn hub_url(
         }
         None => "Use an https:// address, such as the public hub.".to_owned(),
     };
-    Ok(view! { hub_form_screen(setting_error: setting_error) })
+    Ok(view! { hub_form_screen(notice: Notice::HubSetting(setting_error)) })
 }
 
 /// presence dots. Empty without a hub or an answer.

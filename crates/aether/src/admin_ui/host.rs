@@ -23,7 +23,8 @@ use super::{
     hub::{hub_section, hub_setting},
     layout::{Tab, node_header},
     listing::listing_section,
-    require_admin_session, shared,
+    require_admin_session,
+    shared::{self, Notice},
 };
 use crate::access_groups::{self, Action};
 use crate::hub_client::{HubClient, Role};
@@ -51,31 +52,6 @@ use topcoat::icon::icon;
 pub(super) struct NewInvitation {
     friend_name: String,
     line: String,
-}
-
-/// What the last form on this screen asks the page to show.
-#[derive(Clone, Default)]
-pub(super) struct Notice {
-    invite_error: String,
-    workspace_error: String,
-    relay_error: String,
-    confirm_revoke: String,
-    hub_error: String,
-    hub_setting_error: String,
-    group_error: String,
-    card_error: String,
-    card_saved: bool,
-    listing_error: String,
-}
-
-impl Notice {
-    pub(super) fn hub(error: String, setting_error: String) -> Self {
-        Self { hub_error: error, hub_setting_error: setting_error, ..Self::default() }
-    }
-
-    pub(super) fn listing(error: String) -> Self {
-        Self { listing_error: error, ..Self::default() }
-    }
 }
 
 /// One grant in the direct scope, as the host sees it.
@@ -160,12 +136,7 @@ pub(super) async fn host_screen(
         .iter()
         .map(|friend| (friend.name.clone(), friend.endpoint_id.clone()))
         .collect::<Vec<_>>();
-    let refused = !notice.invite_error.is_empty()
-        || !notice.workspace_error.is_empty()
-        || !notice.relay_error.is_empty()
-        || !notice.group_error.is_empty()
-        || !notice.card_error.is_empty()
-        || !notice.listing_error.is_empty();
+    let refused = notice.refused();
     let command = format!("aether node direct import '{}'", invitation.line);
     let hub_access = page.hub_access();
     let hub = page.current_hub();
@@ -178,7 +149,7 @@ pub(super) async fn host_screen(
             == Some(crate::hub_client::AgentKind::Service);
     // The code form is the second way when a hub is set; it opens when it
     // is in use.
-    let code_open = !invitation.line.is_empty() || !notice.invite_error.is_empty();
+    let code_open = !invitation.line.is_empty() || !notice.invite_error().is_empty();
 
     let agent_name = page.agent_name();
     Ok(view! {
@@ -192,7 +163,7 @@ pub(super) async fn host_screen(
                     <div id="people">
                         page_title(
                             title: "Who can use your agent",
-                            workspace_line(path: folder, error: notice.workspace_error.clone(), task_folder_mode: page.task_folder_mode)
+                            workspace_line(path: folder, error: notice.workspace_error(), task_folder_mode: page.task_folder_mode)
                         )
                     </div>
                     if drafts > 0 {
@@ -216,11 +187,11 @@ pub(super) async fn host_screen(
                             )
                         )
                     }
-                    people(friends: friends, confirm_revoke: notice.confirm_revoke.clone())
+                    people(friends: friends, confirm_revoke: notice.confirm_revoke())
                     if service {
                         listing_section(
                             data_dir: page.data_dir.clone(),
-                            error: notice.listing_error.clone(),
+                            error: notice.listing_error(),
                         )
                     }
                 </section>
@@ -236,7 +207,7 @@ pub(super) async fn host_screen(
                             hub_section(
                                 hub: hub.clone(),
                                 role: Role::Sender,
-                                error: notice.hub_error.clone(),
+                                error: notice.hub_error(),
                                 relay_missing: relay_host.is_none(),
                                 <details class="group border-t border-border pt-4" open=(code_open.then_some(""))>
                                     <summary class="flex cursor-pointer list-none items-center gap-2 text-sm text-muted-foreground">
@@ -244,7 +215,7 @@ pub(super) async fn host_screen(
                                         "Invite with a connect code instead"
                                     </summary>
                                     <div class="flex flex-col gap-5 pt-4">
-                                        invite_form(error: notice.invite_error.clone())
+                                        invite_form(error: notice.invite_error())
                                         if !invitation.line.is_empty() {
                                             invite_result(invitation: invitation.clone(), command: command.clone(), agent_name: agent_name.clone())
                                         }
@@ -261,7 +232,7 @@ pub(super) async fn host_screen(
                                 if relay_host.is_none() {
                                     shared::relay_notice()
                                 }
-                                invite_form(error: notice.invite_error.clone())
+                                invite_form(error: notice.invite_error())
                                 if !invitation.line.is_empty() {
                                     invite_result(invitation: invitation.clone(), command: command.clone(), agent_name: agent_name.clone())
                                 }
@@ -273,11 +244,11 @@ pub(super) async fn host_screen(
                         <div class="flex flex-col divide-y divide-border border-t border-border">
                             relay_line(
                                 url: relay_url.clone().unwrap_or_default(),
-                                error: notice.relay_error.clone(),
+                                error: notice.relay_error(),
                             )
                             hub_setting(
                                 url: hub.as_ref().map(HubClient::url),
-                                error: notice.hub_setting_error.clone(),
+                                error: notice.hub_setting_error(),
                             )
                         </div>
                     </section>
@@ -286,10 +257,10 @@ pub(super) async fn host_screen(
             <div class="grid items-start gap-10 border-t border-border pt-10 lg:grid-cols-[minmax(0,1fr)_30rem]">
                 card_section(
                     settings: crate::agent_card::settings(&page.data_dir),
-                    error: notice.card_error.clone(),
-                    saved: notice.card_saved,
+                    error: notice.card_error(),
+                    saved: notice.card_saved(),
                 )
-                groups_section(groups: groups, friend_choices: friend_choices, error: notice.group_error.clone())
+                groups_section(groups: groups, friend_choices: friend_choices, error: notice.group_error())
             </div>
         </main>
     }
@@ -459,7 +430,7 @@ pub(super) async fn change_group(
     .err()
     .unwrap_or_default()
     .to_owned();
-    Ok(view! { host_screen(notice: Notice { group_error, ..Notice::default() }) })
+    Ok(view! { host_screen(notice: Notice::Group(group_error)) })
 }
 
 /// The relay people reach the agent through, as a row of the Connection
@@ -539,7 +510,7 @@ pub(super) async fn relay(
     } else {
         "This is not a relay URL. It starts with https://.".to_owned()
     };
-    Ok(view! { host_screen(notice: Notice { relay_error, ..Notice::default() }) })
+    Ok(view! { host_screen(notice: Notice::Relay(relay_error)) })
 }
 
 /// The Agent Card that people get with an invite, and a form to change it.
@@ -627,11 +598,10 @@ pub(super) async fn save_card(
             .collect(),
     };
     let notice = match crate::agent_card::save_settings(&page.data_dir, &card_input) {
-        Ok(_) => Notice { card_saved: true, ..Notice::default() },
-        Err(crate::agent_card::CardError::Invalid(reason)) => Notice {
-            card_error: format!("The card was not saved: {reason}."),
-            ..Notice::default()
-        },
+        Ok(_) => Notice::CardSaved,
+        Err(crate::agent_card::CardError::Invalid(reason)) => {
+            Notice::Card(format!("The card was not saved: {reason}."))
+        }
         Err(error) => return Err(internal_server_error(error).into()),
     };
     Ok(view! { host_screen(notice: notice) })
@@ -918,10 +888,7 @@ pub(super) async fn invite(
         None
     };
     let (invitation, notice) = if let Some(refusal) = refusal {
-        (
-            NewInvitation::default(),
-            Notice { invite_error: refusal.to_owned(), ..Notice::default() },
-        )
+        (NewInvitation::default(), Notice::Invite(refusal.to_owned()))
     } else {
         let line = create_invite(cx, page, &form.friend_name, &endpoint_id, form.days)?;
         (NewInvitation { friend_name: form.friend_name, line }, Notice::default())
@@ -986,7 +953,7 @@ pub(super) async fn revoke(
             .map_err(|_| bad_request("the access cannot be revoked"))?;
         Notice::default()
     } else {
-        Notice { confirm_revoke: form.grant_id, ..Notice::default() }
+        Notice::ConfirmRevoke(form.grant_id)
     };
     Ok(view! { host_screen(notice: notice) })
 }
@@ -1028,10 +995,7 @@ pub(super) async fn workspace(
     let notice = if applied {
         Notice::default()
     } else {
-        Notice {
-            workspace_error: "The agent cannot use this folder. It must exist on this computer and be allowed by the policy.".to_owned(),
-            ..Notice::default()
-        }
+        Notice::Workspace("The agent cannot use this folder. It must exist on this computer and be allowed by the policy.".to_owned())
     };
     Ok(view! { host_screen(notice: notice) })
 }
@@ -1079,5 +1043,5 @@ pub(super) async fn publish_listing(
         .map(crate::listing::hub_publish_message)
         .unwrap_or_default()
         .to_owned();
-    Ok(view! { host_screen(notice: Notice::listing(error)) })
+    Ok(view! { host_screen(notice: Notice::Listing(error)) })
 }

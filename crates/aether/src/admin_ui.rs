@@ -47,7 +47,8 @@ mod shared;
 use crate::admin::SharedAdministration;
 use advanced::dashboard;
 use caller::caller_screen;
-use host::{Notice, host_screen};
+use host::host_screen;
+use shared::Notice;
 
 const UI_SESSION_LIFETIME: Duration = Duration::from_secs(3_600);
 /// Matches the `DefaultBodyLimit` of `UI_HARDENING`: both cap the same
@@ -301,17 +302,13 @@ async fn root_layout(slot: Slot<'_>) -> TopcoatResult<impl View> {
 }
 
 #[component]
-async fn hub_form_screen(
-    cx: &Cx,
-    #[default] error: String,
-    #[default] setting_error: String,
-) -> TopcoatResult<impl View> {
+async fn hub_form_screen(cx: &Cx, notice: Notice) -> TopcoatResult<impl View> {
     let hosting = app_context::<Page>(cx).mode().is_some_and(UiMode::hosts);
     Ok(view! {
         if hosting {
-            host_screen(notice: Notice::hub(error.clone(), setting_error.clone()))
+            host_screen(notice: notice.clone())
         } else {
-            caller_screen(hub_error: error.clone(), hub_setting_error: setting_error.clone())
+            caller_screen(notice: notice.clone())
         }
     })
 }
