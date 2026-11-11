@@ -13,6 +13,7 @@ use aether_store::{NodeStore, SentState, SentTask};
 
 use crate::access_groups::{self, Action};
 use crate::admin::{AuditEntry, ChangeRequest};
+use crate::admin_socket::{Request, Response};
 use crate::hub_client::HubClient;
 use crate::outbox::{self, Courier};
 
@@ -138,27 +139,24 @@ impl McpServer {
         self
     }
 
+    /// Sends `request` to the node through its administration socket.
+    fn ask(&self, request: &Request) -> io::Result<Response> {
+        crate::admin_socket::send(&self.socket, request)
+    }
+
     /// Asks the node's outbox to start a round now.
     async fn wake_node(&self) -> Wake {
         let path = self.socket.clone();
         let answer = tokio::task::spawn_blocking(move || {
-            crate::admin_socket::send(&path, &crate::admin_socket::Request::OutboxWake)
+            crate::admin_socket::send(&path, &Request::OutboxWake)
         })
         .await;
         match answer {
-            Ok(Ok(crate::admin_socket::Response::Applied)) => Wake::Applied,
+            Ok(Ok(Response::Applied)) => Wake::Applied,
             // `node admin` has a socket but no endpoint.
-            Ok(Ok(crate::admin_socket::Response::Error { code }))
-                if code == "unsupported" =>
-            {
-                Wake::NoNode
-            }
+            Ok(Ok(Response::Error { code })) if code == "unsupported" => Wake::NoNode,
             // A node from before the outbox cannot read the request.
-            Ok(Ok(crate::admin_socket::Response::Error { code }))
-                if code == "invalid" =>
-            {
-                Wake::OldNode
-            }
+            Ok(Ok(Response::Error { code })) if code == "invalid" => Wake::OldNode,
             Ok(Err(error)) if no_node(&error) => Wake::NoNode,
             _ => Wake::Unknown,
         }
@@ -246,12 +244,9 @@ impl McpServer {
     }
 
     fn audit_entries(&self) -> Result<Vec<AuditEntry>, &'static str> {
-        match crate::admin_socket::send(
-            &self.socket,
-            &crate::admin_socket::Request::Audit,
-        ) {
-            Ok(crate::admin_socket::Response::Audit { entries }) => Ok(entries),
-            Ok(crate::admin_socket::Response::Error { .. }) | Err(_) => {
+        match self.ask(&Request::Audit) {
+            Ok(Response::Audit { entries }) => Ok(entries),
+            Ok(Response::Error { .. }) | Err(_) => {
                 Err("administration service is unavailable")
             }
             Ok(_) => Err("administration service returned an invalid response"),
@@ -260,11 +255,8 @@ impl McpServer {
 
     /// The agent and endpoint ID of each live direct grant of the node.
     fn direct_peers(&self) -> Result<Vec<(String, String)>, &'static str> {
-        match crate::admin_socket::send(
-            &self.socket,
-            &crate::admin_socket::Request::DirectGrants,
-        ) {
-            Ok(crate::admin_socket::Response::DirectGrants { grants }) => Ok(grants
+        match self.ask(&Request::DirectGrants) {
+            Ok(Response::DirectGrants { grants }) => Ok(grants
                 .into_iter()
                 .map(|grant| (grant.agent, grant.endpoint_id))
                 .collect()),
@@ -303,21 +295,11 @@ impl McpServer {
         if request.clone().into_change().is_err() {
             return Err("aether.change has an invalid field");
         }
-        match crate::admin_socket::send(
-            &self.socket,
-            &crate::admin_socket::Request::Change {
-                change: Box::new(request),
-                dry_run,
-            },
-        ) {
-            Ok(crate::admin_socket::Response::Validated) => Ok("validated"),
-            Ok(crate::admin_socket::Response::Pending) => {
-                Ok("pending local confirmation")
-            }
-            Ok(crate::admin_socket::Response::Applied) => Ok("applied"),
-            Ok(crate::admin_socket::Response::Error { .. }) => {
-                Err("aether.change is invalid")
-            }
+        match self.ask(&Request::Change { change: Box::new(request), dry_run }) {
+            Ok(Response::Validated) => Ok("validated"),
+            Ok(Response::Pending) => Ok("pending local confirmation"),
+            Ok(Response::Applied) => Ok("applied"),
+            Ok(Response::Error { .. }) => Err("aether.change is invalid"),
             Ok(_) => Err("administration service returned an invalid response"),
             Err(_) => Err("administration service is unavailable"),
         }
@@ -327,14 +309,9 @@ impl McpServer {
         if Uuid::parse_str(task_id).is_err() {
             return Err("aether.task.cancel task_id must be a UUID");
         }
-        match crate::admin_socket::send(
-            &self.socket,
-            &crate::admin_socket::Request::Cancel { task_id: task_id.to_owned() },
-        ) {
-            Ok(crate::admin_socket::Response::Cancelled) => Ok("cancelled"),
-            Ok(crate::admin_socket::Response::Error { .. }) => {
-                Err("aether.task.cancel failed")
-            }
+        match self.ask(&Request::Cancel { task_id: task_id.to_owned() }) {
+            Ok(Response::Cancelled) => Ok("cancelled"),
+            Ok(Response::Error { .. }) => Err("aether.task.cancel failed"),
             Ok(_) => Err("administration service returned an invalid response"),
             Err(_) => Err("administration service is unavailable"),
         }

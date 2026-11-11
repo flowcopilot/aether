@@ -7,11 +7,12 @@ use serde_json::json;
 
 use crate::access_groups::{self, Action};
 use crate::admin::ChangeRequest;
+use crate::admin_socket::{Request, Response};
 use crate::hub_client::{AgentKind, HUB_OFF, valid_name_part};
 
 use super::super::McpServer;
 use super::super::support::{
-    AuditField, audit_item, no_node, tool_error, tool_success,
+    AuditField, audit_item, no_node, refused, tool_error, tool_success,
 };
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -158,34 +159,29 @@ impl McpServer {
             Ok(None) => return tool_error("start the node once to create its policy"),
             Err(_) => return tool_error("the node policy is unavailable"),
         }
-        match crate::admin_socket::send(
-            &self.socket,
-            &crate::admin_socket::Request::UpdatePolicy {
-                workspace: arguments.workspace,
-                max_context_tokens: arguments.max_context_tokens,
-                max_seconds: arguments.max_seconds,
-                queue_global: arguments.queue_global,
-                queue_per_peer: arguments.queue_per_peer,
-                dry_run: arguments.dry_run,
-            },
-        ) {
-            Ok(crate::admin_socket::Response::Validated) => tool_success(
+        match self.ask(&Request::UpdatePolicy {
+            workspace: arguments.workspace,
+            max_context_tokens: arguments.max_context_tokens,
+            max_seconds: arguments.max_seconds,
+            queue_global: arguments.queue_global,
+            queue_per_peer: arguments.queue_per_peer,
+            dry_run: arguments.dry_run,
+        }) {
+            Ok(Response::Validated) => tool_success(
                 json!({
                     "status": "validated",
                     "restartRequired": false,
                 })
                 .to_string(),
             ),
-            Ok(crate::admin_socket::Response::Applied) => tool_success(
+            Ok(Response::Applied) => tool_success(
                 json!({
                     "status": "saved",
                     "restartRequired": true,
                 })
                 .to_string(),
             ),
-            Ok(crate::admin_socket::Response::Error { code }) => {
-                tool_error(format!("the node refused the policy change: {code}"))
-            }
+            Ok(Response::Error { code }) => refused("the policy change", &code),
             _ => tool_error("administration service is unavailable"),
         }
     }
@@ -211,16 +207,11 @@ impl McpServer {
         if arguments.dry_run {
             return tool_success(json!({"status": "validated"}).to_string());
         }
-        match crate::admin_socket::send(
-            &self.socket,
-            &crate::admin_socket::Request::SetRelay { url: relay.map(str::to_owned) },
-        ) {
-            Ok(crate::admin_socket::Response::Applied) => tool_success(
+        match self.ask(&Request::SetRelay { url: relay.map(str::to_owned) }) {
+            Ok(Response::Applied) => tool_success(
                 json!({"status": "applied", "restartRequired": false}).to_string(),
             ),
-            Ok(crate::admin_socket::Response::Error { code }) => {
-                tool_error(format!("the node refused the relay: {code}"))
-            }
+            Ok(Response::Error { code }) => refused("the relay", &code),
             // No node runs: it uses the saved choice on its next start.
             Err(error) if no_node(&error) => {
                 match crate::settings::store_setting::<crate::transport::relay::Relay>(
@@ -326,20 +317,15 @@ impl McpServer {
         if arguments.dry_run {
             return tool_success("validated");
         }
-        match crate::admin_socket::send(
-            &self.socket,
-            &crate::admin_socket::Request::CreateInvite {
-                friend_name: arguments.friend_name,
-                endpoint_id: arguments.endpoint_id.split_whitespace().collect(),
-                days: arguments.days,
-            },
-        ) {
-            Ok(crate::admin_socket::Response::Invitation { line }) => {
+        match self.ask(&Request::CreateInvite {
+            friend_name: arguments.friend_name,
+            endpoint_id: arguments.endpoint_id.split_whitespace().collect(),
+            days: arguments.days,
+        }) {
+            Ok(Response::Invitation { line }) => {
                 tool_success(json!({"code": line}).to_string())
             }
-            Ok(crate::admin_socket::Response::Error { code }) => {
-                tool_error(format!("the node refused the invite: {code}"))
-            }
+            Ok(Response::Error { code }) => refused("the invite", &code),
             _ => tool_error("the running node is unavailable"),
         }
     }
@@ -370,11 +356,8 @@ impl McpServer {
         description = "List people who can send tasks to this running node and their grant IDs."
     )]
     async fn access_list(&self) -> CallToolResult {
-        match crate::admin_socket::send(
-            &self.socket,
-            &crate::admin_socket::Request::DirectGrants,
-        ) {
-            Ok(crate::admin_socket::Response::DirectGrants { grants }) => {
+        match self.ask(&Request::DirectGrants) {
+            Ok(Response::DirectGrants { grants }) => {
                 tool_success(json!({"grants": grants}).to_string())
             }
             _ => tool_error("the running node is unavailable"),
@@ -395,14 +378,9 @@ impl McpServer {
         if arguments.dry_run {
             return tool_success("validated");
         }
-        match crate::admin_socket::send(
-            &self.socket,
-            &crate::admin_socket::Request::RevokeGrant { id: arguments.grant_id },
-        ) {
-            Ok(crate::admin_socket::Response::Applied) => tool_success("revoked"),
-            Ok(crate::admin_socket::Response::Error { code }) => {
-                tool_error(format!("the node refused the revocation: {code}"))
-            }
+        match self.ask(&Request::RevokeGrant { id: arguments.grant_id }) {
+            Ok(Response::Applied) => tool_success("revoked"),
+            Ok(Response::Error { code }) => refused("the revocation", &code),
             _ => tool_error("the running node is unavailable"),
         }
     }
