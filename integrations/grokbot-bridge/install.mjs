@@ -29,21 +29,36 @@ try {
     const tools = path.join(dataDir, 'tools');
     const binary = values['aether-bin'] ? path.resolve(values['aether-bin']) : path.join(tools, 'bin', 'aether');
     if (/[\x00-\x1f\x7f]/.test(binary)) throw new Error('Binary path contains a control character');
-    const build = !values['aether-bin'] && !existsSync(binary);
-    const cargoArgs = ['install', '--path', path.join(root, 'crates/aether'), '--locked', '--root', tools];
+    const owned = !values['aether-bin'];
+    let build = owned && !existsSync(binary);
+    let cargoArgs = ['install', '--path', path.join(root, 'crates/aether'), '--locked', '--root', tools];
     const config = { command: process.execPath, args: [path.join(directory, 'src/main.mjs')], env: {
       AETHER_DATA_DIR: dataDir, AETHER_BIN: binary, GROKBOT_TRANSPORT: 'stdio', GROKBOT_START_NODE: '1', GROKBOT_EXPERIMENTAL: '1',
     } };
     if (!values['dry-run']) {
       if (!existsSync(path.join(directory, 'node_modules/@modelcontextprotocol/sdk/package.json'))) throw new Error('Run npm ci in integrations/grokbot-bridge first');
       mkdirSync(dataDir, { recursive: true, mode: 0o700 });
-      if (build) {
+      const compile = () => {
         console.error('Building Aether locally; Rust 1.98+, a C compiler and CMake are required.');
         const result = spawnSync('cargo', cargoArgs, { cwd: root, stdio: ['ignore', 2, 2] });
         if (result.error || result.status !== 0) throw new Error('Aether build failed; install the documented build prerequisites and retry');
+      };
+      const supported = () => {
+        const probe = spawnSync(binary, ['node', 'serve', '--help'], { encoding: 'utf8' });
+        return !probe.error && probe.status === 0 && probe.stdout.includes('--adapter');
+      };
+      if (build) compile();
+      let ready = supported();
+      // A binary this installer built earlier may predate connected-adapter
+      // support: replace it once. A binary given with --aether-bin is never touched.
+      if (!ready && owned && !build) {
+        console.error('The installed Aether binary lacks connected-adapter support; rebuilding it.');
+        build = true;
+        cargoArgs = ['install', '--force', ...cargoArgs.slice(1)];
+        compile();
+        ready = supported();
       }
-      const probe = spawnSync(binary, ['node', 'serve', '--help'], { encoding: 'utf8' });
-      if (probe.error || probe.status !== 0 || !probe.stdout.includes('--adapter')) throw new Error('Aether binary is unavailable or lacks connected-adapter support');
+      if (!ready) throw new Error('Aether binary is unavailable or lacks connected-adapter support');
     }
     console.log(JSON.stringify({ status: values['dry-run'] ? 'planned' : 'installed', data_dir: dataDir,
       build: build ? { command: 'cargo', args: cargoArgs } : null,

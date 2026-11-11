@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { mkdtempSync, existsSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import os from 'node:os';
@@ -52,4 +52,43 @@ test('installed command owns its node, speaks clean stdio MCP, executes a task, 
   assert.equal((await call('finish_task', { ...claim, outcome: 'result', text: 'Blue' })).status, 'recorded');
   await until(() => existsSync(results), 'the node must receive the result');
   assert.deepEqual(JSON.parse(readFileSync(results, 'utf8')), { type: 'result', id: 'stdio-task', text: 'Blue' });
+});
+
+test('an installed binary without connected-adapter support is rebuilt once', t => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'ae-install-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const data = path.join(dir, 'data');
+  const bin = path.join(dir, 'bin');
+  const calls = path.join(dir, 'cargo-calls');
+  mkdirSync(path.join(data, 'tools', 'bin'), { recursive: true });
+  mkdirSync(bin);
+  fakeAether(path.join(data, 'tools', 'bin', 'aether'), { adapter: false });
+  // Stands in for `cargo install --root <tools>`: installs a current binary.
+  writeFileSync(path.join(bin, 'cargo'), `#!${process.execPath}
+import fs from 'node:fs';
+import path from 'node:path';
+import { fakeAether } from ${JSON.stringify(new URL('./support.mjs', import.meta.url).href)};
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(calls)}, JSON.stringify(args) + '\\n');
+fakeAether(path.join(args[args.indexOf('--root') + 1], 'bin', 'aether'), {});
+`, { mode: 0o700 });
+  const env = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}` };
+  const result = spawnSync(process.execPath, [installer, '--data-dir', data], { encoding: 'utf8', env });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  const report = JSON.parse(result.stdout);
+  assert.equal(report.status, 'installed');
+  assert.equal(report.build.command, 'cargo');
+  const invocations = readFileSync(calls, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  assert.equal(invocations.length, 1);
+  assert.equal(invocations[0].at(-1), path.join(data, 'tools'));
+});
+
+test('a binary given with --aether-bin is never rebuilt', t => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'ae-install-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const binary = fakeAether(path.join(dir, 'aether'), { adapter: false });
+  const env = { ...process.env, PATH: path.join(dir, 'no-cargo') };
+  const result = spawnSync(process.execPath, [installer, '--data-dir', path.join(dir, 'data'), '--aether-bin', binary], { encoding: 'utf8', env });
+  assert.equal(result.status, 1);
+  assert.match(JSON.parse(result.stdout).error, /lacks connected-adapter support/);
 });
