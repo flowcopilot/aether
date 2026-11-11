@@ -115,6 +115,43 @@ pub fn change(
     }
 }
 
+/// Whether `agent` at `endpoint_id` is a member of `group`.
+pub fn is_member(
+    data_dir: &Path,
+    group: &str,
+    agent: &str,
+    endpoint_id: &str,
+) -> Result<bool, StoreError> {
+    member_of(&NodeStore::in_dir(data_dir)?, group, agent, endpoint_id)
+}
+
+/// Takes `agent` at `endpoint_id` out of `group`.
+pub fn leave(
+    data_dir: &Path,
+    group: &str,
+    agent: &str,
+    endpoint_id: &str,
+) -> Result<(), StoreError> {
+    NodeStore::in_dir(data_dir)?.remove_access_group_member(group, agent, endpoint_id)
+}
+
+fn member_of(
+    store: &NodeStore,
+    group: &str,
+    agent: &str,
+    endpoint_id: &str,
+) -> Result<bool, StoreError> {
+    Ok(store
+        .access_groups()?
+        .into_iter()
+        .find(|entry| entry.name == group)
+        .is_some_and(|entry| {
+            entry.members.iter().any(|member| {
+                member.agent_id == agent && member.endpoint_id == endpoint_id
+            })
+        }))
+}
+
 /// Why [`join_and_apply`] failed.
 #[derive(Debug)]
 pub enum JoinError<E> {
@@ -137,16 +174,8 @@ pub fn join_and_apply<T, E>(
     apply: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, JoinError<E>> {
     let store = NodeStore::in_dir(data_dir).map_err(JoinError::Store)?;
-    let was_member = store
-        .access_groups()
-        .map_err(JoinError::Store)?
-        .into_iter()
-        .find(|entry| entry.name == group)
-        .is_some_and(|entry| {
-            entry.members.iter().any(|member| {
-                member.agent_id == agent && member.endpoint_id == endpoint_id
-            })
-        });
+    let was_member =
+        member_of(&store, group, agent, endpoint_id).map_err(JoinError::Store)?;
     store
         .add_access_group_member(group, agent, endpoint_id)
         .map_err(JoinError::Store)?;

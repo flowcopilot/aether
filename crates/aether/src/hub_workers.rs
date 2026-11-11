@@ -75,7 +75,8 @@ fn host_inputs(
 }
 
 /// Signs the grant of `step` and pins `approval` to the line. `None` when
-/// either fails; a grant whose line is not pinned is revoked again.
+/// either fails. When the line cannot be pinned, the grant is revoked again,
+/// and the person leaves `access_group` if the signing put them in it.
 #[allow(clippy::too_many_arguments)]
 fn sign_and_pin(
     administration: &SharedAdministration,
@@ -88,6 +89,9 @@ fn sign_and_pin(
     days: u64,
     access_group: &str,
 ) -> Option<String> {
+    let was_member =
+        crate::access_groups::is_member(data_dir, access_group, friend_name, endpoint)
+            .ok()?;
     let signing = DirectInviteSigning::for_data_dir(data_dir);
     let (line, grant_id) = sign_direct_invite(
         administration,
@@ -105,6 +109,14 @@ fn sign_and_pin(
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .revoke(&grant_id, AuditActor::Ui);
+        if !was_member {
+            let _ = crate::access_groups::leave(
+                data_dir,
+                access_group,
+                friend_name,
+                endpoint,
+            );
+        }
         return None;
     }
     Some(line)
@@ -265,4 +277,83 @@ fn log_reason(event: &str, invite: &Invite, reason: &str) {
             "reason": reason,
         })
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use aether_store::{ApprovalKind, ApprovalSide, NodeStore};
+
+    use super::sign_and_pin;
+    use crate::admin::test_support::{FakeNode, shared_in};
+
+    fn members(data_dir: &std::path::Path, group: &str) -> Vec<String> {
+        NodeStore::in_dir(data_dir)
+            .expect("store must open")
+            .access_groups()
+            .expect("groups must read")
+            .into_iter()
+            .find(|entry| entry.name == group)
+            .map(|entry| {
+                entry.members.into_iter().map(|member| member.agent_id).collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_line_that_cannot_be_pinned_leaves_no_grant_and_no_new_member() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let data_dir = directory.path();
+        let administration = shared_in(data_dir);
+        let node = Arc::new(FakeNode::default().with_workspace("/start"));
+        administration.lock().expect("administration must lock").set_live(node);
+        let store =
+            crate::hub_store::HubStore::open(data_dir).expect("store must open");
+        let group = crate::access_groups::REQUESTS_GROUP;
+        // This approval was never kept, so no line can be pinned to it.
+        let approval = crate::hub_membership::new_approval(
+            "0123456789abcdef0123456789abcdef",
+            ApprovalSide::Sender,
+            ApprovalKind::Request,
+            "ana#0001",
+            7,
+            group,
+            aether_core::time::now(),
+        );
+        let sign = |endpoint: &str| {
+            sign_and_pin(
+                &administration,
+                data_dir,
+                &store,
+                "law#0042",
+                &approval,
+                "ana#0001",
+                endpoint,
+                7,
+                group,
+            )
+        };
+        let grants = || {
+            administration
+                .lock()
+                .expect("administration must lock")
+                .grants()
+                .expect("grants must read")
+        };
+
+        let endpoint = iroh::SecretKey::generate().public().to_string();
+        assert_eq!(sign(&endpoint), None);
+        assert_eq!(grants(), Vec::new());
+        assert!(members(data_dir, group).is_empty());
+
+        // A person who was in the group before stays in it.
+        NodeStore::in_dir(data_dir)
+            .expect("store must open")
+            .add_access_group_member(group, "ana#0001", &endpoint)
+            .expect("member must add");
+        assert_eq!(sign(&endpoint), None);
+        assert_eq!(grants(), Vec::new());
+        assert_eq!(members(data_dir, group), ["ana#0001"]);
+    }
 }
