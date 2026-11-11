@@ -120,10 +120,6 @@ pub trait Agent {
         self.start_turn_with_events(ctx, &mut |_| {})
     }
     fn cancel(&self, task_id: &str);
-    fn set_workspace(&self, _workspace: &Path) {}
-    fn supports_workspace_change(&self) -> bool {
-        true
-    }
 }
 pub struct Executor<P> {
     process: P,
@@ -203,11 +199,7 @@ impl<P: Agent> Executor<P> {
         if !subpath && !canonical.starts_with(&root) {
             self.allowed_root.clone_from(&canonical);
         }
-        self.workspace.set(canonical.clone())?;
-        if self.process.supports_workspace_change() {
-            self.process.set_workspace(&canonical);
-        }
-        Ok(())
+        self.workspace.set(canonical)
     }
 }
 
@@ -237,9 +229,12 @@ mod tests {
     use super::{
         Agent, ExecutionError, ExecutionEvent, Executor, Limits, Task, TurnContext,
     };
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+    use std::{
+        path::PathBuf,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
     };
     struct Fake {
         cancelled: Arc<AtomicBool>,
@@ -307,6 +302,50 @@ mod tests {
         );
         executor.cancel("task");
         assert!(cancelled.load(Ordering::Acquire));
+    }
+
+    struct RecordsWorkspace(Arc<Mutex<Option<PathBuf>>>);
+
+    impl Agent for RecordsWorkspace {
+        fn start_turn_with_events(
+            &mut self,
+            ctx: &TurnContext,
+            _events: &mut dyn FnMut(ExecutionEvent),
+        ) -> Result<String, ExecutionError> {
+            *self.0.lock().expect("record must lock") = Some(ctx.workspace.clone());
+            Ok(String::new())
+        }
+
+        fn cancel(&self, _id: &str) {}
+    }
+
+    #[test]
+    fn a_turn_runs_in_the_workspace_set_last() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let moved = directory.path().join("moved");
+        std::fs::create_dir(&moved).expect("workspace must create");
+        let recorded = Arc::new(Mutex::new(None));
+        let limits = Limits {
+            workspace: directory.path().to_path_buf(),
+            max_context_tokens: 10,
+            max_seconds: 1,
+        };
+        let mut executor =
+            Executor::new(RecordsWorkspace(Arc::clone(&recorded)), limits);
+        executor.set_workspace(&moved).expect("workspace must set");
+        let task = Task {
+            id: "task".to_owned(),
+            skill: "review".to_owned(),
+            workspace_id: "workspace".to_owned(),
+            remote_text: "text".to_owned(),
+        };
+        executor
+            .execute_with_confirmed_start(&task, &mut || Ok(()), &mut |_| {})
+            .expect("turn must run");
+        assert_eq!(
+            recorded.lock().expect("record must lock").clone(),
+            Some(moved.canonicalize().expect("workspace must canonicalize"))
+        );
     }
 
     #[test]

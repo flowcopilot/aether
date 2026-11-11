@@ -313,10 +313,6 @@ impl Agent for ConnectedAgent {
             early.insert(task_id.to_owned());
         }
     }
-
-    fn supports_workspace_change(&self) -> bool {
-        false
-    }
 }
 
 #[cfg(test)]

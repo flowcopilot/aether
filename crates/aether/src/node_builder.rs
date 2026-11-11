@@ -188,7 +188,6 @@ fn build(
         Some(sandbox) => NodeAgent::Codex(codex_agent(
             data_dir,
             codex_binary,
-            workspace.clone(),
             CodexLimits {
                 sandbox: sandbox.as_str().to_owned(),
                 approval: "never".to_owned(),
@@ -307,7 +306,6 @@ fn is_default_tasks_root(workspace: &Path, layout: &DataDir) -> bool {
 fn codex_agent(
     data_dir: &Path,
     codex_binary: PathBuf,
-    workspace: PathBuf,
     limits: CodexLimits,
     environment_allowlist: &[String],
     task_folder: bool,
@@ -325,11 +323,7 @@ fn codex_agent(
         task_folder,
         |name| std::env::var(name).ok(),
     )?;
-    Ok(CodexAppServer::new(
-        codex_binary,
-        workspace,
-        CodexLimits { environment, ..limits },
-    ))
+    Ok(CodexAppServer::new(codex_binary, CodexLimits { environment, ..limits }))
 }
 
 /// Creates the node's Codex home. It shares only the owner's login file, when

@@ -61,7 +61,7 @@ const fn reserved_slots(task_folder: bool) -> usize {
 }
 
 fn codex_limits_are_valid(limits: &CodexLimits) -> bool {
-    spawn_environment_valid(&limits.environment, limits.sandbox == TASK_FOLDER)
+    spawn_environment_valid(&limits.environment)
         && matches!(
             limits.sandbox.as_str(),
             "read-only" | "workspace-write" | TASK_FOLDER
@@ -69,10 +69,7 @@ fn codex_limits_are_valid(limits: &CodexLimits) -> bool {
         && matches!(limits.approval.as_str(), "untrusted" | "on-request" | "never")
 }
 
-fn spawn_environment_valid(
-    environment: &BTreeMap<String, String>,
-    _task_folder: bool,
-) -> bool {
+fn spawn_environment_valid(environment: &BTreeMap<String, String>) -> bool {
     environment.len() <= MAX_ENVIRONMENT
         && environment.iter().all(|(key, value)| {
             valid_environment_key(key) && valid_environment_value(value)
@@ -91,7 +88,7 @@ pub(crate) fn build_node_environment(
         let path = path.to_str().ok_or(PolicyError::Invalid)?;
         environment.insert(name.to_owned(), path.to_owned());
     }
-    if spawn_environment_valid(&environment, task_folder) {
+    if spawn_environment_valid(&environment) {
         Ok(environment)
     } else {
         Err(PolicyError::InvalidField("environmentAllowlist".to_owned()))
@@ -203,7 +200,7 @@ fn app_server_arguments() -> Vec<String> {
 
 impl CodexAppServer {
     #[must_use]
-    pub fn new(binary: PathBuf, _workspace: PathBuf, limits: CodexLimits) -> Self {
+    pub fn new(binary: PathBuf, limits: CodexLimits) -> Self {
         Self {
             source: resolve_binary(&binary).ok(),
             binary,
@@ -528,7 +525,6 @@ impl Agent for CodexAppServer {
 impl CodexAppServer {
     fn with_arguments(
         binary: PathBuf,
-        _workspace: PathBuf,
         arguments: Vec<String>,
         limits: CodexLimits,
     ) -> Self {
@@ -949,23 +945,19 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn app_server_uses_the_workspace_set_after_construction() {
-        let old_workspace = tempfile::tempdir().expect("old workspace must create");
-        let new_workspace = tempfile::tempdir().expect("new workspace must create");
-        let expected_cwd = new_workspace
-            .path()
-            .canonicalize()
-            .expect("new workspace must canonicalize");
+    fn app_server_runs_in_the_workspace_of_the_turn() {
+        let workspace = tempfile::tempdir().expect("workspace must create");
+        let expected_cwd =
+            workspace.path().canonicalize().expect("workspace must canonicalize");
         let limits = CodexLimits {
             sandbox: "workspace-write".to_owned(),
             approval: "never".to_owned(),
             allow_network: false,
             environment: BTreeMap::new(),
         };
-        // The script only answers "thread/start" (id 2) once the cwd it
-        // receives matches the workspace set below, not the one the
-        // process was constructed with — proving Executor::set_workspace
-        // reaches the process, not only its own bookkeeping copy.
+        // The script answers "thread/start" (id 2) only when its cwd is the
+        // turn's workspace: the executor's current workspace reaches Codex
+        // through `TurnContext::workspace`.
         let script = format!(
             r#"
 while IFS= read -r request; do
@@ -989,11 +981,9 @@ done
         );
         let mut server = CodexAppServer::with_arguments(
             PathBuf::from("sh"),
-            old_workspace.path().to_path_buf(),
             vec!["-c".to_owned(), script],
             limits,
         );
-        server.set_workspace(new_workspace.path());
         assert_eq!(
             server.start_turn(&turn_ctx(
                 &expected_cwd,
@@ -1035,7 +1025,6 @@ done
 "#;
         let mut server = CodexAppServer::with_arguments(
             PathBuf::from("sh"),
-            directory.path().to_path_buf(),
             vec!["-c".to_owned(), script.to_owned()],
             limits,
         );
@@ -1081,7 +1070,6 @@ done
 "#;
         let mut server = CodexAppServer::with_arguments(
             PathBuf::from("sh"),
-            directory.path().to_path_buf(),
             vec!["-c".to_owned(), script.to_owned()],
             limits,
         );
@@ -1181,7 +1169,6 @@ done
 "#;
         let server = CodexAppServer::with_arguments(
             PathBuf::from("sh"),
-            directory.path().to_path_buf(),
             vec!["-c".to_owned(), script.to_owned()],
             limits,
         );
@@ -1237,7 +1224,6 @@ done
 "#;
         let mut server = CodexAppServer::with_arguments(
             PathBuf::from("sh"),
-            directory.path().to_path_buf(),
             vec!["-c".to_owned(), script.to_owned()],
             limits,
         );
@@ -1283,7 +1269,6 @@ done
 "#;
         let mut server = CodexAppServer::with_arguments(
             PathBuf::from("sh"),
-            directory.path().to_path_buf(),
             vec!["-c".to_owned(), script.to_owned()],
             limits,
         );
@@ -1330,7 +1315,6 @@ done
 "#;
         let mut server = CodexAppServer::with_arguments(
             PathBuf::from("sh"),
-            directory.path().to_path_buf(),
             vec!["-c".to_owned(), script.to_owned()],
             limits,
         );
@@ -1360,11 +1344,8 @@ done
                 "value".to_owned(),
             )]),
         };
-        let mut server = CodexAppServer::new(
-            PathBuf::from("not-a-codex-binary"),
-            directory.path().to_path_buf(),
-            limits,
-        );
+        let mut server =
+            CodexAppServer::new(PathBuf::from("not-a-codex-binary"), limits);
         assert_eq!(
             server.start_turn(&turn_ctx(
                 directory.path(),
@@ -1478,11 +1459,7 @@ done
                 })
                 .collect(),
         };
-        let mut server = CodexAppServer::new(
-            PathBuf::from("codex"),
-            directory.path().to_path_buf(),
-            limits,
-        );
+        let mut server = CodexAppServer::new(PathBuf::from("codex"), limits);
         let answer = server
             .start_turn(&turn_ctx(
                 directory.path(),

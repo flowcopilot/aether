@@ -948,69 +948,6 @@ mod tests {
         node.shutdown();
     }
 
-    #[derive(Clone)]
-    struct RecordsWorkspace {
-        workspace: Arc<Mutex<Option<PathBuf>>>,
-    }
-
-    impl Agent for RecordsWorkspace {
-        fn start_turn_with_events(
-            &mut self,
-            _ctx: &TurnContext,
-            events: &mut dyn FnMut(ExecutionEvent),
-        ) -> Result<String, ExecutionError> {
-            events(ExecutionEvent::Completed);
-            Ok("done".to_owned())
-        }
-
-        fn cancel(&self, _task_id: &str) {}
-
-        fn set_workspace(&self, workspace: &Path) {
-            if let Ok(mut current) = self.workspace.lock() {
-                *current = Some(workspace.to_path_buf());
-            }
-        }
-    }
-
-    #[test]
-    fn apply_workspace_reaches_the_underlying_process() {
-        let directory = tempfile::tempdir().expect("directory must create");
-        let old_workspace = directory.path().join("old");
-        let new_workspace = directory.path().join("new");
-        std::fs::create_dir_all(&old_workspace).expect("old workspace must create");
-        std::fs::create_dir_all(&new_workspace).expect("new workspace must create");
-        let recorded = Arc::new(Mutex::new(None));
-        let node = ProofNode::new(
-            PolicyEngine::new(Trusted, Vec::<Grant>::new()),
-            NodeStore::in_dir(directory.path()).expect("store must open"),
-            Executor::new(
-                RecordsWorkspace { workspace: Arc::clone(&recorded) },
-                crate::execution::Limits {
-                    workspace: old_workspace,
-                    max_context_tokens: 32,
-                    max_seconds: 1,
-                },
-            ),
-            QueueLimits { global: 1, per_peer: 1 },
-            Scope { id: ScopeId::new("direct"), kind: ScopeKind::Direct },
-        )
-        .expect("node must create");
-        // Only Executor::set_workspace ran so far, at construction: nothing
-        // has told the process about a workspace change yet.
-        assert_eq!(recorded.lock().expect("recorded value must read").as_deref(), None);
-        node.apply_workspace(&new_workspace).expect("workspace must apply");
-        assert_eq!(
-            recorded.lock().expect("recorded workspace must read").as_deref(),
-            Some(
-                new_workspace
-                    .canonicalize()
-                    .expect("new workspace must canonicalize")
-                    .as_path()
-            )
-        );
-        node.shutdown();
-    }
-
     #[test]
     fn startup_recovers_an_expired_running_lease() {
         let directory = tempfile::tempdir().expect("directory must create");

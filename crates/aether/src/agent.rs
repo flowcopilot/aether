@@ -11,8 +11,6 @@
 pub mod codex;
 pub mod connected;
 
-use std::path::Path;
-
 use crate::{
     execution::{Agent, ExecutionError, ExecutionEvent, TurnContext},
     policy::AgentAdapter,
@@ -51,20 +49,6 @@ impl Agent for NodeAgent {
         match self {
             Self::Codex(agent) => agent.cancel(task_id),
             Self::Connected(agent) => agent.cancel(task_id),
-        }
-    }
-
-    fn set_workspace(&self, workspace: &Path) {
-        match self {
-            Self::Codex(agent) => agent.set_workspace(workspace),
-            Self::Connected(agent) => agent.set_workspace(workspace),
-        }
-    }
-
-    fn supports_workspace_change(&self) -> bool {
-        match self {
-            Self::Codex(agent) => agent.supports_workspace_change(),
-            Self::Connected(agent) => agent.supports_workspace_change(),
         }
     }
 }
