@@ -14,7 +14,7 @@ use std::{path::PathBuf, process::Output};
 
 use cucumber::{then, when};
 
-use crate::common::{Scratch, ServerProcess, aether_command, run, utf8};
+use crate::common::{Control, Scratch, ServerProcess, aether_command, run};
 
 #[derive(Debug, Default)]
 pub struct State {
@@ -48,42 +48,6 @@ impl State {
 
     const fn control(&mut self) -> &mut Control {
         self.control.as_mut().expect("a control service must run")
-    }
-}
-
-/// A running control service and the address it reports.
-#[derive(Debug)]
-struct Control {
-    process: ServerProcess,
-    url: String,
-    config: PathBuf,
-    data: PathBuf,
-}
-
-impl Control {
-    /// Starts the control service of `config` on `port` and reads its URL.
-    async fn start(config: PathBuf, data: PathBuf, port: &str) -> Self {
-        let mut process = ServerProcess::spawn(aether_command().args([
-            "control",
-            "--config",
-            utf8(&config),
-            "--port",
-            port,
-        ]));
-        assert_eq!(process.event(None).await["event"], "process_ready");
-        let url = process.event(None).await["url"]
-            .as_str()
-            .expect("control URL must be reported")
-            .to_owned();
-        Self { process, url, config, data }
-    }
-
-    fn port(&self) -> &str {
-        self.url.rsplit(':').next().expect("control URL must include a port")
-    }
-
-    fn certificate(&self) -> PathBuf {
-        aether::data_dir::DataDir::new(&self.data).control_certificate()
     }
 }
 

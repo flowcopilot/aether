@@ -35,7 +35,7 @@ use cucumber::{given, then, when};
 use serde_json::{Value, json};
 
 use crate::common::{
-    FakeCodex, PolicyLimits, Scratch, ServerProcess, aether_command, blocking,
+    Control, FakeCodex, PolicyLimits, Scratch, ServerProcess, aether_command, blocking,
     host_signing_key, policy_for_grants, read_event, read_node_listening, review_claim,
     review_grant, run, utf8,
 };
@@ -1319,28 +1319,11 @@ async fn roster_revokes(world: &mut World) {
 #[given("a directory service is running")]
 async fn directory_running(world: &mut World) {
     let state = &mut world.tasks;
-    let root = state.root();
-    let control_data = root.join("control");
-    let config = root.join("control.toml");
-    fs::write(&config, format!("data_dir = \"{}\"\n", control_data.display()))
-        .expect("control configuration must write");
-    let mut process = ServerProcess::spawn(aether_command().args([
-        "control",
-        "--config",
-        utf8(&config),
-        "--port",
-        "0",
-    ]));
-    process.event(None).await;
-    let url = process.event(None).await["url"]
-        .as_str()
-        .expect("control URL must be reported")
-        .to_owned();
+    let control = Control::start_in(&state.root()).await;
     state.directory = Some(Directory {
-        process: Some(process),
-        url,
-        certificate: aether::data_dir::DataDir::new(&control_data)
-            .control_certificate(),
+        certificate: control.certificate(),
+        process: Some(control.process),
+        url: control.url,
     });
 }
 

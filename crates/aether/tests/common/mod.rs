@@ -144,6 +144,52 @@ impl ServerProcess {
     }
 }
 
+/// A running control service and the address it reports.
+#[derive(Debug)]
+pub struct Control {
+    pub process: ServerProcess,
+    pub url: String,
+    pub config: PathBuf,
+    pub data: PathBuf,
+}
+
+impl Control {
+    /// Writes a configuration that keeps the data of the service in `root`,
+    /// and starts the service on a free port.
+    pub async fn start_in(root: &Path) -> Self {
+        let data = root.join("control");
+        let config = root.join("control.toml");
+        std::fs::write(&config, format!("data_dir = \"{}\"\n", data.display()))
+            .expect("control configuration must write");
+        Self::start(config, data, "0").await
+    }
+
+    /// Starts the control service of `config` on `port` and reads its URL.
+    pub async fn start(config: PathBuf, data: PathBuf, port: &str) -> Self {
+        let mut process = ServerProcess::spawn(aether_command().args([
+            "control",
+            "--config",
+            utf8(&config),
+            "--port",
+            port,
+        ]));
+        assert_eq!(process.event(None).await["event"], "process_ready");
+        let url = process.event(None).await["url"]
+            .as_str()
+            .expect("control URL must be reported")
+            .to_owned();
+        Self { process, url, config, data }
+    }
+
+    pub fn port(&self) -> &str {
+        self.url.rsplit(':').next().expect("control URL must include a port")
+    }
+
+    pub fn certificate(&self) -> PathBuf {
+        aether::data_dir::DataDir::new(&self.data).control_certificate()
+    }
+}
+
 impl Drop for ServerProcess {
     fn drop(&mut self) {
         let _ = self.child.kill();

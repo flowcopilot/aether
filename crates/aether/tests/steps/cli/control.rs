@@ -7,9 +7,9 @@ use cucumber::{given, then, when};
 use ed25519_dalek::SigningKey;
 use serde_json::json;
 
-use super::{Control, assert_success};
+use super::assert_success;
 use crate::{
-    common::{aether_command, blocking, run, utf8},
+    common::{Control, aether_command, blocking, run, utf8},
     steps::World,
 };
 
@@ -67,11 +67,7 @@ async fn succeeds(command: Command) -> std::process::Output {
 #[given("a running control service")]
 async fn running_control(world: &mut World) {
     let root = world.cli.root();
-    let data = root.join("control");
-    let config = root.join("control.toml");
-    fs::write(&config, format!("data_dir = \"{}\"\n", data.display()))
-        .expect("configuration must write");
-    world.cli.control = Some(Control::start(config, data, "0").await);
+    world.cli.control = Some(Control::start_in(&root).await);
 }
 
 #[given("a signed test record and an agent key")]
