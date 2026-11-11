@@ -195,12 +195,6 @@ def close_all() -> None:
                 server.lock.release()
 
 
-def caller_command(aether_bin: str, data_dir: Path) -> list[str]:
-    """The command of the MCP server that lists and accepts only the caller
-    tools."""
-    return [aether_bin, "mcp", "serve", "--caller-only", "--data-dir", str(data_dir)]
-
-
 def _request(command: list[str], method: str, params: dict[str, Any], timeout: float) -> dict:
     deadline = time.monotonic() + timeout
     server = _server(command)

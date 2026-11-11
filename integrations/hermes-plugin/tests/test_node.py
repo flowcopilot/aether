@@ -328,7 +328,7 @@ class McpClientTest(unittest.TestCase):
         self.aether = directory / "aether"
         self.aether.write_text(f"#!/bin/sh\nexec {sys.executable} -I {script} \"$@\"\n")
         os.chmod(self.aether, 0o755)
-        self.command = mcp_client.caller_command(str(self.aether), Path("/data"))
+        self.command = tools.Settings(Path("/data"), str(self.aether)).command()
 
     def tearDown(self) -> None:
         mcp_client.close_all()
@@ -427,7 +427,7 @@ class ManifestTest(unittest.TestCase):
 
     def test_the_manifest_names_the_tools_that_the_caller_server_lists(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            listed = mcp_client.list_tools(mcp_client.caller_command(_aether_bin(), Path(directory)))
+            listed = mcp_client.list_tools(tools.Settings(Path(directory), _aether_bin()).command())
         manifest = (PLUGIN / "plugin.yaml").read_text().splitlines()
         start = manifest.index("provides_tools:") + 1
         provided = []
