@@ -271,8 +271,13 @@ struct UnverifiedIssuer {
 
 #[derive(Deserialize)]
 struct PaClaims {
+    /// `iss` and `aud` are typed as one string so that a list is refused:
+    /// `Validation` accepts a list that holds the expected value. It
+    /// checks the value itself.
+    #[expect(dead_code, reason = "deserialized only to refuse a list")]
     iss: String,
     sub: String,
+    #[expect(dead_code, reason = "deserialized only to refuse a list")]
     aud: String,
     iat: i64,
     exp: i64,
@@ -329,12 +334,11 @@ impl PaVerifier {
         validation.leeway = SKEW_SECONDS.unsigned_abs();
         let claims =
             jsonwebtoken::decode::<PaClaims>(token, &key, &validation).ok()?.claims;
+        // `validation` already required `iss` and `aud` and matched them.
         let lifetime = claims.exp.checked_sub(claims.iat)?;
         if claims.iat > now.saturating_add(SKEW_SECONDS)
             || !(0..=MAX_LIFETIME_SECONDS).contains(&lifetime)
             || claims.sub.is_empty()
-            || claims.aud != self.audience
-            || claims.iss != issuer
         {
             return None;
         }
@@ -585,6 +589,12 @@ pub mod tests {
                 Some(bearer(
                     &agent
                         .token(&claims(&|c| c["aud"] = serde_json::json!([AUDIENCE]))),
+                )),
+            ),
+            (
+                "issuer list",
+                Some(bearer(
+                    &agent.token(&claims(&|c| c["iss"] = serde_json::json!([ISSUER]))),
                 )),
             ),
             (
