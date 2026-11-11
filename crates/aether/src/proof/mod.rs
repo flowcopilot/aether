@@ -540,7 +540,10 @@ mod tests {
     };
 
     use super::*;
-    use crate::{execution::TurnContext, test_support::Trusted};
+    use crate::{
+        execution::{ExecutionEvent, TurnContext},
+        test_support::Trusted,
+    };
 
     #[derive(Clone)]
     struct Cancellable {
@@ -548,7 +551,12 @@ mod tests {
     }
 
     impl Agent for Cancellable {
-        fn start_turn(&mut self, _ctx: &TurnContext) -> Result<String, ExecutionError> {
+        fn start_turn_with_events(
+            &mut self,
+            _ctx: &TurnContext,
+            events: &mut dyn FnMut(ExecutionEvent),
+        ) -> Result<String, ExecutionError> {
+            events(ExecutionEvent::Completed);
             Ok("done".to_owned())
         }
 
@@ -565,7 +573,11 @@ mod tests {
     }
 
     impl Agent for Blocking {
-        fn start_turn(&mut self, ctx: &TurnContext) -> Result<String, ExecutionError> {
+        fn start_turn_with_events(
+            &mut self,
+            ctx: &TurnContext,
+            events: &mut dyn FnMut(ExecutionEvent),
+        ) -> Result<String, ExecutionError> {
             self.active.fetch_add(1, Ordering::AcqRel);
             if let Ok(mut order) = self.order.lock() {
                 order.push(ctx.task_id.clone());
@@ -574,6 +586,7 @@ mod tests {
                 thread::sleep(Duration::from_millis(5));
             }
             self.active.fetch_sub(1, Ordering::AcqRel);
+            events(ExecutionEvent::Completed);
             Ok(format!("done:{}", ctx.task_id))
         }
 
@@ -808,7 +821,11 @@ mod tests {
     }
 
     impl Agent for BlockingCancellable {
-        fn start_turn(&mut self, _ctx: &TurnContext) -> Result<String, ExecutionError> {
+        fn start_turn_with_events(
+            &mut self,
+            _ctx: &TurnContext,
+            events: &mut dyn FnMut(ExecutionEvent),
+        ) -> Result<String, ExecutionError> {
             self.active.fetch_add(1, Ordering::AcqRel);
             while !self.gate.load(Ordering::Acquire) {
                 if self.cancelled.load(Ordering::Acquire) {
@@ -818,6 +835,7 @@ mod tests {
                 thread::sleep(Duration::from_millis(5));
             }
             self.active.fetch_sub(1, Ordering::AcqRel);
+            events(ExecutionEvent::Completed);
             Ok("done".to_owned())
         }
 
@@ -936,7 +954,12 @@ mod tests {
     }
 
     impl Agent for RecordsWorkspace {
-        fn start_turn(&mut self, _ctx: &TurnContext) -> Result<String, ExecutionError> {
+        fn start_turn_with_events(
+            &mut self,
+            _ctx: &TurnContext,
+            events: &mut dyn FnMut(ExecutionEvent),
+        ) -> Result<String, ExecutionError> {
+            events(ExecutionEvent::Completed);
             Ok("done".to_owned())
         }
 
@@ -1459,7 +1482,11 @@ mod tests {
     struct FailsAfterStart;
 
     impl Agent for FailsAfterStart {
-        fn start_turn(&mut self, _ctx: &TurnContext) -> Result<String, ExecutionError> {
+        fn start_turn_with_events(
+            &mut self,
+            _ctx: &TurnContext,
+            _events: &mut dyn FnMut(ExecutionEvent),
+        ) -> Result<String, ExecutionError> {
             Err(ExecutionError::Protocol)
         }
 

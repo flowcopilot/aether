@@ -36,13 +36,6 @@ impl NodeAgent {
 }
 
 impl Agent for NodeAgent {
-    fn start_turn(&mut self, ctx: &TurnContext) -> Result<String, ExecutionError> {
-        match self {
-            Self::Codex(agent) => agent.start_turn(ctx),
-            Self::Connected(agent) => agent.start_turn(ctx),
-        }
-    }
-
     fn start_turn_with_events(
         &mut self,
         ctx: &TurnContext,

@@ -238,10 +238,6 @@ fn write_line(
 }
 
 impl Agent for ConnectedAgent {
-    fn start_turn(&mut self, ctx: &TurnContext) -> Result<String, ExecutionError> {
-        self.start_turn_with_events(ctx, &mut |_| {})
-    }
-
     fn start_turn_with_events(
         &mut self,
         ctx: &TurnContext,

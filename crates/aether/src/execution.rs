@@ -108,15 +108,16 @@ pub fn agent_instructions(skill: &str) -> String {
 /// caller except the final text: events become task states, and errors
 /// carry no detail.
 pub trait Agent {
-    fn start_turn(&mut self, ctx: &TurnContext) -> Result<String, ExecutionError>;
+    /// Runs one turn and reports its events; a successful turn ends with
+    /// `ExecutionEvent::Completed`.
     fn start_turn_with_events(
         &mut self,
         ctx: &TurnContext,
         events: &mut dyn FnMut(ExecutionEvent),
-    ) -> Result<String, ExecutionError> {
-        let result = self.start_turn(ctx)?;
-        events(ExecutionEvent::Completed);
-        Ok(result)
+    ) -> Result<String, ExecutionError>;
+    /// Runs one turn and drops its events.
+    fn start_turn(&mut self, ctx: &TurnContext) -> Result<String, ExecutionError> {
+        self.start_turn_with_events(ctx, &mut |_| {})
     }
     fn cancel(&self, task_id: &str);
     fn set_workspace(&self, _workspace: &Path) {}
@@ -244,7 +245,12 @@ mod tests {
         cancelled: Arc<AtomicBool>,
     }
     impl Agent for Fake {
-        fn start_turn(&mut self, ctx: &TurnContext) -> Result<String, ExecutionError> {
+        fn start_turn_with_events(
+            &mut self,
+            ctx: &TurnContext,
+            events: &mut dyn FnMut(ExecutionEvent),
+        ) -> Result<String, ExecutionError> {
+            events(ExecutionEvent::Completed);
             Ok(format!("{}:{}", ctx.skill, ctx.text))
         }
         fn cancel(&self, _id: &str) {
@@ -255,7 +261,12 @@ mod tests {
     struct OversizedOutput;
 
     impl Agent for OversizedOutput {
-        fn start_turn(&mut self, _ctx: &TurnContext) -> Result<String, ExecutionError> {
+        fn start_turn_with_events(
+            &mut self,
+            _ctx: &TurnContext,
+            events: &mut dyn FnMut(ExecutionEvent),
+        ) -> Result<String, ExecutionError> {
+            events(ExecutionEvent::Completed);
             Ok("x".repeat(31))
         }
 
