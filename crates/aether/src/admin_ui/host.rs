@@ -1047,7 +1047,7 @@ pub(super) async fn publish_listing(
     cx: &Cx,
     Form(form): Form<ListingForm>,
 ) -> TopcoatResult<impl View> {
-    ensure_admin_session(cx).await?;
+    require_admin_session(cx).await?;
     let Page(Some(page)) = app_context::<Page>(cx) else {
         return Err(bad_request("this node has no listing").into());
     };

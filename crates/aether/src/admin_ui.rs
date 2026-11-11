@@ -3326,6 +3326,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_post_without_any_session_cannot_change_the_listing() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let (admin_ui, _) = host_ui(directory.path());
+        let application = app(admin_ui);
+        for action in ["action=list", "action=stop"] {
+            let response =
+                post(application.clone(), "/listing/publish", None, action).await;
+            assert_eq!(response.status, StatusCode::FORBIDDEN);
+            assert!(response.set_cookie.is_none(), "a refused POST starts no session");
+        }
+    }
+
+    #[tokio::test]
     async fn expired_session_cannot_confirm_a_change() {
         let (_directory, admin_ui, _administration) = admin_ui_with_directory_applier();
         let sessions = Arc::clone(&admin_ui.sessions);
