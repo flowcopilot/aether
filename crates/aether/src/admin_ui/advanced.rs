@@ -311,14 +311,14 @@ pub(super) async fn confirm(
     Form(form): Form<ConfirmForm>,
 ) -> TopcoatResult<impl View> {
     super::require_admin_session(cx).await?;
-    let Some(id) = app_context::<Arc<AdminConfirmations>>(cx).resolve(&form.id) else {
-        return Err(bad_request("this change is no longer available").into());
-    };
-    let result = app_context::<SharedAdministration>(cx)
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .confirm_ui(&id);
-    if result.is_err() {
+    let confirmed =
+        app_context::<Arc<AdminConfirmations>>(cx).confirm(&form.id, |id| {
+            app_context::<SharedAdministration>(cx)
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .confirm_ui(id)
+        });
+    if !matches!(confirmed, Some(Ok(()))) {
         return Err(bad_request("this change is no longer available").into());
     }
     Ok(view! { dashboard() })
@@ -380,4 +380,30 @@ pub(super) async fn save_policy(
             bad_request("use an existing absolute folder and limits above zero")
         })?;
     Ok(view! { dashboard(policy_saved: true) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AdminConfirmations;
+
+    #[test]
+    fn a_failed_confirm_keeps_its_token_and_a_confirmed_one_uses_it_up() {
+        let confirmations = AdminConfirmations::new();
+        let tokens = confirmations
+            .reset(vec![crate::admin::PendingChange {
+                id: "workspace".to_owned(),
+                kind: "workspace".to_owned(),
+            }])
+            .expect("tokens must issue");
+        let [token] = tokens.as_slice() else { panic!("one token must issue") };
+        assert_eq!(confirmations.confirm(token, |_| Err("store")), Some(Err("store")));
+        let mut confirmed = Vec::new();
+        let result = confirmations.confirm(token, |id| {
+            confirmed.push(id.to_owned());
+            Ok::<(), &str>(())
+        });
+        assert_eq!(result, Some(Ok(())));
+        assert_eq!(confirmed, ["workspace"]);
+        assert_eq!(confirmations.confirm(token, |_| Ok::<(), &str>(())), None);
+    }
 }

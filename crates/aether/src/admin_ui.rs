@@ -181,8 +181,26 @@ impl AdminConfirmations {
         Ok(tokens)
     }
 
-    fn resolve(&self, token: &str) -> Option<String> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner).remove(token)
+    /// Runs `confirm` on the change behind `token`, and uses the token up
+    /// only when it succeeds: a confirm that fails leaves the change pending,
+    /// so the same button can try again. `None` when the token is unknown.
+    /// The map stays locked meanwhile, so two posts of one token cannot both
+    /// confirm.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "the lock spans the confirm on purpose"
+    )]
+    fn confirm<E>(
+        &self,
+        token: &str,
+        confirm: impl FnOnce(&str) -> Result<(), E>,
+    ) -> Option<Result<(), E>> {
+        let mut confirmations = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let result = confirm(confirmations.get(token)?);
+        if result.is_ok() {
+            confirmations.remove(token);
+        }
+        Some(result)
     }
 }
 
