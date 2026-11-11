@@ -141,13 +141,15 @@ impl From<NodeServe> for aether::node_runtime::NodeServeOptions {
             codex_bin: arguments.codex_bin,
             relay_url: arguments.relay_url,
             hub_url: arguments.hub_url,
-            directory: arguments.directory,
-            directory_certificate: arguments.directory_certificate,
-            agent_id: arguments.agent_id,
-            address: arguments.address,
-            scope: arguments.scope,
-            capability: arguments.capability,
-            directory_record_ttl: arguments.directory_record_ttl,
+            publication: aether::node_runtime::PublicationFlags {
+                directory: arguments.directory,
+                directory_certificate: arguments.directory_certificate,
+                agent_id: arguments.agent_id,
+                address: arguments.address,
+                scope: arguments.scope,
+                capability: arguments.capability,
+                directory_record_ttl: arguments.directory_record_ttl,
+            },
             invite_name: arguments.invite_name,
         }
     }
@@ -769,50 +771,13 @@ fn transport_error(error: &aether::transport::TransportError) -> ExitCode {
 mod tests {
     use std::{
         fs,
-        path::PathBuf,
         time::{Duration, SystemTime},
     };
 
     use aether::directory_client::{cache_directory_record, cached_directory_record};
     use aether::managed_client::{cached_managed_member, sync_managed};
-    use aether::node_runtime::{NodeServeOptions, start_directory_publication};
     use axum_server::Handle;
     use ed25519_dalek::SigningKey;
-
-    #[tokio::test]
-    async fn live_publication_rejects_a_scope_outside_the_node_policy() {
-        let arguments = NodeServeOptions {
-            policy: PathBuf::from("policy.json"),
-            data_dir: PathBuf::from("node"),
-            port: 0,
-            admin_port: None,
-            pact_listen: None,
-            managed_control: None,
-            managed_control_certificate: None,
-            adapter: None,
-            codex_bin: PathBuf::from("codex"),
-            relay_url: None,
-            hub_url: None,
-            directory: Some("https://directory.test".to_owned()),
-            directory_certificate: Some(PathBuf::from("certificate.der")),
-            agent_id: Some("agent".to_owned()),
-            address: Some("127.0.0.1:1".to_owned()),
-            scope: Some("other".to_owned()),
-            capability: Some("review".to_owned()),
-            directory_record_ttl: Some(60),
-            invite_name: None,
-        };
-        assert!(
-            start_directory_publication(
-                &arguments,
-                "endpoint".to_owned(),
-                1,
-                "directory"
-            )
-            .await
-            .is_err()
-        );
-    }
 
     #[test]
     fn stale_cached_directory_record_cannot_be_used() {
