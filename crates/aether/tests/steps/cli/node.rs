@@ -14,8 +14,10 @@ use aether::admin_socket::{
 use cucumber::{given, then, when};
 use serde_json::json;
 
-use super::{Process, blocking, run};
-use crate::{common::aether_command, steps::World};
+use crate::{
+    common::{ServerProcess, aether_command, blocking, read_node_listening, run},
+    steps::World,
+};
 
 const EXPIRED_TASK_ID: &str = "00000000-0000-4000-8000-000000000042";
 
@@ -47,18 +49,8 @@ fn node_serve(world: &World) -> Command {
 
 /// Starts `command` and reads the event that says the node listens for peers.
 async fn start(world: &mut World, mut command: Command) {
-    let mut process = Process::spawn(&mut command);
-    let startup = process.event(None).await;
-    assert_eq!(startup["event"], "node_listening");
-    assert!(
-        startup["endpoint_id"].as_str().is_some(),
-        "server endpoint must be logged"
-    );
-    let port = startup["port"]
-        .as_u64()
-        .and_then(|port| u16::try_from(port).ok())
-        .filter(|port| *port != 0)
-        .expect("server must report its bound port");
+    let mut process = ServerProcess::spawn(&mut command);
+    let (_, port) = process.read(read_node_listening).await;
     world.cli.node_files.port = Some(port);
     world.cli.node = Some(process);
 }
@@ -102,7 +94,6 @@ async fn expired_outbox_task(world: &mut World) {
     .await;
 }
 
-#[when("the node starts")]
 async fn node_starts(world: &mut World) {
     let command = node_serve(world);
     start(world, command).await;
@@ -141,7 +132,7 @@ async fn start_with_invite_name(world: &mut World, name: String) {
 
 #[when("the node stops")]
 async fn node_stops(world: &mut World) {
-    world.cli.node.take().expect("a node must run").interrupt().await;
+    world.cli.node.take().expect("a node must run").stop().await;
 }
 
 #[when("the node is woken to send its outbox")]

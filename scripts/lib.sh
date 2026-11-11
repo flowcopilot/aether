@@ -49,6 +49,31 @@ retry() {
   done
 }
 
+# fail <message>: prints the message and the script's own `logs`, and exits.
+fail() {
+  printf 'FAIL: %s\n' "$1" >&2
+  logs >&2
+  exit 1
+}
+
+# live_model <model>: prints 1 when OPENROUTER_API_KEY and the model are both
+# set, so a real model answers instead of a mock.
+live_model() {
+  if [ -n "${OPENROUTER_API_KEY:-}" ] && [ -n "$1" ]; then
+    echo 1
+  fi
+}
+
+# retry_model <mock tries> <command> [<argument>...]: retry, tuned to the
+# model. A mock gets <mock tries> tries, 3 s apart. A real model has a rate
+# limit (free OpenRouter models allow a few requests a minute), so with
+# $live set the tries are fewer and further apart.
+retry_model() {
+  mock_tries="$1"
+  shift
+  retry "${live:+6}${live:-$mock_tries}" "${live:+20}${live:-3}" "$@"
+}
+
 logs_contain() {
   docker logs "$1" 2>&1 | grep -qF "$2"
 }
@@ -60,6 +85,16 @@ wait_for_log() {
     docker logs "$1" 2>&1
     return 1
   }
+}
+
+# start_relay <container> <image> <server network> <client network>: creates
+# both networks and starts a dev relay on them as the host `relay`.
+start_relay() {
+  new_network "$3"
+  new_network "$4"
+  run_detached "$1" --network "$3" --network-alias relay -e RUST_LOG=info "$2" --dev
+  docker network connect --alias relay "$4" "$1"
+  wait_for_log "$1" 'relay: serving on'
 }
 
 # The endpoint ID in the node log lines on stdin: the last one.

@@ -12,14 +12,14 @@ use cucumber::{given, then, when};
 use tempfile::TempDir;
 
 use super::fixtures::{
-    CALLER, CALLER_ENDPOINT, blocking, claim, grant, invitation, managed_member,
-    record, request, scope, trust_provider,
+    CALLER, CALLER_ENDPOINT, claim, grant, invitation, managed_member, record, request,
+    scope, trust_provider,
 };
 use crate::common::{
     discovery_signing_key, load_contact, load_directory_record,
     store_contact_invitation, store_directory_record,
 };
-use crate::steps::World;
+use crate::{common::blocking, steps::World};
 
 type Store = Arc<Mutex<NodeStore>>;
 

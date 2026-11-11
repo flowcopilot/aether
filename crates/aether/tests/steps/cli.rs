@@ -10,25 +10,18 @@ mod help;
 mod mcp;
 mod node;
 
-use std::{
-    fmt,
-    io::BufReader,
-    path::{Path, PathBuf},
-    process::{ChildStdout, Command, ExitStatus, Output, Stdio},
-};
+use std::{path::PathBuf, process::Output};
 
 use cucumber::{then, when};
-use serde_json::Value;
-use tempfile::TempDir;
 
-use crate::common::{ServerProcess, aether_command, read_event};
+use crate::common::{Control, Scratch, ServerProcess, aether_command, run};
 
 #[derive(Debug, Default)]
 pub struct State {
-    root: Option<TempDir>,
+    root: Scratch,
     output: Option<Output>,
     /// A running `node serve` or `node admin`.
-    node: Option<Process>,
+    node: Option<ServerProcess>,
     /// A running control service.
     control: Option<Control>,
     node_files: node::State,
@@ -38,10 +31,7 @@ pub struct State {
 
 impl State {
     fn root(&mut self) -> PathBuf {
-        self.root
-            .get_or_insert_with(|| tempfile::tempdir().expect("directory must create"))
-            .path()
-            .to_path_buf()
+        self.root.path()
     }
 
     const fn output(&self) -> &Output {
@@ -52,113 +42,13 @@ impl State {
         String::from_utf8(self.output().stdout.clone()).expect("output must be UTF-8")
     }
 
-    const fn node(&mut self) -> &mut Process {
+    const fn node(&mut self) -> &mut ServerProcess {
         self.node.as_mut().expect("a node must run")
     }
 
     const fn control(&mut self) -> &mut Control {
         self.control.as_mut().expect("a control service must run")
     }
-}
-
-/// A long-running `aether` process with its standard output.
-pub struct Process {
-    server: ServerProcess,
-    stdout: Option<BufReader<ChildStdout>>,
-}
-
-impl fmt::Debug for Process {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("Process").finish_non_exhaustive()
-    }
-}
-
-impl Process {
-    /// Starts `command` with its standard output piped.
-    fn spawn(command: &mut Command) -> Self {
-        let mut server = ServerProcess::spawn(command.stdout(Stdio::piped()));
-        let stdout = Some(server.stdout());
-        Self { server, stdout }
-    }
-
-    /// Reads the next event the process prints, or with a `name`, the next
-    /// event with that name.
-    async fn event(&mut self, name: Option<&'static str>) -> Value {
-        let mut stdout = self.stdout.take().expect("output must be readable");
-        let (stdout, event) = tokio::task::spawn_blocking(move || {
-            let event = read_event(&mut stdout, name);
-            (stdout, event)
-        })
-        .await
-        .expect("read task must finish");
-        self.stdout = Some(stdout);
-        event
-    }
-
-    /// Stops the process with SIGINT and returns its exit status. The output
-    /// stays open until the process exits: a closed pipe would make it panic.
-    async fn interrupt(self) -> ExitStatus {
-        let Self { server, stdout } = self;
-        tokio::task::spawn_blocking(move || {
-            let status = server.interrupt();
-            drop(stdout);
-            status
-        })
-        .await
-        .expect("stop task must finish")
-    }
-}
-
-/// A running control service and the address it reports.
-#[derive(Debug)]
-struct Control {
-    process: Process,
-    url: String,
-    config: PathBuf,
-    data: PathBuf,
-}
-
-impl Control {
-    /// Starts the control service of `config` on `port` and reads its URL.
-    async fn start(config: PathBuf, data: PathBuf, port: &str) -> Self {
-        let mut process = Process::spawn(aether_command().args([
-            "control",
-            "--config",
-            utf8(&config),
-            "--port",
-            port,
-        ]));
-        assert_eq!(process.event(None).await["event"], "process_ready");
-        let url = process.event(None).await["url"]
-            .as_str()
-            .expect("control URL must be reported")
-            .to_owned();
-        Self { process, url, config, data }
-    }
-
-    fn port(&self) -> &str {
-        self.url.rsplit(':').next().expect("control URL must include a port")
-    }
-
-    fn certificate(&self) -> PathBuf {
-        aether::data_dir::DataDir::new(&self.data).control_certificate()
-    }
-}
-
-async fn run(mut command: Command) -> Output {
-    tokio::task::spawn_blocking(move || command.output().expect("aether must start"))
-        .await
-        .expect("command task must finish")
-}
-
-async fn blocking<T: Send + 'static>(
-    blocking: impl FnOnce() -> T + Send + 'static,
-) -> T {
-    tokio::task::spawn_blocking(blocking).await.expect("blocking task must finish")
-}
-
-fn utf8(path: &Path) -> &str {
-    path.to_str().expect("path must be UTF-8")
 }
 
 fn assert_success(output: &Output) {

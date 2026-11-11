@@ -6,8 +6,11 @@ use std::{fs, path::PathBuf};
 use aether::discovery::wire::{WireInvitation, WireRecord};
 use cucumber::{given, then, when};
 
-use super::{assert_success, run, utf8};
-use crate::{common::aether_command, steps::World};
+use super::assert_success;
+use crate::{
+    common::{aether_command, run, utf8},
+    steps::World,
+};
 
 #[derive(Debug, Default)]
 pub struct State {

@@ -11,7 +11,7 @@ use std::{
     io::{BufRead, BufReader, Write},
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
-    process::{Child, ChildStdout, Command, Output, Stdio},
+    process::{Child, Command, Output, Stdio},
     sync::Arc,
     thread::JoinHandle,
     time::{Duration, Instant, SystemTime},
@@ -33,11 +33,11 @@ use aether_core::{Claim, EndpointId};
 use aether_store::{NodeStore, SentState, SentTask, TaskState};
 use cucumber::{given, then, when};
 use serde_json::{Value, json};
-use tempfile::TempDir;
 
 use crate::common::{
-    FakeCodex, PolicyLimits, ServerProcess, aether_command, host_signing_key,
-    policy_for_grants, read_event, read_node_listening, review_claim, review_grant,
+    Control, FakeCodex, PolicyLimits, Scratch, ServerProcess, aether_command, blocking,
+    host_signing_key, policy_for_grants, read_event, read_node_listening, review_claim,
+    review_grant, run, utf8,
 };
 
 type World = super::World;
@@ -107,8 +107,6 @@ impl Caller {
 /// The `node serve` process of the host.
 struct Host {
     process: ServerProcess,
-    /// Kept open so the node can keep writing its events.
-    _stdout: BufReader<ChildStdout>,
     id: String,
     port: u16,
 }
@@ -128,7 +126,7 @@ struct Listing {
 
 /// A directory (control) service. The process is gone once it stopped.
 struct Directory {
-    process: Option<(ServerProcess, BufReader<ChildStdout>)>,
+    process: Option<ServerProcess>,
     url: String,
     certificate: PathBuf,
 }
@@ -166,7 +164,7 @@ struct Outbox {
 
 #[derive(Default)]
 pub struct State {
-    root: Option<TempDir>,
+    root: Scratch,
     agent: Agent,
     max_context_tokens: Option<u64>,
     owner_codex_home: Option<PathBuf>,
@@ -203,21 +201,6 @@ impl fmt::Debug for State {
             .field("output", &self.output)
             .finish_non_exhaustive()
     }
-}
-
-async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
-    match tokio::task::spawn_blocking(work).await {
-        Ok(value) => value,
-        Err(error) => std::panic::resume_unwind(error.into_panic()),
-    }
-}
-
-async fn run(mut command: Command) -> Output {
-    blocking(move || command.output().expect("aether must start")).await
-}
-
-fn utf8(path: &Path) -> &str {
-    path.to_str().expect("path must be UTF-8")
 }
 
 fn stdout(output: &Output) -> String {
@@ -320,10 +303,7 @@ fn far_future() -> i64 {
 
 impl State {
     fn root(&mut self) -> PathBuf {
-        self.root
-            .get_or_insert_with(|| tempfile::tempdir().expect("directory must create"))
-            .path()
-            .to_path_buf()
+        self.root.path()
     }
 
     fn server_data(&mut self) -> PathBuf {
@@ -455,17 +435,12 @@ impl State {
         let root = self.root();
         let server_data = self.server_data();
         let policy = self.write_policy();
-        let codex_kind = match self.agent {
-            Agent::Codex => Some(FakeCodex::Standard),
-            Agent::SlowCodex => Some(FakeCodex::Slow),
-            Agent::McpProbe => Some(FakeCodex::McpProbe),
-            Agent::Connected => None,
+        let codex_bin = match self.agent {
+            Agent::Codex => FakeCodex::Standard.write_in(&root),
+            Agent::SlowCodex => FakeCodex::Slow.write_in(&root),
+            Agent::McpProbe => FakeCodex::McpProbe.write_in(&root),
+            Agent::Connected => root.join("no-codex-here"),
         };
-        let codex_bin = root.join("fake-codex");
-        if let Some(kind) = codex_kind {
-            aether::fixture::write_executable(&codex_bin, kind.script())
-                .expect("fake Codex must write");
-        }
         let mut command = aether_command();
         command
             .args([
@@ -477,15 +452,7 @@ impl State {
                 utf8(&server_data),
             ])
             .args(["--port", "0", "--admin-port", "0"])
-            .env(
-                "AETHER_CODEX_BIN",
-                if codex_kind.is_some() {
-                    codex_bin
-                } else {
-                    root.join("no-codex-here")
-                },
-            )
-            .stdout(Stdio::piped());
+            .env("AETHER_CODEX_BIN", codex_bin);
         if let Some(home) = &self.owner_codex_home {
             command.env("CODEX_HOME", home);
         }
@@ -510,18 +477,18 @@ impl State {
         }
         let listed = self.listing.is_some();
         let mut process = ServerProcess::spawn(&mut command);
-        let mut output = process.stdout();
-        let (output, id, port, published) = blocking(move || {
-            let (id, port) = read_node_listening(&mut output);
-            let published = listed.then(|| {
-                let published = read_event(&mut output, None);
-                assert_eq!(published["event"], "directory_record_published");
-                published
-            });
-            assert_eq!(read_event(&mut output, None)["event"], "admin_listening");
-            (output, id, port, published)
-        })
-        .await;
+        let (id, port, published) = process
+            .read(move |output| {
+                let (id, port) = read_node_listening(output);
+                let published = listed.then(|| {
+                    let published = read_event(output, None);
+                    assert_eq!(published["event"], "directory_record_published");
+                    published
+                });
+                assert_eq!(read_event(output, None)["event"], "admin_listening");
+                (id, port, published)
+            })
+            .await;
         if let Some(published) = &published {
             let signing_key = published["signing_key"]
                 .as_str()
@@ -531,7 +498,7 @@ impl State {
             self.record_key = Some(record_key);
         }
         self.published = published;
-        self.host = Some(Host { process, _stdout: output, id, port });
+        self.host = Some(Host { process, id, port });
     }
 
     /// `node invite` on the host: the invitation JSON.
@@ -776,11 +743,7 @@ async fn host_stops(world: &mut World) {
     {
         endpoint.close().await;
     }
-    let host = state.host.take().expect("the host node must run");
-    let Host { process, _stdout: output, .. } = host;
-    let status = blocking(move || process.interrupt()).await;
-    drop(output);
-    assert!(status.success(), "the host node exited with {status}");
+    state.host.take().expect("the host node must run").process.stop_cleanly().await;
 }
 
 // Callers.
@@ -1344,31 +1307,11 @@ async fn roster_revokes(world: &mut World) {
 #[given("a directory service is running")]
 async fn directory_running(world: &mut World) {
     let state = &mut world.tasks;
-    let root = state.root();
-    let control_data = root.join("control");
-    let config = root.join("control.toml");
-    fs::write(&config, format!("data_dir = \"{}\"\n", control_data.display()))
-        .expect("control configuration must write");
-    let mut process = ServerProcess::spawn(
-        aether_command()
-            .args(["control", "--config", utf8(&config), "--port", "0"])
-            .stdout(Stdio::piped()),
-    );
-    let mut output = process.stdout();
-    let (output, url) = blocking(move || {
-        read_event(&mut output, None);
-        let url = read_event(&mut output, None)["url"]
-            .as_str()
-            .expect("control URL must be reported")
-            .to_owned();
-        (output, url)
-    })
-    .await;
+    let control = Control::start_in(&state.root()).await;
     state.directory = Some(Directory {
-        process: Some((process, output)),
-        url,
-        certificate: aether::data_dir::DataDir::new(&control_data)
-            .control_certificate(),
+        certificate: control.certificate(),
+        process: Some(control.process),
+        url: control.url,
     });
 }
 
@@ -1413,15 +1356,14 @@ async fn record_renewed(world: &mut World) {
 async fn directory_stops(world: &mut World) {
     // The URL and the certificate stay: the caller still names the host by
     // the record it keeps.
-    let (process, output) = world
+    world
         .tasks
         .directory
         .as_mut()
         .and_then(|directory| directory.process.take())
-        .expect("a directory service must run");
-    let status = blocking(move || process.interrupt()).await;
-    drop(output);
-    assert!(status.success(), "the directory service exited with {status}");
+        .expect("a directory service must run")
+        .stop_cleanly()
+        .await;
 }
 
 #[given(expr = "a reader gets {int} record(s) from the directory")]

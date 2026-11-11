@@ -28,10 +28,10 @@ use tempfile::TempDir;
 use tokio::{sync::broadcast, task::JoinHandle};
 
 use super::fixtures::{
-    CALLER_ENDPOINT, blocking, claim, expired_claim, grant, names, request, scope,
-    task, task_input,
+    CALLER_ENDPOINT, claim, expired_claim, grant, names, request, scope, task,
+    task_input,
 };
-use crate::steps::World;
+use crate::{common::blocking, steps::World};
 
 type Node = ProofNode<SignedClaims, TestAgent>;
 type Outcome = Result<(TaskState, Option<String>), ProofError>;

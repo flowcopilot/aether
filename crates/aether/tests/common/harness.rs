@@ -18,12 +18,19 @@ pub enum FakeCodex {
 }
 
 impl FakeCodex {
-    pub const fn script(self) -> &'static str {
+    const fn script(self) -> &'static str {
         match self {
             Self::Standard => fixture::fake_codex_script(false, false),
             Self::Slow => fixture::fake_codex_script(true, false),
             Self::McpProbe => fixture::fake_codex_script(false, true),
         }
+    }
+
+    /// Writes the fake Codex as the executable `fake-codex` in `dir`.
+    pub fn write_in(self, dir: &Path) -> PathBuf {
+        let path = dir.join("fake-codex");
+        write_executable(&path, self.script()).expect("fake Codex must write");
+        path
     }
 }
 
@@ -48,12 +55,6 @@ impl TestNodeDir {
         let path = self.root.join("policy.json");
         fs::write(&path, serde_json::to_vec(policy).expect("policy must encode"))
             .expect("policy must write");
-        path
-    }
-
-    pub fn write_fake_codex(&self, kind: FakeCodex) -> PathBuf {
-        let path = self.root.join("fake-codex");
-        write_executable(&path, kind.script()).expect("fake Codex must write");
         path
     }
 }
