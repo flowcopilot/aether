@@ -8,10 +8,10 @@ use aether_store::pact::{PactStore, PendingDevice};
 
 use super::{
     config::{Brand, PactConfig},
-    grant::{GrantSignError, pact_grant_record, sign_aether_grant},
+    grant::{pact_grant_record, sign_aether_grant},
     jwks::PaIdentity,
 };
-use crate::admin::{GrantApplicator, GrantApplyError};
+use crate::admin::GrantApplicator;
 
 pub type SharedPactStore = Arc<Mutex<PactStore>>;
 
@@ -33,14 +33,8 @@ impl ConsentLink {
 pub enum ConsentError {
     #[error("the request expired or was already decided")]
     NotPending,
-    #[error("the grant cannot be signed")]
-    Sign,
-    #[error("the node refused the grant")]
-    Refused,
-    #[error("the decision cannot be stored")]
-    Store,
-    #[error("the grant was applied but could not be rolled back")]
-    RollbackFailed,
+    #[error("the decision cannot be made")]
+    Failed,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -98,11 +92,11 @@ impl PactConsent {
         let device = self
             .store()
             .pending_device(&user_code, aether_core::time::now())
-            .map_err(|_| ConsentError::Store)?;
+            .map_err(|_| ConsentError::Failed)?;
         let Some(device) = device else {
             return Ok(None);
         };
-        let brand = self.config.brand(&device.brand_id).ok_or(ConsentError::Store)?;
+        let brand = self.config.brand(&device.brand_id).ok_or(ConsentError::Failed)?;
         Ok(Some((device, brand)))
     }
 
@@ -131,16 +125,10 @@ impl PactConsent {
             issuer: device.pa_issuer.clone(),
             subject: device.pa_subject.clone(),
         };
-        let grant =
-            sign_aether_grant(&self.data_dir, brand, &caller, at).map_err(|error| {
-                match error {
-                    GrantSignError::Sign => ConsentError::Sign,
-                }
-            })?;
+        let grant = sign_aether_grant(&self.data_dir, brand, &caller, at)
+            .ok_or(ConsentError::Failed)?;
         let grant_id = grant.id.as_str().to_owned();
-        grants.apply_signed_grant(grant).map_err(|error| match error {
-            GrantApplyError::Refused => ConsentError::Refused,
-        })?;
+        grants.apply_signed_grant(grant).map_err(|_| ConsentError::Failed)?;
         let record = pact_grant_record(
             &grant_id,
             &brand.id,
@@ -150,8 +138,13 @@ impl PactConsent {
             at,
         );
         if self.store().approve_device(&device.user_code, &record, at).is_err() {
-            if grants.revoke_signed_grant(&grant_id).is_err() {
-                return Err(ConsentError::RollbackFailed);
+            if let Err(error) = grants.revoke_signed_grant(&grant_id) {
+                tracing::error!(
+                    ?error,
+                    grant_id,
+                    "pact grant applied but not stored, and could not be revoked"
+                );
+                return Err(ConsentError::Failed);
             }
             return Err(ConsentError::NotPending);
         }
@@ -163,7 +156,7 @@ impl PactConsent {
             .deny_device(&normalize_user_code(user_code), aether_core::time::now())
             .map_err(|error| match error {
                 aether_store::StoreError::NotFound => ConsentError::NotPending,
-                _ => ConsentError::Store,
+                _ => ConsentError::Failed,
             })
     }
 }
