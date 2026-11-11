@@ -11,7 +11,6 @@ use crate::{
         validate_record,
         wire::{self, WireManagedEvent, WireManagedRedeem, WireRecord},
     },
-    pinned_https::PinnedError,
     pinned_json::{self, HttpError, PinnedJsonClient},
     transport::{self, Frame, TransportError},
 };
@@ -28,16 +27,6 @@ pub enum ManagedClientError {
     Status,
     #[error("control returned an invalid managed record")]
     InvalidRecord,
-}
-
-impl From<PinnedError> for ManagedClientError {
-    fn from(error: PinnedError) -> Self {
-        match error {
-            PinnedError::Origin => Self::InvalidControl,
-            PinnedError::Certificate => Self::InvalidCertificate,
-            PinnedError::Client => Self::Request,
-        }
-    }
 }
 
 impl From<HttpError> for ManagedClientError {

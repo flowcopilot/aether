@@ -29,7 +29,7 @@ pub struct PinnedJsonClient {
 }
 
 impl PinnedJsonClient {
-    pub fn open(origin: &str, certificate_der: &[u8]) -> Result<Self, PinnedError> {
+    pub fn open(origin: &str, certificate_der: &[u8]) -> Result<Self, HttpError> {
         Ok(Self { pinned: PinnedOrigin::open(origin, certificate_der)? })
     }
 

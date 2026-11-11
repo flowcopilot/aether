@@ -12,7 +12,6 @@ use crate::{
         validate_record,
         wire::{self, WireDirectoryEvent, WireRecord},
     },
-    pinned_https::PinnedError,
     pinned_json::{self, HttpError, PinnedJsonClient},
     transport::{self, Frame, TransportError},
 };
@@ -31,16 +30,6 @@ pub enum DirectoryClientError {
     InvalidRecord,
     #[error("directory record signer is not trusted")]
     UntrustedRecord,
-}
-
-impl From<PinnedError> for DirectoryClientError {
-    fn from(error: PinnedError) -> Self {
-        match error {
-            PinnedError::Origin => Self::InvalidDirectory,
-            PinnedError::Certificate => Self::InvalidCertificate,
-            PinnedError::Client => Self::Request,
-        }
-    }
 }
 
 impl From<HttpError> for DirectoryClientError {
