@@ -1074,14 +1074,18 @@ pub(super) async fn unblock(
 ) -> TopcoatResult<impl View> {
     require_admin_session(cx).await?;
     let hub = page_hub(cx)?;
-    let error =
-        hub.unblock(&form.endpoint).await.err().map(hub_message).unwrap_or_default();
-    if error.is_empty()
-        && let Some(store) = page_data_dir(cx)
-            .and_then(|data_dir| crate::hub_store::HubStore::open(&data_dir).ok())
-    {
-        let _ = store.remove_block(&form.endpoint);
-    }
+    // The node's own block goes first: while the hub block stays, the page
+    // lists it, so a failed unblock can be tried again.
+    let kept = page_data_dir(cx).is_some_and(|data_dir| {
+        crate::hub_store::HubStore::open(&data_dir)
+            .and_then(|store| store.remove_block(&form.endpoint))
+            .is_err()
+    });
+    let error = if kept {
+        "This computer could not remove the block. Try again."
+    } else {
+        hub.unblock(&form.endpoint).await.err().map(hub_message).unwrap_or_default()
+    };
     Ok(view! { hub_form_screen(error: error.to_owned()) })
 }
 
