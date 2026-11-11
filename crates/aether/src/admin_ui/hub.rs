@@ -135,15 +135,15 @@ pub(super) async fn hub_section(
     // no other.
     let approved: std::collections::BTreeSet<String> = page_data_dir(cx)
         .and_then(|data_dir| {
-            crate::hub_store::HubStore::open(&data_dir).ok().and_then(|store| {
-                store
-                    .sender_approved_invite_ids(
-                        invites
-                            .iter()
-                            .filter(|invite| invite.role == Role::Sender)
-                            .map(|invite| invite.id.clone()),
-                    )
-                    .ok()
+            aether_store::NodeStore::in_dir(&data_dir).ok().and_then(|store| {
+                sender_approved_invite_ids(
+                    &store,
+                    invites
+                        .iter()
+                        .filter(|invite| invite.role == Role::Sender)
+                        .map(|invite| invite.id.clone()),
+                )
+                .ok()
             })
         })
         .unwrap_or_default();
@@ -305,6 +305,23 @@ pub(super) async fn hub_section(
     }
     // The page is deep: on the heap, its view does not fill the stack.
     .boxed())
+}
+
+/// The ids in `invite_ids` whose local approval is on the sender's side.
+fn sender_approved_invite_ids(
+    store: &aether_store::NodeStore,
+    invite_ids: impl IntoIterator<Item = String>,
+) -> Result<std::collections::BTreeSet<String>, aether_store::StoreError> {
+    let mut approved = std::collections::BTreeSet::new();
+    for invite_id in invite_ids {
+        if store
+            .hub_approval(&invite_id)?
+            .is_some_and(|approval| approval.side == ApprovalSide::Sender)
+        {
+            approved.insert(invite_id);
+        }
+    }
+    Ok(approved)
 }
 
 /// The service agents that this personal agent claims as its own, with a
@@ -864,13 +881,13 @@ async fn approve(
         return Err(HubError::Forbidden);
     }
     let store =
-        crate::hub_store::HubStore::open(data_dir).map_err(|_| HubError::Unexpected)?;
-    if store.is_blocked(&endpoint).map_err(|_| HubError::Unexpected)? {
+        aether_store::NodeStore::in_dir(data_dir).map_err(|_| HubError::Unexpected)?;
+    if store.hub_blocked(&endpoint).map_err(|_| HubError::Unexpected)? {
         return Err(HubError::Forbidden);
     }
     let approved_days = u32::try_from(days).map_err(|_| HubError::Invalid)?;
     store
-        .put_approval(&HubApproval {
+        .put_hub_approval(&HubApproval {
             peer_endpoint: Some(endpoint),
             ..new_approval(
                 &invite.id,
@@ -887,7 +904,7 @@ async fn approve(
     // hub may have accepted the row, and the host signs it only with it.
     if let Err(error) = hub.approve(id, days).await {
         if !error.may_have_applied() {
-            let _ = store.remove_approval(id);
+            let _ = store.remove_hub_approval(id);
         }
         return Err(error);
     }
@@ -915,12 +932,12 @@ async fn block_requester(
     let (invite, endpoint) = open_request(hub, id).await?;
     {
         let _sign = page.hub_sign().lock().unwrap_or_else(PoisonError::into_inner);
-        let store = crate::hub_store::HubStore::open(&page.data_dir)
+        let store = aether_store::NodeStore::in_dir(&page.data_dir)
             .map_err(|_| HubError::Unexpected)?;
         store
-            .put_block(&endpoint, &invite.to, now())
+            .put_hub_block(&endpoint, &invite.to, now())
             .map_err(|_| HubError::Unexpected)?;
-        let _ = store.remove_approval(id);
+        let _ = store.remove_hub_approval(id);
     }
     hub.block(&endpoint).await
 }
@@ -1056,8 +1073,8 @@ pub(super) async fn unblock(
     // The node's own block goes first: while the hub block stays, the page
     // lists it, so a failed unblock can be tried again.
     let kept = page_data_dir(cx).is_some_and(|data_dir| {
-        crate::hub_store::HubStore::open(&data_dir)
-            .and_then(|store| store.remove_block(&form.endpoint))
+        aether_store::NodeStore::in_dir(&data_dir)
+            .and_then(|store| store.remove_hub_block(&form.endpoint))
             .is_err()
     });
     let error = if kept {

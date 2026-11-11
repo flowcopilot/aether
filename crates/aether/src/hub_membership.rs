@@ -95,7 +95,7 @@ fn approve_invite(
     invite: &Invite,
     days: u64,
 ) -> Result<(), StoreError> {
-    crate::hub_store::HubStore::open(data_dir)?.put_approval(&new_approval(
+    aether_store::NodeStore::in_dir(data_dir)?.put_hub_approval(&new_approval(
         &invite.id,
         ApprovalSide::Sender,
         ApprovalKind::Invite,
@@ -130,9 +130,9 @@ pub async fn accept(
         crate::hub_client::protocol::ACCESS_DAYS_MAX,
     ))
     .map_err(|_| HubError::Unexpected)?;
-    crate::hub_store::HubStore::open(data_dir)
+    aether_store::NodeStore::in_dir(data_dir)
         .map_err(|_| HubError::Unexpected)?
-        .put_approval(&new_approval(
+        .put_hub_approval(&new_approval(
             &invite.id,
             ApprovalSide::Receiver,
             ApprovalKind::Invite,
