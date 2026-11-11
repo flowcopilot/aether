@@ -210,6 +210,49 @@ class TranscriptTest(unittest.TestCase):
             self.assertEqual(task_id in host.stopped, outcome in ("cancelled", "lost"), task_id)
 
 
+class NodeLinkTest(unittest.TestCase):
+    def test_a_failing_message_handler_closes_the_session_and_the_link_reconnects(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = node.socket_path(Path(directory.name))
+        fake = FakeNode(path)
+        self.addCleanup(fake.stop)
+        host = Host()
+        statuses: list[bool] = []
+
+        def stop_turn(task_id: str) -> None:
+            if task_id == "task-1":
+                raise RuntimeError("Event loop is closed")
+            host.stop(task_id)
+
+        def on_status(connected: bool) -> None:
+            statuses.append(connected)
+            if not connected:
+                tasks.close()
+
+        link = node.NodeLink(path, lambda message: tasks.receive(message), on_status, retry=0.01)
+        tasks = node.Tasks(send=link.send, start=host.start, stop=stop_turn)
+        stop = threading.Event()
+        runner = threading.Thread(target=link.run, args=(stop,), daemon=True)
+        runner.start()
+        self.addCleanup(runner.join, 5)
+        self.addCleanup(link.close)
+        self.addCleanup(stop.set)
+
+        fake.accept()
+        self.assertEqual(fake.read(), {"type": "ready", "protocol": 1})
+        for task_id in ("task-1", "task-2"):
+            fake.write(json.dumps({"type": "task", "id": task_id, "instructions": "", "text": "hi"}).encode() + b"\n")
+        fake.write(b'{"type":"cancel","id":"task-1"}\n')
+        self.assertTrue(fake.closed())
+        fake.close()
+        _wait(lambda: statuses == [True, False], "the session must report that it closed")
+        self.assertEqual(host.stopped, ["task-2"])
+        fake.accept()
+        self.assertEqual(fake.read(), {"type": "ready", "protocol": 1})
+        self.assertTrue(runner.is_alive())
+
+
 class TasksTest(unittest.TestCase):
     def test_a_turn_that_cannot_start_fails_its_task(self) -> None:
         sent: list[dict] = []
