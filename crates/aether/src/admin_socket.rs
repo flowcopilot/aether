@@ -2,7 +2,7 @@ use std::{
     fs,
     io::{self, BufRead, BufReader, Read, Write},
     os::unix::{
-        fs::{FileTypeExt, PermissionsExt},
+        fs::{DirBuilderExt, FileTypeExt, PermissionsExt},
         net::{UnixListener, UnixStream},
     },
     path::Path,
@@ -104,18 +104,46 @@ pub fn start(path: &Path, administration: SharedAdministration) -> io::Result<()
         }
         fs::remove_file(path)?;
     }
-    let listener = UnixListener::bind(path)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     let data_dir = path
         .parent()
         .ok_or_else(|| io::Error::other("socket path has no parent"))?
         .to_path_buf();
+    let listener = bind_private(path, &data_dir)?;
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let _ = serve(stream, &administration, &data_dir);
         }
     });
     Ok(())
+}
+
+/// The staging directory, in the socket's directory, that a socket is bound
+/// in. Its name is as long as `admin.sock`, so a socket path that fits the
+/// system's limit at its place also fits there.
+const STAGING_DIRECTORY: &str = ".admin.d";
+
+/// Binds a socket that only this user can connect to at `path`, in the
+/// directory `parent`.
+///
+/// A socket gets its mode only after it is bound, so a socket bound at
+/// `path` takes the umask's mode for a moment. It is bound instead in a
+/// staging directory that only this user can enter, set to `0600`, and then
+/// moved to `path`.
+fn bind_private(path: &Path, parent: &Path) -> io::Result<UnixListener> {
+    let staging = parent.join(STAGING_DIRECTORY);
+    match fs::remove_dir_all(&staging) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
+    fs::DirBuilder::new().mode(0o700).create(&staging)?;
+    let staged = staging.join("s");
+    let bound = UnixListener::bind(&staged).and_then(|listener| {
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o600))?;
+        fs::rename(&staged, path)?;
+        Ok(listener)
+    });
+    let _ = fs::remove_dir_all(&staging);
+    bound
 }
 
 pub fn send(path: &Path, request: &Request) -> io::Result<Response> {
@@ -518,6 +546,26 @@ mod tests {
         assert!(matches!(
             serde_json::from_slice::<Response>(&response).expect("response must decode"),
             Response::Error { code } if code == "invalid"
+        ));
+    }
+
+    #[test]
+    fn the_socket_is_private_from_the_start() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("directory must create");
+        let socket = crate::data_dir::DataDir::new(directory.path()).admin_socket();
+        // A leftover staging directory from a crash does not stop a start.
+        std::fs::create_dir(directory.path().join(super::STAGING_DIRECTORY))
+            .expect("leftover must create");
+        start(&socket, shared_in(directory.path())).expect("socket must start");
+        let mode =
+            std::fs::metadata(&socket).expect("socket must exist").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert!(!directory.path().join(super::STAGING_DIRECTORY).exists());
+        assert!(matches!(
+            send(&socket, &Request::OutboxWake).expect("socket must answer"),
+            Response::Error { .. } | Response::Applied
         ));
     }
 
