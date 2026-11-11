@@ -5,6 +5,7 @@ use topcoat::{
 };
 
 use super::{Page, PageContext, UiMode, administration, shared};
+use crate::admin_components::count_badge;
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(super) enum Tab {
@@ -84,10 +85,7 @@ pub(super) async fn node_header(
                                 current: current == Tab::Agents,
                                 "Agents you use"
                                 if drafts > 0 {
-                                    <span
-                                        class="flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-primary px-1.5 text-[11px] font-semibold text-primary-foreground"
-                                        aria-label=(format!("{drafts} requests wait"))
-                                    >(drafts)</span>
+                                    count_badge(count: drafts, aria_label: format!("{drafts} requests wait"))
                                 }
                             )
                         }
@@ -96,10 +94,7 @@ pub(super) async fn node_header(
                             current: current == Tab::Advanced,
                             "Advanced"
                             if pending > 0 {
-                                <span
-                                    class="flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-warning px-1.5 text-[11px] font-semibold text-primary-foreground"
-                                    aria-label=(format!("{pending} changes wait"))
-                                >(pending)</span>
+                                count_badge(count: pending, warning: true, aria_label: format!("{pending} changes wait"))
                             }
                         )
                     </nav>

@@ -24,7 +24,7 @@ use super::{
 };
 use crate::{
     admin::AdminStoreAccess,
-    admin_components::page_title,
+    admin_components::{page_title, section_heading},
     components::{
         alert::{AlertVariant, alert, alert_description, alert_title},
         button::{ButtonSize, ButtonVariant, button, button_variants},
@@ -116,7 +116,7 @@ pub(super) async fn dashboard(
             }
 
             <section id="pending" class="flex scroll-mt-6 flex-col gap-3">
-                <h2 class="text-xl font-semibold tracking-tight">"Pending changes"</h2>
+                section_heading("Pending changes")
                 if store_unavailable {
                     <p class="text-muted-foreground">"Pending changes cannot be loaded."</p>
                 } else if tokens.is_empty() {
@@ -144,7 +144,7 @@ pub(super) async fn dashboard(
             </section>
 
             <section id="overview" class="flex scroll-mt-6 flex-col gap-3">
-            <h2 class="text-xl font-semibold tracking-tight">"Overview"</h2>
+            section_heading("Overview")
             if store_unavailable {
                 <p class="text-muted-foreground">"Overview counts cannot be loaded."</p>
             } else {
@@ -160,7 +160,7 @@ pub(super) async fn dashboard(
             </section>
 
             <section id="permissions" class="flex scroll-mt-6 flex-col gap-3">
-                <h2 class="text-xl font-semibold tracking-tight">"Permissions"</h2>
+                section_heading("Permissions")
                 if page.as_ref().is_some_and(|page| page.mode.hosts()) {
                     <p class="text-muted-foreground">"Invite a person to send tasks to your agent. Access groups control who can send tasks."</p>
                     <div class="flex flex-wrap gap-2">
@@ -173,7 +173,7 @@ pub(super) async fn dashboard(
             </section>
 
             <section id="policy" class="flex scroll-mt-6 flex-col gap-3">
-                <h2 class="text-xl font-semibold tracking-tight">"Task policy"</h2>
+                section_heading("Task policy")
                 if let Some(policy) = policy {
                     <p class="text-muted-foreground">"Set the folder for new task folders and the task limits. Restart the node to use saved changes."</p>
                     if policy_saved {
@@ -211,7 +211,7 @@ pub(super) async fn dashboard(
             </section>
 
             <section id="tasks" class="flex scroll-mt-6 flex-col gap-3">
-                <h2 class="text-xl font-semibold tracking-tight">"Tasks"</h2>
+                section_heading("Tasks")
                 if store_unavailable {
                     <p class="text-muted-foreground">"Task counts cannot be loaded."</p>
                 } else {
@@ -229,7 +229,7 @@ pub(super) async fn dashboard(
             </section>
 
             <section id="activity" class="flex scroll-mt-6 flex-col gap-2">
-                <h2 class="text-xl font-semibold tracking-tight">"Activity"</h2>
+                section_heading("Activity")
                 <p id="activity-status" role="status" class="rounded-lg bg-muted px-3.5 py-2.5 font-mono text-[13px] text-foreground">
                     "The local control service is ready."
                 </p>
@@ -237,7 +237,7 @@ pub(super) async fn dashboard(
 
             if managed {
                 <section id="members" class="flex flex-col gap-2">
-                    <h2 class="text-xl font-semibold tracking-tight">"Members"</h2>
+                    section_heading("Members")
                     if store_unavailable {
                         <p class="text-muted-foreground">"Members cannot be loaded."</p>
                     } else if members.is_empty() {
@@ -257,7 +257,7 @@ pub(super) async fn dashboard(
                     }
                 </section>
                 <section id="invitations" class="flex flex-col gap-2">
-                    <h2 class="text-xl font-semibold tracking-tight">"Invitations"</h2>
+                    section_heading("Invitations")
                     <p class="text-muted-foreground">"Manage invitations with the control command."</p>
                 </section>
             }

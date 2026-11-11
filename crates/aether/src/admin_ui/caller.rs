@@ -19,14 +19,14 @@ use topcoat::{
 
 use super::{
     Page, admin_page, ensure_admin_session,
-    hub::{error_line, hub_failure, hub_section, hub_setting},
+    hub::{hub_failure, hub_section, hub_setting},
     layout::{Tab, node_header},
     shared::{IdForm, Notice},
 };
 use crate::{
     admin_components::{
-        CHEVRON, CopyTone, Tone, copy_field, days_label, days_select, key_code,
-        page_title, presence_dot, state_badge, step,
+        CHEVRON, CopyTone, Tone, copy_field, days_label, days_select, error_line,
+        key_code, page_title, presence_dot, section_heading, state_badge, step,
     },
     components::{
         avatar::{AvatarSize, avatar, avatar_fallback},
@@ -139,7 +139,7 @@ pub(super) async fn caller_screen(
             if connected {
                 <section aria-labelledby="agents" class="flex flex-col gap-4">
                     <div id="agents" class="flex flex-col gap-1.5">
-                        <h2 class="text-xl font-semibold tracking-tight">"Agents you can use"</h2>
+                        section_heading("Agents you can use")
                         <p class="text-sm text-muted-foreground">"Your own agent reaches them through Aether. From a terminal, the command next to each one sends a task."</p>
                     </div>
                     <ul class="flex flex-col divide-y divide-border rounded-xl border border-border bg-background" aria-label="Agents">
@@ -221,7 +221,7 @@ pub(super) async fn caller_screen(
                 Ok(_) => {}
                 Err(_) => {
                     <section aria-labelledby="sent" class="flex flex-col gap-4">
-                        <h2 id="sent" class="text-xl font-semibold tracking-tight">"Sent tasks"</h2>
+                        section_heading(id: "sent", "Sent tasks")
                         <p role="alert" class="text-muted-foreground">"Sent tasks cannot be loaded."</p>
                     </section>
                 }
@@ -314,7 +314,7 @@ async fn request_drafts(
     Ok(view! {
         <section id="requests" aria-labelledby="requests-title" class="flex flex-col gap-4">
             <div class="flex flex-col gap-1.5">
-                <h2 id="requests-title" class="text-xl font-semibold tracking-tight">"Requests your agent wants to send"</h2>
+                section_heading(id: "requests-title", "Requests your agent wants to send")
                 <p class="text-sm text-muted-foreground">
                     "Your agent found these agents and asks for access to them. Nothing is sent until you select Confirm."
                 </p>
@@ -547,7 +547,7 @@ async fn sent_tasks(
 ) -> TopcoatResult<impl View> {
     Ok(view! {
         <section aria-labelledby="sent" class="flex flex-col gap-4">
-            <h2 id="sent" class="text-xl font-semibold tracking-tight">"Sent tasks"</h2>
+            section_heading(id: "sent", "Sent tasks")
             <ul class="flex flex-col divide-y divide-border border-y border-border" aria-label="Sent tasks">
                 for task in &tasks {
                     <li class="flex flex-col gap-2 py-3.5 text-sm">

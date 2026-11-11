@@ -2,10 +2,17 @@ use std::path::Path;
 
 use topcoat::{
     Result as TopcoatResult,
-    view::{View, component, view},
+    view::{Child, View, attributes, component, view},
 };
 
-use crate::components::alert::{alert, alert_description};
+use crate::{
+    admin_components::{ErrorIcon, error_line, field},
+    components::{
+        alert::{alert, alert_description},
+        button::{ButtonSize, ButtonVariant, button},
+        input::input,
+    },
+};
 
 /// What the last form asks the host or caller screen to show. Each form sets
 /// at most one; an empty text shows nothing.
@@ -135,5 +142,58 @@ pub(super) async fn relay_notice() -> TopcoatResult<impl View> {
                 " before you invite someone elsewhere."
             )
         )
+    })
+}
+
+/// A row of the Connection card: what the node uses now (the child), a link
+/// that opens the form, and the form that changes the URL. The form is open
+/// while no URL is set (`missing`) or when it refused the last input.
+#[component]
+pub(super) async fn url_setting(
+    /// The row's anchor, such as `relay`.
+    id: &'static str,
+    action: &'static str,
+    /// The label of the URL field.
+    name: &'static str,
+    /// The id and form name of the URL field.
+    control: &'static str,
+    #[into] hint: String,
+    placeholder: &'static str,
+    value: String,
+    error: String,
+    missing: bool,
+    /// The text of the link that opens the form.
+    link: &'static str,
+    /// The text of the submit button.
+    submit: &'static str,
+    #[default] child: Child<'_>,
+) -> TopcoatResult<impl View> {
+    let open = missing || !error.is_empty();
+    Ok(view! {
+        <div id=(id) class="py-3">
+            <details class="group" open=(open.then_some(""))>
+                <summary class="flex cursor-pointer list-none items-center justify-between gap-3">
+                    <span class="flex min-w-0 flex-col gap-0.5">(child)</span>
+                    <span class="shrink-0 text-[13px] font-medium text-primary underline underline-offset-4">(link)</span>
+                </summary>
+                <form method="post" action=(action) class="mt-3 flex flex-col gap-2">
+                    field(
+                        name: name,
+                        control_id: control,
+                        hint: hint,
+                        input(attrs: attributes! {
+                            id=(control) name=(control) type="url" value=(&value)
+                            placeholder=(placeholder) class="font-mono"
+                            spellcheck="false" autocomplete="off"
+                            aria-invalid=((!error.is_empty()).then_some("true"))
+                        })
+                    )
+                    if !error.is_empty() {
+                        error_line(text: error.clone(), placement: ErrorIcon::Centered)
+                    }
+                    button(variant: ButtonVariant::Outline, size: ButtonSize::Sm, attrs: attributes! { type="submit" class="w-fit" }, (submit))
+                </form>
+            </details>
+        </div>
     })
 }

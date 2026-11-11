@@ -31,8 +31,9 @@ use crate::invites::{DirectInviteSigning, sign_direct_invite};
 use crate::{
     admin::SharedAdministration,
     admin_components::{
-        ALERT, CHECK, CHEVRON, CopyTone, Tone, ago, copy_field, days_label,
-        days_select, field, page_title, presence_dot, state_badge,
+        ALERT, CHECK, CHEVRON, CopyTone, ErrorIcon, Tone, ago, copy_field, days_label,
+        days_select, error_line, field, page_title, presence_dot, section_heading,
+        state_badge,
     },
     components::{
         alert::{AlertVariant, alert, alert_description, alert_title},
@@ -307,11 +308,11 @@ async fn groups_section(
     Ok(view! {
         <section id="groups" class="flex flex-col gap-4" aria-labelledby="groups-title">
             <div class="flex flex-col gap-1.5">
-                <h2 id="groups-title" class="text-xl font-semibold tracking-tight">"Incoming access groups"</h2>
+                section_heading(id: "groups-title", "Incoming access groups")
                 <p class="text-sm text-muted-foreground">"A person must have direct access and belong to at least one group to send tasks. New invites join friends. People whose access request you approve join requests."</p>
             </div>
             if !error.is_empty() {
-                <p role="alert" class="flex items-center gap-1.5 text-sm text-destructive">icon(data: ALERT) (error.clone())</p>
+                error_line(text: error.clone(), placement: ErrorIcon::Centered)
             }
             <form method="post" action="/groups" class="flex gap-2">
                 <input type="hidden" name="action" value=(GroupAction::Create.as_str()) />
@@ -449,43 +450,27 @@ pub(super) async fn change_group(
 /// because an invite needs one to work outside the local network.
 #[component]
 async fn relay_line(url: String, error: String) -> TopcoatResult<impl View> {
-    let open = url.is_empty() || !error.is_empty();
     Ok(view! {
-        <div id="relay" class="py-3">
-            <details class="group" open=(open.then_some(""))>
-                <summary class="flex cursor-pointer list-none items-center justify-between gap-3">
-                    <span class="flex min-w-0 flex-col gap-0.5">
-                        <span class="text-[13px] text-muted-foreground">"Relay"</span>
-                        if url.is_empty() {
-                            <span class="text-[13px] text-muted-foreground">"No relay yet: only your local network can reach it."</span>
-                        } else {
-                            <span class="sr-only">"People reach it through "</span>
-                            <code class="font-mono text-[13px] break-all text-foreground">(&url)</code>
-                        }
-                    </span>
-                    <span class="shrink-0 text-[13px] font-medium text-primary underline underline-offset-4">
-                        (if url.is_empty() { "Set a relay" } else { "Change relay" })
-                    </span>
-                </summary>
-                <form method="post" action="/relay" class="mt-3 flex flex-col gap-2">
-                    field(
-                        name: "Relay URL",
-                        control_id: "relay_url",
-                        hint: "An iroh relay, such as one you run. Leave it empty to use only your local network.",
-                        input(attrs: attributes! {
-                            id="relay_url" name="relay_url" type="url" value=(&url)
-                            placeholder="https://relay.example.com" class="font-mono"
-                            spellcheck="false" autocomplete="off"
-                            aria-invalid=((!error.is_empty()).then_some("true"))
-                        })
-                    )
-                    if !error.is_empty() {
-                        <p class="flex items-center gap-1.5 text-sm text-destructive" role="alert">icon(data: ALERT) (&error)</p>
-                    }
-                    button(variant: ButtonVariant::Outline, size: ButtonSize::Sm, attrs: attributes! { type="submit" class="w-fit" }, "Use this relay")
-                </form>
-            </details>
-        </div>
+        shared::url_setting(
+            id: "relay",
+            action: "/relay",
+            name: "Relay URL",
+            control: "relay_url",
+            hint: "An iroh relay, such as one you run. Leave it empty to use only your local network.",
+            placeholder: "https://relay.example.com",
+            value: url.clone(),
+            error: error,
+            missing: url.is_empty(),
+            link: if url.is_empty() { "Set a relay" } else { "Change relay" },
+            submit: "Use this relay",
+            <span class="text-[13px] text-muted-foreground">"Relay"</span>
+            if url.is_empty() {
+                <span class="text-[13px] text-muted-foreground">"No relay yet: only your local network can reach it."</span>
+            } else {
+                <span class="sr-only">"People reach it through "</span>
+                <code class="font-mono text-[13px] break-all text-foreground">(&url)</code>
+            }
+        )
     })
 }
 
@@ -531,7 +516,7 @@ async fn card_section(
     Ok(view! {
         <section id="card" class="flex flex-col gap-4" aria-labelledby="card-title">
             <div class="flex flex-col gap-1.5">
-                <h2 id="card-title" class="text-xl font-semibold tracking-tight">"Your agent's card"</h2>
+                section_heading(id: "card-title", "Your agent's card")
                 <p class="text-sm text-muted-foreground">
                     "People you invite get this card with the invite. It is never public. Do not name your tools, model, folders or settings."
                 </p>
@@ -647,7 +632,7 @@ async fn workspace_line(
                 button(variant: ButtonVariant::Outline, attrs: attributes! { type="submit" class="mb-5" }, "Use this folder")
             </form>
             if open {
-                <p class="flex items-start gap-1.5 text-sm text-destructive" role="alert">icon(data: ALERT) (&error)</p>
+                error_line(text: error.clone(), placement: ErrorIcon::Top)
             }
         </details>
         }
@@ -833,7 +818,7 @@ async fn invite_form(error: String) -> TopcoatResult<impl View> {
                 )
             </div>
             if !error.is_empty() {
-                <p class="flex items-start gap-1.5 text-sm text-destructive" role="alert">icon(data: ALERT) (&error)</p>
+                error_line(text: error.clone(), placement: ErrorIcon::Top)
             }
             button(attrs: attributes! { type="submit" class="w-full" }, "Create invite")
         </form>

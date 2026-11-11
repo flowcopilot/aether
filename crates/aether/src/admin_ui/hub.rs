@@ -10,7 +10,6 @@ use serde::Deserialize;
 use topcoat::{
     Result as TopcoatResult,
     context::{Cx, app_context},
-    icon::icon,
     router::{
         HeaderValue,
         content::Form,
@@ -34,7 +33,10 @@ use crate::hub_client::protocol::{DEFAULT_ACCESS_DAYS, OFFER_DAYS};
 use aether_store::{ApprovalKind, ApprovalSide, HubApproval};
 
 use crate::{
-    admin_components::{ALERT, copy_button, days_label, days_select, field},
+    admin_components::{
+        copy_button, count_badge, days_label, days_select, error_line, field,
+        section_heading,
+    },
     components::{
         button::{ButtonSize, ButtonVariant, button},
         input::input,
@@ -171,7 +173,7 @@ pub(super) async fn hub_section(
                         <h2 class="flex items-center gap-2 text-lg leading-tight font-semibold">
                             "Access requests"
                             if requests > 0 {
-                                <span class="flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-primary px-1.5 text-[11px] font-semibold text-primary-foreground">(requests)</span>
+                                count_badge(count: requests)
                             }
                         </h2>
                         <p class="text-[13px] text-muted-foreground">"This is a service agent."</p>
@@ -269,7 +271,7 @@ pub(super) async fn hub_section(
                             }
                             if !invites.is_empty() {
                                 <section aria-labelledby="invites-title" class="flex flex-col gap-3">
-                                    <h2 id="invites-title" class="text-xl font-semibold tracking-tight">"Invites"</h2>
+                                    section_heading(id: "invites-title", "Invites")
                                     <ul class="flex flex-col divide-y divide-border rounded-xl border border-border bg-background px-5" aria-label="Invites">
                                         for invite in &invites {
                                             invite_row(
@@ -304,17 +306,6 @@ pub(super) async fn hub_section(
     }
     // The page is deep: on the heap, its view does not fill the stack.
     .boxed())
-}
-
-/// A refusal under a form, in the destructive color, with its icon.
-#[component]
-pub(super) async fn error_line(text: String) -> TopcoatResult<impl View> {
-    Ok(view! {
-        <p class="flex items-start gap-1.5 text-sm text-destructive" role="alert">
-            <span class="mt-0.5 shrink-0">icon(data: ALERT)</span>
-            (text)
-        </p>
-    })
 }
 
 /// The service agents that this personal agent claims as its own, with a
@@ -1074,44 +1065,27 @@ pub(super) async fn hub_setting(
     url: Option<String>,
     #[default] error: String,
 ) -> TopcoatResult<impl View> {
-    let open = url.is_none() || !error.is_empty();
-    let value = url.clone().unwrap_or_default();
     Ok(view! {
-        <div id="hub" class="py-3">
-            <details class="group" open=(open.then_some(""))>
-                <summary class="flex cursor-pointer list-none items-center justify-between gap-3">
-                    <span class="flex min-w-0 flex-col gap-0.5">
-                        match &url {
-                            Some(url) => {
-                                <span class="text-[13px] text-muted-foreground">"Names go through"</span>
-                                <code class="font-mono text-[13px] break-all text-foreground">(url)</code>
-                            }
-                            None => <span class="text-[13px] text-muted-foreground">"No hub: connect with a code."</span>,
-                        }
-                    </span>
-                    <span class="shrink-0 text-[13px] font-medium text-primary underline underline-offset-4">
-                        (if url.is_some() { "Change hub" } else { "Set a hub" })
-                    </span>
-                </summary>
-                <form method="post" action="/hub/url" class="mt-3 flex flex-col gap-2">
-                    field(
-                        name: "Hub URL",
-                        control_id: "hub_url",
-                        hint: format!("The public hub is {DEFAULT_HUB_URL}. Leave it empty to turn names off."),
-                        input(attrs: attributes! {
-                            id="hub_url" name="hub_url" type="url" value=(&value)
-                            placeholder=(DEFAULT_HUB_URL) class="font-mono"
-                            spellcheck="false" autocomplete="off"
-                            aria-invalid=((!error.is_empty()).then_some("true"))
-                        })
-                    )
-                    if !error.is_empty() {
-                        <p class="flex items-center gap-1.5 text-sm text-destructive" role="alert">icon(data: ALERT) (&error)</p>
-                    }
-                    button(variant: ButtonVariant::Outline, size: ButtonSize::Sm, attrs: attributes! { type="submit" class="w-fit" }, "Use this hub")
-                </form>
-            </details>
-        </div>
+        shared::url_setting(
+            id: "hub",
+            action: "/hub/url",
+            name: "Hub URL",
+            control: "hub_url",
+            hint: format!("The public hub is {DEFAULT_HUB_URL}. Leave it empty to turn names off."),
+            placeholder: DEFAULT_HUB_URL,
+            value: url.clone().unwrap_or_default(),
+            error: error,
+            missing: url.is_none(),
+            link: if url.is_some() { "Change hub" } else { "Set a hub" },
+            submit: "Use this hub",
+            match &url {
+                Some(url) => {
+                    <span class="text-[13px] text-muted-foreground">"Names go through"</span>
+                    <code class="font-mono text-[13px] break-all text-foreground">(url)</code>
+                }
+                None => <span class="text-[13px] text-muted-foreground">"No hub: connect with a code."</span>,
+            }
+        )
     })
 }
 

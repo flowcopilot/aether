@@ -60,7 +60,7 @@ pub(super) async fn listing_section(
     Ok(view! {
         <section id="listing" class="flex flex-col gap-4 pt-2" aria-labelledby="listing-title">
             <div class="flex flex-col gap-1.5">
-                <h2 id="listing-title" class="text-xl font-semibold tracking-tight">"Public listing"</h2>
+                crate::admin_components::section_heading(id: "listing-title", "Public listing")
                 <p class="text-sm text-muted-foreground">
                     "People find a listed agent by search on the hub and ask for access. You approve each request on this page."
                 </p>
@@ -89,7 +89,7 @@ pub(super) async fn listing_section(
                 </div>
             </div>
             if !error.is_empty() {
-                super::hub::error_line(text: error.clone())
+                crate::admin_components::error_line(text: error.clone())
             }
             <div class="grid gap-6 md:grid-cols-[21rem_minmax(0,1fr)]">
                 <div class="flex flex-col gap-2 rounded-xl border border-border bg-background px-4.5 py-4 text-sm" aria-label="People see this">

@@ -254,6 +254,79 @@ pub async fn state_badge(state: (&'static str, Tone)) -> Result<impl View> {
     })
 }
 
+/// Where an [`error_line`] sets its icon.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ErrorIcon {
+    /// At the top, nudged down to the first line of text.
+    #[default]
+    Nudged,
+    /// At the top, as it is.
+    Top,
+    /// In the middle of a one-line row.
+    Centered,
+}
+
+/// A refusal under a form, in the destructive color, with its icon.
+#[component]
+pub async fn error_line(
+    #[into] text: String,
+    #[default] placement: ErrorIcon,
+) -> Result<impl View> {
+    Ok(view! {
+        match placement {
+            ErrorIcon::Nudged => {
+                <p class="flex items-start gap-1.5 text-sm text-destructive" role="alert">
+                    <span class="mt-0.5 shrink-0">icon(data: ALERT)</span>
+                    (text)
+                </p>
+            }
+            ErrorIcon::Top => {
+                <p class="flex items-start gap-1.5 text-sm text-destructive" role="alert">icon(data: ALERT) (text)</p>
+            }
+            ErrorIcon::Centered => {
+                <p class="flex items-center gap-1.5 text-sm text-destructive" role="alert">icon(data: ALERT) (text)</p>
+            }
+        }
+    })
+}
+
+/// The heading of a page section. `id` is the target of its
+/// `aria-labelledby`, when it has one.
+#[component]
+pub async fn section_heading(
+    #[default]
+    #[into]
+    id: String,
+    #[default] child: Child<'_>,
+) -> Result<impl View> {
+    Ok(view! {
+        <h2 id=((!id.is_empty()).then_some(&id)) class="text-xl font-semibold tracking-tight">(child)</h2>
+    })
+}
+
+/// A count beside a tab or heading. `warning` marks changes that wait for
+/// the operator; `aria_label` reads the count out where the number alone is
+/// unclear.
+#[component]
+pub async fn count_badge(
+    count: usize,
+    #[default] warning: bool,
+    #[default]
+    #[into]
+    aria_label: String,
+) -> Result<impl View> {
+    Ok(view! {
+        <span
+            class=(if warning {
+                "flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-warning px-1.5 text-[11px] font-semibold text-primary-foreground"
+            } else {
+                "flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-primary px-1.5 text-[11px] font-semibold text-primary-foreground"
+            })
+            aria-label=((!aria_label.is_empty()).then_some(&aria_label))
+        >(count)</span>
+    })
+}
+
 /// A number of days in words: "1 day", "7 days".
 #[must_use]
 pub fn days_label(days: u64) -> String {
