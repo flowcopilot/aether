@@ -181,11 +181,7 @@ pub async fn host_worker(
                 println!("{}", serde_json::json!({ "event": "hub_store_unavailable" }));
                 return;
             }
-            let own_name = crate::settings::setting::<
-                crate::hub_client::settings::HubName,
-            >(&ctx.data_dir)
-            .ok()
-            .flatten();
+            let own_name = crate::hub_client::settings::hub_name(&ctx.data_dir);
             for invite in invites {
                 match host_send(
                     &administration,

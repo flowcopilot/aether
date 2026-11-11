@@ -37,11 +37,7 @@ pub const fn hub_message(error: HubError) -> &'static str {
 /// in invites. A name that cannot be an agent name is not kept.
 pub fn keep_hub_name(data_dir: &std::path::Path, handle: &str) {
     if crate::hub_client::valid_full_name(handle)
-        && crate::settings::setting::<crate::hub_client::settings::HubName>(data_dir)
-            .ok()
-            .flatten()
-            .as_deref()
-            != Some(handle)
+        && crate::hub_client::settings::hub_name(data_dir).as_deref() != Some(handle)
     {
         let _ = crate::settings::store_setting::<crate::hub_client::settings::HubName>(
             data_dir,

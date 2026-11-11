@@ -43,9 +43,7 @@ pub enum InviteError {
 }
 
 pub fn invite_agent_name(data_dir: &Path, invite_name: Option<&str>) -> String {
-    if let Ok(Some(name)) =
-        crate::settings::setting::<crate::hub_client::settings::HubName>(data_dir)
-    {
+    if let Some(name) = crate::hub_client::settings::hub_name(data_dir) {
         return name;
     }
     if let Some(name) = invite_name.filter(|name| !name.is_empty()) {

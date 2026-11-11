@@ -187,11 +187,8 @@ pub(crate) async fn publish_to_hub(
 ) -> Result<ListingState, HubPublishError> {
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 
-    let name =
-        crate::settings::setting::<crate::hub_client::settings::HubName>(data_dir)
-            .ok()
-            .flatten()
-            .ok_or(HubPublishError::NoName)?;
+    let name = crate::hub_client::settings::hub_name(data_dir)
+        .ok_or(HubPublishError::NoName)?;
     let settings = crate::agent_card::settings(data_dir);
     let bytes = listing_bytes(&settings, &name);
     let key = crate::data_dir::DataDir::new(data_dir)
@@ -255,11 +252,7 @@ async fn renew_listing(ctx: &crate::node_serve_context::NodeServeContext) {
             state.listed
                 && state.expires_at.saturating_sub(now) < RENEW_BEFORE.as_secs()
         });
-    let service = crate::settings::setting::<crate::hub_client::settings::AgentKind>(
-        &ctx.data_dir,
-    )
-    .ok()
-    .flatten()
+    let service = crate::hub_client::settings::agent_kind(&ctx.data_dir)
         == Some(AgentKind::Service);
     if !(due && service) {
         return;
