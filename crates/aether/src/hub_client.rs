@@ -18,12 +18,10 @@ mod types;
 pub use self::full_name::{
     FullName, split_full_name, valid_full_name, valid_name_part,
 };
-pub use self::node_hub::{
-    HubAccess, NodeHub, hub_access, hub_client as configured_hub_client,
-};
+pub use self::node_hub::{HubAccess, NodeHub, hub_client as configured_hub_client};
 pub use self::protocol::{
-    DEFAULT_HUB_URL, HUB_OFF, INVITE_SECONDS, MAX_WAIT_SECONDS, PROTOCOL_HEADER,
-    PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
+    DEFAULT_HUB_URL, HUB_OFF, MAX_WAIT_SECONDS, PROTOCOL_HEADER,
+    PROTOCOL_VERSION_HEADER,
 };
 pub use self::types::{
     Account, AgentKind, AgentRow, Block, Contact, HeldListing, HubError, Invite,
@@ -212,15 +210,6 @@ impl HubClient {
             expires_at,
         })?;
         parse(&self.send(Method::PUT, "/v1/listing", &[], Some(body)).await?)
-    }
-
-    pub async fn listing(&self) -> Result<Option<HeldListing>, HubError> {
-        self.require_protocol_2().await?;
-        match self.send(Method::GET, "/v1/listing", &[], None).await {
-            Ok(body) => parse(&body).map(Some),
-            Err(HubError::NotFound) => Ok(None),
-            Err(error) => Err(error),
-        }
     }
 
     pub async fn delete_listing(&self) -> Result<(), HubError> {

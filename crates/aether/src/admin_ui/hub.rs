@@ -44,7 +44,6 @@ use crate::{
 
 /// How long a page waits for the hub before it shows the page without it.
 const PAGE_WAIT: Duration = Duration::from_secs(4);
-/// How long a worker waits after the hub fails before it asks again.
 /// The hub's answer for one page, or why there is none.
 enum HubState {
     Ready {

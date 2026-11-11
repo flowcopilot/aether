@@ -9,9 +9,8 @@ use topcoat::{
 use super::{Page, shared};
 use crate::admin::SharedAdministration;
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Tab {
-    #[default]
     Sharing,
     Agents,
     Advanced,
