@@ -25,8 +25,8 @@ use super::{
 };
 use crate::{
     admin_components::{
-        CHEVRON, CopyTone, Tone, copy_field, key_code, page_title, presence_dot,
-        state_badge, step,
+        CHEVRON, CopyTone, Tone, copy_field, days_label, days_select, key_code,
+        page_title, presence_dot, state_badge, step,
     },
     components::{
         avatar::{AvatarSize, avatar, avatar_fallback},
@@ -163,8 +163,7 @@ pub(super) async fn caller_screen(
                                         }
                                     </div>
                                     match contact.days_left {
-                                        Some(1) => <span class="text-[13px] text-muted-foreground">"Access ends in 1 day"</span>,
-                                        Some(days) => <span class="text-[13px] text-muted-foreground">"Access ends in " (days) " days"</span>,
+                                        Some(days) => <span class="text-[13px] text-muted-foreground">"Access ends in " (days_label(days))</span>,
                                         None => <span class="text-[13px] font-medium text-destructive">"Invite expired. Ask for a new one."</span>,
                                     }
                                     <form method="post" action="/contacts/remove">
@@ -360,17 +359,12 @@ async fn request_draft(
             <div class="flex flex-wrap items-center gap-2">
                 <form method="post" action="/requests/confirm" class="flex items-center gap-2">
                     <input type="hidden" name="id" value=(&draft.id)>
-                    <select
-                        name="days"
-                        aria-label=(format!("Access to {} for", draft.target_name))
-                        class="h-8 rounded-lg border border-border bg-background px-2 text-sm"
-                    >
-                        for days in &choices {
-                            <option value=(days) selected=((*days == u64::from(draft.days)).then_some(""))>
-                                (if *days == 1 { "1 day".to_owned() } else { format!("{days} days") })
-                            </option>
-                        }
-                    </select>
+                    days_select(
+                        aria_label: format!("Access to {} for", draft.target_name),
+                        class: "h-8 rounded-lg border border-border bg-background px-2 text-sm",
+                        choices: choices.clone(),
+                        selected: u64::from(draft.days),
+                    )
                     button(size: ButtonSize::Sm, attrs: attributes! { type="submit" }, "Confirm")
                 </form>
                 <form method="post" action="/requests/discard">

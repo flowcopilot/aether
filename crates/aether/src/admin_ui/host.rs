@@ -31,8 +31,8 @@ use crate::invites::{DirectInviteSigning, sign_direct_invite};
 use crate::{
     admin::SharedAdministration,
     admin_components::{
-        ALERT, CHECK, CHEVRON, CopyTone, Tone, ago, copy_field, field, page_title,
-        presence_dot, state_badge,
+        ALERT, CHECK, CHEVRON, CopyTone, Tone, ago, copy_field, days_label,
+        days_select, field, page_title, presence_dot, state_badge,
     },
     components::{
         alert::{AlertVariant, alert, alert_description, alert_title},
@@ -794,8 +794,7 @@ const fn task_state(state: TaskState) -> (&'static str, Tone) {
 fn access_ends(days_left: u64) -> String {
     match days_left {
         0 => "today".to_owned(),
-        1 => "in 1 day".to_owned(),
-        days => format!("in {days} days"),
+        days => format!("in {}", days_label(days)),
     }
 }
 
@@ -825,17 +824,12 @@ async fn invite_form(error: String) -> TopcoatResult<impl View> {
                 field(
                     name: "Access for",
                     control_id: "days",
-                    <select
-                        id="days"
-                        name="days"
-                        class="h-9 rounded-lg border border-border bg-background px-3 text-sm shadow-xs"
-                    >
-                        for days in crate::direct::DIRECT_OFFER_DAYS {
-                            <option value=(days) selected=((days == crate::direct::DEFAULT_DIRECT_ACCESS_DAYS).then_some(""))>
-                                (if days == 1 { "1 day".to_owned() } else { format!("{days} days") })
-                            </option>
-                        }
-                    </select>
+                    days_select(
+                        id: "days",
+                        class: "h-9 rounded-lg border border-border bg-background px-3 text-sm shadow-xs",
+                        choices: crate::direct::DIRECT_OFFER_DAYS.to_vec(),
+                        selected: crate::direct::DEFAULT_DIRECT_ACCESS_DAYS,
+                    )
                 )
             </div>
             if !error.is_empty() {

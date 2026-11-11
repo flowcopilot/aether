@@ -233,7 +233,7 @@ pub enum Tone {
 }
 
 impl Tone {
-    /// The classes of an outline badge in this tone.
+    /// The classes of a state badge in this tone.
     #[must_use]
     pub const fn class(self) -> &'static str {
         match self {
@@ -245,12 +245,48 @@ impl Tone {
     }
 }
 
-/// A state as an outline badge: its word, in its tone.
+/// A state as a bordered badge: its word, in its tone.
 #[component]
 pub async fn state_badge(state: (&'static str, Tone)) -> Result<impl View> {
     let (word, tone) = state;
     Ok(view! {
         badge(variant: BadgeVariant::Outline, attrs: attributes! { class=(tone.class()) }, (word))
+    })
+}
+
+/// A number of days in words: "1 day", "7 days".
+#[must_use]
+pub fn days_label(days: u64) -> String {
+    if days == 1 { "1 day".to_owned() } else { format!("{days} days") }
+}
+
+/// The `days` select of an access form: `choices`, with `selected` chosen.
+/// `id` names it for a label; `aria_label` names it where there is none.
+#[component]
+pub async fn days_select(
+    choices: Vec<u64>,
+    selected: u64,
+    #[into] class: String,
+    #[default]
+    #[into]
+    id: String,
+    #[default]
+    #[into]
+    aria_label: String,
+) -> Result<impl View> {
+    Ok(view! {
+        <select
+            id=((!id.is_empty()).then_some(&id))
+            name="days"
+            aria-label=((!aria_label.is_empty()).then_some(&aria_label))
+            class=(class)
+        >
+            for days in &choices {
+                <option value=(days) selected=((*days == selected).then_some(""))>
+                    (days_label(*days))
+                </option>
+            }
+        </select>
     })
 }
 

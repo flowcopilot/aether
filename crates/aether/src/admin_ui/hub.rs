@@ -34,7 +34,7 @@ use crate::hub_client::protocol::{DEFAULT_ACCESS_DAYS, OFFER_DAYS};
 use aether_store::{ApprovalKind, ApprovalSide, HubApproval};
 
 use crate::{
-    admin_components::{ALERT, copy_button, field},
+    admin_components::{ALERT, copy_button, days_label, days_select, field},
     components::{
         button::{ButtonSize, ButtonVariant, button},
         input::input,
@@ -523,17 +523,12 @@ async fn invite_form(error: String) -> TopcoatResult<impl View> {
                 field(
                     name: "Access for",
                     control_id: "hub-days",
-                    <select
-                        id="hub-days"
-                        name="days"
-                        class="h-9 rounded-lg border border-border bg-background px-3 text-sm shadow-xs"
-                    >
-                        for days in OFFER_DAYS {
-                            <option value=(days) selected=((days == DEFAULT_ACCESS_DAYS).then_some(""))>
-                                (if days == 1 { "1 day".to_owned() } else { format!("{days} days") })
-                            </option>
-                        }
-                    </select>
+                    days_select(
+                        id: "hub-days",
+                        class: "h-9 rounded-lg border border-border bg-background px-3 text-sm shadow-xs",
+                        choices: OFFER_DAYS.to_vec(),
+                        selected: DEFAULT_ACCESS_DAYS,
+                    )
                 )
             </div>
             if !error.is_empty() {
@@ -559,24 +554,19 @@ async fn request_row(invite: Invite) -> TopcoatResult<impl View> {
             <p class="text-sm">
                 <strong>(&invite.to)</strong>
                 " asks for access for "
-                (if invite.days == 1 { "1 day".to_owned() } else { format!("{} days", invite.days) })
+                (days_label(invite.days))
                 "."
             </p>
             <p class="font-mono text-xs break-all text-muted-foreground">"Key " (crate::admin_components::grouped(&endpoint))</p>
             <div class="flex flex-wrap items-center gap-2">
                 <form method="post" action="/hub/approve" class="flex items-center gap-2">
                     <input type="hidden" name="id" value=(&invite.id)>
-                    <select
-                        name="days"
-                        aria-label=(format!("Access for {}", invite.to))
-                        class="h-8 rounded-lg border border-border bg-background px-2 text-sm"
-                    >
-                        for days in OFFER_DAYS {
-                            <option value=(days) selected=((days == selected).then_some(""))>
-                                (if days == 1 { "1 day".to_owned() } else { format!("{days} days") })
-                            </option>
-                        }
-                    </select>
+                    days_select(
+                        aria_label: format!("Access for {}", invite.to),
+                        class: "h-8 rounded-lg border border-border bg-background px-2 text-sm",
+                        choices: OFFER_DAYS.to_vec(),
+                        selected: selected,
+                    )
                     button(size: ButtonSize::Sm, attrs: attributes! { type="submit" }, "Approve")
                 </form>
                 <form method="post" action="/hub/remove">
@@ -604,11 +594,7 @@ async fn request_row(invite: Invite) -> TopcoatResult<impl View> {
 
 #[component]
 async fn invite_row(invite: Invite, approved: bool) -> TopcoatResult<impl View> {
-    let days = if invite.days == 1 {
-        "1 day".to_owned()
-    } else {
-        format!("{} days", invite.days)
-    };
+    let days = days_label(invite.days);
     let text = match (invite.role, invite.status) {
         (Role::Sender, _) if !approved => {
             "This invite was made before an update. Cancel it and invite again."

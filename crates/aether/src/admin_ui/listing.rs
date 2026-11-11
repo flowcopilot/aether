@@ -51,14 +51,10 @@ pub(super) async fn listing_section(
             .map(|state| state.expires_at.saturating_sub(now).div_ceil(24 * 60 * 60));
     let queue = shared::queue_text(&data_dir);
     let status = match days_left {
-        Some(1) => {
-            "Listed. The listing ends in 1 day unless this page renews it.".to_owned()
-        }
-        Some(days) => {
-            format!(
-                "Listed. The listing ends in {days} days unless this page renews it."
-            )
-        }
+        Some(days) => format!(
+            "Listed. The listing ends in {} unless this page renews it.",
+            crate::admin_components::days_label(days)
+        ),
         None => "Not listed.".to_owned(),
     };
     Ok(view! {
