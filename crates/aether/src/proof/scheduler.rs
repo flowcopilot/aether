@@ -49,8 +49,8 @@ struct RunReport {
     renewal_failed: bool,
     /// A progress event could not be written to the journal.
     event_error: bool,
-    /// The start closure already rejected the task, so nothing is left to
-    /// settle.
+    /// The start closure already wrote the task's next state (a rejection
+    /// or a requeue), so nothing is left to settle.
     settled_at_start: bool,
 }
 
@@ -414,6 +414,13 @@ where
                             .lock()
                             .map_err(|_| ExecutionError::Unavailable)?;
                         if shutdown.load(Ordering::Acquire) {
+                            // The process never started, so the task goes
+                            // back to the queue, as it does when shutdown
+                            // lands before this worker registered.
+                            let task_id = dispatch_task_id.clone();
+                            settled_at_start = start_store
+                                .call(move |store| store.requeue_leased(&task_id))
+                                .is_ok();
                             return Err(ExecutionError::Cancelled);
                         }
                         let execution_data = start_store
