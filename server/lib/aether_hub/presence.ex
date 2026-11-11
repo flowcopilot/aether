@@ -23,10 +23,13 @@ defmodule AetherHub.Presence do
     :ok
   end
 
-  @doc "The Unix time of the last signed request, or nil."
+  @doc """
+  The Unix time of the last signed request, or nil when it is older than
+  the time that the hub keeps, also before `sweep/0` removes it.
+  """
   def last_seen(endpoint) do
     case :ets.lookup(@table, endpoint) do
-      [{^endpoint, time}] -> time
+      [{^endpoint, time}] -> if time >= cutoff(), do: time
       [] -> nil
     end
   end
@@ -40,10 +43,11 @@ defmodule AetherHub.Presence do
 
   @doc "Forgets the requests that are older than the time the hub keeps them."
   def sweep do
-    cutoff = Clock.now() - @keep
-    :ets.select_delete(@table, [{{:_, :"$1"}, [{:<, :"$1", cutoff}], [true]}])
+    :ets.select_delete(@table, [{{:_, :"$1"}, [{:<, :"$1", cutoff()}], [true]}])
     :ok
   end
+
+  defp cutoff, do: Clock.now() - @keep
 
   @impl true
   def init(nil) do
