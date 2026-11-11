@@ -19,7 +19,7 @@ use crate::{
 pub struct NodeService<T, P> {
     proof: ProofNode<T, P>,
     // Empty unless the policy file names approved workspaces — see
-    // `set_approved_workspaces`'s own doc comment. Immutable after
+    // `NodeOptions::approved_workspaces`. Immutable after
     // construction: the approved set itself is not something a live admin
     // change can extend, only pick from.
     approved_workspaces: BTreeMap<String, PathBuf>,
@@ -29,24 +29,32 @@ pub struct NodeService<T, P> {
     pact: Option<crate::pact::config::PactConfig>,
 }
 
+/// What [`NodeService::new`] takes besides the node. The default has no
+/// approved workspaces, no task folder, the Codex adapter and no PACT.
+#[derive(Debug, Default)]
+pub struct NodeOptions {
+    /// Names the workspace paths a live `Change::Workspace` may switch to
+    /// by id. Left empty (the default), any path is still accepted, exactly
+    /// as before this existed — this is an opt-in restriction a policy file
+    /// enables by naming `approvedWorkspaces`, not a behavior change for a
+    /// node that does not configure any.
+    pub approved_workspaces: BTreeMap<String, PathBuf>,
+    pub task_folder_mode: bool,
+    pub agent_adapter: AgentAdapter,
+    /// The `pact` section of the policy file, when the node offers PACT.
+    pub pact: Option<crate::pact::config::PactConfig>,
+}
+
 impl<T, P> NodeService<T, P>
 where
     T: TrustProvider + 'static,
     P: Agent + Clone + Send + 'static,
 {
     #[must_use]
-    pub const fn new(node: ProofNode<T, P>) -> Self {
-        Self {
-            proof: node,
-            approved_workspaces: BTreeMap::new(),
-            task_folder_mode: false,
-            agent_adapter: AgentAdapter::Codex,
-            pact: None,
-        }
-    }
-
-    pub fn set_pact_config(&mut self, pact: Option<crate::pact::config::PactConfig>) {
-        self.pact = pact;
+    pub fn new(node: ProofNode<T, P>, options: NodeOptions) -> Self {
+        let NodeOptions { approved_workspaces, task_folder_mode, agent_adapter, pact } =
+            options;
+        Self { proof: node, approved_workspaces, task_folder_mode, agent_adapter, pact }
     }
 
     #[must_use]
@@ -88,26 +96,9 @@ where
         &self.proof
     }
 
-    /// Names the workspace paths a live `Change::Workspace` may switch to
-    /// by id. Left empty (the default), any path is still accepted, exactly
-    /// as before this existed — this is an opt-in restriction a policy file
-    /// enables by naming `approvedWorkspaces`, not a behavior change for a
-    /// node that does not configure any.
-    pub fn set_approved_workspaces(&mut self, approved: BTreeMap<String, PathBuf>) {
-        self.approved_workspaces = approved;
-    }
-
-    pub const fn set_task_folder_mode(&mut self, enabled: bool) {
-        self.task_folder_mode = enabled;
-    }
-
     #[must_use]
     pub const fn task_folder_mode(&self) -> bool {
         self.task_folder_mode
-    }
-
-    pub const fn set_agent_adapter(&mut self, adapter: AgentAdapter) {
-        self.agent_adapter = adapter;
     }
 
     #[must_use]
@@ -421,7 +412,7 @@ mod tests {
     use aether_store::{NodeStore, QueueLimits, TaskInput};
     use ed25519_dalek::SigningKey;
 
-    use super::NodeService;
+    use super::{NodeOptions, NodeService};
     use crate::{
         execution::{Agent, ExecutionError, Executor, Limits, TurnContext},
         identity::{ClaimInput, GrantInput, SignedClaims, signed_claim, signed_grant},
@@ -536,7 +527,7 @@ mod tests {
             access_mode: A2aAccessMode::ReadOnly,
             claim: (&claim).into(),
         });
-        let service = NodeService::new(node);
+        let service = NodeService::new(node, NodeOptions::default());
         // Each poll is a new exchange of the same request, as a caller sends.
         let mut answer = serde_json::Value::Null;
         for poll in 0..100_u32 {
@@ -666,7 +657,8 @@ mod tests {
             access_mode: A2aAccessMode::ReadOnly,
             claim: (&claim).into(),
         });
-        let service = Arc::new(Mutex::new(NodeService::new(node)));
+        let service =
+            Arc::new(Mutex::new(NodeService::new(node, NodeOptions::default())));
         let server_service = Arc::clone(&service);
         let server_router =
             router(server.clone(), move |authenticated_endpoint, frames| {
@@ -849,7 +841,8 @@ mod tests {
             access_mode: A2aAccessMode::ReadOnly,
             claim: (&claim).into(),
         });
-        let service = Arc::new(Mutex::new(NodeService::new(node)));
+        let service =
+            Arc::new(Mutex::new(NodeService::new(node, NodeOptions::default())));
         let server_router =
             router(server.clone(), move |authenticated_endpoint, frames| {
                 let service = service.lock().map_err(|_| {
@@ -921,7 +914,7 @@ mod tests {
             scope,
         )
         .expect("node must create");
-        let service = NodeService::new(node);
+        let service = NodeService::new(node, NodeOptions::default());
         let payload = crate::transport::text_request_payload(
             WIRE_TASK_ID,
             "key",
@@ -1008,7 +1001,7 @@ mod tests {
             scope,
         )
         .expect("node must create");
-        let service = NodeService::new(node);
+        let service = NodeService::new(node, NodeOptions::default());
         let mut event_wake = service.subscribe_events();
         let response = service
             .a2a()
@@ -1132,7 +1125,7 @@ mod tests {
             node.state(WIRE_TASK_ID).expect("state must load"),
             aether_store::TaskState::UnknownResult
         );
-        let service = NodeService::new(node);
+        let service = NodeService::new(node, NodeOptions::default());
         let mut payload: A2aRequest =
             serde_json::from_value(crate::transport::text_request_payload(
                 WIRE_TASK_ID,
@@ -1271,7 +1264,7 @@ mod tests {
             node.content_is_expired(WIRE_TASK_ID).expect("expiry check must run"),
             "content must already be expired before the request arrives"
         );
-        let service = NodeService::new(node);
+        let service = NodeService::new(node, NodeOptions::default());
         let mut payload: A2aRequest =
             serde_json::from_value(crate::transport::text_request_payload(
                 WIRE_TASK_ID,
@@ -1396,7 +1389,7 @@ mod tests {
             scope,
         )
         .expect("node must create");
-        let service = NodeService::new(node);
+        let service = NodeService::new(node, NodeOptions::default());
         let mut payload: A2aRequest =
             serde_json::from_value(crate::transport::text_request_payload(
                 WIRE_TASK_ID,
@@ -1553,7 +1546,7 @@ mod tests {
                 scope,
             )
             .expect("node must create");
-            let service = NodeService::new(node);
+            let service = NodeService::new(node, NodeOptions::default());
             let mut payload: A2aRequest =
                 serde_json::from_value(crate::transport::text_request_payload(
                     WIRE_TASK_ID,
@@ -1621,7 +1614,10 @@ mod tests {
             .collect()
     }
 
-    fn minimal_service(workspace: PathBuf) -> NodeService<Trusted, Fake> {
+    fn minimal_service(
+        workspace: PathBuf,
+        approved_workspaces: BTreeMap<String, PathBuf>,
+    ) -> NodeService<Trusted, Fake> {
         let root = workspace.parent().expect("workspace must have a parent").to_owned();
         let store = NodeStore::in_dir(&root).expect("store must open");
         let node = ProofNode::new(
@@ -1635,7 +1631,10 @@ mod tests {
             Scope { id: ScopeId::new("direct"), kind: ScopeKind::Direct },
         )
         .expect("node must create");
-        NodeService::new(node)
+        NodeService::new(
+            node,
+            NodeOptions { approved_workspaces, ..NodeOptions::default() },
+        )
     }
 
     #[test]
@@ -1643,7 +1642,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("directory must create");
         let workspace = directory.path().join("workspace");
         fs::create_dir_all(&workspace).expect("workspace must create");
-        let service = minimal_service(workspace.clone());
+        let service = minimal_service(workspace.clone(), BTreeMap::new());
         assert!(service.workspace_change_is_approved("any-id", &workspace));
     }
 
@@ -1652,11 +1651,13 @@ mod tests {
         let directory = tempfile::tempdir().expect("directory must create");
         let workspace = directory.path().join("workspace");
         fs::create_dir_all(&workspace).expect("workspace must create");
-        let mut service = minimal_service(workspace.clone());
-        service.set_approved_workspaces(BTreeMap::from([(
-            "reviews".to_owned(),
-            workspace.canonicalize().expect("workspace must canonicalize"),
-        )]));
+        let service = minimal_service(
+            workspace.clone(),
+            BTreeMap::from([(
+                "reviews".to_owned(),
+                workspace.canonicalize().expect("workspace must canonicalize"),
+            )]),
+        );
         assert!(service.workspace_change_is_approved("reviews", &workspace));
     }
 
@@ -1665,11 +1666,13 @@ mod tests {
         let directory = tempfile::tempdir().expect("directory must create");
         let workspace = directory.path().join("workspace");
         fs::create_dir_all(&workspace).expect("workspace must create");
-        let mut service = minimal_service(workspace.clone());
-        service.set_approved_workspaces(BTreeMap::from([(
-            "reviews".to_owned(),
-            workspace.canonicalize().expect("workspace must canonicalize"),
-        )]));
+        let service = minimal_service(
+            workspace.clone(),
+            BTreeMap::from([(
+                "reviews".to_owned(),
+                workspace.canonicalize().expect("workspace must canonicalize"),
+            )]),
+        );
         assert!(!service.workspace_change_is_approved("other", &workspace));
     }
 
@@ -1680,11 +1683,13 @@ mod tests {
         let other = directory.path().join("other");
         fs::create_dir_all(&workspace).expect("workspace must create");
         fs::create_dir_all(&other).expect("other workspace must create");
-        let mut service = minimal_service(workspace.clone());
-        service.set_approved_workspaces(BTreeMap::from([(
-            "reviews".to_owned(),
-            workspace.canonicalize().expect("workspace must canonicalize"),
-        )]));
+        let service = minimal_service(
+            workspace.clone(),
+            BTreeMap::from([(
+                "reviews".to_owned(),
+                workspace.canonicalize().expect("workspace must canonicalize"),
+            )]),
+        );
         assert!(!service.workspace_change_is_approved("reviews", &other));
     }
 }

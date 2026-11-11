@@ -107,11 +107,7 @@ pub(super) async fn hub_section(
         (&state, page_data_dir(cx))
     {
         keep_hub_name(&data_dir, &account.handle);
-        if crate::settings::setting::<crate::hub_client::settings::AgentKind>(&data_dir)
-            .ok()
-            .flatten()
-            .is_none()
-        {
+        if crate::hub_client::settings::agent_kind(&data_dir).is_none() {
             let _ =
                 crate::hub_client::settings::store_agent_kind(&data_dir, account.kind);
         }
@@ -738,11 +734,7 @@ pub(super) async fn claim_name(
         (false, _) | (true, None) => Some(AgentKind::Personal),
         (true, Some(kind)) => AgentKind::parse(kind),
     };
-    let stored = data_dir.as_deref().and_then(|dir| {
-        crate::settings::setting::<crate::hub_client::settings::AgentKind>(dir)
-            .ok()
-            .flatten()
-    });
+    let stored = data_dir.as_deref().and_then(crate::hub_client::settings::agent_kind);
     let error = match chosen {
         _ if !valid_name_part(name) => {
             "Use lowercase letters, digits, dots, dashes or underscores, up to 32."

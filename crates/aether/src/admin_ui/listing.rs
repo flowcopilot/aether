@@ -41,10 +41,7 @@ pub(super) async fn listing_section(
     error: String,
 ) -> TopcoatResult<impl View> {
     let settings = crate::agent_card::settings(&data_dir);
-    let name =
-        crate::settings::setting::<crate::hub_client::settings::HubName>(&data_dir)
-            .ok()
-            .flatten();
+    let name = crate::hub_client::settings::hub_name(&data_dir);
     let now = now_seconds();
     let days_left =
         crate::settings::setting::<crate::listing::settings::ListingState>(&data_dir)

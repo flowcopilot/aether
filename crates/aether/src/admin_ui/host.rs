@@ -132,11 +132,7 @@ pub(super) async fn host_screen(
     let hub_access = page.hub_access();
     let hub = page.current_hub();
     let service = hub.is_some()
-        && crate::settings::setting::<crate::hub_client::settings::AgentKind>(
-            &page.data_dir,
-        )
-        .ok()
-        .flatten()
+        && crate::hub_client::settings::agent_kind(&page.data_dir)
             == Some(crate::hub_client::AgentKind::Service);
     // The code form is the second way when a hub is set; it opens when it
     // is in use.
@@ -965,11 +961,7 @@ pub(super) async fn publish_listing(
     Form(form): Form<ListingForm>,
 ) -> TopcoatResult<impl View> {
     let page = admin_page(cx, "this node has no listing").await?;
-    if crate::settings::setting::<crate::hub_client::settings::AgentKind>(
-        &page.data_dir,
-    )
-    .ok()
-    .flatten()
+    if crate::hub_client::settings::agent_kind(&page.data_dir)
         != Some(crate::hub_client::AgentKind::Service)
     {
         return Err(bad_request("only a service agent has a public listing").into());
