@@ -13,7 +13,7 @@ use crate::{
     admin::{AdminError, LiveNode},
     directory_publication::{DirectoryPublication, PublicationError},
     execution::{Agent, Task},
-    proof::{Identity, ProofError, ProofHandle, ProofNode, SubmissionInput},
+    proof::{Identity, ProofError, ProofNode, SubmissionInput},
 };
 
 pub struct NodeService<T, P> {
@@ -84,8 +84,8 @@ where
     }
 
     #[must_use]
-    pub const fn proof(&self) -> ProofHandle<'_, T, P> {
-        ProofHandle::new(&self.proof)
+    pub const fn proof(&self) -> &ProofNode<T, P> {
+        &self.proof
     }
 
     /// Names the workspace paths a live `Change::Workspace` may switch to

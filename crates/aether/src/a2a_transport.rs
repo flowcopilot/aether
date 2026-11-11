@@ -4,7 +4,7 @@ use aether_store::StoreError;
 
 use crate::{
     execution::{Agent, Task},
-    proof::{Identity, ProofError, ProofHandle, SubmissionInput},
+    proof::{Identity, ProofError, ProofNode, SubmissionInput},
     transport::{
         A2aCancel, A2aPartContent, A2aRequest, A2aTaskStatus, Frame, FrameKind,
         MAX_EXCHANGE_BYTES, MAX_FRAMES, TransportError, event_payload,
@@ -15,12 +15,12 @@ use crate::{
 const EVENT_PAGE_BYTE_BUDGET: usize = MAX_EXCHANGE_BYTES - 65_536;
 
 pub struct A2aTransport<'a, T, P> {
-    proof: ProofHandle<'a, T, P>,
+    proof: &'a ProofNode<T, P>,
 }
 
 impl<'a, T, P> A2aTransport<'a, T, P> {
     #[must_use]
-    pub const fn new(proof: ProofHandle<'a, T, P>) -> Self {
+    pub const fn new(proof: &'a ProofNode<T, P>) -> Self {
         Self { proof }
     }
 
