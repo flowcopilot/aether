@@ -4,6 +4,8 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use super::HubError;
+
 pub const PROTOCOL_VERSION: u64 = 2;
 pub const PROTOCOL_VERSION_HEADER: &str = "2";
 pub const PROTOCOL_HEADER: &str = "x-aether-protocol";
@@ -70,12 +72,11 @@ pub struct ListingSkillPayload {
     pub tags: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum ListingWireError {
-    Invalid,
-    Signature,
-    Expired,
-}
+/// A listing that is not valid, not signed by the endpoint it names, or
+/// expired.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
+#[error("the listing is not valid, not signed by its endpoint, or expired")]
+pub struct ListingError;
 
 #[must_use]
 pub fn sign_listing(key: &iroh::SecretKey, bytes: &[u8], expires_at: u64) -> String {
@@ -90,44 +91,42 @@ pub fn verify_listing(
     endpoint: &str,
     expires_at: u64,
     at: u64,
-) -> Result<(), ListingWireError> {
+) -> Result<(), ListingError> {
     if expires_at <= at {
-        return Err(ListingWireError::Expired);
+        return Err(ListingError);
     }
-    let bytes = URL_SAFE_NO_PAD.decode(text).map_err(|_| ListingWireError::Invalid)?;
+    let bytes = URL_SAFE_NO_PAD.decode(text).map_err(|_| ListingError)?;
     let signature: [u8; 64] = URL_SAFE_NO_PAD
         .decode(signature)
         .ok()
         .and_then(|signature| signature.try_into().ok())
-        .ok_or(ListingWireError::Signature)?;
-    let key =
-        iroh::PublicKey::from_str(endpoint).map_err(|_| ListingWireError::Signature)?;
+        .ok_or(ListingError)?;
+    let key = iroh::PublicKey::from_str(endpoint).map_err(|_| ListingError)?;
     key.verify(
         listing_message(endpoint, expires_at, &bytes).as_bytes(),
         &iroh::Signature::from_bytes(&signature),
     )
-    .map_err(|_| ListingWireError::Signature)
+    .map_err(|_| ListingError)
 }
 
 pub fn listing_bytes_match_handle(
     text: &str,
     handle: &str,
-) -> Result<(), ListingWireError> {
-    let bytes = URL_SAFE_NO_PAD.decode(text).map_err(|_| ListingWireError::Invalid)?;
+) -> Result<(), ListingError> {
+    let bytes = URL_SAFE_NO_PAD.decode(text).map_err(|_| ListingError)?;
     parse_listing_bytes(&bytes, handle).map(|_| ())
 }
 
 pub fn parse_listing_bytes(
     bytes: &[u8],
     handle: &str,
-) -> Result<ListingPayload, ListingWireError> {
+) -> Result<ListingPayload, ListingError> {
     if bytes.len() > MAX_LISTING_BYTES {
-        return Err(ListingWireError::Invalid);
+        return Err(ListingError);
     }
-    let raw: RawListing =
-        serde_json::from_slice(bytes).map_err(|_| ListingWireError::Invalid)?;
+    let raw: RawListing = serde_json::from_slice(bytes).map_err(|_| ListingError)?;
     if !listing_payload_valid(&raw, handle) {
-        return Err(ListingWireError::Invalid);
+        return Err(ListingError);
     }
     Ok(ListingPayload {
         name: raw.name,
@@ -254,33 +253,19 @@ pub fn owner_confirm_message(
     )
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HubWireError {
-    Invalid,
-    Unauthorized,
-    NoAccount,
-    Forbidden,
-    NotFound,
-    Taken,
-    Limit,
-    RateLimited,
-    OldNode,
-    Unexpected,
-}
-
 #[must_use]
-pub fn wire_error(status: u16, code: Option<&str>) -> HubWireError {
+pub fn wire_error(status: u16, code: Option<&str>) -> HubError {
     match (status, code) {
-        (401, _) => HubWireError::Unauthorized,
-        (403, Some("no_account")) => HubWireError::NoAccount,
-        (403, _) => HubWireError::Forbidden,
-        (404, _) => HubWireError::NotFound,
-        (409, Some("limit")) => HubWireError::Limit,
-        (409, _) => HubWireError::Taken,
-        (400 | 413, _) => HubWireError::Invalid,
-        (429, _) => HubWireError::RateLimited,
-        (426, _) => HubWireError::OldNode,
-        _ => HubWireError::Unexpected,
+        (401, _) => HubError::Unauthorized,
+        (403, Some("no_account")) => HubError::NoAccount,
+        (403, _) => HubError::Forbidden,
+        (404, _) => HubError::NotFound,
+        (409, Some("limit")) => HubError::Limit,
+        (409, _) => HubError::Taken,
+        (400 | 413, _) => HubError::Invalid,
+        (429, _) => HubError::RateLimited,
+        (426, _) => HubError::OldNode,
+        _ => HubError::Unexpected,
     }
 }
 
@@ -297,7 +282,7 @@ mod tests {
         ACCESS_DAYS_MAX, ACCESS_DAYS_MIN, AGENT_SEARCH_LIMIT_DEFAULT,
         AGENT_SEARCH_LIMIT_MAX, AGENT_SEARCH_LIMIT_MIN, AGENT_SEARCH_MAX_QUERY_CHARS,
         AGENT_SEARCH_MAX_WORDS, AGENT_SEARCH_MIN_WORD_CHARS, DEFAULT_ACCESS_DAYS,
-        DEFAULT_HUB_URL, ENDPOINT_HEADER, HUB_OFF, HubWireError, INVITE_PREFIX,
+        DEFAULT_HUB_URL, ENDPOINT_HEADER, HUB_OFF, HubError, INVITE_PREFIX,
         INVITE_SECONDS, LISTING_HIDDEN_CODEPOINTS, MAX_BLOCKS, MAX_BODY_BYTES,
         MAX_DIRECTORY_AGENTS, MAX_INVITE_BYTES, MAX_LISTED_REQUESTS, MAX_LISTING_BYTES,
         MAX_LISTING_DAYS, MAX_LISTING_DESCRIPTION, MAX_LISTING_SKILL_DESCRIPTION,
@@ -483,16 +468,16 @@ mod tests {
                 u16::try_from(status.as_u64().expect("status")).expect("status u16");
             let mapped = wire_error(status, Some(code.as_str()));
             let expected = match code.as_str() {
-                "invalid" | "too_large" => HubWireError::Invalid,
-                "unauthorized" => HubWireError::Unauthorized,
-                "no_account" => HubWireError::NoAccount,
-                "forbidden" => HubWireError::Forbidden,
-                "not_found" => HubWireError::NotFound,
-                "taken" => HubWireError::Taken,
-                "limit" => HubWireError::Limit,
-                "upgrade_required" => HubWireError::OldNode,
-                "rate_limited" => HubWireError::RateLimited,
-                _ => HubWireError::Unexpected,
+                "invalid" | "too_large" => HubError::Invalid,
+                "unauthorized" => HubError::Unauthorized,
+                "no_account" => HubError::NoAccount,
+                "forbidden" => HubError::Forbidden,
+                "not_found" => HubError::NotFound,
+                "taken" => HubError::Taken,
+                "limit" => HubError::Limit,
+                "upgrade_required" => HubError::OldNode,
+                "rate_limited" => HubError::RateLimited,
+                _ => HubError::Unexpected,
             };
             assert_eq!(mapped, expected, "{code}");
         }

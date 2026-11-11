@@ -455,18 +455,7 @@ fn status_error(status: StatusCode, body: &[u8]) -> HubError {
         error: String,
     }
     let code = serde_json::from_slice::<ErrorBody>(body).map(|body| body.error).ok();
-    match protocol::wire_error(status.as_u16(), code.as_deref()) {
-        protocol::HubWireError::Invalid => HubError::Invalid,
-        protocol::HubWireError::Unauthorized => HubError::Unauthorized,
-        protocol::HubWireError::NoAccount => HubError::NoAccount,
-        protocol::HubWireError::Forbidden => HubError::Forbidden,
-        protocol::HubWireError::NotFound => HubError::NotFound,
-        protocol::HubWireError::Taken => HubError::Taken,
-        protocol::HubWireError::Limit => HubError::Limit,
-        protocol::HubWireError::RateLimited => HubError::RateLimited,
-        protocol::HubWireError::OldNode => HubError::OldNode,
-        protocol::HubWireError::Unexpected => HubError::Unexpected,
-    }
+    protocol::wire_error(status.as_u16(), code.as_deref())
 }
 
 fn parse<T: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<T, HubError> {
