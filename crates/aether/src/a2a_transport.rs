@@ -113,16 +113,16 @@ impl<'a, T, P> A2aTransport<'a, T, P> {
         let mut cursor = last_sequence;
         for event in events {
             let event_frame = Frame {
-                version: 0,
-                kind: FrameKind::Event,
-                exchange_id: frame.exchange_id.clone(),
-                scope_id: frame.scope_id.clone(),
                 task_id: Some(task_id.clone()),
-                payload: event_payload(
-                    &task_id,
-                    event_status(event.event_type, state),
-                    Some(event.sequence),
-                ),
+                ..Frame::reply_to(
+                    &frame,
+                    FrameKind::Event,
+                    event_payload(
+                        &task_id,
+                        event_status(event.event_type, state),
+                        Some(event.sequence),
+                    ),
+                )
             };
             let frame_bytes =
                 serde_json::to_vec(&event_frame).map_or(0, |encoded| encoded.len());
@@ -135,18 +135,18 @@ impl<'a, T, P> A2aTransport<'a, T, P> {
             response.push(event_frame);
         }
         response.push(Frame {
-            version: 0,
-            kind: FrameKind::Result,
-            exchange_id: frame.exchange_id.clone(),
-            scope_id: frame.scope_id.clone(),
             task_id: Some(task_id.clone()),
-            payload: text_result_payload_with_progress(
-                &task_id,
-                status,
-                &result_text,
-                cursor,
-                more_events,
-            ),
+            ..Frame::reply_to(
+                &frame,
+                FrameKind::Result,
+                text_result_payload_with_progress(
+                    &task_id,
+                    status,
+                    &result_text,
+                    cursor,
+                    more_events,
+                ),
+            )
         });
         Ok(response)
     }
@@ -181,26 +181,20 @@ impl<'a, T, P> A2aTransport<'a, T, P> {
             .last()
             .ok_or_else(|| TransportError::Network("task event missing".to_owned()))?;
         Ok(vec![
-            Frame {
-                version: 0,
-                kind: FrameKind::Event,
-                exchange_id: frame.exchange_id.clone(),
-                scope_id: frame.scope_id.clone(),
-                task_id: frame.task_id.clone(),
-                payload: event_payload(
+            Frame::reply_to(
+                &frame,
+                FrameKind::Event,
+                event_payload(
                     task_id,
                     event_status(event.event_type, aether_store::TaskState::Cancelled),
                     Some(event.sequence),
                 ),
-            },
-            Frame {
-                version: 0,
-                kind: FrameKind::Result,
-                exchange_id: frame.exchange_id.clone(),
-                scope_id: frame.scope_id.clone(),
-                task_id: frame.task_id.clone(),
-                payload: text_result_payload(task_id, A2aTaskStatus::Canceled, ""),
-            },
+            ),
+            Frame::reply_to(
+                &frame,
+                FrameKind::Result,
+                text_result_payload(task_id, A2aTaskStatus::Canceled, ""),
+            ),
         ])
     }
 }

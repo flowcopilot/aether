@@ -71,6 +71,26 @@ pub struct Frame {
     pub payload: serde_json::Value,
 }
 
+impl Frame {
+    /// The frame of `kind` that answers `request`: version 0, in the same
+    /// exchange, scope and task.
+    #[must_use]
+    pub fn reply_to(
+        request: &Self,
+        kind: FrameKind,
+        payload: serde_json::Value,
+    ) -> Self {
+        Self {
+            version: 0,
+            kind,
+            exchange_id: request.exchange_id.clone(),
+            scope_id: request.scope_id.clone(),
+            task_id: request.task_id.clone(),
+            payload,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct A2aRequest {

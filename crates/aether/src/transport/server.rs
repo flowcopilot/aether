@@ -275,18 +275,15 @@ pub(crate) fn error_response(request: &[Frame], error: &TransportError) -> Vec<F
     let Some(request) = request.first() else {
         return Vec::new();
     };
-    vec![Frame {
-        version: 0,
-        kind: FrameKind::Error,
-        exchange_id: request.exchange_id.clone(),
-        scope_id: request.scope_id.clone(),
-        task_id: request.task_id.clone(),
-        payload: payload(A2aError {
+    vec![Frame::reply_to(
+        request,
+        FrameKind::Error,
+        payload(A2aError {
             code: a2a_error_code(error),
             message: a2a_error_message(error).to_owned(),
             data: a2a_error_data(error),
         }),
-    }]
+    )]
 }
 
 // JSON-RPC reserves -32000 through -32099 for implementation-defined server
