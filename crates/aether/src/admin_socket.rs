@@ -155,25 +155,13 @@ fn serve(
 fn read_request(stream: &mut UnixStream, output: &mut Vec<u8>) -> io::Result<()> {
     let mut reader = BufReader::new(stream.take(MAX_SOCKET_BYTES + 1));
     reader.read_until(b'\n', output)?;
-    if over_limit(output.len()) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "socket message is too large",
-        ));
-    }
-    Ok(())
+    within_limit(output)
 }
 
 fn read_limited(stream: &mut UnixStream, output: &mut Vec<u8>) -> io::Result<()> {
     let mut reader = stream.take(MAX_SOCKET_BYTES + 1);
     reader.read_to_end(output)?;
-    if over_limit(output.len()) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "socket message is too large",
-        ));
-    }
-    Ok(())
+    within_limit(output)
 }
 
 fn handle(
@@ -181,43 +169,46 @@ fn handle(
     data_dir: &Path,
     request: Request,
 ) -> Response {
-    if let Request::CreateInvite { friend_name, endpoint_id, days } = &request {
-        return create_invite_response(
-            administration,
-            data_dir,
-            friend_name,
-            endpoint_id,
-            *days,
-        );
-    }
-    let Ok(mut administration) = administration.lock() else {
-        return Response::Error { code: "unavailable".to_owned() };
-    };
     match request {
-        Request::Audit => match administration.audit_entries() {
-            Ok(entries) => Response::Audit { entries },
-            Err(_) => Response::Error { code: "unavailable".to_owned() },
-        },
-        Request::DirectGrants => match administration.grants() {
-            Ok(grants) => Response::DirectGrants {
-                grants: grants
-                    .into_iter()
-                    .filter(|grant| {
-                        grant.scope_id.as_str() == crate::direct::SCOPE
-                            && grant.expires_at > std::time::SystemTime::now()
-                    })
-                    .map(|grant| DirectGrantInfo {
-                        id: grant.id.as_str().to_owned(),
-                        agent: grant.subject_agent_id.as_str().to_owned(),
-                        endpoint_id: grant.subject_endpoint_id.as_str().to_owned(),
-                        expires_at: aether_core::time::unix_timestamp(grant.expires_at)
+        Request::CreateInvite { friend_name, endpoint_id, days } => {
+            create_invite_response(
+                administration,
+                data_dir,
+                &friend_name,
+                &endpoint_id,
+                days,
+            )
+        }
+        Request::Audit => with_lock(administration, |administration| {
+            match administration.audit_entries() {
+                Ok(entries) => Response::Audit { entries },
+                Err(_) => Response::Error { code: "unavailable".to_owned() },
+            }
+        }),
+        Request::DirectGrants => {
+            with_lock(administration, |administration| match administration.grants() {
+                Ok(grants) => Response::DirectGrants {
+                    grants: grants
+                        .into_iter()
+                        .filter(|grant| {
+                            grant.scope_id.as_str() == crate::direct::SCOPE
+                                && grant.expires_at > std::time::SystemTime::now()
+                        })
+                        .map(|grant| DirectGrantInfo {
+                            id: grant.id.as_str().to_owned(),
+                            agent: grant.subject_agent_id.as_str().to_owned(),
+                            endpoint_id: grant.subject_endpoint_id.as_str().to_owned(),
+                            expires_at: aether_core::time::unix_timestamp(
+                                grant.expires_at,
+                            )
                             .unwrap_or(i64::MAX),
-                    })
-                    .collect(),
-            },
-            Err(_) => Response::Error { code: "unavailable".to_owned() },
-        },
-        Request::RevokeGrant { id } => {
+                        })
+                        .collect(),
+                },
+                Err(_) => Response::Error { code: "unavailable".to_owned() },
+            })
+        }
+        Request::RevokeGrant { id } => with_lock(administration, |administration| {
             let Ok(grants) = administration.grants() else {
                 return Response::Error { code: "unavailable".to_owned() };
             };
@@ -231,30 +222,38 @@ fn handle(
                 Ok(()) => Response::Applied,
                 Err(error) => error_response(&error),
             }
-        }
-        Request::SetRelay { url } => match administration.set_relay(url) {
-            Ok(()) => Response::Applied,
-            Err(error) => error_response(&error),
-        },
-        Request::Cancel { task_id } => match administration.cancel_task(&task_id) {
-            Ok(()) => Response::Cancelled,
-            Err(error) => error_response(&error),
-        },
-        Request::OutboxWake => match administration.wake_outbox() {
-            Ok(()) => Response::Applied,
-            Err(error) => error_response(&error),
-        },
-        Request::Change { change, dry_run } => {
-            let change = match change.as_ref().clone().into_change() {
-                Ok(change) => change,
-                Err(error) => return error_response(&error),
-            };
-            match administration.submit(&change, AuditActor::Mcp, dry_run) {
-                Ok(ChangeOutcome::Validated) => Response::Validated,
-                Ok(ChangeOutcome::Applied) => Response::Applied,
-                Ok(ChangeOutcome::Pending) => Response::Pending,
+        }),
+        Request::SetRelay { url } => with_lock(administration, |administration| {
+            match administration.set_relay(url) {
+                Ok(()) => Response::Applied,
                 Err(error) => error_response(&error),
             }
+        }),
+        Request::Cancel { task_id } => with_lock(administration, |administration| {
+            match administration.cancel_task(&task_id) {
+                Ok(()) => Response::Cancelled,
+                Err(error) => error_response(&error),
+            }
+        }),
+        Request::OutboxWake => with_lock(administration, |administration| {
+            match administration.wake_outbox() {
+                Ok(()) => Response::Applied,
+                Err(error) => error_response(&error),
+            }
+        }),
+        Request::Change { change, dry_run } => {
+            with_lock(administration, |administration| {
+                let change = match change.as_ref().clone().into_change() {
+                    Ok(change) => change,
+                    Err(error) => return error_response(&error),
+                };
+                match administration.submit(&change, AuditActor::Mcp, dry_run) {
+                    Ok(ChangeOutcome::Validated) => Response::Validated,
+                    Ok(ChangeOutcome::Applied) => Response::Applied,
+                    Ok(ChangeOutcome::Pending) => Response::Pending,
+                    Err(error) => error_response(&error),
+                }
+            })
         }
         Request::UpdatePolicy {
             workspace,
@@ -263,7 +262,7 @@ fn handle(
             queue_global,
             queue_per_peer,
             dry_run,
-        } => {
+        } => with_lock(administration, |administration| {
             let Some(mut settings) =
                 crate::policy::policy_settings(data_dir).ok().flatten()
             else {
@@ -295,14 +294,31 @@ fn handle(
                     Err(error) => error_response(&error),
                 }
             }
-        }
-        Request::CreateInvite { .. } => Response::Error { code: "invalid".to_owned() },
+        }),
     }
 }
 
-/// Whether a message of `length` bytes is over the socket's limit.
-fn over_limit(length: usize) -> bool {
-    u64::try_from(length).map_or(true, |length| length > MAX_SOCKET_BYTES)
+/// The response of `respond` with the locked administration; `unavailable`
+/// when the lock is poisoned.
+fn with_lock(
+    administration: &SharedAdministration,
+    respond: impl FnOnce(&mut crate::admin::Administration) -> Response,
+) -> Response {
+    match administration.lock() {
+        Ok(mut administration) => respond(&mut administration),
+        Err(_) => Response::Error { code: "unavailable".to_owned() },
+    }
+}
+
+/// An error when `message` is over the socket's limit.
+fn within_limit(message: &[u8]) -> io::Result<()> {
+    if u64::try_from(message.len()).map_or(true, |length| length > MAX_SOCKET_BYTES) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "socket message is too large",
+        ));
+    }
+    Ok(())
 }
 
 fn create_invite_response(
