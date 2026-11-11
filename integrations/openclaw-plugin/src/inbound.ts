@@ -17,7 +17,7 @@ export const DESCRIPTION = "Send and receive Aether agent tasks through the loca
 // never the owner.
 export const NODE_SENDER_ID = "aether-node";
 
-export interface DispatchOptions {
+interface DispatchOptions {
   cfg: OpenClawConfig;
   accountId: string;
   channelRuntime: PluginRuntime["channel"];

@@ -4,7 +4,7 @@
 import { frameTask } from "./protocol.ts";
 import type { AgentMessage, NodeMessage } from "./protocol.ts";
 
-export type DeliverKind = "tool" | "block" | "final";
+type DeliverKind = "tool" | "block" | "final";
 export type Dispatch = (
   task: { id: string; body: string; signal: AbortSignal },
   hooks: {

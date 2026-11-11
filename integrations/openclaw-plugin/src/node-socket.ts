@@ -47,7 +47,6 @@ export class NodeSocket {
   #session(signal: AbortSignal): Promise<void> {
     return new Promise((resolve) => {
       const socket = net.createConnection(this.#path);
-      let connected = false;
       let buffer = Buffer.alloc(0);
       const stop = () => socket.destroy();
       signal.addEventListener("abort", stop, { once: true });
@@ -55,7 +54,6 @@ export class NodeSocket {
       socket.on("connect", () => {
         socket.write(encode({ type: "ready", protocol: PROTOCOL }));
         this.#socket = socket;
-        connected = true;
         this.#onStatus(true);
       });
       socket.on("data", (chunk: Buffer) => {
@@ -77,10 +75,10 @@ export class NodeSocket {
       socket.on("error", () => {});
       socket.on("close", () => {
         signal.removeEventListener("abort", stop);
+        // Sessions run one at a time, so the socket is this one's exactly
+        // when it connected.
         if (this.#socket === socket) {
           this.#socket = undefined;
-        }
-        if (connected) {
           this.#onStatus(false);
         }
         resolve();

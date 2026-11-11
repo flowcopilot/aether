@@ -15,15 +15,14 @@ import { TaskRunner } from "./task-runner.ts";
 
 const DEFAULT_ACCOUNT_ID = "default";
 
-export interface AetherAccount {
+interface AetherAccount {
   accountId: string;
   enabled: boolean;
   configured: boolean;
   dataDir: string;
-  allowedTools: string[];
 }
 
-export function channelSection(cfg: OpenClawConfig): Record<string, unknown> | undefined {
+function channelSection(cfg: OpenClawConfig): Record<string, unknown> | undefined {
   const channels: unknown = (cfg as { channels?: unknown }).channels;
   if (!isRecord(channels) || !isRecord(channels[CHANNEL_ID])) {
     return undefined;
@@ -38,7 +37,7 @@ export function allowedToolsFrom(cfg: OpenClawConfig): string[] {
 
 // A "~/" prefix means the home directory, as the README shows. Without a
 // setting, the same default as the aether command is used.
-export function resolveDataDir(configured: unknown): string {
+function resolveDataDir(configured: unknown): string {
   if (typeof configured !== "string" || configured.trim() === "") {
     return defaultDataDir();
   }
@@ -53,7 +52,6 @@ function resolveAccount(cfg: OpenClawConfig, accountId?: string | null): AetherA
     enabled: section?.enabled !== false,
     configured: section !== undefined,
     dataDir: resolveDataDir(section?.dataDir),
-    allowedTools: allowedToolsFrom(cfg),
   };
 }
 
@@ -124,6 +122,14 @@ export const aetherChannelPlugin = createChatChannelPlugin<AetherAccount>({
           resolveRoute: resolveAgentRoute,
         });
 
+        // The runner and the socket refer to each other; the runner sends
+        // only once the socket below has connected.
+        const runner = new TaskRunner({
+          send: (message) => {
+            socket.send(message);
+          },
+          dispatch,
+        });
         const socket = new NodeSocket({
           path: socketPath(account.dataDir),
           onMessage: (message) => runner.handle(message),
@@ -139,12 +145,6 @@ export const aetherChannelPlugin = createChatChannelPlugin<AetherAccount>({
               enabled: account.enabled,
             });
           },
-        });
-        const runner = new TaskRunner({
-          send: (message) => {
-            socket.send(message);
-          },
-          dispatch,
         });
 
         ctx.setStatus(channelReadyPatch({ accountId: account.accountId }));
