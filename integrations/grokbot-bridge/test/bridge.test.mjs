@@ -15,14 +15,7 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { Mailbox } from '../src/mailbox.mjs';
 import { NodeLink, contract, frameTask } from '../src/node-link.mjs';
 import { createBridgeServer } from '../src/server.mjs';
-
-async function until(check) {
-  const deadline = Date.now() + 3000;
-  while (!check()) {
-    assert.ok(Date.now() < deadline, 'timed out waiting for protocol outcome');
-    await sleep(2);
-  }
-}
+import { until } from './support.mjs';
 
 async function fixture(t, options = {}) {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'ae-grok-'));

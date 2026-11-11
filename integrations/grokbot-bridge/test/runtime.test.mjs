@@ -7,9 +7,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { setTimeout as sleep } from 'node:timers/promises';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { connectStdio, fakeAether, until } from './support.mjs';
 import { acquireRuntime, alive } from '../src/runtime.mjs';
 
 const installer = fileURLToPath(new URL('../install.mjs', import.meta.url));
@@ -19,16 +17,6 @@ function directory(t) {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'ae-runtime-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   return dir;
-}
-
-async function until(check, message, ms = 7000) {
-  const deadline = Date.now() + ms;
-  for (;;) {
-    const value = await check();
-    if (value) return value;
-    assert.ok(Date.now() < deadline, message);
-    await sleep(20);
-  }
 }
 
 async function deadPid() {
@@ -150,42 +138,14 @@ test('two command connectors share one node; the survivor restarts it when the o
   const binary = path.join(dir, 'fake-aether');
   const data = path.join(dir, 'data');
   const starts = path.join(dir, 'starts');
-  writeFileSync(binary, `#!${process.execPath}
-import net from 'node:net';
-import fs from 'node:fs';
-import path from 'node:path';
-if (process.argv.includes('--help')) { console.log('--adapter'); process.exit(0); }
-fs.appendFileSync(${JSON.stringify(starts)}, process.pid + '\\n');
-const socket = path.join(process.env.AETHER_DATA_DIR, 'agent.sock');
-fs.rmSync(socket, { force: true });
-net.createServer(peer => {
-  let buffer = '';
-  peer.setEncoding('utf8');
-  peer.on('data', chunk => {
-    buffer += chunk;
-    let end;
-    while ((end = buffer.indexOf('\\n')) !== -1) {
-      const message = JSON.parse(buffer.slice(0, end)); buffer = buffer.slice(end + 1);
-      if (message.type === 'ready') peer.write(JSON.stringify({ type: 'task', id: 'task-' + process.pid, instructions: 'Be brief.', text: 'Name a colour.' }) + '\\n');
-    }
-  });
-}).listen(socket);
-process.on('SIGTERM', () => process.exit(0));
-`, { mode: 0o700 });
+  fakeAether(binary, { starts });
   const install = spawnSync(process.execPath, [installer, '--data-dir', data, '--aether-bin', binary], { encoding: 'utf8' });
   assert.equal(install.status, 0, install.stdout + install.stderr);
   const config = JSON.parse(install.stdout).mcpServers['aether-executor'];
   const connect = async () => {
-    const transport = new StdioClientTransport({ ...config, stderr: 'pipe' });
-    transport.stderr?.resume();
-    const client = new Client({ name: 'command-host', version: '1.0.0' });
-    await client.connect(transport);
-    t.after(() => client.close());
-    const call = async (name, args = {}) => {
-      const response = await client.callTool({ name, arguments: args });
-      return response.isError ? { error: response.content[0].text } : JSON.parse(response.content[0].text);
-    };
-    return { client, call };
+    const connector = await connectStdio(config);
+    t.after(() => connector.client.close());
+    return connector;
   };
   const nodes = () => existsSync(starts) ? readFileSync(starts, 'utf8').trim().split('\n').map(Number) : [];
   const first = await connect();
