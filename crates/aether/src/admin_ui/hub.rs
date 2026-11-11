@@ -583,11 +583,24 @@ async fn request_row(invite: Invite) -> TopcoatResult<impl View> {
     })
 }
 
-#[component]
-async fn invite_row(invite: Invite, approved: bool) -> TopcoatResult<impl View> {
-    let days = days_label(invite.days);
+/// What one invite row says and offers.
+#[derive(Debug, PartialEq, Eq)]
+struct InviteOffer {
+    text: String,
+    /// The two nodes are connecting.
+    spinner: bool,
+    /// **Accept** and **Block**: a received invite that waits.
+    answer: bool,
+    /// The label of the button that removes the invite, if it has one.
+    remove: Option<&'static str>,
+}
+
+/// What a row offers for `invite`, from its side, its status, and whether
+/// this page approved it (`approved` counts only for a sent invite).
+fn invite_offer(invite: &Invite, approved: bool) -> InviteOffer {
+    let unapproved = invite.role == Role::Sender && !approved;
     let text = match (invite.role, invite.status) {
-        (Role::Sender, _) if !approved => {
+        (Role::Sender, _) if unapproved => {
             "This invite was made before an update. Cancel it and invite again."
                 .to_owned()
         }
@@ -595,32 +608,44 @@ async fn invite_row(invite: Invite, approved: bool) -> TopcoatResult<impl View> 
             format!("Waiting for {} to accept", invite.to)
         }
         (Role::Sender, _) => format!("Connecting {}…", invite.to),
-        (Role::Receiver, Status::Pending) => {
-            format!("{} wants to share their agent with you for {days}", invite.from)
-        }
+        (Role::Receiver, Status::Pending) => format!(
+            "{} wants to share their agent with you for {}",
+            invite.from,
+            days_label(invite.days)
+        ),
         (Role::Receiver, Status::Requested) => {
             format!("Waiting for {} to approve", invite.from)
         }
         (Role::Receiver, _) => format!("Connecting to {}…", invite.from),
     };
-    let can_accept = invite.role == Role::Receiver && invite.status == Status::Pending;
+    let removable =
+        matches!(invite.status, Status::Pending | Status::Requested) || unapproved;
     let remove_label = match (invite.role, invite.status) {
         (Role::Sender, _) | (Role::Receiver, Status::Requested) => "Cancel",
         (Role::Receiver, _) => "Decline",
     };
+    InviteOffer {
+        text,
+        spinner: matches!(invite.status, Status::Accepted | Status::Delivered),
+        answer: invite.role == Role::Receiver && invite.status == Status::Pending,
+        remove: removable.then_some(remove_label),
+    }
+}
+
+#[component]
+async fn invite_row(invite: Invite, approved: bool) -> TopcoatResult<impl View> {
+    let offer = invite_offer(&invite, approved);
     Ok(view! {
         <li class="flex flex-wrap items-center gap-3 py-3">
-            if matches!(invite.status, Status::Accepted | Status::Delivered) {
+            if offer.spinner {
                 <span class="size-3.5 shrink-0 animate-spin rounded-full border-2 border-border border-t-primary" aria-hidden="true"></span>
             }
-            <span class="mr-auto text-sm">(text)</span>
-            if can_accept {
+            <span class="mr-auto text-sm">(&offer.text)</span>
+            if offer.answer {
                 <form method="post" action="/hub/accept">
                     <input type="hidden" name="id" value=(&invite.id)>
                     button(size: ButtonSize::Sm, attrs: attributes! { type="submit" }, "Accept")
                 </form>
-            }
-            if invite.role == Role::Receiver && invite.status == Status::Pending {
                 <form method="post" action="/hub/block" title="Block hides this person's invites from you. They see the same as after a decline.">
                     <input type="hidden" name="id" value=(&invite.id)>
                     button(
@@ -631,16 +656,14 @@ async fn invite_row(invite: Invite, approved: bool) -> TopcoatResult<impl View> 
                     )
                 </form>
             }
-            if matches!(invite.status, Status::Pending | Status::Requested)
-                || (invite.role == Role::Sender && !approved)
-            {
+            if let Some(label) = offer.remove {
                 <form method="post" action="/hub/remove">
                     <input type="hidden" name="id" value=(&invite.id)>
                     button(
                         variant: ButtonVariant::Outline,
                         size: ButtonSize::Sm,
                         attrs: attributes! { type="submit" },
-                        (remove_label)
+                        (label)
                     )
                 </form>
             }
@@ -1148,4 +1171,103 @@ pub(super) async fn presence(cx: &Cx) -> TopcoatResult<impl IntoResponse> {
     };
     let body = serde_json::to_string(&presence).map_err(internal_server_error)?;
     Ok(([(header::CONTENT_TYPE, HeaderValue::from_static("application/json"))], body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InviteOffer, invite_offer};
+    use crate::hub_client::{Invite, Origin, Role, Status};
+
+    fn invite(role: Role, status: Status) -> Invite {
+        Invite {
+            id: "one".to_owned(),
+            from: "bob#0001".to_owned(),
+            to: "ana#0002".to_owned(),
+            role,
+            days: 7,
+            status,
+            origin: Origin::default(),
+            receiver_endpoint: None,
+            bundle: None,
+            sender_endpoint: None,
+            created_at: 0,
+        }
+    }
+
+    fn offer(
+        text: &str,
+        spinner: bool,
+        answer: bool,
+        remove: Option<&'static str>,
+    ) -> InviteOffer {
+        InviteOffer { text: text.to_owned(), spinner, answer, remove }
+    }
+
+    #[test]
+    fn an_invite_row_offers_what_its_side_and_status_allow() {
+        let stale =
+            "This invite was made before an update. Cancel it and invite again.";
+        let cases = [
+            (
+                Role::Sender,
+                Status::Pending,
+                false,
+                offer(stale, false, false, Some("Cancel")),
+            ),
+            (
+                Role::Sender,
+                Status::Accepted,
+                false,
+                offer(stale, true, false, Some("Cancel")),
+            ),
+            (
+                Role::Sender,
+                Status::Pending,
+                true,
+                offer("Waiting for ana#0002 to accept", false, false, Some("Cancel")),
+            ),
+            (
+                Role::Sender,
+                Status::Accepted,
+                true,
+                offer("Connecting ana#0002…", true, false, None),
+            ),
+            (
+                Role::Sender,
+                Status::Delivered,
+                true,
+                offer("Connecting ana#0002…", true, false, None),
+            ),
+            (
+                Role::Receiver,
+                Status::Pending,
+                false,
+                offer(
+                    "bob#0001 wants to share their agent with you for 7 days",
+                    false,
+                    true,
+                    Some("Decline"),
+                ),
+            ),
+            (
+                Role::Receiver,
+                Status::Requested,
+                false,
+                offer("Waiting for bob#0001 to approve", false, false, Some("Cancel")),
+            ),
+            (
+                Role::Receiver,
+                Status::Accepted,
+                false,
+                offer("Connecting to bob#0001…", true, false, None),
+            ),
+        ];
+        for (role, status, approved, expected) in cases {
+            assert_eq!(
+                invite_offer(&invite(role, status), approved),
+                expected,
+                "{role:?} {status:?} approved={approved}"
+            );
+        }
+    }
 }
