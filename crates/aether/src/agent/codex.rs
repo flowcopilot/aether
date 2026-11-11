@@ -17,6 +17,7 @@ use std::{
 use process_wrap::std::{ChildWrapper, CommandWrap};
 use serde_json::{Value, json};
 
+use super::EarlyCancels;
 use crate::{
     execution::{
         Agent, ExecutionError, ExecutionEvent, TurnContext, agent_instructions,
@@ -156,7 +157,14 @@ pub struct CodexAppServer {
     source: Option<PathBuf>,
     arguments: Vec<String>,
     limits: CodexLimits,
-    active_turns: Arc<Mutex<BTreeMap<String, ActiveTurn>>>,
+    turns: Arc<Mutex<Turns>>,
+}
+
+/// The turns that run now, and the cancels for turns that do not.
+#[derive(Default)]
+struct Turns {
+    active: BTreeMap<String, ActiveTurn>,
+    cancels: EarlyCancels,
 }
 
 #[derive(Clone)]
@@ -226,7 +234,7 @@ impl CodexAppServer {
             binary,
             arguments,
             limits,
-            active_turns: Arc::new(Mutex::new(BTreeMap::new())),
+            turns: Arc::default(),
         })
     }
 
@@ -272,6 +280,7 @@ impl CodexAppServer {
         remote_text: &str,
         events: &mut dyn FnMut(ExecutionEvent),
     ) -> Result<String, ExecutionError> {
+        self.cancelled_early(task_id)?;
         // No `thread/goal/set` token budget: real Codex rejects goals on an
         // ephemeral thread, and the thread stays ephemeral so remote task
         // text never lands in the node owner's Codex history. The turn is
@@ -291,16 +300,72 @@ impl CodexAppServer {
             input: Arc::clone(&session.input),
             next_id: Arc::clone(&session.next_id),
         };
-        self.active_turns
+        {
+            let mut turns =
+                self.turns.lock().map_err(|_| ExecutionError::Unavailable)?;
+            // The turn has started; dropping the session stops it.
+            if turns.cancels.take(task_id) {
+                return Err(ExecutionError::Cancelled);
+            }
+            turns.active.insert(task_id.to_owned(), active);
+        }
+        session.wait_for_turn(thread_id, turn_id, events)
+    }
+
+    /// `Cancelled` when a cancel for `task_id` came before its turn started.
+    fn cancelled_early(&self, task_id: &str) -> Result<(), ExecutionError> {
+        if self
+            .turns
             .lock()
             .map_err(|_| ExecutionError::Unavailable)?
-            .insert(task_id.to_owned(), active);
-        let result = session.wait_for_turn(thread_id, turn_id, events);
-        self.active_turns
-            .lock()
-            .map_err(|_| ExecutionError::Unavailable)?
-            .remove(task_id);
-        result
+            .cancels
+            .take(task_id)
+        {
+            return Err(ExecutionError::Cancelled);
+        }
+        Ok(())
+    }
+
+    fn start(
+        &mut self,
+        ctx: &TurnContext,
+        events: &mut dyn FnMut(ExecutionEvent),
+    ) -> Result<String, ExecutionError> {
+        if Instant::now() >= ctx.deadline {
+            return Err(ExecutionError::Timeout);
+        }
+        self.cancelled_early(&ctx.task_id)?;
+        let task_folder = if self.limits.sandbox == CodexSandbox::TaskFolder {
+            Some(TaskFolder::create(&ctx.workspace, &ctx.task_id)?)
+        } else {
+            None
+        };
+        let workspace = if let Some(folder) = &task_folder {
+            folder.0.clone()
+        } else {
+            ctx.workspace.clone()
+        };
+        let (binary, arguments, environment) = match &task_folder {
+            Some(folder) => {
+                let mut arguments = self.arguments.clone();
+                arguments.extend(folder.arguments());
+                (
+                    self.task_binary(folder)?,
+                    arguments,
+                    spawn_environment(&self.limits.environment, Some(folder)),
+                )
+            }
+            None => (
+                self.binary.clone(),
+                self.arguments.clone(),
+                spawn_environment(&self.limits.environment, None),
+            ),
+        };
+        let session =
+            AppServerSession::spawn(&binary, &arguments, ctx.deadline, &environment)?;
+        session.request("initialize", &initialize_params(), events)?;
+        let thread_id = self.start_thread(&session, &workspace, &ctx.skill, events)?;
+        self.run_turn(&session, &workspace, &ctx.task_id, &thread_id, &ctx.text, events)
     }
 }
 
@@ -494,55 +559,29 @@ impl Agent for CodexAppServer {
         ctx: &TurnContext,
         events: &mut dyn FnMut(ExecutionEvent),
     ) -> Result<String, ExecutionError> {
-        if Instant::now() >= ctx.deadline {
-            return Err(ExecutionError::Timeout);
+        let result = self.start(ctx, events);
+        if let Ok(mut turns) = self.turns.lock() {
+            turns.active.remove(&ctx.task_id);
+            turns.cancels.end(&ctx.task_id);
         }
-        let task_folder = if self.limits.sandbox == CodexSandbox::TaskFolder {
-            Some(TaskFolder::create(&ctx.workspace, &ctx.task_id)?)
-        } else {
-            None
-        };
-        let workspace = if let Some(folder) = &task_folder {
-            folder.0.clone()
-        } else {
-            ctx.workspace.clone()
-        };
-        let (binary, arguments, environment) = match &task_folder {
-            Some(folder) => {
-                let mut arguments = self.arguments.clone();
-                arguments.extend(folder.arguments());
-                (
-                    self.task_binary(folder)?,
-                    arguments,
-                    spawn_environment(&self.limits.environment, Some(folder)),
-                )
-            }
-            None => (
-                self.binary.clone(),
-                self.arguments.clone(),
-                spawn_environment(&self.limits.environment, None),
-            ),
-        };
-        let session =
-            AppServerSession::spawn(&binary, &arguments, ctx.deadline, &environment)?;
-        session.request("initialize", &initialize_params(), events)?;
-        let thread_id = self.start_thread(&session, &workspace, &ctx.skill, events)?;
-        self.run_turn(&session, &workspace, &ctx.task_id, &thread_id, &ctx.text, events)
+        result
     }
 
     fn cancel(&self, task_id: &str) {
-        let active =
-            self.active_turns.lock().ok().and_then(|turns| turns.get(task_id).cloned());
-        if let Some(active) = active {
-            let id = active.next_id.fetch_add(1, Ordering::Relaxed);
-            let request = json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "method": "turn/interrupt",
-                "params": {"threadId": active.thread_id, "turnId": active.turn_id},
-            });
-            let _ = write_json(&active.input, &request);
-        }
+        let Ok(mut turns) = self.turns.lock() else { return };
+        let Some(active) = turns.active.get(task_id).cloned() else {
+            turns.cancels.cancel(task_id);
+            return;
+        };
+        drop(turns);
+        let id = active.next_id.fetch_add(1, Ordering::Relaxed);
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "turn/interrupt",
+            "params": {"threadId": active.thread_id, "turnId": active.turn_id},
+        });
+        let _ = write_json(&active.input, &request);
     }
 }
 
@@ -1236,6 +1275,64 @@ done
             turn.join().expect("turn thread must join"),
             Err(ExecutionError::Cancelled)
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn app_server_honours_a_cancel_that_comes_before_the_turn_starts() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let markers = tempfile::tempdir().expect("markers must create");
+        let starting = markers.path().join("thread-start");
+        let turned = markers.path().join("turn-start");
+        let limits = CodexLimits {
+            sandbox: CodexSandbox::WorkspaceWrite,
+            allow_network: false,
+            environment: test_path(),
+        };
+        // `thread/start` takes a while; the cancel comes then, before the
+        // adapter knows the turn's ID.
+        let script = format!(
+            r#"
+while IFS= read -r request; do
+  case "$request" in
+    *'"id":1'*) printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{}}}}' ;;
+    *'"id":2'*)
+      touch '{starting}'
+      sleep 0.5
+      printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"thread":{{"id":"thread"}}}}}}' ;;
+    *'"id":3'*)
+      touch '{turned}'
+      printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"turn":{{"id":"turn"}}}}}}'
+      printf '%s\n' '{{"jsonrpc":"2.0","method":"turn/completed","params":{{"threadId":"thread","turn":{{"id":"turn","status":"completed","items":[{{"type":"agentMessage","text":"ok"}}]}}}}}}'
+      ;;
+  esac
+done
+"#,
+            starting = starting.display(),
+            turned = turned.display(),
+        );
+        let server = CodexAppServer::with_arguments(
+            PathBuf::from("sh"),
+            vec!["-c".to_owned(), script],
+            limits,
+        )
+        .expect("limits must be valid");
+        let mut running = server.clone();
+        let workspace = directory.path().to_path_buf();
+        let turn = std::thread::spawn(move || {
+            running.start_turn(&turn_ctx(&workspace, "task", "review", "untrusted", 30))
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !starting.exists() {
+            assert!(Instant::now() < deadline, "the thread must start");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        server.cancel("task");
+        assert_eq!(
+            turn.join().expect("turn thread must join"),
+            Err(ExecutionError::Cancelled)
+        );
+        assert!(!turned.exists(), "a cancelled turn must not start");
     }
 
     #[test]
