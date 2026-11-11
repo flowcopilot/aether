@@ -9,6 +9,21 @@ export function publicError(error) {
   return error?.code ? 'Bridge storage unavailable; stop work and contact the owner' : String(error?.message ?? error);
 }
 
+// The executor operations and their argument names, in call order. Proxies,
+// the bridge socket and the tool wrapper derive from this table; the MCP tools
+// below and localExecutor are written out by hand.
+export const OPERATIONS = {
+  status: [],
+  claim: ['claim_id'],
+  progress: ['id', 'lease'],
+  finish: ['id', 'lease', 'outcome', 'text'],
+};
+
+// An executor whose every operation calls `invoke(name, args)`.
+export function forwardOperations(invoke) {
+  return Object.fromEntries(Object.keys(OPERATIONS).map(name => [name, (...args) => invoke(name, args)]));
+}
+
 // The four executor operations on this process's own mailbox. A bridge that
 // does not own the node uses the same operations forwarded to the owner.
 export function localExecutor(mailbox) {

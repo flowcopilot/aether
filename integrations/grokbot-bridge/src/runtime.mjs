@@ -2,7 +2,7 @@ import net from 'node:net';
 import path from 'node:path';
 import { chmodSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { publicError } from './server.mjs';
+import { OPERATIONS, forwardOperations, publicError } from './server.mjs';
 
 // One bridge owns the local node: it holds `runtime.lock`, runs the node and
 // its mailbox, and serves the executor tools on `bridge.sock`. A client can
@@ -154,17 +154,12 @@ function lines(socket, receive) {
   socket.on('error', () => {});
 }
 
-const METHODS = {
-  status: executor => executor.status(),
-  claim: (executor, { claim_id }) => executor.claim(claim_id),
-  progress: (executor, { id, lease }) => executor.progress(id, lease),
-  finish: (executor, { id, lease, outcome, text }) => executor.finish(id, lease, outcome, text),
-};
-
 async function answer(executor, request) {
   const id = request?.id;
-  if (!Object.hasOwn(METHODS, request?.method)) return { id, error: 'Unknown bridge request' };
-  try { return { id, result: await METHODS[request.method](executor, request.params ?? {}) }; }
+  const method = request?.method;
+  if (!Object.hasOwn(OPERATIONS, method)) return { id, error: 'Unknown bridge request' };
+  const params = request.params ?? {};
+  try { return { id, result: await executor[method](...OPERATIONS[method].map(name => params[name])) }; }
   catch (error) { return { id, error: publicError(error) }; }
 }
 
@@ -226,11 +221,11 @@ function remoteExecutor(socket) {
     waiting.set(next, { resolve, reject });
     socket.write(JSON.stringify({ id: next, method, params }) + '\n');
   });
+  const params = (method, args) => OPERATIONS[method].length
+    ? Object.fromEntries(OPERATIONS[method].map((name, index) => [name, args[index]]))
+    : undefined;
   return {
-    status: () => call('status'),
-    claim: claim_id => call('claim', { claim_id }),
-    progress: (id, lease) => call('progress', { id, lease }),
-    finish: (id, lease, outcome, text) => call('finish', { id, lease, outcome, text }),
+    ...forwardOperations((method, args) => call(method, params(method, args))),
     closed: done,
     close: () => socket.destroy(),
   };

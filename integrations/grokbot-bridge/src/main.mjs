@@ -6,7 +6,7 @@ import { spawn } from 'node:child_process';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { Mailbox } from './mailbox.mjs';
 import { NodeLink, contract } from './node-link.mjs';
-import { createBridgeServer, createMcpServer, localExecutor } from './server.mjs';
+import { createBridgeServer, createMcpServer, forwardOperations, localExecutor } from './server.mjs';
 import { UNAVAILABLE, acquireRuntime } from './runtime.mjs';
 
 function secret(file) {
@@ -74,12 +74,7 @@ async function main() {
     if (!executor) throw new Error(UNAVAILABLE);
     return executor;
   };
-  const tools = {
-    status: () => current().status(),
-    claim: claimId => current().claim(claimId),
-    progress: (id, lease) => current().progress(id, lease),
-    finish: (id, lease, outcome, text) => current().finish(id, lease, outcome, text),
-  };
+  const tools = forwardOperations((name, args) => current()[name](...args));
   let server;
   let child;
   let runtime;
