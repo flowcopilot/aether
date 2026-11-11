@@ -126,7 +126,8 @@ class NodeLink:
                 logger.exception("Aether: closing the open tasks failed")
         finally:
             with self._lock:
-                self._socket = None
+                if self._socket is connection:
+                    self._socket = None
             reader.close()
             connection.close()
 
