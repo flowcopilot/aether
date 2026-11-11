@@ -67,17 +67,15 @@ defmodule AetherHub.OwnerLinks do
 
   def claim(%Account{}, _body), do: {:error, :invalid}
 
+  # Counts the live rows only, as the reads do: an expired row that the
+  # sweeper has not removed yet counts for nothing.
   defp within_limits!(personal, service) do
     others =
-      from(l in OwnerLink,
+      from(l in live(),
         where: l.personal_endpoint == ^personal and l.service_endpoint != ^service
       )
 
-    open =
-      Repo.aggregate(
-        from(l in others, where: is_nil(l.confirm_signature) and l.created_at > ^claim_cutoff()),
-        :count
-      )
+    open = Repo.aggregate(from(l in others, where: is_nil(l.confirm_signature)), :count)
 
     if open >= @max_open_claims or Repo.aggregate(others, :count) >= @max_links,
       do: Repo.rollback(:limit)
@@ -154,12 +152,10 @@ defmodule AetherHub.OwnerLinks do
 
   @doc "The full name of the active owner of the service agent `service`, or `nil`."
   def active_owner(service) do
-    from(l in OwnerLink,
+    from(l in live(),
       join: p in Account,
       on: p.endpoint == l.personal_endpoint,
-      where:
-        l.service_endpoint == ^service and not is_nil(l.confirm_signature) and
-          l.expires_at > ^Clock.now(),
+      where: l.service_endpoint == ^service and not is_nil(l.confirm_signature),
       select: p,
       limit: 1
     )
@@ -172,22 +168,26 @@ defmodule AetherHub.OwnerLinks do
 
   @doc "Removes the expired links, and the claims that waited too long."
   def delete_expired do
-    Repo.delete_all(
-      from l in OwnerLink,
-        where:
-          l.expires_at <= ^Clock.now() or
-            (is_nil(l.confirm_signature) and l.created_at <= ^claim_cutoff())
-    )
-
+    Repo.delete_all(stale())
     :ok
   end
 
-  defp seen_by(endpoint) do
+  defp seen_by(endpoint), do: from(l in live(), where: ^sides(endpoint))
+
+  # A link is live until it expires; a claim that the service did not
+  # confirm is live for the claim window only. `stale/0` is the rest.
+  defp live do
     from l in OwnerLink,
       where:
         l.expires_at > ^Clock.now() and
-          (not is_nil(l.confirm_signature) or l.created_at > ^claim_cutoff()),
-      where: ^sides(endpoint)
+          (not is_nil(l.confirm_signature) or l.created_at > ^claim_cutoff())
+  end
+
+  defp stale do
+    from l in OwnerLink,
+      where:
+        l.expires_at <= ^Clock.now() or
+          (is_nil(l.confirm_signature) and l.created_at <= ^claim_cutoff())
   end
 
   # The personal side sees every link it claimed; the service side does not
