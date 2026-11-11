@@ -123,8 +123,7 @@ defmodule AetherHub.Features.DirectoryTest do
 
   defstep ~r/^a visitor reads the directory as many times as the limit allows$/, _, _state do
     ip = unique_ip()
-    {limit, seconds} = AetherHub.RateLimit.limit(:directory_ip)
-    Clock.set(div(Clock.now(), seconds) * seconds)
+    limit = start_of_window(:directory_ip)
 
     {:ok, %{ip: ip, statuses: for(_ <- 1..limit, do: public("/directory.json", ip).status)}}
   end

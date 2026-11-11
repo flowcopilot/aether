@@ -7,9 +7,7 @@ defmodule AetherHub.Features.AccessRequestsTest do
     request(requester, "POST", "/v1/requests", %{"to" => service.handle, "days" => days})
   end
 
-  defp list(node), do: json(http_get(node, "/v1/invites"))
-
-  defp requests(node), do: list(node)["invites"]
+  defp requests(node), do: invites(node)["invites"]
 
   defp approve(node, id, body),
     do: request(node, "POST", "/v1/invites/#{id}/approve", body)
@@ -266,10 +264,10 @@ defmodule AetherHub.Features.AccessRequestsTest do
   # Versions and expiry
 
   defstep ~r/^the version of (?<who>\w+) is noted$/, %{who: who}, state do
-    {:ok, %{version: list(actor(state, who))["version"]}}
+    {:ok, %{version: invites(actor(state, who))["version"]}}
   end
 
   defstep ~r/^the version of (?<who>\w+) is the same$/, %{who: who}, state do
-    assert list(actor(state, who))["version"] == state.version
+    assert invites(actor(state, who))["version"] == state.version
   end
 end
