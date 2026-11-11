@@ -10,7 +10,7 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
-use crate::{StoreError, migrate::open_connection};
+use crate::{StoreError, migrate::open_connection, sql_named};
 
 pub const PACT_DATABASE: &str = "pact.sqlite";
 
@@ -299,7 +299,7 @@ impl PactStore {
                 authorization.interval_seconds,
                 authorization.created_at,
                 authorization.expires_at,
-                DeviceStatus::Pending.as_str(),
+                DeviceStatus::Pending,
             ],
         )?;
         Ok(())
@@ -315,7 +315,7 @@ impl PactStore {
             .connection
             .query_row(
                 "SELECT user_code, brand_id, pa_issuer, pa_subject, scopes, expires_at FROM pact_device_authorizations WHERE user_code=?1 AND status=?3 AND expires_at > ?2",
-                params![user_code, now, DeviceStatus::Pending.as_str()],
+                params![user_code, now, DeviceStatus::Pending],
                 |row| {
                     Ok(PendingDevice {
                         user_code: row.get(0)?,
@@ -345,8 +345,8 @@ impl PactStore {
                 user_code,
                 grant.grant_id,
                 now,
-                DeviceStatus::Approved.as_str(),
-                DeviceStatus::Pending.as_str(),
+                DeviceStatus::Approved,
+                DeviceStatus::Pending,
             ],
         )?;
         if changed != 1 {
@@ -361,7 +361,7 @@ impl PactStore {
     pub fn deny_device(&self, user_code: &str) -> Result<(), StoreError> {
         let changed = self.connection.execute(
             "UPDATE pact_device_authorizations SET status=?2 WHERE user_code=?1 AND status=?3",
-            params![user_code, DeviceStatus::Denied.as_str(), DeviceStatus::Pending.as_str()],
+            params![user_code, DeviceStatus::Denied, DeviceStatus::Pending],
         )?;
         if changed == 1 { Ok(()) } else { Err(StoreError::NotFound) }
     }
@@ -405,7 +405,7 @@ impl PactStore {
         let poll = if expires_at <= now {
             DevicePoll::Expired
         } else {
-            match DeviceStatus::parse(&status).ok_or(StoreError::InvalidState)? {
+            match status {
                 DeviceStatus::Denied => DevicePoll::Denied,
                 DeviceStatus::Consumed => DevicePoll::Consumed,
                 DeviceStatus::Pending => {
@@ -420,7 +420,7 @@ impl PactStore {
                 DeviceStatus::Approved => {
                     transaction.execute(
                         "UPDATE pact_device_authorizations SET status=?2 WHERE device_code_hash=?1",
-                        params![device_code_hash, DeviceStatus::Consumed.as_str()],
+                        params![device_code_hash, DeviceStatus::Consumed],
                     )?;
                     let grant = grant_id
                         .map(|grant_id| query_grant(&transaction, &grant_id))
@@ -526,9 +526,11 @@ aether_core::named!(DeviceStatus {
     Consumed => "consumed",
 });
 
+sql_named!(DeviceStatus);
+
 /// The device-authorization columns `poll_device` decides on.
 struct DeviceRow {
-    status: String,
+    status: DeviceStatus,
     grant_id: Option<String>,
     interval: i64,
     last_polled_at: Option<i64>,
