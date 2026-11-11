@@ -31,13 +31,12 @@ use crate::invites::{DirectInviteSigning, sign_direct_invite};
 use crate::{
     admin::SharedAdministration,
     admin_components::{
-        ALERT, CHECK, CHEVRON, CopyTone, ago, copy_field, field, page_title,
-        presence_dot,
+        ALERT, CHECK, CHEVRON, CopyTone, Tone, ago, copy_field, field, page_title,
+        presence_dot, state_badge,
     },
     components::{
         alert::{AlertVariant, alert, alert_description, alert_title},
         avatar::{AvatarSize, avatar, avatar_fallback},
-        badge::{BadgeVariant, badge},
         button::{ButtonSize, ButtonVariant, button},
         input::input,
         table::{table, table_body, table_cell, table_head, table_header, table_row},
@@ -759,7 +758,7 @@ async fn last_task(task: Option<LastTask>, now: i64) -> TopcoatResult<impl View>
             Some(task) => {
                 <div class="flex flex-col gap-2">
                     <span class="flex items-center gap-2">
-                        badge(variant: BadgeVariant::Outline, attrs: attributes! { class=(state_tone(task.state)) }, (state_name(task.state)))
+                        state_badge(state: task_state(task.state))
                         <span class="text-muted-foreground">(ago(now.saturating_sub(task.created_at)))</span>
                     </span>
                     if let Some(result) = task.result {
@@ -777,32 +776,18 @@ async fn last_task(task: Option<LastTask>, now: i64) -> TopcoatResult<impl View>
     })
 }
 
-const fn state_name(state: TaskState) -> &'static str {
+/// The word and the badge tone of a task state.
+const fn task_state(state: TaskState) -> (&'static str, Tone) {
     match state {
-        TaskState::PendingApproval => "Waits for approval",
-        TaskState::Queued | TaskState::Leased => "Waiting",
-        TaskState::Running => "Running",
-        TaskState::Succeeded => "Answered",
+        TaskState::PendingApproval => ("Waits for approval", Tone::Warning),
+        TaskState::Queued | TaskState::Leased => ("Waiting", Tone::Warning),
+        TaskState::Running => ("Running", Tone::Warning),
+        TaskState::Succeeded => ("Answered", Tone::Success),
         TaskState::Failed | TaskState::UnknownResult | TaskState::OperatorReviewed => {
-            "Failed"
+            ("Failed", Tone::Destructive)
         }
-        TaskState::Rejected => "Refused",
-        TaskState::Cancelled => "Cancelled",
-    }
-}
-
-const fn state_tone(state: TaskState) -> &'static str {
-    match state {
-        TaskState::Succeeded => "border-success/40 text-success",
-        TaskState::PendingApproval
-        | TaskState::Queued
-        | TaskState::Leased
-        | TaskState::Running => "border-warning/40 text-warning",
-        TaskState::Failed
-        | TaskState::UnknownResult
-        | TaskState::OperatorReviewed
-        | TaskState::Rejected => "border-destructive/40 text-destructive",
-        TaskState::Cancelled => "text-muted-foreground",
+        TaskState::Rejected => ("Refused", Tone::Destructive),
+        TaskState::Cancelled => ("Cancelled", Tone::Muted),
     }
 }
 

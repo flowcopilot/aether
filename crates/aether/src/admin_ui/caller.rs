@@ -25,11 +25,11 @@ use super::{
 };
 use crate::{
     admin_components::{
-        CHEVRON, CopyTone, copy_field, key_code, page_title, presence_dot, step,
+        CHEVRON, CopyTone, Tone, copy_field, key_code, page_title, presence_dot,
+        state_badge, step,
     },
     components::{
         avatar::{AvatarSize, avatar, avatar_fallback},
-        badge::{BadgeVariant, badge},
         button::{ButtonSize, ButtonVariant, button},
         input::input,
     },
@@ -532,27 +532,15 @@ fn age(then: i64, now: u64) -> String {
     )
 }
 
-const fn sent_state_word(state: aether_store::SentState) -> &'static str {
+/// The word and the badge tone of a sent task's state.
+const fn sent_state(state: aether_store::SentState) -> (&'static str, Tone) {
     match state {
         aether_store::SentState::Waiting | aether_store::SentState::Working => {
-            "Waiting"
+            ("Waiting", Tone::Warning)
         }
-        aether_store::SentState::Answered => "Answered",
-        aether_store::SentState::Failed => "Failed",
-        aether_store::SentState::NotDelivered => "Not delivered",
-    }
-}
-
-/// The badge color of a sent task's state.
-const fn sent_state_tone(state: aether_store::SentState) -> &'static str {
-    match state {
-        aether_store::SentState::Answered => "border-success/40 text-success",
-        aether_store::SentState::Waiting | aether_store::SentState::Working => {
-            "border-warning/40 text-warning"
-        }
-        aether_store::SentState::Failed | aether_store::SentState::NotDelivered => {
-            "border-destructive/40 text-destructive"
-        }
+        aether_store::SentState::Answered => ("Answered", Tone::Success),
+        aether_store::SentState::Failed => ("Failed", Tone::Destructive),
+        aether_store::SentState::NotDelivered => ("Not delivered", Tone::Destructive),
     }
 }
 
@@ -571,7 +559,7 @@ async fn sent_tasks(
                     <li class="flex flex-col gap-2 py-3.5 text-sm">
                         <div class="flex flex-wrap items-center gap-3">
                             <span class="w-36 font-mono text-[13px] font-medium">(&task.agent_id)</span>
-                            badge(variant: BadgeVariant::Outline, attrs: attributes! { class=(sent_state_tone(task.state)) }, (sent_state_word(task.state)))
+                            state_badge(state: sent_state(task.state))
                             <span class="ml-auto text-[13px] text-muted-foreground">(age(task.created_at, now))</span>
                         </div>
                         if let Some(reason) = &task.reason {

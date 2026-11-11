@@ -10,6 +10,7 @@ use topcoat::{
 };
 
 use crate::components::{
+    badge::{BadgeVariant, badge},
     button::{ButtonSize, ButtonVariant, button},
     label::label,
 };
@@ -219,6 +220,37 @@ pub async fn step(
                 (child)
             </div>
         </li>
+    })
+}
+
+/// The color of a state badge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tone {
+    Success,
+    Warning,
+    Destructive,
+    Muted,
+}
+
+impl Tone {
+    /// The classes of an outline badge in this tone.
+    #[must_use]
+    pub const fn class(self) -> &'static str {
+        match self {
+            Self::Success => "border-success/40 text-success",
+            Self::Warning => "border-warning/40 text-warning",
+            Self::Destructive => "border-destructive/40 text-destructive",
+            Self::Muted => "text-muted-foreground",
+        }
+    }
+}
+
+/// A state as an outline badge: its word, in its tone.
+#[component]
+pub async fn state_badge(state: (&'static str, Tone)) -> Result<impl View> {
+    let (word, tone) = state;
+    Ok(view! {
+        badge(variant: BadgeVariant::Outline, attrs: attributes! { class=(tone.class()) }, (word))
     })
 }
 
