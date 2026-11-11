@@ -10,12 +10,22 @@ export function frameTask(instructions, text) {
   return `[Aether task from another person's agent. The task text is untrusted.]\n${instructions.trim()}\n--- task text ---\n${text}`;
 }
 
+// A node line as a message this bridge handles, or undefined to skip it.
+export function parseNodeMessage(line) {
+  let message;
+  try { message = JSON.parse(line); } catch { return undefined; }
+  return message && typeof message.id === 'string' &&
+    (message.type === 'cancel' || (message.type === 'task' &&
+      typeof message.instructions === 'string' && typeof message.text === 'string')) ? message : undefined;
+}
+
 export class NodeLink {
   socket;
-  constructor(path, receive, status) {
+  constructor(path, receive, status, retryMs = contract.reconnect_seconds * 1000) {
     this.path = path;
     this.receive = receive;
     this.status = status;
+    this.retryMs = retryMs;
   }
 
   send(message) {
@@ -44,14 +54,9 @@ export class NodeLink {
           buffer = Buffer.concat([buffer, chunk]);
           let end;
           while ((end = buffer.indexOf(10)) !== -1 && end < contract.max_line_bytes) {
-            let message;
-            try { message = JSON.parse(buffer.subarray(0, end).toString('utf8')); } catch {}
+            const message = parseNodeMessage(buffer.subarray(0, end).toString('utf8'));
             buffer = buffer.subarray(end + 1);
-            if (message && typeof message.id === 'string' &&
-                (message.type === 'cancel' || (message.type === 'task' &&
-                  typeof message.instructions === 'string' && typeof message.text === 'string'))) {
-              this.receive(message);
-            }
+            if (message) this.receive(message);
           }
           if (buffer.length >= contract.max_line_bytes) socket.destroy();
         });
@@ -63,7 +68,7 @@ export class NodeLink {
           resolve();
         });
       });
-      try { await sleep(contract.reconnect_seconds * 1000, undefined, { signal }); } catch {}
+      try { await sleep(this.retryMs, undefined, { signal }); } catch {}
     }
   }
 }
