@@ -740,6 +740,10 @@ impl NodeStore {
         execution_id: &str,
     ) -> Result<(), StoreError> {
         let tx = self.connection.transaction()?;
+        if state(&tx, task_id)? == TaskState::Cancelled {
+            tx.commit()?;
+            return Ok(());
+        }
         if !lease_matches(&tx, task_id, execution_id)? {
             return Err(StoreError::NotFound);
         }
@@ -1569,6 +1573,21 @@ mod tests {
             .mark_rejected("task", "execution")
             .expect("a leased task must be rejectable");
         assert_eq!(store.state("task"), Ok(TaskState::Rejected));
+        fs::remove_file(database).expect("database must remove");
+    }
+
+    #[test]
+    fn rejecting_a_task_cancelled_while_leased_is_a_no_op() {
+        let (mut store, database) = store();
+        store
+            .admit(&input("task", "caller"), QueueLimits { global: 1, per_peer: 1 })
+            .expect("task must admit");
+        store.lease_next("worker", "execution", 10).expect("task must lease");
+        store.cancel("task").expect("task must cancel");
+        store
+            .mark_rejected("task", "execution")
+            .expect("a dispatch denial after cancellation must be a no-op");
+        assert_eq!(store.state("task"), Ok(TaskState::Cancelled));
         fs::remove_file(database).expect("database must remove");
     }
 
