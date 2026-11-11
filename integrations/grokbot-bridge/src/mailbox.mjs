@@ -4,6 +4,9 @@ import { performance } from 'node:perf_hooks';
 import { frameTask, contract } from './node-link.mjs';
 
 // One executor, no automatic reassignment: expired work might still have effects.
+// Disconnecting clears `pending` and stops the active claim, and nothing is
+// queued or claimed while disconnected, so a waiting task or an active claim
+// that is not stopped implies `connected`.
 export class Mailbox {
   connected = false;
   pending = new Map();
@@ -50,7 +53,7 @@ export class Mailbox {
   stopActive() {
     this.active.stopped = true;
     // Do not falsely claim that a hosted Bot has stopped running.
-    if (this.connected) this.send({ type: 'failed', id: this.active.id });
+    this.send({ type: 'failed', id: this.active.id });
   }
 
   tick() {
@@ -58,7 +61,7 @@ export class Mailbox {
     for (const [id, task] of this.pending) {
       if (task.deadline <= now) {
         this.pending.delete(id);
-        if (this.connected) this.send({ type: 'failed', id });
+        this.send({ type: 'failed', id });
       }
     }
     if (this.active && !this.active.stopped &&
@@ -106,7 +109,7 @@ export class Mailbox {
   progress(id, lease) {
     this.tick();
     const task = this.requireClaim(id, lease);
-    if (task.stopped || !this.connected) return { status: 'stop_required' };
+    if (task.stopped) return { status: 'stop_required' };
     task.leaseUntil = performance.now() + this.leaseMs;
     if (!this.send({ type: 'progress', id })) {
       task.stopped = true;
@@ -124,14 +127,14 @@ export class Mailbox {
       return { status: 'recorded' };
     }
     const task = this.requireClaim(id, lease);
-    if (outcome !== 'stopped' && (task.stopped || !this.connected)) {
+    if (outcome !== 'stopped' && task.stopped) {
       return { status: 'stop_required', reason: 'Stop all work, then finish with outcome stopped. Late answers are discarded.' };
     }
     if (outcome === 'result') {
       const line = JSON.stringify({ type: 'result', id, text }) + '\n';
       if (Buffer.byteLength(line) > contract.max_line_bytes) throw new Error('Answer exceeds the agent socket line limit');
     }
-    if (!task.stopped && this.connected) {
+    if (!task.stopped) {
       if (!this.send(outcome === 'result' ? { type: 'result', id, text } :
         { type: outcome === 'stopped' ? 'cancelled' : 'failed', id })) {
         task.stopped = true;
