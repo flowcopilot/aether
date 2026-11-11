@@ -33,11 +33,11 @@ use aether_core::{Claim, EndpointId};
 use aether_store::{NodeStore, SentState, SentTask, TaskState};
 use cucumber::{given, then, when};
 use serde_json::{Value, json};
-use tempfile::TempDir;
 
 use crate::common::{
-    FakeCodex, PolicyLimits, ServerProcess, aether_command, host_signing_key,
-    policy_for_grants, read_event, read_node_listening, review_claim, review_grant,
+    FakeCodex, PolicyLimits, Scratch, ServerProcess, aether_command, blocking,
+    host_signing_key, policy_for_grants, read_event, read_node_listening, review_claim,
+    review_grant, run, utf8,
 };
 
 type World = super::World;
@@ -166,7 +166,7 @@ struct Outbox {
 
 #[derive(Default)]
 pub struct State {
-    root: Option<TempDir>,
+    root: Scratch,
     agent: Agent,
     max_context_tokens: Option<u64>,
     owner_codex_home: Option<PathBuf>,
@@ -203,21 +203,6 @@ impl fmt::Debug for State {
             .field("output", &self.output)
             .finish_non_exhaustive()
     }
-}
-
-async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
-    match tokio::task::spawn_blocking(work).await {
-        Ok(value) => value,
-        Err(error) => std::panic::resume_unwind(error.into_panic()),
-    }
-}
-
-async fn run(mut command: Command) -> Output {
-    blocking(move || command.output().expect("aether must start")).await
-}
-
-fn utf8(path: &Path) -> &str {
-    path.to_str().expect("path must be UTF-8")
 }
 
 fn stdout(output: &Output) -> String {
@@ -320,10 +305,7 @@ fn far_future() -> i64 {
 
 impl State {
     fn root(&mut self) -> PathBuf {
-        self.root
-            .get_or_insert_with(|| tempfile::tempdir().expect("directory must create"))
-            .path()
-            .to_path_buf()
+        self.root.path()
     }
 
     fn server_data(&mut self) -> PathBuf {

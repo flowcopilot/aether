@@ -17,10 +17,12 @@ pub use store::{
 
 use std::{
     io::{BufRead, BufReader},
-    process::{Child, ChildStdout, Command, ExitStatus},
+    path::{Path, PathBuf},
+    process::{Child, ChildStdout, Command, ExitStatus, Output},
 };
 
 use serde_json::Value;
+use tempfile::TempDir;
 
 /// The `aether` binary, without the public hub: local integration tests do
 /// not depend on public services.
@@ -28,6 +30,39 @@ pub fn aether_command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_aether"));
     command.env("AETHER_HUB_URL", "off");
     command
+}
+
+/// Runs `work` on a blocking thread, so it does not stop the other scenarios.
+/// A panic in `work` surfaces as that panic.
+pub async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    match tokio::task::spawn_blocking(work).await {
+        Ok(value) => value,
+        Err(error) => std::panic::resume_unwind(error.into_panic()),
+    }
+}
+
+/// Runs `command` to the end and returns its output.
+pub async fn run(mut command: Command) -> Output {
+    blocking(move || command.output().expect("aether must start")).await
+}
+
+pub fn utf8(path: &Path) -> &str {
+    path.to_str().expect("path must be UTF-8")
+}
+
+/// A temporary directory that is created on first use.
+#[derive(Debug, Default)]
+pub struct Scratch(Option<TempDir>);
+
+impl Scratch {
+    pub fn path(&mut self) -> PathBuf {
+        self.0
+            .get_or_insert_with(|| tempfile::tempdir().expect("directory must create"))
+            .path()
+            .to_path_buf()
+    }
 }
 
 /// A long-running aether process. Dropping it kills the process, so a test

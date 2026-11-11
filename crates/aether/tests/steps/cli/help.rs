@@ -4,8 +4,8 @@
 
 use cucumber::{then, when};
 
-use super::{assert_success, run};
-use crate::common::aether_command;
+use super::assert_success;
+use crate::common::{aether_command, run};
 
 #[when(expr = "I ask for help on `aether node {word}`")]
 async fn ask_for_help(world: &mut crate::steps::World, command: String) {

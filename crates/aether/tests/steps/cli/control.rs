@@ -7,8 +7,11 @@ use cucumber::{given, then, when};
 use ed25519_dalek::SigningKey;
 use serde_json::json;
 
-use super::{Control, assert_success, blocking, run, utf8};
-use crate::{common::aether_command, steps::World};
+use super::{Control, assert_success};
+use crate::{
+    common::{aether_command, blocking, run, utf8},
+    steps::World,
+};
 
 #[derive(Debug, Default)]
 pub struct State {

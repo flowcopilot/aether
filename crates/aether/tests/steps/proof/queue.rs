@@ -12,8 +12,8 @@ use aether_store::{
 use cucumber::{given, then, when};
 use tempfile::TempDir;
 
-use super::fixtures::{blocking, names, task_input};
-use crate::steps::World;
+use super::fixtures::{names, task_input};
+use crate::{common::blocking, steps::World};
 
 const LIMITS: QueueLimits = QueueLimits { global: 1, per_peer: 1 };
 

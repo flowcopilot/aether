@@ -14,8 +14,11 @@ use aether::admin_socket::{
 use cucumber::{given, then, when};
 use serde_json::json;
 
-use super::{Process, blocking, run};
-use crate::{common::aether_command, steps::World};
+use super::Process;
+use crate::{
+    common::{aether_command, blocking, run},
+    steps::World,
+};
 
 const EXPIRED_TASK_ID: &str = "00000000-0000-4000-8000-000000000042";
 

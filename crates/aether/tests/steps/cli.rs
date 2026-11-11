@@ -13,19 +13,20 @@ mod node;
 use std::{
     fmt,
     io::BufReader,
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::{ChildStdout, Command, ExitStatus, Output, Stdio},
 };
 
 use cucumber::{then, when};
 use serde_json::Value;
-use tempfile::TempDir;
 
-use crate::common::{ServerProcess, aether_command, read_event};
+use crate::common::{
+    Scratch, ServerProcess, aether_command, blocking, read_event, run, utf8,
+};
 
 #[derive(Debug, Default)]
 pub struct State {
-    root: Option<TempDir>,
+    root: Scratch,
     output: Option<Output>,
     /// A running `node serve` or `node admin`.
     node: Option<Process>,
@@ -38,10 +39,7 @@ pub struct State {
 
 impl State {
     fn root(&mut self) -> PathBuf {
-        self.root
-            .get_or_insert_with(|| tempfile::tempdir().expect("directory must create"))
-            .path()
-            .to_path_buf()
+        self.root.path()
     }
 
     const fn output(&self) -> &Output {
@@ -85,12 +83,11 @@ impl Process {
     /// event with that name.
     async fn event(&mut self, name: Option<&'static str>) -> Value {
         let mut stdout = self.stdout.take().expect("output must be readable");
-        let (stdout, event) = tokio::task::spawn_blocking(move || {
+        let (stdout, event) = blocking(move || {
             let event = read_event(&mut stdout, name);
             (stdout, event)
         })
-        .await
-        .expect("read task must finish");
+        .await;
         self.stdout = Some(stdout);
         event
     }
@@ -99,13 +96,12 @@ impl Process {
     /// stays open until the process exits: a closed pipe would make it panic.
     async fn interrupt(self) -> ExitStatus {
         let Self { server, stdout } = self;
-        tokio::task::spawn_blocking(move || {
+        blocking(move || {
             let status = server.interrupt();
             drop(stdout);
             status
         })
         .await
-        .expect("stop task must finish")
     }
 }
 
@@ -143,22 +139,6 @@ impl Control {
     fn certificate(&self) -> PathBuf {
         aether::data_dir::DataDir::new(&self.data).control_certificate()
     }
-}
-
-async fn run(mut command: Command) -> Output {
-    tokio::task::spawn_blocking(move || command.output().expect("aether must start"))
-        .await
-        .expect("command task must finish")
-}
-
-async fn blocking<T: Send + 'static>(
-    blocking: impl FnOnce() -> T + Send + 'static,
-) -> T {
-    tokio::task::spawn_blocking(blocking).await.expect("blocking task must finish")
-}
-
-fn utf8(path: &Path) -> &str {
-    path.to_str().expect("path must be UTF-8")
 }
 
 fn assert_success(output: &Output) {

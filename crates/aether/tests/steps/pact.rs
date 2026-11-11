@@ -24,7 +24,7 @@ use tempfile::TempDir;
 use aether::fixture::{PolicyLimits, policy_json};
 
 use crate::common::{
-    FakeCodex, ServerProcess, TestNodeDir, aether_command, read_events,
+    FakeCodex, ServerProcess, TestNodeDir, aether_command, blocking, read_events,
 };
 
 /// The scope that the code review offer grants.
@@ -434,9 +434,7 @@ async fn personal_agent(world: &mut super::World) {
 
 #[given("a node that offers code review to personal agents")]
 async fn node_offers_review(world: &mut super::World) {
-    let node =
-        tokio::task::spawn_blocking(Node::start).await.expect("node start must finish");
-    world.pact.node = Some(node);
+    world.pact.node = Some(blocking(Node::start).await);
 }
 
 #[given("the owner gave the personal agent read-only review access")]
@@ -643,8 +641,6 @@ async fn node_stops(world: &mut super::World) {
         .as_mut()
         .and_then(|node| node.process.take())
         .expect("a node must run");
-    let status = tokio::task::spawn_blocking(move || process.interrupt())
-        .await
-        .expect("interrupt must finish");
+    let status = blocking(move || process.interrupt()).await;
     assert!(status.success(), "{status}");
 }

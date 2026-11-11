@@ -6,8 +6,8 @@ use aether::execution::{Agent, ExecutionError, Executor, Limits, Task, TurnConte
 use cucumber::{given, then, when};
 use tempfile::TempDir;
 
-use super::fixtures::{blocking, task};
-use crate::steps::World;
+use super::fixtures::task;
+use crate::{common::blocking, steps::World};
 
 #[derive(Debug, Default)]
 pub struct State {

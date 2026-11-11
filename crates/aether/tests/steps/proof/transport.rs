@@ -21,12 +21,12 @@ use aether::{
 use cucumber::{given, then, when};
 use tempfile::TempDir;
 
-use super::fixtures::{blocking, invitation, managed_member, record};
+use super::fixtures::{invitation, managed_member, record};
 use crate::common::{
     discovery_signing_key, load_contact, load_directory_record, open_store,
     store_contact_invitation, store_directory_record,
 };
-use crate::steps::World;
+use crate::{common::blocking, steps::World};
 
 const WIRE_NONCE: &str = "00000000-0000-4000-8000-000000000009";
 
