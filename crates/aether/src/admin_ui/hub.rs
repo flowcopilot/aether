@@ -39,7 +39,7 @@ use crate::{
         Account, AgentKind, Block, DEFAULT_HUB_URL, HubClient, HubError, Invite,
         Origin, OwnerLink, Role, Status, valid_full_name, valid_name_part,
     },
-    hub_membership::{APPROVAL_SECONDS, hub_message, keep_hub_name, offer},
+    hub_membership::{hub_message, keep_hub_name, new_approval, offer},
 };
 
 /// How long a page waits for the hub before it shows the page without it.
@@ -871,20 +871,19 @@ async fn approve(
     if store.is_blocked(&endpoint).map_err(|_| HubError::Unexpected)? {
         return Err(HubError::Forbidden);
     }
-    let now = now();
+    let approved_days = u32::try_from(days).map_err(|_| HubError::Invalid)?;
     store
         .put_approval(&HubApproval {
-            invite_id: invite.id.clone(),
-            side: ApprovalSide::Sender,
-            kind: ApprovalKind::Request,
-            peer_name: invite.to.clone(),
             peer_endpoint: Some(endpoint),
-            days: u32::try_from(days).map_err(|_| HubError::Invalid)?,
-            access_group: crate::access_groups::REQUESTS_GROUP.to_owned(),
-            bundle: None,
-            created_at: now,
-            expires_at: now.saturating_add(APPROVAL_SECONDS),
-            listing: None,
+            ..new_approval(
+                &invite.id,
+                ApprovalSide::Sender,
+                ApprovalKind::Request,
+                &invite.to,
+                approved_days,
+                crate::access_groups::REQUESTS_GROUP,
+                now(),
+            )
         })
         .map_err(|_| HubError::Unexpected)?;
     if let Err(error) = hub.approve(id, days).await {

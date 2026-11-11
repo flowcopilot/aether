@@ -70,27 +70,49 @@ pub async fn offer(
     Ok(invite)
 }
 
+/// A new approval of the hub row `invite_id`, kept for as long as the hub
+/// keeps the invite. It names no endpoint, signed line or listing yet.
+#[must_use]
+pub fn new_approval(
+    invite_id: &str,
+    side: ApprovalSide,
+    kind: ApprovalKind,
+    peer_name: &str,
+    days: u32,
+    access_group: &str,
+    now: i64,
+) -> HubApproval {
+    HubApproval {
+        invite_id: invite_id.to_owned(),
+        side,
+        kind,
+        peer_name: peer_name.to_owned(),
+        peer_endpoint: None,
+        days,
+        access_group: access_group.to_owned(),
+        bundle: None,
+        created_at: now,
+        expires_at: now.saturating_add(APPROVAL_SECONDS),
+        listing: None,
+    }
+}
+
 /// Keeps the local approval of `invite`, which this node just sent.
 fn approve_invite(
     data_dir: &std::path::Path,
     invite: &Invite,
     days: u64,
 ) -> Result<(), StoreError> {
-    let now = now();
-    crate::hub_store::HubStore::open(data_dir)?.put_approval(&HubApproval {
-        invite_id: invite.id.clone(),
-        side: ApprovalSide::Sender,
-        kind: ApprovalKind::Invite,
-        peer_name: invite.to.clone(),
-        peer_endpoint: None,
-        days: u32::try_from(days).map_err(|_| StoreError::InvalidState)?,
+    crate::hub_store::HubStore::open(data_dir)?.put_approval(&new_approval(
+        &invite.id,
+        ApprovalSide::Sender,
+        ApprovalKind::Invite,
+        &invite.to,
+        u32::try_from(days).map_err(|_| StoreError::InvalidState)?,
         // New hub invites join the default group, as connect codes do.
-        access_group: crate::access_groups::FRIENDS_GROUP.to_owned(),
-        bundle: None,
-        created_at: now,
-        expires_at: now.saturating_add(APPROVAL_SECONDS),
-        listing: None,
-    })
+        crate::access_groups::FRIENDS_GROUP,
+        now(),
+    ))
 }
 
 /// Accepts the pending invite `id` that this node received: first the local
@@ -111,7 +133,6 @@ pub async fn accept(
             invite.role == Role::Receiver && invite.status == Status::Pending
         })
         .ok_or(HubError::Forbidden)?;
-    let now = now();
     let days = u32::try_from(invite.days.clamp(
         crate::hub_client::protocol::ACCESS_DAYS_MIN,
         crate::hub_client::protocol::ACCESS_DAYS_MAX,
@@ -119,19 +140,15 @@ pub async fn accept(
     .map_err(|_| HubError::Unexpected)?;
     crate::hub_store::HubStore::open(data_dir)
         .map_err(|_| HubError::Unexpected)?
-        .put_approval(&HubApproval {
-            invite_id: invite.id.clone(),
-            side: ApprovalSide::Receiver,
-            kind: ApprovalKind::Invite,
-            peer_name: invite.from.clone(),
-            peer_endpoint: None,
+        .put_approval(&new_approval(
+            &invite.id,
+            ApprovalSide::Receiver,
+            ApprovalKind::Invite,
+            &invite.from,
             days,
-            access_group: crate::access_groups::FRIENDS_GROUP.to_owned(),
-            bundle: None,
-            created_at: now,
-            expires_at: now.saturating_add(APPROVAL_SECONDS),
-            listing: None,
-        })
+            crate::access_groups::FRIENDS_GROUP,
+            now(),
+        ))
         .map_err(|_| HubError::Unexpected)?;
     hub.accept(id).await
 }
