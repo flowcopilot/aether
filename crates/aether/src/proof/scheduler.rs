@@ -12,7 +12,7 @@ use std::{
 use aether_core::{
     Denial, PolicyEngine, Scope, ScopeId, ScopeKind, TrustProvider, WorkspaceId,
 };
-use aether_store::{TaskExecutionData, TaskState};
+use aether_store::{NodeStore, StoreError, TaskExecutionData, TaskState};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
@@ -36,9 +36,91 @@ enum DispatchBlock {
     Group,
 }
 
+#[derive(Debug, Eq, PartialEq)]
 enum TaskOutcome {
     Succeeded(String),
     Failed,
+}
+
+/// What one run observed, in the terms that decide how it settles.
+struct RunReport {
+    result: Result<String, ExecutionError>,
+    /// The lease renewal failed, so the lease may belong to recovery.
+    renewal_failed: bool,
+    /// A progress event could not be written to the journal.
+    event_error: bool,
+    /// The start closure already wrote the task's next state (a rejection
+    /// or a requeue), so nothing is left to settle.
+    settled_at_start: bool,
+}
+
+/// The single store write that ends a run, and the label its error is
+/// logged under.
+#[derive(Debug, Eq, PartialEq)]
+struct Settlement {
+    label: &'static str,
+    outcome: TaskOutcome,
+}
+
+/// Decides how a run settles. `cancelled` reads whether the task was
+/// cancelled; it is consulted only after a renewal failure, where the
+/// process was stopped by the renewal thread or by a cancel.
+fn settlement(run: RunReport, cancelled: impl FnOnce() -> bool) -> Option<Settlement> {
+    let settle = |label, outcome| Some(Settlement { label, outcome });
+    if run.settled_at_start {
+        return None;
+    }
+    if run.renewal_failed {
+        return match run.result {
+            Ok(text) => {
+                settle("late success after renewal loss", TaskOutcome::Succeeded(text))
+            }
+            Err(_) if cancelled() => None,
+            Err(_) => settle("renewal failed", TaskOutcome::Failed),
+        };
+    }
+    if run.event_error {
+        return settle("event journal write", TaskOutcome::Failed);
+    }
+    match run.result {
+        Ok(text) => settle("succeeded", TaskOutcome::Succeeded(text)),
+        Err(ExecutionError::Cancelled) => None,
+        Err(_) => settle("execution failed", TaskOutcome::Failed),
+    }
+}
+
+/// Holds the scheduler's single execution slot for one task. Dropping it
+/// clears the active task if it still names this one, frees the slot and
+/// wakes the scheduler, on every exit of the run.
+struct ExecutionSlot {
+    executing: Arc<AtomicBool>,
+    active_task: Arc<Mutex<Option<String>>>,
+    scheduler_wake: SyncSender<()>,
+    task_id: String,
+}
+
+impl ExecutionSlot {
+    fn activate(&self) {
+        if let Ok(mut active) = self.active_task.lock() {
+            *active = Some(self.task_id.clone());
+        }
+    }
+
+    fn deactivate(&self) {
+        if let Ok(mut active) = self.active_task.lock()
+            && active.as_deref() == Some(self.task_id.as_str())
+        {
+            *active = None;
+        }
+    }
+}
+
+impl Drop for ExecutionSlot {
+    fn drop(&mut self) {
+        self.deactivate();
+        self.executing.store(false, Ordering::Release);
+        let _ = self.scheduler_wake.try_send(());
+    }
 }
 
 pub(in crate::proof) struct SchedulerContext<T, P> {
@@ -90,11 +172,7 @@ where
             .ok_or(DispatchBlock::Policy(Denial::ScopeMismatch))?;
         policy.permits_dispatch(&data.request, scope).map_err(DispatchBlock::Policy)?;
         drop(policy);
-        if self
-            .scopes
-            .get(&data.request.scope_id)
-            .is_some_and(|scope| scope.kind == ScopeKind::Direct)
-        {
+        if scope.kind == ScopeKind::Direct {
             let agent = data.request.caller_agent_id.as_str().to_owned();
             let endpoint = data.request.caller_endpoint_id.as_str().to_owned();
             let allowed = self
@@ -120,15 +198,18 @@ where
         }
     }
 
-    fn reject_leased(
+    /// Ends a leased task that will not run with `end`
+    /// (`NodeStore::mark_rejected` or `NodeStore::mark_failed`).
+    fn end_leased(
         &self,
         task_id: &str,
         execution_id: &str,
+        end: fn(&mut NodeStore, &str, &str) -> Result<(), StoreError>,
     ) -> Result<(), ProofError> {
         let task_id = task_id.to_owned();
         let execution_id = execution_id.to_owned();
         let notify = task_id.clone();
-        self.store.call(move |store| store.mark_rejected(&task_id, &execution_id))?;
+        self.store.call(move |store| end(store, &task_id, &execution_id))?;
         self.notify_task(&notify);
         Ok(())
     }
@@ -154,15 +235,6 @@ where
                 }
             }
         })
-    }
-
-    fn fail_leased(&self, task_id: &str, execution_id: &str) -> Result<(), ProofError> {
-        let task_id = task_id.to_owned();
-        let execution_id = execution_id.to_owned();
-        let notify = task_id.clone();
-        self.store.call(move |store| store.mark_failed(&task_id, &execution_id))?;
-        self.notify_task(&notify);
-        Ok(())
     }
 
     fn prepare_execution(&self) -> Result<Option<ExecutionBundle>, ProofError> {
@@ -196,10 +268,7 @@ where
             let task_id = task_id.clone();
             move |store| store.state(&task_id)
         })?;
-        if state == TaskState::Cancelled {
-            let _ = self.store.call(move |store| store.requeue_leased(&task_id));
-            return Ok(None);
-        }
+        // A task cancelled after it was leased has no lease left to return.
         if state != TaskState::Leased {
             return Ok(None);
         }
@@ -211,7 +280,7 @@ where
         if !WorkspaceId::allows_path_token(workspace_id) {
             Self::log_store(
                 "invalid workspace id",
-                self.fail_leased(&task_id, &execution_id),
+                self.end_leased(&task_id, &execution_id, NodeStore::mark_failed),
             );
             return Ok(None);
         }
@@ -220,14 +289,14 @@ where
             Err(DispatchBlock::Policy(denial)) => {
                 Self::log_store(
                     "reject leased",
-                    self.reject_leased(&task_id, &execution_id),
+                    self.end_leased(&task_id, &execution_id, NodeStore::mark_rejected),
                 );
                 return Err(ProofError::Denied(denial));
             }
             Err(DispatchBlock::Group) => {
                 Self::log_store(
                     "reject leased",
-                    self.reject_leased(&task_id, &execution_id),
+                    self.end_leased(&task_id, &execution_id, NodeStore::mark_rejected),
                 );
                 return Err(ProofError::GroupDenied);
             }
@@ -243,18 +312,21 @@ where
 
     fn run_execution(&self, bundle: ExecutionBundle) {
         let ExecutionBundle { task_id, execution_id, task } = bundle;
+        let slot = ExecutionSlot {
+            executing: Arc::clone(&self.executing),
+            active_task: Arc::clone(&self.active_task),
+            scheduler_wake: self.scheduler_wake.clone(),
+            task_id: task_id.clone(),
+        };
         if self.shutdown.load(Ordering::Acquire) {
             // Shutdown landed before this worker could register as the
             // active task or touch the executor. The lease was never
             // confirmed as started, so the task can go straight back to the
             // queue for a future node run instead of being marked failed.
             let _ = self.store.call(move |store| store.requeue_leased(&task_id));
-            self.finish_execution();
             return;
         }
-        if let Ok(mut active) = self.active_task.lock() {
-            *active = Some(task_id.clone());
-        }
+        slot.activate();
         let renewal_failed = Arc::new(AtomicBool::new(false));
         let renewal = {
             let store = self.store.clone();
@@ -274,9 +346,6 @@ where
                         match stop_rx.recv_timeout(LEASE_RENEWAL_INTERVAL) {
                             Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
                             Err(RecvTimeoutError::Timeout) => {
-                                if renewal_failed.load(Ordering::Acquire) {
-                                    continue;
-                                }
                                 if store
                                     .call({
                                         let task_id = task_id.clone();
@@ -299,6 +368,7 @@ where
                                     // pass. A cancel also deletes the lease,
                                     // so this is the cancel's second signal.
                                     canceller.cancel(&task_id);
+                                    break;
                                 }
                             }
                         }
@@ -312,7 +382,6 @@ where
                 // Without a renewal thread the lease would lapse mid-run:
                 // give the task back to the queue instead of starting it.
                 let _ = self.store.call(move |store| store.requeue_leased(&task_id));
-                self.finish_execution();
                 return;
             }
         };
@@ -322,14 +391,8 @@ where
         if self.workspace.path().is_err() {
             Self::log_store(
                 "workspace path",
-                self.fail_leased(&task_id, &execution_id),
+                self.end_leased(&task_id, &execution_id, NodeStore::mark_failed),
             );
-            if let Ok(mut active) = self.active_task.lock()
-                && active.as_deref() == Some(task_id.as_str())
-            {
-                *active = None;
-            }
-            self.finish_execution();
             return;
         }
         let dispatch_task_id = task_id.clone();
@@ -341,6 +404,7 @@ where
         let start_confirmed = Arc::new(AtomicBool::new(false));
         let confirmed_flag = Arc::clone(&start_confirmed);
         let mut event_error = false;
+        let mut settled_at_start = false;
         let result = executor.lock().map_err(|_| ExecutionError::Unavailable).and_then(
             |mut executor| {
                 executor.execute_with_confirmed_start(
@@ -350,6 +414,13 @@ where
                             .lock()
                             .map_err(|_| ExecutionError::Unavailable)?;
                         if shutdown.load(Ordering::Acquire) {
+                            // The process never started, so the task goes
+                            // back to the queue, as it does when shutdown
+                            // lands before this worker registered.
+                            let task_id = dispatch_task_id.clone();
+                            settled_at_start = start_store
+                                .call(move |store| store.requeue_leased(&task_id))
+                                .is_ok();
                             return Err(ExecutionError::Cancelled);
                         }
                         let execution_data = start_store
@@ -359,13 +430,13 @@ where
                             })
                             .map_err(|_| ExecutionError::Unavailable)?;
                         if dispatch_ctx.dispatch_allowed(&execution_data).is_err() {
-                            Self::log_store(
-                                "reject at start",
-                                dispatch_ctx.reject_leased(
-                                    &dispatch_task_id,
-                                    &start_execution_id,
-                                ),
+                            let rejected = dispatch_ctx.end_leased(
+                                &dispatch_task_id,
+                                &start_execution_id,
+                                NodeStore::mark_rejected,
                             );
+                            settled_at_start = rejected.is_ok();
+                            Self::log_store("reject at start", rejected);
                             return Err(ExecutionError::Unavailable);
                         }
                         start_store
@@ -423,93 +494,32 @@ where
         );
         let _ = renewal.0.send(());
         let _ = renewal.1.join();
-        if let Ok(mut active) = self.active_task.lock()
-            && active.as_deref() == Some(task_id.as_str())
-        {
-            *active = None;
-        }
-        let start_confirmed = start_confirmed.load(Ordering::Acquire);
-        if renewal_failed.load(Ordering::Acquire) {
-            if let Ok(late_result) = &result {
-                Self::log_store(
-                    "late success after renewal loss",
-                    self.settle(
-                        &task_id,
-                        &execution_id,
-                        start_confirmed,
-                        TaskOutcome::Succeeded(late_result.clone()),
-                    ),
-                );
-            }
-            if matches!(
-                self.store.call({
-                    let task_id = task_id.clone();
-                    move |store| store.state(&task_id)
-                }),
+        slot.deactivate();
+        let run = RunReport {
+            result,
+            renewal_failed: renewal_failed.load(Ordering::Acquire),
+            event_error,
+            settled_at_start,
+        };
+        let cancelled = || {
+            let task_id = task_id.clone();
+            matches!(
+                self.store.call(move |store| store.state(&task_id)),
                 Ok(TaskState::Cancelled)
-            ) {
-                self.finish_execution();
-                return;
-            }
+            )
+        };
+        if let Some(Settlement { label, outcome }) = settlement(run, cancelled) {
             Self::log_store(
-                "renewal failed",
+                label,
                 self.settle(
                     &task_id,
                     &execution_id,
-                    start_confirmed,
-                    TaskOutcome::Failed,
+                    start_confirmed.load(Ordering::Acquire),
+                    outcome,
                 ),
             );
-            self.notify_task(&task_id);
-            self.finish_execution();
-            return;
-        }
-        if event_error {
-            Self::log_store(
-                "event journal write",
-                self.settle(
-                    &task_id,
-                    &execution_id,
-                    start_confirmed,
-                    TaskOutcome::Failed,
-                ),
-            );
-            self.notify_task(&task_id);
-            self.finish_execution();
-            return;
-        }
-        match result {
-            Ok(text) => {
-                Self::log_store(
-                    "succeeded",
-                    self.settle(
-                        &task_id,
-                        &execution_id,
-                        start_confirmed,
-                        TaskOutcome::Succeeded(text),
-                    ),
-                );
-            }
-            Err(ExecutionError::Cancelled) => {}
-            Err(_) => {
-                Self::log_store(
-                    "execution failed",
-                    self.settle(
-                        &task_id,
-                        &execution_id,
-                        start_confirmed,
-                        TaskOutcome::Failed,
-                    ),
-                );
-            }
         }
         self.notify_task(&task_id);
-        self.finish_execution();
-    }
-
-    fn finish_execution(&self) {
-        self.executing.store(false, Ordering::Release);
-        let _ = self.scheduler_wake.try_send(());
     }
 
     fn dispatch_one(&self) {
@@ -602,6 +612,80 @@ where
         }
         for task_id in recovered {
             self.notify_task(task_id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(result: Result<&str, ExecutionError>) -> RunReport {
+        RunReport {
+            result: result.map(str::to_owned),
+            renewal_failed: false,
+            event_error: false,
+            settled_at_start: false,
+        }
+    }
+
+    fn outcome(run: RunReport, cancelled: bool) -> Option<TaskOutcome> {
+        settlement(run, || cancelled).map(|settlement| settlement.outcome)
+    }
+
+    #[test]
+    fn a_finished_run_settles_from_its_result() {
+        assert_eq!(
+            outcome(run(Ok("done")), false),
+            Some(TaskOutcome::Succeeded("done".to_owned()))
+        );
+        assert_eq!(outcome(run(Err(ExecutionError::Cancelled)), false), None);
+        assert_eq!(
+            outcome(run(Err(ExecutionError::Timeout)), false),
+            Some(TaskOutcome::Failed)
+        );
+    }
+
+    #[test]
+    fn a_journal_error_fails_the_run_whatever_its_result() {
+        for result in [Ok("done"), Err(ExecutionError::Cancelled)] {
+            let report = RunReport { event_error: true, ..run(result) };
+            assert_eq!(outcome(report, false), Some(TaskOutcome::Failed));
+        }
+    }
+
+    #[test]
+    fn a_late_success_after_renewal_loss_settles_only_as_success() {
+        let report = RunReport { renewal_failed: true, ..run(Ok("late")) };
+        assert_eq!(
+            settlement(report, || true),
+            Some(Settlement {
+                label: "late success after renewal loss",
+                outcome: TaskOutcome::Succeeded("late".to_owned()),
+            })
+        );
+    }
+
+    #[test]
+    fn a_renewal_loss_fails_the_run_unless_it_was_cancelled() {
+        let lost = || RunReport {
+            renewal_failed: true,
+            event_error: true,
+            ..run(Err(ExecutionError::Cancelled))
+        };
+        assert_eq!(outcome(lost(), true), None);
+        assert_eq!(outcome(lost(), false), Some(TaskOutcome::Failed));
+    }
+
+    #[test]
+    fn a_run_settled_at_start_is_not_settled_again() {
+        for renewal_failed in [false, true] {
+            let report = RunReport {
+                settled_at_start: true,
+                renewal_failed,
+                ..run(Err(ExecutionError::Unavailable))
+            };
+            assert_eq!(outcome(report, false), None);
         }
     }
 }
