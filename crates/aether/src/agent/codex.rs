@@ -249,10 +249,12 @@ impl CodexAppServer {
         session: &AppServerSession,
         workspace: &Path,
         instruction: &str,
+        events: &mut dyn FnMut(ExecutionEvent),
     ) -> Result<String, ExecutionError> {
         let response = session.request(
             "thread/start",
             &thread_start_params(&self.limits, workspace, instruction),
+            events,
         )?;
         response
             .pointer("/result/thread/id")
@@ -277,6 +279,7 @@ impl CodexAppServer {
         let response = session.request(
             "turn/start",
             &turn_start_params(&self.limits, workspace, thread_id, remote_text),
+            events,
         )?;
         let turn_id = response
             .pointer("/result/turn/id")
@@ -522,8 +525,8 @@ impl Agent for CodexAppServer {
         };
         let session =
             AppServerSession::spawn(&binary, &arguments, ctx.deadline, &environment)?;
-        session.request("initialize", &initialize_params())?;
-        let thread_id = self.start_thread(&session, &workspace, &ctx.skill)?;
+        session.request("initialize", &initialize_params(), events)?;
+        let thread_id = self.start_thread(&session, &workspace, &ctx.skill, events)?;
         self.run_turn(&session, &workspace, &ctx.task_id, &thread_id, &ctx.text, events)
     }
 
@@ -611,14 +614,25 @@ impl AppServerSession {
         })
     }
 
-    fn request(&self, method: &str, params: &Value) -> Result<Value, ExecutionError> {
+    /// Sends one request and waits for its response. An approval request
+    /// that comes first is declined and reported: Codex waits for its
+    /// answer before it answers this request.
+    fn request(
+        &self,
+        method: &str,
+        params: &Value,
+        events: &mut dyn FnMut(ExecutionEvent),
+    ) -> Result<Value, ExecutionError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let request =
             json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         write_json(&self.input, &request)?;
         loop {
             let response = self.receive()?;
-            if response.get("id") != Some(&Value::from(id)) {
+            if self.decline_approval(&response, events)?
+                || response.get("method").is_some()
+                || response.get("id") != Some(&Value::from(id))
+            {
                 continue;
             }
             if response.get("error").is_some() {
@@ -643,9 +657,7 @@ impl AppServerSession {
         let mut final_answer: Option<String> = None;
         loop {
             let notification = self.receive()?;
-            if approval_request(&notification) {
-                events(ExecutionEvent::ApprovalRequested);
-                self.deny_approval(&notification)?;
+            if self.decline_approval(&notification, events)? {
                 continue;
             }
             let Some(method) = notification.get("method").and_then(Value::as_str)
@@ -737,6 +749,21 @@ impl AppServerSession {
                 Err(ExecutionError::Unavailable)
             }
         }
+    }
+
+    /// Declines `message` when it is an approval request, and reports it;
+    /// `false` for any other message.
+    fn decline_approval(
+        &self,
+        message: &Value,
+        events: &mut dyn FnMut(ExecutionEvent),
+    ) -> Result<bool, ExecutionError> {
+        if !approval_request(message) {
+            return Ok(false);
+        }
+        events(ExecutionEvent::ApprovalRequested);
+        self.deny_approval(message)?;
+        Ok(true)
     }
 
     fn deny_approval(&self, request: &Value) -> Result<(), ExecutionError> {
@@ -1097,7 +1124,7 @@ done
         )
         .expect("session must start");
         assert_eq!(
-            session.request("initialize", &initialize_params()),
+            session.request("initialize", &initialize_params(), &mut |_| {}),
             Err(ExecutionError::Timeout)
         );
     }
@@ -1301,6 +1328,55 @@ done
     }
 
     #[test]
+    #[cfg(unix)]
+    fn app_server_denies_an_approval_request_sent_before_the_turn_starts() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let limits = CodexLimits {
+            sandbox: CodexSandbox::WorkspaceWrite,
+            allow_network: false,
+            environment: BTreeMap::new(),
+        };
+        // The approval request comes before the `turn/start` response, and
+        // Codex waits for its answer before it sends anything else.
+        let script = r#"
+while IFS= read -r request; do
+  case "$request" in
+    *'"id":1'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}' ;;
+    *'"id":2'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread"}}}' ;;
+    *'"id":3'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":10,"method":"item/fileChange/requestApproval","params":{"threadId":"thread","turnId":"turn"}}'
+      IFS= read -r approval
+      case "$approval" in
+        *'"id":10'*'"decision":"decline"'*) ;;
+        *) exit 1 ;;
+      esac
+      printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn"}}}'
+      printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread","turn":{"id":"turn","status":"completed","items":[{"type":"agentMessage","text":"ok"}]}}}'
+      ;;
+  esac
+done
+"#;
+        let mut server = CodexAppServer::with_arguments(
+            PathBuf::from("sh"),
+            vec!["-c".to_owned(), script.to_owned()],
+            limits,
+        )
+        .expect("limits must be valid");
+        let mut events = Vec::new();
+        assert_eq!(
+            server.start_turn_with_events(
+                &turn_ctx(directory.path(), "task", "review", "untrusted", 3),
+                &mut |event| events.push(event),
+            ),
+            Ok("ok".to_owned())
+        );
+        assert_eq!(
+            events,
+            [ExecutionEvent::ApprovalRequested, ExecutionEvent::Completed]
+        );
+    }
+
+    #[test]
     fn app_server_declines_an_mcp_elicitation_request() {
         let directory = tempfile::tempdir().expect("directory must create");
         let limits = CodexLimits {
@@ -1444,11 +1520,13 @@ done
             &environment,
         )
         .expect("app server must start");
-        session.request("initialize", &initialize_params()).expect("initialize");
+        session
+            .request("initialize", &initialize_params(), &mut |_| {})
+            .expect("initialize");
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let status = session
-                .request("mcpServerStatus/list", &json!({}))
+                .request("mcpServerStatus/list", &json!({}), &mut |_| {})
                 .expect("status must list")
                 .to_string();
             if status.contains("probe")
