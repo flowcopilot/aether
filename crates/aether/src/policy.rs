@@ -52,6 +52,10 @@ pub enum PolicyError {
     Invalid,
     #[error("node policy is invalid at {0}")]
     InvalidField(String),
+    #[error(
+        "node policy workspace {path} cannot be opened ({reason}); create the folder or change workspace in the policy"
+    )]
+    Workspace { path: String, reason: String },
 }
 
 #[derive(Deserialize, Serialize)]

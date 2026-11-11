@@ -183,11 +183,7 @@ fn build(
         .initialize_access_groups(&initial_members)
         .map_err(|_| PolicyError::Invalid)?;
     let trust = RosterClaims::new(signed_claims, layout.clone());
-    // The folder must exist; say which field names it.
-    let workspace = policy
-        .workspace
-        .canonicalize()
-        .map_err(|_| PolicyError::InvalidField("workspace".to_owned()))?;
+    let workspace = resolve_workspace(&policy.workspace, &layout)?;
     let agent = match sandbox {
         Some(sandbox) => NodeAgent::Codex(codex_agent(
             data_dir,
@@ -264,6 +260,46 @@ fn build(
         }
     }
     Ok(service)
+}
+
+/// The canonical policy workspace. The default task-folder root beside the
+/// data directory belongs to the node, so it is made again when it is gone
+/// (a cleaned home directory, a migrated machine). Any other folder belongs
+/// to the owner: a missing one fails startup and the error names it.
+fn resolve_workspace(
+    workspace: &Path,
+    layout: &DataDir,
+) -> Result<PathBuf, PolicyError> {
+    let error = |reason: std::io::Error| PolicyError::Workspace {
+        path: workspace.display().to_string(),
+        reason: reason.kind().to_string(),
+    };
+    match workspace.canonicalize() {
+        Ok(path) => Ok(path),
+        Err(reason)
+            if reason.kind() == std::io::ErrorKind::NotFound
+                && is_default_tasks_root(workspace, layout) =>
+        {
+            fs::create_dir_all(workspace).map_err(error)?;
+            workspace.canonicalize().map_err(error)
+        }
+        Err(reason) => Err(error(reason)),
+    }
+}
+
+/// Whether `workspace` is the default task-folder root. The policy stores
+/// that root canonicalized, so the data directory's parent is resolved too.
+fn is_default_tasks_root(workspace: &Path, layout: &DataDir) -> bool {
+    let default = layout.default_tasks_root();
+    if workspace == default {
+        return true;
+    }
+    match (default.parent(), default.file_name()) {
+        (Some(parent), Some(name)) => {
+            parent.canonicalize().is_ok_and(|parent| parent.join(name) == workspace)
+        }
+        _ => false,
+    }
 }
 
 /// The Codex adapter of a node: its own Codex home, which shares only the
@@ -535,6 +571,46 @@ mod tests {
         .expect("node must start with Codex");
         assert_eq!(service.agent_adapter(), AgentAdapter::Codex);
         assert!(service.task_folder_mode());
+    }
+
+    #[test]
+    fn a_deleted_default_task_folder_is_made_again_on_the_next_start() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let data_dir = directory.path().join("host");
+        let import = directory.path().join("missing-policy.json");
+        let tasks = directory.path().join("tasks");
+        let service = load_or_create_service(
+            &import,
+            &data_dir,
+            "codex".into(),
+            Some(AgentAdapter::Connected),
+        )
+        .expect("node must start");
+        drop(service);
+        fs::remove_dir_all(&tasks).expect("task folder must delete");
+        load_or_create_service(&import, &data_dir, "codex".into(), None)
+            .expect("node must start without its task folder");
+        assert!(tasks.is_dir());
+    }
+
+    #[test]
+    fn a_missing_owner_workspace_fails_startup_and_names_the_path() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let path = minimal_policy(directory.path());
+        let workspace = directory.path().join("workspace");
+        fs::remove_dir_all(&workspace).expect("workspace must delete");
+        let Err(error) = load_service(&path, directory.path(), "codex".into()) else {
+            panic!("a missing owner workspace must fail startup");
+        };
+        assert_eq!(
+            error,
+            PolicyError::Workspace {
+                path: workspace.display().to_string(),
+                reason: std::io::ErrorKind::NotFound.to_string(),
+            }
+        );
+        assert!(!workspace.exists());
+        assert!(error.to_string().contains(&workspace.display().to_string()));
     }
 
     #[test]
