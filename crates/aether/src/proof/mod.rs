@@ -86,11 +86,8 @@ pub(crate) fn timestamp_after(duration: Duration) -> i64 {
 }
 
 mod admission;
-mod handle;
 mod scheduler;
 mod worker;
-
-pub use handle::ProofHandle;
 
 use scheduler::SchedulerContext;
 use worker::StoreWorker;
@@ -320,6 +317,7 @@ where
         self.workspace.path().map_err(|_| ProofError::Internal)
     }
 
+    #[cfg(test)]
     pub fn apply_grant(&self, grant: aether_core::Grant) -> Result<(), ProofError> {
         self.apply_grant_inner(grant, true)
     }
