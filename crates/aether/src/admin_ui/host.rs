@@ -1,7 +1,7 @@
 //! The host screen of `node serve --admin-port`: who can use the agent, the
 //! folder it works in, and the form that invites someone.
 
-use std::{sync::PoisonError, time::SystemTime};
+use std::time::SystemTime;
 
 use aether_core::time::now_seconds;
 
@@ -19,11 +19,11 @@ use topcoat::{
 };
 
 use super::{
-    Page, PageContext, ensure_admin_session,
+    Page, PageContext, admin_page, administration, ensure_admin_session,
     hub::{hub_section, hub_setting},
-    layout::{Tab, node_header},
-    listing::listing_section,
-    require_admin_session, shared,
+    layout::{Tab, Waiting, node_header},
+    listing::{ListingAction, listing_section},
+    shared::{self, Notice},
 };
 use crate::access_groups::{self, Action};
 use crate::hub_client::{HubClient, Role};
@@ -31,13 +31,13 @@ use crate::invites::{DirectInviteSigning, sign_direct_invite};
 use crate::{
     admin::SharedAdministration,
     admin_components::{
-        ALERT, CHECK, CHEVRON, CopyTone, ago, copy_field, field, page_title,
-        presence_dot,
+        ALERT, CHECK, CHEVRON, CopyTone, ErrorIcon, Tone, ago, copy_field, days_label,
+        days_select, error_line, field, page_title, post_button, presence_dot,
+        section_heading, state_badge,
     },
     components::{
         alert::{AlertVariant, alert, alert_description, alert_title},
         avatar::{AvatarSize, avatar, avatar_fallback},
-        badge::{BadgeVariant, badge},
         button::{ButtonSize, ButtonVariant, button},
         input::input,
         table::{table, table_body, table_cell, table_head, table_header, table_row},
@@ -51,31 +51,6 @@ use topcoat::icon::icon;
 pub(super) struct NewInvitation {
     friend_name: String,
     line: String,
-}
-
-/// What the last form on this screen asks the page to show.
-#[derive(Clone, Default)]
-pub(super) struct Notice {
-    invite_error: String,
-    workspace_error: String,
-    relay_error: String,
-    confirm_revoke: String,
-    hub_error: String,
-    hub_setting_error: String,
-    group_error: String,
-    card_error: String,
-    card_saved: bool,
-    listing_error: String,
-}
-
-impl Notice {
-    pub(super) fn hub(error: String, setting_error: String) -> Self {
-        Self { hub_error: error, hub_setting_error: setting_error, ..Self::default() }
-    }
-
-    pub(super) fn listing(error: String) -> Self {
-        Self { listing_error: error, ..Self::default() }
-    }
 }
 
 /// One grant in the direct scope, as the host sees it.
@@ -100,23 +75,15 @@ pub(super) async fn host_screen(
         ))
         .into());
     };
-    let drafts = if page.caller {
+    let drafts = if page.mode.calls() {
         let now = aether_core::time::now_seconds();
         super::shared::request_drafts_of(&page.data_dir, now).len()
     } else {
         0
     };
     let relay_url = page.relay_url();
-    let relay_host = relay_url.as_deref().map(|url| {
-        reqwest::Url::parse(url)
-            .ok()
-            .and_then(|url| url.host_str().map(str::to_owned))
-            .unwrap_or_else(|| url.to_owned())
-    });
     let (grants, last_tasks, folder, pending) = {
-        let administration = app_context::<SharedAdministration>(cx)
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let administration = administration(cx);
         (
             administration.grants().map_err(|_| {
                 internal_server_error(std::io::Error::other("grants unavailable"))
@@ -160,12 +127,7 @@ pub(super) async fn host_screen(
         .iter()
         .map(|friend| (friend.name.clone(), friend.endpoint_id.clone()))
         .collect::<Vec<_>>();
-    let refused = !notice.invite_error.is_empty()
-        || !notice.workspace_error.is_empty()
-        || !notice.relay_error.is_empty()
-        || !notice.group_error.is_empty()
-        || !notice.card_error.is_empty()
-        || !notice.listing_error.is_empty();
+    let refused = notice.refused();
     let command = format!("aether node direct import '{}'", invitation.line);
     let hub_access = page.hub_access();
     let hub = page.current_hub();
@@ -178,21 +140,21 @@ pub(super) async fn host_screen(
             == Some(crate::hub_client::AgentKind::Service);
     // The code form is the second way when a hub is set; it opens when it
     // is in use.
-    let code_open = !invitation.line.is_empty() || !notice.invite_error.is_empty();
+    let code_open = !invitation.line.is_empty() || !notice.invite_error().is_empty();
 
     let agent_name = page.agent_name();
     Ok(view! {
         if refused {
             (StatusCode::BAD_REQUEST)
         }
-        node_header(current: Tab::Sharing)
+        node_header(current: Tab::Sharing, waiting: Some(Waiting { drafts, pending }))
         <main id="main" class="mx-auto flex max-w-6xl flex-col gap-12 px-4 py-10 sm:px-8">
             <div class="grid items-start gap-10 lg:grid-cols-[minmax(0,1fr)_24rem]">
                 <section aria-labelledby="people" class="flex min-w-0 flex-col gap-7">
                     <div id="people">
                         page_title(
                             title: "Who can use your agent",
-                            workspace_line(path: folder, error: notice.workspace_error.clone(), task_folder_mode: page.task_folder_mode)
+                            workspace_line(path: folder, error: notice.workspace_error(), task_folder_mode: page.task_folder_mode)
                         )
                     </div>
                     if drafts > 0 {
@@ -216,11 +178,11 @@ pub(super) async fn host_screen(
                             )
                         )
                     }
-                    people(friends: friends, confirm_revoke: notice.confirm_revoke.clone())
+                    people(friends: friends, confirm_revoke: notice.confirm_revoke())
                     if service {
                         listing_section(
                             data_dir: page.data_dir.clone(),
-                            error: notice.listing_error.clone(),
+                            error: notice.listing_error(),
                         )
                     }
                 </section>
@@ -236,15 +198,15 @@ pub(super) async fn host_screen(
                             hub_section(
                                 hub: hub.clone(),
                                 role: Role::Sender,
-                                error: notice.hub_error.clone(),
-                                relay_missing: relay_host.is_none(),
+                                error: notice.hub_error(),
+                                relay_missing: relay_url.is_none(),
                                 <details class="group border-t border-border pt-4" open=(code_open.then_some(""))>
                                     <summary class="flex cursor-pointer list-none items-center gap-2 text-sm text-muted-foreground">
                                         <span class="transition-transform group-open:rotate-90">icon(data: CHEVRON)</span>
                                         "Invite with a connect code instead"
                                     </summary>
                                     <div class="flex flex-col gap-5 pt-4">
-                                        invite_form(error: notice.invite_error.clone())
+                                        invite_form(error: notice.invite_error())
                                         if !invitation.line.is_empty() {
                                             invite_result(invitation: invitation.clone(), command: command.clone(), agent_name: agent_name.clone())
                                         }
@@ -258,10 +220,10 @@ pub(super) async fn host_screen(
                                     <h2 id="invite-title" class="text-lg leading-tight font-semibold">"Invite someone"</h2>
                                     <p class="text-sm text-muted-foreground">"Ask them for the connect code on their Aether page. The invite works only on their computer."</p>
                                 </div>
-                                if relay_host.is_none() {
+                                if relay_url.is_none() {
                                     shared::relay_notice()
                                 }
-                                invite_form(error: notice.invite_error.clone())
+                                invite_form(error: notice.invite_error())
                                 if !invitation.line.is_empty() {
                                     invite_result(invitation: invitation.clone(), command: command.clone(), agent_name: agent_name.clone())
                                 }
@@ -273,11 +235,11 @@ pub(super) async fn host_screen(
                         <div class="flex flex-col divide-y divide-border border-t border-border">
                             relay_line(
                                 url: relay_url.clone().unwrap_or_default(),
-                                error: notice.relay_error.clone(),
+                                error: notice.relay_error(),
                             )
                             hub_setting(
                                 url: hub.as_ref().map(HubClient::url),
-                                error: notice.hub_setting_error.clone(),
+                                error: notice.hub_setting_error(),
                             )
                         </div>
                     </section>
@@ -286,10 +248,10 @@ pub(super) async fn host_screen(
             <div class="grid items-start gap-10 border-t border-border pt-10 lg:grid-cols-[minmax(0,1fr)_30rem]">
                 card_section(
                     settings: crate::agent_card::settings(&page.data_dir),
-                    error: notice.card_error.clone(),
-                    saved: notice.card_saved,
+                    error: notice.card_error(),
+                    saved: notice.card_saved(),
                 )
-                groups_section(groups: groups, friend_choices: friend_choices, error: notice.group_error.clone())
+                groups_section(groups: groups, friend_choices: friend_choices, error: notice.group_error())
             </div>
         </main>
     }
@@ -346,14 +308,14 @@ async fn groups_section(
     Ok(view! {
         <section id="groups" class="flex flex-col gap-4" aria-labelledby="groups-title">
             <div class="flex flex-col gap-1.5">
-                <h2 id="groups-title" class="text-xl font-semibold tracking-tight">"Incoming access groups"</h2>
+                section_heading(id: "groups-title", "Incoming access groups")
                 <p class="text-sm text-muted-foreground">"A person must have direct access and belong to at least one group to send tasks. New invites join friends. People whose access request you approve join requests."</p>
             </div>
             if !error.is_empty() {
-                <p role="alert" class="flex items-center gap-1.5 text-sm text-destructive">icon(data: ALERT) (error.clone())</p>
+                error_line(text: error.clone(), placement: ErrorIcon::Centered)
             }
             <form method="post" action="/groups" class="flex gap-2">
-                <input type="hidden" name="action" value="create" />
+                <input type="hidden" name="action" value=(GroupAction::Create.as_str()) />
                 input(attrs: attributes! { name="group" aria-label="New group name" placeholder="Group name" required="" maxlength="64" })
                 button(variant: ButtonVariant::Outline, attrs: attributes! { type="submit" }, "Create group")
             </form>
@@ -363,7 +325,7 @@ async fn groups_section(
                         <h3 class="text-[15px] font-semibold">(&group.name)</h3>
                         if group.name != crate::access_groups::FRIENDS_GROUP && group.name != crate::access_groups::REQUESTS_GROUP {
                             <form method="post" action="/groups">
-                                <input type="hidden" name="action" value="delete" />
+                                <input type="hidden" name="action" value=(GroupAction::Delete.as_str()) />
                                 <input type="hidden" name="group" value=(&group.name) />
                                 <button type="submit" class="text-sm font-medium text-destructive hover:underline">"Delete group"</button>
                             </form>
@@ -378,7 +340,7 @@ async fn groups_section(
                                 <li>
                                     <form method="post" action="/groups" class="flex items-center justify-between gap-2 py-2 text-sm">
                                         <span class="font-mono text-[13px]">(&member.agent_id)</span>
-                                        <input type="hidden" name="action" value="remove" />
+                                        <input type="hidden" name="action" value=(GroupAction::Remove.as_str()) />
                                         <input type="hidden" name="group" value=(&group.name) />
                                         <input type="hidden" name="agent" value=(&member.agent_id) />
                                         <input type="hidden" name="endpoint_id" value=(&member.endpoint_id) />
@@ -390,7 +352,7 @@ async fn groups_section(
                     }
                     if !friend_choices.is_empty() {
                         <form method="post" action="/groups" class="flex gap-2 pt-1">
-                            <input type="hidden" name="action" value="add" />
+                            <input type="hidden" name="action" value=(GroupAction::Add.as_str()) />
                             <input type="hidden" name="group" value=(&group.name) />
                             <select name="endpoint_id" aria-label=(format!("Add a person to {}", group.name)) class="h-8 min-w-0 flex-1 rounded-lg border border-border bg-background px-2 text-sm">
                                 for (name, endpoint) in &friend_choices {
@@ -406,10 +368,43 @@ async fn groups_section(
     })
 }
 
+/// The change a group form asks for, from its hidden `action` field.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum GroupAction {
+    Create,
+    Add,
+    Remove,
+    Delete,
+}
+
+impl GroupAction {
+    /// The field value; `Deserialize` reads the same names back.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Add => "add",
+            Self::Remove => "remove",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+impl From<GroupAction> for Action {
+    fn from(action: GroupAction) -> Self {
+        match action {
+            GroupAction::Create => Self::Create,
+            GroupAction::Add => Self::Add,
+            GroupAction::Remove => Self::Remove,
+            GroupAction::Delete => Self::Delete,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct GroupForm {
-    action: String,
+    action: GroupAction,
     group: String,
     agent: Option<String>,
     endpoint_id: Option<String>,
@@ -420,20 +415,8 @@ pub(super) async fn change_group(
     cx: &Cx,
     Form(form): Form<GroupForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let Page(Some(page)) = app_context::<Page>(cx) else {
-        return Err(bad_request("this node has no groups").into());
-    };
-    let action = match form.action.as_str() {
-        "create" => Action::Create,
-        "add" => Action::Add,
-        "remove" => Action::Remove,
-        "delete" => Action::Delete,
-        _ => return Err(bad_request("this group action is invalid").into()),
-    };
-    let peers = app_context::<SharedAdministration>(cx)
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
+    let page = admin_page(cx, "this node has no groups").await?;
+    let peers = administration(cx)
         .grants()
         .map_err(|_| bad_request("grants are unavailable"))?
         .into_iter()
@@ -450,7 +433,7 @@ pub(super) async fn change_group(
         .collect::<Vec<_>>();
     let group_error = access_groups::change(
         &page.data_dir,
-        action,
+        form.action.into(),
         &form.group,
         form.agent.as_deref(),
         form.endpoint_id.as_deref(),
@@ -459,7 +442,7 @@ pub(super) async fn change_group(
     .err()
     .unwrap_or_default()
     .to_owned();
-    Ok(view! { host_screen(notice: Notice { group_error, ..Notice::default() }) })
+    Ok(view! { host_screen(notice: Notice::Group(group_error)) })
 }
 
 /// The relay people reach the agent through, as a row of the Connection
@@ -467,43 +450,27 @@ pub(super) async fn change_group(
 /// because an invite needs one to work outside the local network.
 #[component]
 async fn relay_line(url: String, error: String) -> TopcoatResult<impl View> {
-    let open = url.is_empty() || !error.is_empty();
     Ok(view! {
-        <div id="relay" class="py-3">
-            <details class="group" open=(open.then_some(""))>
-                <summary class="flex cursor-pointer list-none items-center justify-between gap-3">
-                    <span class="flex min-w-0 flex-col gap-0.5">
-                        <span class="text-[13px] text-muted-foreground">"Relay"</span>
-                        if url.is_empty() {
-                            <span class="text-[13px] text-muted-foreground">"No relay yet: only your local network can reach it."</span>
-                        } else {
-                            <span class="sr-only">"People reach it through "</span>
-                            <code class="font-mono text-[13px] break-all text-foreground">(&url)</code>
-                        }
-                    </span>
-                    <span class="shrink-0 text-[13px] font-medium text-primary underline underline-offset-4">
-                        (if url.is_empty() { "Set a relay" } else { "Change relay" })
-                    </span>
-                </summary>
-                <form method="post" action="/relay" class="mt-3 flex flex-col gap-2">
-                    field(
-                        name: "Relay URL",
-                        control_id: "relay_url",
-                        hint: "An iroh relay, such as one you run. Leave it empty to use only your local network.",
-                        input(attrs: attributes! {
-                            id="relay_url" name="relay_url" type="url" value=(&url)
-                            placeholder="https://relay.example.com" class="font-mono"
-                            spellcheck="false" autocomplete="off"
-                            aria-invalid=((!error.is_empty()).then_some("true"))
-                        })
-                    )
-                    if !error.is_empty() {
-                        <p class="flex items-center gap-1.5 text-sm text-destructive" role="alert">icon(data: ALERT) (&error)</p>
-                    }
-                    button(variant: ButtonVariant::Outline, size: ButtonSize::Sm, attrs: attributes! { type="submit" class="w-fit" }, "Use this relay")
-                </form>
-            </details>
-        </div>
+        shared::url_setting(
+            id: "relay",
+            action: "/relay",
+            name: "Relay URL",
+            control: "relay_url",
+            hint: "An iroh relay, such as one you run. Leave it empty to use only your local network.",
+            placeholder: "https://relay.example.com",
+            value: url.clone(),
+            error: error,
+            missing: url.is_empty(),
+            link: if url.is_empty() { "Set a relay" } else { "Change relay" },
+            submit: "Use this relay",
+            <span class="text-[13px] text-muted-foreground">"Relay"</span>
+            if url.is_empty() {
+                <span class="text-[13px] text-muted-foreground">"No relay yet: only your local network can reach it."</span>
+            } else {
+                <span class="sr-only">"People reach it through "</span>
+                <code class="font-mono text-[13px] break-all text-foreground">(&url)</code>
+            }
+        )
     })
 }
 
@@ -521,10 +488,7 @@ pub(super) async fn relay(
     cx: &Cx,
     Form(form): Form<RelayForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let Page(Some(page)) = app_context::<Page>(cx) else {
-        return Err(bad_request("this node has no relay to change").into());
-    };
+    let page = admin_page(cx, "this node has no relay to change").await?;
     let relay = form.relay_url.trim();
     let relay = (!relay.is_empty()).then(|| relay.to_owned());
     let valid = relay.as_deref().is_none_or(crate::transport::relay::valid_relay_url);
@@ -539,7 +503,7 @@ pub(super) async fn relay(
     } else {
         "This is not a relay URL. It starts with https://.".to_owned()
     };
-    Ok(view! { host_screen(notice: Notice { relay_error, ..Notice::default() }) })
+    Ok(view! { host_screen(notice: Notice::Relay(relay_error)) })
 }
 
 /// The Agent Card that people get with an invite, and a form to change it.
@@ -552,7 +516,7 @@ async fn card_section(
     Ok(view! {
         <section id="card" class="flex flex-col gap-4" aria-labelledby="card-title">
             <div class="flex flex-col gap-1.5">
-                <h2 id="card-title" class="text-xl font-semibold tracking-tight">"Your agent's card"</h2>
+                section_heading(id: "card-title", "Your agent's card")
                 <p class="text-sm text-muted-foreground">
                     "People you invite get this card with the invite. It is never public. Do not name your tools, model, folders or settings."
                 </p>
@@ -610,10 +574,7 @@ pub(super) async fn save_card(
     cx: &Cx,
     Form(form): Form<CardForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let Page(Some(page)) = app_context::<Page>(cx) else {
-        return Err(bad_request("this node has no agent card").into());
-    };
+    let page = admin_page(cx, "this node has no agent card").await?;
     let card_input = crate::agent_card::CardInput {
         description: form.description,
         skill_name: form.skill_name,
@@ -627,11 +588,10 @@ pub(super) async fn save_card(
             .collect(),
     };
     let notice = match crate::agent_card::save_settings(&page.data_dir, &card_input) {
-        Ok(_) => Notice { card_saved: true, ..Notice::default() },
-        Err(crate::agent_card::CardError::Invalid(reason)) => Notice {
-            card_error: format!("The card was not saved: {reason}."),
-            ..Notice::default()
-        },
+        Ok(_) => Notice::CardSaved,
+        Err(crate::agent_card::CardError::Invalid(reason)) => {
+            Notice::Card(format!("The card was not saved: {reason}."))
+        }
         Err(error) => return Err(internal_server_error(error).into()),
     };
     Ok(view! { host_screen(notice: notice) })
@@ -672,7 +632,7 @@ async fn workspace_line(
                 button(variant: ButtonVariant::Outline, attrs: attributes! { type="submit" class="mb-5" }, "Use this folder")
             </form>
             if open {
-                <p class="flex items-start gap-1.5 text-sm text-destructive" role="alert">icon(data: ALERT) (&error)</p>
+                error_line(text: error.clone(), placement: ErrorIcon::Top)
             }
         </details>
         }
@@ -717,15 +677,12 @@ async fn people(
                                             "Revoke " (&friend.name) "'s access? A task that is running still finishes. The next one fails."
                                         </p>
                                         <a href="/" class="px-3 py-2 text-sm">"Keep access"</a>
-                                        <form method="post" action="/revoke">
-                                            <input type="hidden" name="grant_id" value=(&friend.grant_id)>
-                                            <input type="hidden" name="confirm" value="yes">
-                                            button(
-                                                variant: ButtonVariant::Destructive,
-                                                attrs: attributes! { type="submit" },
-                                                "Revoke"
-                                            )
-                                        </form>
+                                        post_button(
+                                            action: "/revoke",
+                                            fields: vec![("grant_id", friend.grant_id.clone()), ("confirm", "yes".to_owned())],
+                                            variant: ButtonVariant::Destructive,
+                                            "Revoke"
+                                        )
                                     </div>
                                 )
                             )
@@ -744,14 +701,13 @@ async fn people(
                                 table_cell((access_ends(friend.days_left)))
                                 table_cell(
                                     attrs: attributes! { class="text-right" },
-                                    <form method="post" action="/revoke">
-                                        <input type="hidden" name="grant_id" value=(&friend.grant_id)>
-                                        button(
-                                            variant: ButtonVariant::Outline,
-                                            attrs: attributes! { type="submit" aria-label=(format!("Revoke {}", friend.name)) },
-                                            "Revoke"
-                                        )
-                                    </form>
+                                    post_button(
+                                        action: "/revoke",
+                                        fields: vec![("grant_id", friend.grant_id.clone())],
+                                        variant: ButtonVariant::Outline,
+                                        aria_label: format!("Revoke {}", friend.name),
+                                        "Revoke"
+                                    )
                                 )
                             )
                         }
@@ -783,7 +739,7 @@ async fn last_task(task: Option<LastTask>, now: i64) -> TopcoatResult<impl View>
             Some(task) => {
                 <div class="flex flex-col gap-2">
                     <span class="flex items-center gap-2">
-                        badge(variant: BadgeVariant::Outline, attrs: attributes! { class=(state_tone(task.state)) }, (state_name(task.state)))
+                        state_badge(state: task_state(task.state))
                         <span class="text-muted-foreground">(ago(now.saturating_sub(task.created_at)))</span>
                     </span>
                     if let Some(result) = task.result {
@@ -801,40 +757,25 @@ async fn last_task(task: Option<LastTask>, now: i64) -> TopcoatResult<impl View>
     })
 }
 
-const fn state_name(state: TaskState) -> &'static str {
+/// The word and the badge tone of a task state.
+const fn task_state(state: TaskState) -> (&'static str, Tone) {
     match state {
-        TaskState::PendingApproval => "Waits for approval",
-        TaskState::Queued | TaskState::Leased => "Waiting",
-        TaskState::Running => "Running",
-        TaskState::Succeeded => "Answered",
+        TaskState::PendingApproval => ("Waits for approval", Tone::Warning),
+        TaskState::Queued | TaskState::Leased => ("Waiting", Tone::Warning),
+        TaskState::Running => ("Running", Tone::Warning),
+        TaskState::Succeeded => ("Answered", Tone::Success),
         TaskState::Failed | TaskState::UnknownResult | TaskState::OperatorReviewed => {
-            "Failed"
+            ("Failed", Tone::Destructive)
         }
-        TaskState::Rejected => "Refused",
-        TaskState::Cancelled => "Cancelled",
-    }
-}
-
-const fn state_tone(state: TaskState) -> &'static str {
-    match state {
-        TaskState::Succeeded => "border-success/40 text-success",
-        TaskState::PendingApproval
-        | TaskState::Queued
-        | TaskState::Leased
-        | TaskState::Running => "border-warning/40 text-warning",
-        TaskState::Failed
-        | TaskState::UnknownResult
-        | TaskState::OperatorReviewed
-        | TaskState::Rejected => "border-destructive/40 text-destructive",
-        TaskState::Cancelled => "text-muted-foreground",
+        TaskState::Rejected => ("Refused", Tone::Destructive),
+        TaskState::Cancelled => ("Cancelled", Tone::Muted),
     }
 }
 
 fn access_ends(days_left: u64) -> String {
     match days_left {
         0 => "today".to_owned(),
-        1 => "in 1 day".to_owned(),
-        days => format!("in {days} days"),
+        days => format!("in {}", days_label(days)),
     }
 }
 
@@ -864,21 +805,16 @@ async fn invite_form(error: String) -> TopcoatResult<impl View> {
                 field(
                     name: "Access for",
                     control_id: "days",
-                    <select
-                        id="days"
-                        name="days"
-                        class="h-9 rounded-lg border border-border bg-background px-3 text-sm shadow-xs"
-                    >
-                        for days in crate::direct::DIRECT_OFFER_DAYS {
-                            <option value=(days) selected=((days == crate::direct::DEFAULT_DIRECT_ACCESS_DAYS).then_some(""))>
-                                (if days == 1 { "1 day".to_owned() } else { format!("{days} days") })
-                            </option>
-                        }
-                    </select>
+                    days_select(
+                        id: "days",
+                        class: "h-9 rounded-lg border border-border bg-background px-3 text-sm shadow-xs",
+                        choices: crate::direct::DIRECT_OFFER_DAYS.to_vec(),
+                        selected: crate::direct::DEFAULT_DIRECT_ACCESS_DAYS,
+                    )
                 )
             </div>
             if !error.is_empty() {
-                <p class="flex items-start gap-1.5 text-sm text-destructive" role="alert">icon(data: ALERT) (&error)</p>
+                error_line(text: error.clone(), placement: ErrorIcon::Top)
             }
             button(attrs: attributes! { type="submit" class="w-full" }, "Create invite")
         </form>
@@ -900,10 +836,7 @@ pub(super) async fn invite(
     cx: &Cx,
     Form(form): Form<InviteForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let Page(Some(page)) = app_context::<Page>(cx) else {
-        return Err(bad_request("this node cannot invite").into());
-    };
+    let page = admin_page(cx, "this node cannot invite").await?;
     // A code copied from the caller's page may keep its groups of four.
     let endpoint_id = form.endpoint_id.split_whitespace().collect::<String>();
     let refusal = if endpoint_id.parse::<iroh::EndpointId>().is_err() {
@@ -918,10 +851,7 @@ pub(super) async fn invite(
         None
     };
     let (invitation, notice) = if let Some(refusal) = refusal {
-        (
-            NewInvitation::default(),
-            Notice { invite_error: refusal.to_owned(), ..Notice::default() },
-        )
+        (NewInvitation::default(), Notice::Invite(refusal.to_owned()))
     } else {
         let line = create_invite(cx, page, &form.friend_name, &endpoint_id, form.days)?;
         (NewInvitation { friend_name: form.friend_name, line }, Notice::default())
@@ -974,19 +904,14 @@ pub(super) async fn revoke(
     cx: &Cx,
     Form(form): Form<RevokeForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let Page(Some(_page)) = app_context::<Page>(cx) else {
-        return Err(bad_request("this node cannot revoke").into());
-    };
+    admin_page(cx, "this node cannot revoke").await?;
     let notice = if form.confirm.as_deref() == Some("yes") {
-        app_context::<SharedAdministration>(cx)
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        administration(cx)
             .revoke(&form.grant_id, aether_store::AuditActor::Ui)
             .map_err(|_| bad_request("the access cannot be revoked"))?;
         Notice::default()
     } else {
-        Notice { confirm_revoke: form.grant_id, ..Notice::default() }
+        Notice::ConfirmRevoke(form.grant_id)
     };
     Ok(view! { host_screen(notice: notice) })
 }
@@ -1005,10 +930,7 @@ pub(super) async fn workspace(
     cx: &Cx,
     Form(form): Form<WorkspaceForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let Page(Some(page)) = app_context::<Page>(cx) else {
-        return Err(bad_request("this node has no workspace to change").into());
-    };
+    let page = admin_page(cx, "this node has no workspace to change").await?;
     if page.task_folder_mode {
         return Err(bad_request("task folders do not allow folder changes").into());
     }
@@ -1018,9 +940,7 @@ pub(super) async fn workspace(
     }
     .into_change()
     .is_ok_and(|change| {
-        app_context::<SharedAdministration>(cx)
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        administration(cx)
             .apply(&change, aether_store::AuditActor::Ui)
             .map(|_| ())
             .is_ok()
@@ -1028,10 +948,7 @@ pub(super) async fn workspace(
     let notice = if applied {
         Notice::default()
     } else {
-        Notice {
-            workspace_error: "The agent cannot use this folder. It must exist on this computer and be allowed by the policy.".to_owned(),
-            ..Notice::default()
-        }
+        Notice::Workspace("The agent cannot use this folder. It must exist on this computer and be allowed by the policy.".to_owned())
     };
     Ok(view! { host_screen(notice: notice) })
 }
@@ -1039,7 +956,7 @@ pub(super) async fn workspace(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ListingForm {
-    action: String,
+    action: ListingAction,
 }
 
 #[page(POST "/listing/publish")]
@@ -1047,10 +964,7 @@ pub(super) async fn publish_listing(
     cx: &Cx,
     Form(form): Form<ListingForm>,
 ) -> TopcoatResult<impl View> {
-    ensure_admin_session(cx).await?;
-    let Page(Some(page)) = app_context::<Page>(cx) else {
-        return Err(bad_request("this node has no listing").into());
-    };
+    let page = admin_page(cx, "this node has no listing").await?;
     if crate::settings::setting::<crate::hub_client::settings::AgentKind>(
         &page.data_dir,
     )
@@ -1060,24 +974,42 @@ pub(super) async fn publish_listing(
     {
         return Err(bad_request("only a service agent has a public listing").into());
     }
-    let result = match (form.action.as_str(), page.current_hub()) {
+    let result = match (form.action, page.current_hub()) {
         (_, None) => Err(crate::listing::HubPublishError::Hub(
             crate::hub_client::HubError::Unreachable,
         )),
-        ("list", Some(hub)) => {
+        (ListingAction::List, Some(hub)) => {
             crate::listing::publish_to_hub(&page.data_dir, &hub, now_seconds())
                 .await
                 .map(drop)
         }
-        ("stop", Some(hub)) => {
+        (ListingAction::Stop, Some(hub)) => {
             crate::listing::stop_hub_listing(&page.data_dir, &hub).await
         }
-        _ => return Err(bad_request("unknown listing action").into()),
     };
     let error = result
         .err()
         .map(crate::listing::hub_publish_message)
         .unwrap_or_default()
         .to_owned();
-    Ok(view! { host_screen(notice: Notice::listing(error)) })
+    Ok(view! { host_screen(notice: Notice::Listing(error)) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GroupAction;
+
+    #[test]
+    fn a_group_action_value_reads_back_as_its_action() {
+        for action in [
+            GroupAction::Create,
+            GroupAction::Add,
+            GroupAction::Remove,
+            GroupAction::Delete,
+        ] {
+            let value = serde_json::Value::from(action.as_str());
+            assert_eq!(serde_json::from_value::<GroupAction>(value).ok(), Some(action));
+        }
+        assert!(serde_json::from_value::<GroupAction>("rename".into()).is_err());
+    }
 }

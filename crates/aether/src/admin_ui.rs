@@ -5,7 +5,7 @@ use std::{
     net::TcpListener,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{Arc, Mutex, PoisonError},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::{Duration, SystemTime},
 };
 
@@ -23,14 +23,14 @@ use topcoat::{
         Body as TopcoatBody, BodyLimit, HeaderValue, Next, Router as TopcoatRouter,
         Slot,
         content::sse::{Event, KeepAlive, Sse, last_event_id},
-        error::{forbidden, internal_server_error},
+        error::{bad_request, forbidden, internal_server_error},
         header, layer, layout, page,
         request::headers,
         response::IntoResponse as TopcoatIntoResponse,
         route,
     },
     session::{self, RouterBuilderSessionExt, SessionConfig, TokenHash},
-    view::{View, component, view},
+    view::{View, view},
 };
 use tower::util::MapResponse;
 
@@ -47,7 +47,7 @@ mod shared;
 use crate::admin::SharedAdministration;
 use advanced::dashboard;
 use caller::caller_screen;
-use host::{Notice, host_screen};
+use host::host_screen;
 
 const UI_SESSION_LIFETIME: Duration = Duration::from_secs(3_600);
 /// Matches the `DefaultBodyLimit` of `UI_HARDENING`: both cap the same
@@ -62,8 +62,11 @@ const UI_HARDENING: crate::https::Hardening = crate::https::Hardening {
 
 /// Copies a `data-copy-text` value on click and says so in the button's
 /// `data-copy-label`. Only the Advanced page, which has `#activity-status`,
-/// opens the activity stream.
-const ADMIN_JAVASCRIPT: &str = "document.addEventListener('click',async event=>{const button=event.target.closest('[data-copy-text]');if(!button)return;const label=button.querySelector('[data-copy-label]')||button;const text=label.textContent;try{await navigator.clipboard.writeText(button.dataset.copyText);label.textContent='Copied'}catch{label.textContent='Select and copy'}setTimeout(()=>{label.textContent=text},1600)});const status=document.getElementById('activity-status');if(status){const events=new EventSource('/events');events.addEventListener('ready',()=>{status.textContent='Activity updates are connected.'});events.addEventListener('audit',event=>{status.textContent=JSON.parse(event.data).entry});events.addEventListener('task',event=>{const task=JSON.parse(event.data);status.textContent=`Task ${task.taskId}: ${task.event}`});events.addEventListener('unavailable',()=>{status.textContent='Activity updates cannot read the administration store.'});events.onerror=()=>{status.textContent='Activity updates will retry.'}}if(document.querySelector('[data-hub-waiting]')){const reload=()=>{const active=document.activeElement;if(active&&active.matches('input,select,textarea')&&active.value){setTimeout(reload,4000);return}location.assign('/')};setTimeout(reload,4000)}const dots=document.querySelectorAll('[data-presence]');if(dots.length){const update=async()=>{try{const answer=await fetch('/hub/presence');if(!answer.ok)return;const presence=await answer.json();for(const dot of dots){const online=presence[dot.dataset.presence];dot.dataset.state=online===undefined?'unknown':online?'online':'offline';dot.querySelector('[data-presence-label]').textContent=online===undefined?'':online?'Online':'Offline'}}catch{}};update();setInterval(update,15000)}";
+/// opens the activity stream. A hub section that waits for the other side
+/// names its screen in `data-hub-waiting`, and the script reloads that
+/// screen: the address bar may still hold the path of a form, which only
+/// answers a POST, and a node with both pages shows the caller at `/agents`.
+const ADMIN_JAVASCRIPT: &str = "document.addEventListener('click',async event=>{const button=event.target.closest('[data-copy-text]');if(!button)return;const label=button.querySelector('[data-copy-label]')||button;const text=label.textContent;try{await navigator.clipboard.writeText(button.dataset.copyText);label.textContent='Copied'}catch{label.textContent='Select and copy'}setTimeout(()=>{label.textContent=text},1600)});const status=document.getElementById('activity-status');if(status){const events=new EventSource('/events');events.addEventListener('ready',()=>{status.textContent='Activity updates are connected.'});events.addEventListener('audit',event=>{status.textContent=JSON.parse(event.data).entry});events.addEventListener('task',event=>{const task=JSON.parse(event.data);status.textContent=`Task ${task.taskId}: ${task.event}`});events.addEventListener('unavailable',()=>{status.textContent='Activity updates cannot read the administration store.'});events.onerror=()=>{status.textContent='Activity updates will retry.'}}const waiting=document.querySelector('[data-hub-waiting]');if(waiting){const reload=()=>{const active=document.activeElement;if(active&&active.matches('input,select,textarea')&&active.value){setTimeout(reload,4000);return}location.assign(waiting.dataset.hubWaiting||'/')};setTimeout(reload,4000)}const dots=document.querySelectorAll('[data-presence]');if(dots.length){const update=async()=>{try{const answer=await fetch('/hub/presence');if(!answer.ok)return;const presence=await answer.json();for(const dot of dots){const online=presence[dot.dataset.presence];dot.dataset.state=online===undefined?'unknown':online?'online':'offline';dot.querySelector('[data-presence-label]').textContent=online===undefined?'':online?'Online':'Offline'}}catch{}};update();setInterval(update,15000)}";
 
 //
 // topcoat has no TLS of its own; its docs point at fronting it with a
@@ -178,8 +181,26 @@ impl AdminConfirmations {
         Ok(tokens)
     }
 
-    fn resolve(&self, token: &str) -> Option<String> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner).remove(token)
+    /// Runs `confirm` on the change behind `token`, and uses the token up
+    /// only when it succeeds: a confirm that fails leaves the change pending,
+    /// so the same button can try again. `None` when the token is unknown.
+    /// The map stays locked meanwhile, so two posts of one token cannot both
+    /// confirm.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "the lock spans the confirm on purpose"
+    )]
+    fn confirm<E>(
+        &self,
+        token: &str,
+        confirm: impl FnOnce(&str) -> Result<(), E>,
+    ) -> Option<Result<(), E>> {
+        let mut confirmations = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let result = confirm(confirmations.get(token)?);
+        if result.is_ok() {
+            confirmations.remove(token);
+        }
+        Some(result)
     }
 }
 
@@ -236,6 +257,24 @@ async fn require_admin_session(cx: &Cx) -> TopcoatResult<()> {
     if valid { Ok(()) } else { Err(forbidden().into()) }
 }
 
+/// Requires the admin session, then the node page of this UI. `refusal` is
+/// the `400` text when the UI has no page.
+async fn admin_page<'cx>(
+    cx: &'cx Cx,
+    refusal: &'static str,
+) -> TopcoatResult<&'cx PageContext> {
+    require_admin_session(cx).await?;
+    let Page(page) = app_context::<Page>(cx);
+    page.as_deref().ok_or_else(|| bad_request(refusal).into())
+}
+
+/// The administration, locked. A panic elsewhere does not lock it out.
+fn administration(cx: &Cx) -> MutexGuard<'_, crate::admin::Administration> {
+    app_context::<SharedAdministration>(cx)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Establishes (or slides the expiry of) the one admin session this process
 /// trusts. There is no login form: whichever browser first loads the page
 /// is the operator.
@@ -279,33 +318,16 @@ async fn root_layout(slot: Slot<'_>) -> TopcoatResult<impl View> {
     })
 }
 
-#[component]
-async fn hub_form_screen(
-    cx: &Cx,
-    #[default] error: String,
-    #[default] setting_error: String,
-) -> TopcoatResult<impl View> {
-    let Page(page) = app_context::<Page>(cx);
-    let hosting = page.as_ref().is_some_and(|page| page.host_ui);
-    Ok(view! {
-        if hosting {
-            host_screen(notice: Notice::hub(error.clone(), setting_error.clone()))
-        } else {
-            caller_screen(hub_error: error.clone(), hub_setting_error: setting_error.clone())
-        }
-    })
-}
-
 /// The screen of this UI's mode: the host screen for `node serve`, the
 /// caller screen for `node admin`, and the Advanced page when neither is
 /// set.
 #[page("/")]
 async fn home(cx: &Cx) -> TopcoatResult<impl View> {
-    let Page(page) = app_context::<Page>(cx);
+    let mode = app_context::<Page>(cx).mode();
     Ok(view! {
-        if page.as_ref().is_some_and(|page| page.host_ui) {
+        if mode.is_some_and(UiMode::hosts) {
             host_screen()
-        } else if page.as_ref().is_some_and(|page| page.caller) {
+        } else if mode.is_some_and(UiMode::calls) {
             caller_screen()
         } else {
             dashboard()
@@ -315,10 +337,7 @@ async fn home(cx: &Cx) -> TopcoatResult<impl View> {
 
 #[page("/agents")]
 async fn agents(cx: &Cx) -> TopcoatResult<impl View> {
-    let Page(Some(page)) = app_context::<Page>(cx) else {
-        return Err(forbidden().into());
-    };
-    if !page.caller {
+    if !app_context::<Page>(cx).mode().is_some_and(UiMode::calls) {
         return Err(forbidden().into());
     }
     Ok(view! { caller_screen() })
@@ -521,11 +540,34 @@ pub type RelaySwitcher =
 
 pub use crate::hub_client::HubAccess;
 
+/// The screens of a page: the host screen of `node serve`, the caller screen
+/// of `node admin`, or both on one node. A UI without a page has neither and
+/// shows the Advanced page at `/`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UiMode {
+    Host,
+    Caller,
+    HostAndCaller,
+}
+
+impl UiMode {
+    /// Whether the page has the host screen.
+    #[must_use]
+    pub const fn hosts(self) -> bool {
+        matches!(self, Self::Host | Self::HostAndCaller)
+    }
+
+    /// Whether the page has the caller screen.
+    #[must_use]
+    pub const fn calls(self) -> bool {
+        matches!(self, Self::Caller | Self::HostAndCaller)
+    }
+}
+
 pub struct PageContext {
     pub data_dir: PathBuf,
     pub task_folder_mode: bool,
-    pub host_ui: bool,
-    pub caller: bool,
+    pub mode: UiMode,
     name: Option<String>,
     relay_url: Mutex<Option<String>>,
     switch_relay: RelaySwitcher,
@@ -546,8 +588,7 @@ impl PageContext {
         Self {
             data_dir,
             task_folder_mode: false,
-            host_ui: true,
-            caller: false,
+            mode: UiMode::Host,
             name,
             relay_url: Mutex::new(relay_url),
             switch_relay,
@@ -562,8 +603,7 @@ impl PageContext {
         Self {
             data_dir,
             task_folder_mode: false,
-            host_ui: false,
-            caller: true,
+            mode: UiMode::Caller,
             name: None,
             relay_url: Mutex::new(None),
             switch_relay: Arc::new(|_, _| Box::pin(async { Ok(()) })),
@@ -572,10 +612,15 @@ impl PageContext {
         }
     }
 
+    /// Adds the caller screen to a host page, or takes it away. A page
+    /// without a host keeps its caller screen.
     #[must_use]
-    #[allow(clippy::missing_const_for_fn)]
-    pub fn with_caller(mut self, enabled: bool) -> Self {
-        self.caller = enabled;
+    pub const fn with_caller(mut self, enabled: bool) -> Self {
+        self.mode = match (self.mode, enabled) {
+            (UiMode::Host | UiMode::HostAndCaller, true) => UiMode::HostAndCaller,
+            (UiMode::Host | UiMode::HostAndCaller, false) => UiMode::Host,
+            (UiMode::Caller, _) => UiMode::Caller,
+        };
         self
     }
 
@@ -585,9 +630,7 @@ impl PageContext {
 
     #[must_use]
     pub fn with_hub(self, hub: Option<crate::hub_client::HubClient>) -> Self {
-        if let Some(client) = hub {
-            let _ = self.hub.as_ref().prime(client);
-        }
+        self.set_hub(hub);
         self
     }
 
@@ -626,7 +669,7 @@ impl PageContext {
             data_dir: self.data_dir.clone(),
             hub: Arc::clone(&self.hub),
             hub_sign: Arc::clone(&self.hub_sign),
-            caller: self.caller,
+            caller: self.mode.calls(),
         })
     }
 
@@ -668,6 +711,13 @@ pub struct PactUi {
 }
 
 pub(super) struct Page(pub Option<Arc<PageContext>>);
+
+impl Page {
+    /// The screens of this UI; `None` when it has no page.
+    fn mode(&self) -> Option<UiMode> {
+        self.0.as_ref().map(|page| page.mode)
+    }
+}
 
 struct Pact(Option<Arc<crate::pact::consent::PactConsent>>);
 
@@ -2981,6 +3031,38 @@ mod tests {
         );
         assert!(response.body.contains("EventSource"));
         assert!(response.body.contains("data-copy-text"));
+        // A waiting hub section reloads its own screen, not always `/`.
+        assert!(response.body.contains("location.assign(waiting.dataset.hubWaiting"));
+        assert!(!response.body.contains("location.assign('/')"));
+    }
+
+    #[tokio::test]
+    async fn a_waiting_invite_on_the_agents_page_reloads_the_agents_page() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let hub = crate::hub_client::test_hub::TestHub::start().await;
+        let (administration, _) = test_administration(directory.path());
+        let page =
+            test_host(directory.path(), Arc::new(std::sync::Mutex::new(Vec::new())))
+                .with_caller(true)
+                .with_hub(Some(hub.client(directory.path())));
+        let own =
+            crate::direct::endpoint_id(directory.path()).expect("endpoint must load");
+        let ana = peer_endpoint(5);
+        {
+            let mut state = hub.state();
+            state.add_account(&own, "tudor#0042");
+            state.add_account(&ana, "ana#0007");
+            state.add_invite(&ana, &own, "accepted");
+        }
+        let options = UiOptions { page: Some(Arc::new(page)), ..UiOptions::default() };
+        let application = app(build_admin_ui(administration, options, PORT));
+        let agents = get(application, "/agents").await;
+        assert_eq!(agents.status, StatusCode::OK);
+        assert!(
+            agents.body.contains("data-hub-waiting=\"/agents\""),
+            "{}",
+            agents.body
+        );
     }
 
     #[tokio::test]
@@ -3288,6 +3370,19 @@ mod tests {
         let (_directory, admin_ui, _administration) = admin_ui_with_directory_applier();
         let response = post(app(admin_ui), "/confirm", None, "id=one").await;
         assert_eq!(response.status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn a_post_without_any_session_cannot_change_the_listing() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let (admin_ui, _) = host_ui(directory.path());
+        let application = app(admin_ui);
+        for action in ["action=list", "action=stop"] {
+            let response =
+                post(application.clone(), "/listing/publish", None, action).await;
+            assert_eq!(response.status, StatusCode::FORBIDDEN);
+            assert!(response.set_cookie.is_none(), "a refused POST starts no session");
+        }
     }
 
     #[tokio::test]

@@ -1,18 +1,16 @@
-use std::sync::PoisonError;
-
 use topcoat::{
     Result as TopcoatResult,
-    context::{Cx, app_context},
+    context::Cx,
     router::page,
     view::{View, ViewExt, attributes, component, view},
 };
 
 use super::{
-    ensure_admin_session,
+    administration, ensure_admin_session,
     layout::{Tab, node_header},
 };
 use crate::{
-    admin::{AdminStoreAccess, SharedAdministration},
+    admin::AdminStoreAccess,
     admin_components::page_title,
     components::alert::{AlertVariant, alert, alert_description, alert_title},
 };
@@ -26,9 +24,7 @@ pub(super) async fn audit() -> TopcoatResult<impl View> {
 pub(super) async fn audit_screen(cx: &Cx) -> TopcoatResult<impl View> {
     ensure_admin_session(cx).await?;
     let (store_access, entries) = {
-        let administration = app_context::<SharedAdministration>(cx)
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let administration = administration(cx);
         (administration.store_access(), administration.audit_entries())
     };
     let store_unavailable =

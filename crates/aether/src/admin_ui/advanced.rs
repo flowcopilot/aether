@@ -3,10 +3,7 @@
 //! confirmation. `node serve` and `node admin` link to it from their own
 //! screen; a UI with neither a host nor a caller shows it at `/`.
 
-use std::{
-    path::PathBuf,
-    sync::{Arc, PoisonError},
-};
+use std::{path::PathBuf, sync::Arc};
 
 use serde::Deserialize;
 use topcoat::{
@@ -21,12 +18,13 @@ use topcoat::{
 };
 
 use super::{
-    AdminConfirmations, Managed, Page, ensure_admin_session,
+    AdminConfirmations, Managed, Page, administration, ensure_admin_session,
     layout::{Tab, node_header, page_data_dir},
+    shared::IdForm,
 };
 use crate::{
-    admin::{AdminStoreAccess, SharedAdministration},
-    admin_components::page_title,
+    admin::AdminStoreAccess,
+    admin_components::{page_title, post_button, section_heading},
     components::{
         alert::{AlertVariant, alert, alert_description, alert_title},
         button::{ButtonSize, ButtonVariant, button, button_variants},
@@ -58,10 +56,8 @@ pub(super) async fn dashboard(
         .map_err(internal_server_error)?
         .flatten();
 
-    let administration = app_context::<SharedAdministration>(cx);
     let (store_access, pending, configured, summary, members) = {
-        let administration =
-            administration.lock().unwrap_or_else(PoisonError::into_inner);
+        let administration = administration(cx);
         (
             administration.store_access(),
             administration.pending(),
@@ -120,7 +116,7 @@ pub(super) async fn dashboard(
             }
 
             <section id="pending" class="flex scroll-mt-6 flex-col gap-3">
-                <h2 class="text-xl font-semibold tracking-tight">"Pending changes"</h2>
+                section_heading("Pending changes")
                 if store_unavailable {
                     <p class="text-muted-foreground">"Pending changes cannot be loaded."</p>
                 } else if tokens.is_empty() {
@@ -133,14 +129,12 @@ pub(super) async fn dashboard(
                                     <p class="font-semibold">"Local change"</p>
                                     <p class="text-sm text-muted-foreground">"Review and confirm this change."</p>
                                 </div>
-                                <form method="post" action="/confirm">
-                                    <input type="hidden" name="id" value=(entry)>
-                                    button(
-                                        variant: ButtonVariant::Primary,
-                                        attrs: attributes! { type="submit" },
-                                        "Confirm change"
-                                    )
-                                </form>
+                                post_button(
+                                    action: "/confirm",
+                                    fields: vec![("id", entry.clone())],
+                                    variant: ButtonVariant::Primary,
+                                    "Confirm change"
+                                )
                             </li>
                         }
                     </ul>
@@ -148,7 +142,7 @@ pub(super) async fn dashboard(
             </section>
 
             <section id="overview" class="flex scroll-mt-6 flex-col gap-3">
-            <h2 class="text-xl font-semibold tracking-tight">"Overview"</h2>
+            section_heading("Overview")
             if store_unavailable {
                 <p class="text-muted-foreground">"Overview counts cannot be loaded."</p>
             } else {
@@ -164,8 +158,8 @@ pub(super) async fn dashboard(
             </section>
 
             <section id="permissions" class="flex scroll-mt-6 flex-col gap-3">
-                <h2 class="text-xl font-semibold tracking-tight">"Permissions"</h2>
-                if page.as_ref().is_some_and(|page| page.host_ui) {
+                section_heading("Permissions")
+                if page.as_ref().is_some_and(|page| page.mode.hosts()) {
                     <p class="text-muted-foreground">"Invite a person to send tasks to your agent. Access groups control who can send tasks."</p>
                     <div class="flex flex-wrap gap-2">
                         <a href="/#invite" class=(class!(button_variants(ButtonVariant::Primary, ButtonSize::Md), "no-underline"))>"Invite someone"</a>
@@ -177,7 +171,7 @@ pub(super) async fn dashboard(
             </section>
 
             <section id="policy" class="flex scroll-mt-6 flex-col gap-3">
-                <h2 class="text-xl font-semibold tracking-tight">"Task policy"</h2>
+                section_heading("Task policy")
                 if let Some(policy) = policy {
                     <p class="text-muted-foreground">"Set the folder for new task folders and the task limits. Restart the node to use saved changes."</p>
                     if policy_saved {
@@ -215,7 +209,7 @@ pub(super) async fn dashboard(
             </section>
 
             <section id="tasks" class="flex scroll-mt-6 flex-col gap-3">
-                <h2 class="text-xl font-semibold tracking-tight">"Tasks"</h2>
+                section_heading("Tasks")
                 if store_unavailable {
                     <p class="text-muted-foreground">"Task counts cannot be loaded."</p>
                 } else {
@@ -233,7 +227,7 @@ pub(super) async fn dashboard(
             </section>
 
             <section id="activity" class="flex scroll-mt-6 flex-col gap-2">
-                <h2 class="text-xl font-semibold tracking-tight">"Activity"</h2>
+                section_heading("Activity")
                 <p id="activity-status" role="status" class="rounded-lg bg-muted px-3.5 py-2.5 font-mono text-[13px] text-foreground">
                     "The local control service is ready."
                 </p>
@@ -241,7 +235,7 @@ pub(super) async fn dashboard(
 
             if managed {
                 <section id="members" class="flex flex-col gap-2">
-                    <h2 class="text-xl font-semibold tracking-tight">"Members"</h2>
+                    section_heading("Members")
                     if store_unavailable {
                         <p class="text-muted-foreground">"Members cannot be loaded."</p>
                     } else if members.is_empty() {
@@ -261,7 +255,7 @@ pub(super) async fn dashboard(
                     }
                 </section>
                 <section id="invitations" class="flex flex-col gap-2">
-                    <h2 class="text-xl font-semibold tracking-tight">"Invitations"</h2>
+                    section_heading("Invitations")
                     <p class="text-muted-foreground">"Manage invitations with the control command."</p>
                 </section>
             }
@@ -299,26 +293,15 @@ fn managed_member_state(member: &ManagedMember) -> &'static str {
     if member.expires_at <= now { "expired" } else { "active" }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct ConfirmForm {
-    id: String,
-}
-
 #[page(POST "/confirm")]
 pub(super) async fn confirm(
     cx: &Cx,
-    Form(form): Form<ConfirmForm>,
+    Form(form): Form<IdForm>,
 ) -> TopcoatResult<impl View> {
     super::require_admin_session(cx).await?;
-    let Some(id) = app_context::<Arc<AdminConfirmations>>(cx).resolve(&form.id) else {
-        return Err(bad_request("this change is no longer available").into());
-    };
-    let result = app_context::<SharedAdministration>(cx)
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .confirm_ui(&id);
-    if result.is_err() {
+    let confirmed = app_context::<Arc<AdminConfirmations>>(cx)
+        .confirm(&form.id, |id| administration(cx).confirm_ui(id));
+    if !matches!(confirmed, Some(Ok(()))) {
         return Err(bad_request("this change is no longer available").into());
     }
     Ok(view! { dashboard() })
@@ -336,10 +319,7 @@ pub(super) async fn cancel(
     Form(form): Form<CancelForm>,
 ) -> TopcoatResult<impl View> {
     super::require_admin_session(cx).await?;
-    let result = app_context::<SharedAdministration>(cx)
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .cancel_task(&form.task_id);
+    let result = administration(cx).cancel_task(&form.task_id);
     if result.is_err() {
         return Err(bad_request("the task cannot be cancelled").into());
     }
@@ -372,12 +352,36 @@ pub(super) async fn save_policy(
             form.queue_per_peer,
         ),
     };
-    app_context::<SharedAdministration>(cx)
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
+    administration(cx)
         .save_policy_settings(&settings, aether_store::AuditActor::Ui)
         .map_err(|_| {
             bad_request("use an existing absolute folder and limits above zero")
         })?;
     Ok(view! { dashboard(policy_saved: true) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AdminConfirmations;
+
+    #[test]
+    fn a_failed_confirm_keeps_its_token_and_a_confirmed_one_uses_it_up() {
+        let confirmations = AdminConfirmations::new();
+        let tokens = confirmations
+            .reset(vec![crate::admin::PendingChange {
+                id: "workspace".to_owned(),
+                kind: "workspace".to_owned(),
+            }])
+            .expect("tokens must issue");
+        let [token] = tokens.as_slice() else { panic!("one token must issue") };
+        assert_eq!(confirmations.confirm(token, |_| Err("store")), Some(Err("store")));
+        let mut confirmed = Vec::new();
+        let result = confirmations.confirm(token, |id| {
+            confirmed.push(id.to_owned());
+            Ok::<(), &str>(())
+        });
+        assert_eq!(result, Some(Ok(())));
+        assert_eq!(confirmed, ["workspace"]);
+        assert_eq!(confirmations.confirm(token, |_| Ok::<(), &str>(())), None);
+    }
 }

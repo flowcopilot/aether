@@ -7,11 +7,32 @@ use std::path::PathBuf;
 
 use topcoat::{
     Result as TopcoatResult,
-    view::{View, attributes, component, view},
+    view::{View, component, view},
 };
 
 use super::shared;
-use crate::components::button::{ButtonSize, ButtonVariant, button};
+use crate::{
+    admin_components::post_button,
+    components::button::{ButtonSize, ButtonVariant},
+};
+
+/// The two buttons of the listing section, from their hidden `action` field.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum ListingAction {
+    List,
+    Stop,
+}
+
+impl ListingAction {
+    /// The field value; `Deserialize` reads the same names back.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::List => "list",
+            Self::Stop => "stop",
+        }
+    }
+}
 
 /// The listing section of a service agent's page.
 #[component]
@@ -33,20 +54,16 @@ pub(super) async fn listing_section(
             .map(|state| state.expires_at.saturating_sub(now).div_ceil(24 * 60 * 60));
     let queue = shared::queue_text(&data_dir);
     let status = match days_left {
-        Some(1) => {
-            "Listed. The listing ends in 1 day unless this page renews it.".to_owned()
-        }
-        Some(days) => {
-            format!(
-                "Listed. The listing ends in {days} days unless this page renews it."
-            )
-        }
+        Some(days) => format!(
+            "Listed. The listing ends in {} unless this page renews it.",
+            crate::admin_components::days_label(days)
+        ),
         None => "Not listed.".to_owned(),
     };
     Ok(view! {
         <section id="listing" class="flex flex-col gap-4 pt-2" aria-labelledby="listing-title">
             <div class="flex flex-col gap-1.5">
-                <h2 id="listing-title" class="text-xl font-semibold tracking-tight">"Public listing"</h2>
+                crate::admin_components::section_heading(id: "listing-title", "Public listing")
                 <p class="text-sm text-muted-foreground">
                     "People find a listed agent by search on the hub and ask for access. You approve each request on this page."
                 </p>
@@ -61,21 +78,26 @@ pub(super) async fn listing_section(
                     (status)
                 </p>
                 <div class="flex flex-wrap gap-2">
-                    <form method="post" action="/listing/publish">
-                        <input type="hidden" name="action" value="list">
-                        button(size: ButtonSize::Sm, attrs: attributes! { type="submit" disabled=(name.is_none().then_some("")) },
-                            (if days_left.is_some() { "List again with the current card" } else { "List this agent" }))
-                    </form>
+                    post_button(
+                        action: "/listing/publish",
+                        fields: vec![("action", ListingAction::List.as_str().to_owned())],
+                        size: ButtonSize::Sm,
+                        disabled: name.is_none(),
+                        (if days_left.is_some() { "List again with the current card" } else { "List this agent" })
+                    )
                     if days_left.is_some() {
-                        <form method="post" action="/listing/publish">
-                            <input type="hidden" name="action" value="stop">
-                            button(variant: ButtonVariant::Outline, size: ButtonSize::Sm, attrs: attributes! { type="submit" }, "Stop listing")
-                        </form>
+                        post_button(
+                            action: "/listing/publish",
+                            fields: vec![("action", ListingAction::Stop.as_str().to_owned())],
+                            variant: ButtonVariant::Outline,
+                            size: ButtonSize::Sm,
+                            "Stop listing"
+                        )
                     }
                 </div>
             </div>
             if !error.is_empty() {
-                super::hub::error_line(text: error.clone())
+                crate::admin_components::error_line(text: error.clone())
             }
             <div class="grid gap-6 md:grid-cols-[21rem_minmax(0,1fr)]">
                 <div class="flex flex-col gap-2 rounded-xl border border-border bg-background px-4.5 py-4 text-sm" aria-label="People see this">
@@ -101,4 +123,21 @@ pub(super) async fn listing_section(
             </div>
         </section>
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ListingAction;
+
+    #[test]
+    fn a_listing_action_value_reads_back_as_its_action() {
+        for action in [ListingAction::List, ListingAction::Stop] {
+            let value = serde_json::Value::from(action.as_str());
+            assert_eq!(
+                serde_json::from_value::<ListingAction>(value).ok(),
+                Some(action)
+            );
+        }
+        assert!(serde_json::from_value::<ListingAction>("pause".into()).is_err());
+    }
 }

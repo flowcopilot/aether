@@ -18,23 +18,24 @@ use topcoat::{
 };
 
 use super::{
-    Page, ensure_admin_session,
-    hub::{error_line, hub_section, hub_setting},
+    Page, admin_page, ensure_admin_session,
+    hub::{hub_failure, hub_section, hub_setting},
     layout::{Tab, node_header},
-    require_admin_session,
+    shared::{IdForm, Notice},
 };
 use crate::{
     admin_components::{
-        CHEVRON, CopyTone, copy_field, key_code, page_title, presence_dot, step,
+        CHEVRON, CopyTone, Tone, copy_field, days_label, days_select, error_line,
+        key_code, page_title, post_button, presence_dot, section_heading, state_badge,
+        step,
     },
     components::{
         avatar::{AvatarSize, avatar, avatar_fallback},
-        badge::{BadgeVariant, badge},
         button::{ButtonSize, ButtonVariant, button},
         input::input,
     },
     hub_client::{HubClient, Role},
-    hub_membership::{accept, hub_message},
+    hub_membership::accept,
 };
 
 /// An agent this computer can use, from its kept invite.
@@ -49,10 +50,7 @@ struct Contact {
 #[component]
 pub(super) async fn caller_screen(
     cx: &Cx,
-    #[default] error: String,
-    #[default] hub_error: String,
-    #[default] hub_setting_error: String,
-    #[default] request_error: String,
+    #[default] notice: Notice,
 ) -> TopcoatResult<impl View> {
     ensure_admin_session(cx).await?;
     let Page(Some(page)) = app_context::<Page>(cx) else {
@@ -61,7 +59,7 @@ pub(super) async fn caller_screen(
         ))
         .into());
     };
-    if !page.caller {
+    if !page.mode.calls() {
         return Err(internal_server_error(std::io::Error::other(
             "the caller screen needs a data directory",
         ))
@@ -98,9 +96,11 @@ pub(super) async fn caller_screen(
     // person's own agent uses the same contacts as this page.
     let mcp_command = mcp_command(&page.data_dir);
 
+    let error = notice.import_error();
+    let request_error = notice.request_error();
     let code_open = !error.is_empty();
     Ok(view! {
-        if !error.is_empty() || !request_error.is_empty() {
+        if notice.refused() {
             (StatusCode::BAD_REQUEST)
         }
         node_header(current: Tab::Agents)
@@ -125,7 +125,7 @@ pub(super) async fn caller_screen(
                     hub_section(
                         hub: hub.clone(),
                         role: Role::Receiver,
-                        error: hub_error.clone(),
+                        error: notice.hub_error(),
                         if !connected {
                             code_disclosure(endpoint_id: endpoint_id.clone(), error: error.clone(), open: code_open)
                         }
@@ -140,7 +140,7 @@ pub(super) async fn caller_screen(
             if connected {
                 <section aria-labelledby="agents" class="flex flex-col gap-4">
                     <div id="agents" class="flex flex-col gap-1.5">
-                        <h2 class="text-xl font-semibold tracking-tight">"Agents you can use"</h2>
+                        section_heading("Agents you can use")
                         <p class="text-sm text-muted-foreground">"Your own agent reaches them through Aether. From a terminal, the command next to each one sends a task."</p>
                     </div>
                     <ul class="flex flex-col divide-y divide-border rounded-xl border border-border bg-background" aria-label="Agents">
@@ -164,19 +164,17 @@ pub(super) async fn caller_screen(
                                         }
                                     </div>
                                     match contact.days_left {
-                                        Some(1) => <span class="text-[13px] text-muted-foreground">"Access ends in 1 day"</span>,
-                                        Some(days) => <span class="text-[13px] text-muted-foreground">"Access ends in " (days) " days"</span>,
+                                        Some(days) => <span class="text-[13px] text-muted-foreground">"Access ends in " (days_label(days))</span>,
                                         None => <span class="text-[13px] font-medium text-destructive">"Invite expired. Ask for a new one."</span>,
                                     }
-                                    <form method="post" action="/contacts/remove">
-                                        <input type="hidden" name="agent" value=(&contact.name)>
-                                        button(
-                                            variant: ButtonVariant::Outline,
-                                            size: ButtonSize::Sm,
-                                            attrs: attributes! { type="submit" aria-label=(format!("Remove {}", contact.name)) },
-                                            "Remove"
-                                        )
-                                    </form>
+                                    post_button(
+                                        action: "/contacts/remove",
+                                        fields: vec![("agent", contact.name.clone())],
+                                        variant: ButtonVariant::Outline,
+                                        size: ButtonSize::Sm,
+                                        aria_label: format!("Remove {}", contact.name),
+                                        "Remove"
+                                    )
                                 </div>
                                 if contact.days_left.is_some() {
                                     <div class="sm:pl-11">
@@ -223,7 +221,7 @@ pub(super) async fn caller_screen(
                 Ok(_) => {}
                 Err(_) => {
                     <section aria-labelledby="sent" class="flex flex-col gap-4">
-                        <h2 id="sent" class="text-xl font-semibold tracking-tight">"Sent tasks"</h2>
+                        section_heading(id: "sent", "Sent tasks")
                         <p role="alert" class="text-muted-foreground">"Sent tasks cannot be loaded."</p>
                     </section>
                 }
@@ -238,7 +236,7 @@ pub(super) async fn caller_screen(
                 </section>
             }
             <section aria-label="Hub" class="rounded-xl border border-border bg-background px-5">
-                hub_setting(url: hub.as_ref().map(HubClient::url), error: hub_setting_error.clone())
+                hub_setting(url: hub.as_ref().map(HubClient::url), error: notice.hub_setting_error())
             </section>
         </main>
     }
@@ -316,7 +314,7 @@ async fn request_drafts(
     Ok(view! {
         <section id="requests" aria-labelledby="requests-title" class="flex flex-col gap-4">
             <div class="flex flex-col gap-1.5">
-                <h2 id="requests-title" class="text-xl font-semibold tracking-tight">"Requests your agent wants to send"</h2>
+                section_heading(id: "requests-title", "Requests your agent wants to send")
                 <p class="text-sm text-muted-foreground">
                     "Your agent found these agents and asks for access to them. Nothing is sent until you select Confirm."
                 </p>
@@ -361,59 +359,40 @@ async fn request_draft(
             <div class="flex flex-wrap items-center gap-2">
                 <form method="post" action="/requests/confirm" class="flex items-center gap-2">
                     <input type="hidden" name="id" value=(&draft.id)>
-                    <select
-                        name="days"
-                        aria-label=(format!("Access to {} for", draft.target_name))
-                        class="h-8 rounded-lg border border-border bg-background px-2 text-sm"
-                    >
-                        for days in &choices {
-                            <option value=(days) selected=((*days == u64::from(draft.days)).then_some(""))>
-                                (if *days == 1 { "1 day".to_owned() } else { format!("{days} days") })
-                            </option>
-                        }
-                    </select>
+                    days_select(
+                        aria_label: format!("Access to {} for", draft.target_name),
+                        class: "h-8 rounded-lg border border-border bg-background px-2 text-sm",
+                        choices: choices.clone(),
+                        selected: u64::from(draft.days),
+                    )
                     button(size: ButtonSize::Sm, attrs: attributes! { type="submit" }, "Confirm")
                 </form>
-                <form method="post" action="/requests/discard">
-                    <input type="hidden" name="id" value=(&draft.id)>
-                    button(
-                        variant: ButtonVariant::Outline,
-                        size: ButtonSize::Sm,
-                        attrs: attributes! { type="submit" },
-                        "Discard"
-                    )
-                </form>
+                post_button(
+                    action: "/requests/discard",
+                    fields: vec![("id", draft.id.clone())],
+                    variant: ButtonVariant::Outline,
+                    size: ButtonSize::Sm,
+                    "Discard"
+                )
             </div>
         </li>
     })
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct InviteIdForm {
-    id: String,
-}
-
 #[page(POST "/hub/accept")]
 pub(super) async fn accept_invite(
     cx: &Cx,
-    Form(form): Form<InviteIdForm>,
+    Form(form): Form<IdForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let Page(Some(page)) = app_context::<Page>(cx) else {
-        return Err(bad_request("this node cannot accept invites").into());
-    };
-    if !page.caller {
+    let page = admin_page(cx, "this node cannot accept invites").await?;
+    if !page.mode.calls() {
         return Err(bad_request("this node cannot accept invites").into());
     }
     let Some(hub) = page.current_hub() else {
         return Err(bad_request("this node has no hub").into());
     };
-    let error = match accept(&hub, &page.data_dir, &form.id).await {
-        Ok(_) => "",
-        Err(error) => hub_message(error),
-    };
-    Ok(view! { caller_screen(hub_error: error.to_owned()) })
+    let error = hub_failure(accept(&hub, &page.data_dir, &form.id).await);
+    Ok(view! { caller_screen(notice: Notice::Hub(error.to_owned())) })
 }
 
 #[derive(Deserialize)]
@@ -429,10 +408,7 @@ pub(super) async fn confirm_request(
     cx: &Cx,
     Form(form): Form<ConfirmForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let Page(Some(page)) = app_context::<Page>(cx) else {
-        return Err(bad_request("this node sends no access requests").into());
-    };
+    let page = admin_page(cx, "this node sends no access requests").await?;
     let error = match page.hub_access() {
         super::HubAccess::Ready(hub) => {
             confirm(&hub, &page.data_dir, &form.id, form.days)
@@ -445,7 +421,7 @@ pub(super) async fn confirm_request(
             "This node cannot read its hub settings. Fix the data directory and try again."
         }
     };
-    Ok(view! { caller_screen(request_error: error.to_owned()) })
+    Ok(view! { caller_screen(notice: Notice::Request(error.to_owned())) })
 }
 
 /// Sends the draft `id` for `days` days: first to the hub, then the local
@@ -504,21 +480,12 @@ async fn confirm(
     Ok(())
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct DiscardForm {
-    id: String,
-}
-
 #[page(POST "/requests/discard")]
 pub(super) async fn discard_request(
     cx: &Cx,
-    Form(form): Form<DiscardForm>,
+    Form(form): Form<IdForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let Page(Some(page)) = app_context::<Page>(cx) else {
-        return Err(bad_request("this node sends no access requests").into());
-    };
+    let page = admin_page(cx, "this node sends no access requests").await?;
     aether_store::NodeStore::in_dir(&page.data_dir)
         .and_then(|store| store.remove_access_request_draft(&form.id))
         .map_err(internal_server_error)?;
@@ -557,27 +524,15 @@ fn age(then: i64, now: u64) -> String {
     )
 }
 
-const fn sent_state_word(state: aether_store::SentState) -> &'static str {
+/// The word and the badge tone of a sent task's state.
+const fn sent_state(state: aether_store::SentState) -> (&'static str, Tone) {
     match state {
         aether_store::SentState::Waiting | aether_store::SentState::Working => {
-            "Waiting"
+            ("Waiting", Tone::Warning)
         }
-        aether_store::SentState::Answered => "Answered",
-        aether_store::SentState::Failed => "Failed",
-        aether_store::SentState::NotDelivered => "Not delivered",
-    }
-}
-
-/// The badge color of a sent task's state.
-const fn sent_state_tone(state: aether_store::SentState) -> &'static str {
-    match state {
-        aether_store::SentState::Answered => "border-success/40 text-success",
-        aether_store::SentState::Waiting | aether_store::SentState::Working => {
-            "border-warning/40 text-warning"
-        }
-        aether_store::SentState::Failed | aether_store::SentState::NotDelivered => {
-            "border-destructive/40 text-destructive"
-        }
+        aether_store::SentState::Answered => ("Answered", Tone::Success),
+        aether_store::SentState::Failed => ("Failed", Tone::Destructive),
+        aether_store::SentState::NotDelivered => ("Not delivered", Tone::Destructive),
     }
 }
 
@@ -590,13 +545,13 @@ async fn sent_tasks(
 ) -> TopcoatResult<impl View> {
     Ok(view! {
         <section aria-labelledby="sent" class="flex flex-col gap-4">
-            <h2 id="sent" class="text-xl font-semibold tracking-tight">"Sent tasks"</h2>
+            section_heading(id: "sent", "Sent tasks")
             <ul class="flex flex-col divide-y divide-border border-y border-border" aria-label="Sent tasks">
                 for task in &tasks {
                     <li class="flex flex-col gap-2 py-3.5 text-sm">
                         <div class="flex flex-wrap items-center gap-3">
                             <span class="w-36 font-mono text-[13px] font-medium">(&task.agent_id)</span>
-                            badge(variant: BadgeVariant::Outline, attrs: attributes! { class=(sent_state_tone(task.state)) }, (sent_state_word(task.state)))
+                            state_badge(state: sent_state(task.state))
                             <span class="ml-auto text-[13px] text-muted-foreground">(age(task.created_at, now))</span>
                         </div>
                         if let Some(reason) = &task.reason {
@@ -631,10 +586,7 @@ pub(super) async fn import(
     cx: &Cx,
     Form(form): Form<ImportForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let Page(Some(page)) = app_context::<Page>(cx) else {
-        return Err(bad_request("this page cannot import invitations").into());
-    };
+    let page = admin_page(cx, "this page cannot import invitations").await?;
     let error = match crate::direct::InvitationBundle::decode(&form.bundle) {
         Err(_) => "This is not an Aether invite. Ask for it again and paste all of it.",
         Ok(bundle) => match crate::direct::import_bundle(&page.data_dir, &bundle) {
@@ -654,7 +606,7 @@ pub(super) async fn import(
             Err(_) => "This invite is not valid or has expired. Ask for a new one.",
         },
     };
-    Ok(view! { caller_screen(error: error.to_owned()) })
+    Ok(view! { caller_screen(notice: Notice::Import(error.to_owned())) })
 }
 
 #[derive(Deserialize)]
@@ -669,15 +621,12 @@ pub(super) async fn remove_contact(
     cx: &Cx,
     Form(form): Form<RemoveContactForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let Page(Some(page)) = app_context::<Page>(cx) else {
-        return Err(bad_request("this page has no contacts").into());
-    };
-    let error = match crate::direct::remove_contact(&page.data_dir, &form.agent) {
-        Ok(()) | Err(crate::direct::DirectError::UnknownContact) => "",
+    let page = admin_page(cx, "this page has no contacts").await?;
+    match crate::direct::remove_contact(&page.data_dir, &form.agent) {
+        Ok(()) | Err(crate::direct::DirectError::UnknownContact) => {}
         Err(error) => return Err(internal_server_error(error).into()),
-    };
-    Ok(view! { caller_screen(error: error.to_owned()) })
+    }
+    Ok(view! { caller_screen() })
 }
 
 #[cfg(test)]
