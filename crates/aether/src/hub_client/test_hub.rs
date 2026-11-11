@@ -87,6 +87,9 @@ pub struct HubState {
     /// Request paths whose answer is lost: the hub does the request, then
     /// drops the connection before it answers.
     pub lose_answers: BTreeSet<String>,
+    /// Request paths after which the hub overwrites a file, such as the
+    /// store of a node, so that the node fails right after the request.
+    pub break_files: BTreeMap<String, std::path::PathBuf>,
     next_id: u64,
 }
 
@@ -444,6 +447,9 @@ async fn handle(
     let mut state = shared.state.lock().expect("test hub state must lock");
     let response = route(&mut state, &endpoint, &method, &segments, &body, &query);
     let lose_answer = state.lose_answers.contains(uri.path());
+    if let Some(file) = state.break_files.get(uri.path()) {
+        std::fs::write(file, b"not sqlite").expect("test hub must break the file");
+    }
     drop(state);
     shared.changed.notify_waiters();
     if lose_answer {

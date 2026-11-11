@@ -201,11 +201,19 @@ pub(crate) async fn publish_to_hub(
         .await
         .map_err(HubPublishError::Hub)?;
     let state = ListingState { listed: true, expires_at, listing: text };
-    crate::settings::store_setting::<settings::ListingState>(
+    if crate::settings::store_setting::<settings::ListingState>(
         data_dir,
         &Some(state.clone()),
     )
-    .map_err(|_| HubPublishError::Store)?;
+    .is_err()
+    {
+        // Without its local state the node never renews the listing: take
+        // it off the hub again, so that the two sides agree.
+        let _ = hub.delete_listing().await.inspect_err(|error| {
+            tracing::warn!(?error, "hub listing left after local state failed");
+        });
+        return Err(HubPublishError::Store);
+    }
     Ok(state)
 }
 
@@ -221,8 +229,11 @@ pub(crate) async fn stop_hub_listing(
 pub(crate) const fn hub_publish_message(error: HubPublishError) -> &'static str {
     match error {
         HubPublishError::NoName => "Choose your name on Aether first.",
-        HubPublishError::Key | HubPublishError::Store => {
+        HubPublishError::Key => {
             "The listing was not saved on this computer. Try again."
+        }
+        HubPublishError::Store => {
+            "This computer could not keep the listing, so it is not on Aether. Try again."
         }
         HubPublishError::Hub(crate::hub_client::HubError::Invalid) => {
             "The hub refused the listing. Check the text of your agent's card."
@@ -386,5 +397,40 @@ mod tests {
         );
         assert_eq!(parse(&encode(duplicate.as_bytes()), "law#0042"), Err(ListingError));
         assert_eq!(parse("not base64!", "law#0042"), Err(ListingError));
+    }
+
+    #[tokio::test]
+    async fn a_listing_this_computer_cannot_keep_is_taken_off_the_hub() {
+        let hub = crate::hub_client::test_hub::TestHub::start().await;
+        let directory = tempfile::tempdir().expect("directory must create");
+        let data_dir = directory.path();
+        crate::settings::store_setting::<crate::hub_client::settings::HubName>(
+            data_dir,
+            &Some("law#0042".to_owned()),
+        )
+        .expect("name must store");
+        let client = hub.client(data_dir);
+        let endpoint = client.endpoint_id();
+        {
+            let mut state = hub.state();
+            state.add_account(&endpoint, "law#0042");
+            state.kinds.insert(endpoint.clone(), crate::hub_client::AgentKind::Service);
+            state.break_files.insert(
+                "/v1/listing".to_owned(),
+                data_dir.join(aether_store::NODE_DATABASE),
+            );
+        }
+        let published = super::publish_to_hub(data_dir, &client, NOW).await;
+        assert_eq!(published, Err(super::HubPublishError::Store));
+        // The hub took the listing, but this computer cannot renew it: the
+        // listing comes off the hub again.
+        assert!(!hub.state().listings.contains_key(&endpoint));
+        let methods: Vec<String> = hub
+            .requests()
+            .into_iter()
+            .filter(|request| request.target == "/v1/listing")
+            .map(|request| request.method)
+            .collect();
+        assert_eq!(methods, ["PUT", "DELETE"]);
     }
 }
