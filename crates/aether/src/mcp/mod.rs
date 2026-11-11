@@ -236,13 +236,12 @@ impl McpServer {
     async fn presence(
         &self,
     ) -> Result<std::collections::BTreeMap<String, bool>, &'static str> {
-        match self.node_hub().client() {
-            Ok(Some(hub)) => hub
+        match self.caller_hub()? {
+            Some(hub) => hub
                 .presence(PRESENCE_WAIT)
                 .await
                 .map_err(|_| "the hub cannot be reached now"),
-            Ok(None) => Ok(std::collections::BTreeMap::new()),
-            Err(_) => Err("the hub settings are unavailable"),
+            None => Ok(std::collections::BTreeMap::new()),
         }
     }
 
