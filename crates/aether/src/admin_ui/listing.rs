@@ -7,11 +7,14 @@ use std::path::PathBuf;
 
 use topcoat::{
     Result as TopcoatResult,
-    view::{View, attributes, component, view},
+    view::{View, component, view},
 };
 
 use super::shared;
-use crate::components::button::{ButtonSize, ButtonVariant, button};
+use crate::{
+    admin_components::post_button,
+    components::button::{ButtonSize, ButtonVariant},
+};
 
 /// The two buttons of the listing section, from their hidden `action` field.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize)]
@@ -75,16 +78,21 @@ pub(super) async fn listing_section(
                     (status)
                 </p>
                 <div class="flex flex-wrap gap-2">
-                    <form method="post" action="/listing/publish">
-                        <input type="hidden" name="action" value=(ListingAction::List.as_str())>
-                        button(size: ButtonSize::Sm, attrs: attributes! { type="submit" disabled=(name.is_none().then_some("")) },
-                            (if days_left.is_some() { "List again with the current card" } else { "List this agent" }))
-                    </form>
+                    post_button(
+                        action: "/listing/publish",
+                        fields: vec![("action", ListingAction::List.as_str().to_owned())],
+                        size: ButtonSize::Sm,
+                        disabled: name.is_none(),
+                        (if days_left.is_some() { "List again with the current card" } else { "List this agent" })
+                    )
                     if days_left.is_some() {
-                        <form method="post" action="/listing/publish">
-                            <input type="hidden" name="action" value=(ListingAction::Stop.as_str())>
-                            button(variant: ButtonVariant::Outline, size: ButtonSize::Sm, attrs: attributes! { type="submit" }, "Stop listing")
-                        </form>
+                        post_button(
+                            action: "/listing/publish",
+                            fields: vec![("action", ListingAction::Stop.as_str().to_owned())],
+                            variant: ButtonVariant::Outline,
+                            size: ButtonSize::Sm,
+                            "Stop listing"
+                        )
                     }
                 </div>
             </div>

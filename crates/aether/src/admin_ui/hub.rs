@@ -35,7 +35,7 @@ use aether_store::{ApprovalKind, ApprovalSide, HubApproval};
 use crate::{
     admin_components::{
         copy_button, count_badge, days_label, days_select, error_line, field,
-        section_heading,
+        post_button, section_heading,
     },
     components::{
         button::{ButtonSize, ButtonVariant, button},
@@ -328,15 +328,13 @@ async fn service_agents(links: Vec<OwnerLink>) -> TopcoatResult<impl View> {
                                 (&link.service)
                                 (if link.confirmed { " (linked)" } else { " (waits for the service agent to confirm)" })
                             </span>
-                            <form method="post" action="/hub/owner/remove">
-                                <input type="hidden" name="id" value=(&link.id)>
-                                button(
-                                    variant: ButtonVariant::Outline,
-                                    size: ButtonSize::Sm,
-                                    attrs: attributes! { type="submit" },
-                                    "Remove"
-                                )
-                            </form>
+                            post_button(
+                                action: "/hub/owner/remove",
+                                fields: vec![("id", link.id.clone())],
+                                variant: ButtonVariant::Outline,
+                                size: ButtonSize::Sm,
+                                "Remove"
+                            )
                         </li>
                     }
                 </ul>
@@ -385,20 +383,20 @@ async fn owner_claims(links: Vec<OwnerLink>) -> TopcoatResult<impl View> {
                             </p>
                             <div class="flex flex-wrap gap-2">
                                 if !link.confirmed {
-                                    <form method="post" action="/hub/owner/confirm">
-                                        <input type="hidden" name="id" value=(&link.id)>
-                                        button(size: ButtonSize::Sm, attrs: attributes! { type="submit" }, "Confirm")
-                                    </form>
-                                }
-                                <form method="post" action="/hub/owner/remove">
-                                    <input type="hidden" name="id" value=(&link.id)>
-                                    button(
-                                        variant: ButtonVariant::Outline,
+                                    post_button(
+                                        action: "/hub/owner/confirm",
+                                        fields: vec![("id", link.id.clone())],
                                         size: ButtonSize::Sm,
-                                        attrs: attributes! { type="submit" },
-                                        "Remove"
+                                        "Confirm"
                                     )
-                                </form>
+                                }
+                                post_button(
+                                    action: "/hub/owner/remove",
+                                    fields: vec![("id", link.id.clone())],
+                                    variant: ButtonVariant::Outline,
+                                    size: ButtonSize::Sm,
+                                    "Remove"
+                                )
                             </div>
                         </li>
                     }
@@ -420,15 +418,13 @@ async fn blocked_list(blocks: Vec<Block>) -> TopcoatResult<impl View> {
                         <span class="mr-auto text-sm">
                             (block.handle.clone().unwrap_or_else(|| "deleted account".to_owned()))
                         </span>
-                        <form method="post" action="/hub/unblock">
-                            <input type="hidden" name="endpoint" value=(&block.endpoint)>
-                            button(
-                                variant: ButtonVariant::Outline,
-                                size: ButtonSize::Sm,
-                                attrs: attributes! { type="submit" },
-                                "Unblock"
-                            )
-                        </form>
+                        post_button(
+                            action: "/hub/unblock",
+                            fields: vec![("endpoint", block.endpoint.clone())],
+                            variant: ButtonVariant::Outline,
+                            size: ButtonSize::Sm,
+                            "Unblock"
+                        )
                     </li>
                 }
             </ul>
@@ -560,24 +556,21 @@ async fn request_row(invite: Invite) -> TopcoatResult<impl View> {
                     )
                     button(size: ButtonSize::Sm, attrs: attributes! { type="submit" }, "Approve")
                 </form>
-                <form method="post" action="/hub/remove">
-                    <input type="hidden" name="id" value=(&invite.id)>
-                    button(
-                        variant: ButtonVariant::Outline,
-                        size: ButtonSize::Sm,
-                        attrs: attributes! { type="submit" },
-                        "Decline"
-                    )
-                </form>
-                <form method="post" action="/hub/block-request" title="Block hides this key's requests from you. It sees the same as before.">
-                    <input type="hidden" name="id" value=(&invite.id)>
-                    button(
-                        variant: ButtonVariant::Ghost,
-                        size: ButtonSize::Sm,
-                        attrs: attributes! { type="submit" },
-                        "Block"
-                    )
-                </form>
+                post_button(
+                    action: "/hub/remove",
+                    fields: vec![("id", invite.id.clone())],
+                    variant: ButtonVariant::Outline,
+                    size: ButtonSize::Sm,
+                    "Decline"
+                )
+                post_button(
+                    action: "/hub/block-request",
+                    fields: vec![("id", invite.id.clone())],
+                    variant: ButtonVariant::Ghost,
+                    size: ButtonSize::Sm,
+                    title: "Block hides this key's requests from you. It sees the same as before.",
+                    "Block"
+                )
             </div>
         </li>
     })
@@ -642,30 +635,29 @@ async fn invite_row(invite: Invite, approved: bool) -> TopcoatResult<impl View> 
             }
             <span class="mr-auto text-sm">(&offer.text)</span>
             if offer.answer {
-                <form method="post" action="/hub/accept">
-                    <input type="hidden" name="id" value=(&invite.id)>
-                    button(size: ButtonSize::Sm, attrs: attributes! { type="submit" }, "Accept")
-                </form>
-                <form method="post" action="/hub/block" title="Block hides this person's invites from you. They see the same as after a decline.">
-                    <input type="hidden" name="id" value=(&invite.id)>
-                    button(
-                        variant: ButtonVariant::Ghost,
-                        size: ButtonSize::Sm,
-                        attrs: attributes! { type="submit" },
-                        "Block"
-                    )
-                </form>
+                post_button(
+                    action: "/hub/accept",
+                    fields: vec![("id", invite.id.clone())],
+                    size: ButtonSize::Sm,
+                    "Accept"
+                )
+                post_button(
+                    action: "/hub/block",
+                    fields: vec![("id", invite.id.clone())],
+                    variant: ButtonVariant::Ghost,
+                    size: ButtonSize::Sm,
+                    title: "Block hides this person's invites from you. They see the same as after a decline.",
+                    "Block"
+                )
             }
             if let Some(label) = offer.remove {
-                <form method="post" action="/hub/remove">
-                    <input type="hidden" name="id" value=(&invite.id)>
-                    button(
-                        variant: ButtonVariant::Outline,
-                        size: ButtonSize::Sm,
-                        attrs: attributes! { type="submit" },
-                        (label)
-                    )
-                </form>
+                post_button(
+                    action: "/hub/remove",
+                    fields: vec![("id", invite.id.clone())],
+                    variant: ButtonVariant::Outline,
+                    size: ButtonSize::Sm,
+                    (label)
+                )
             }
         </li>
     })

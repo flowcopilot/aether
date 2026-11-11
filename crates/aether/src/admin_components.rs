@@ -254,6 +254,43 @@ pub async fn state_badge(state: (&'static str, Tone)) -> Result<impl View> {
     })
 }
 
+/// A form that is one submit button: it posts the hidden `fields` to
+/// `action`. The child is the button's label. `title` explains the form;
+/// `aria_label` names the button where its label alone is unclear.
+#[component]
+pub async fn post_button(
+    action: &'static str,
+    fields: Vec<(&'static str, String)>,
+    #[default] variant: ButtonVariant,
+    #[default] size: ButtonSize,
+    #[default]
+    #[into]
+    title: String,
+    #[default]
+    #[into]
+    aria_label: String,
+    #[default] disabled: bool,
+    #[default] child: Child<'_>,
+) -> Result<impl View> {
+    Ok(view! {
+        <form method="post" action=(action) title=((!title.is_empty()).then_some(&title))>
+            for (name, value) in &fields {
+                <input type="hidden" name=(*name) value=(value)>
+            }
+            button(
+                variant: variant,
+                size: size,
+                attrs: attributes! {
+                    type="submit"
+                    aria-label=((!aria_label.is_empty()).then_some(&aria_label))
+                    disabled=(disabled.then_some(""))
+                },
+                (child)
+            )
+        </form>
+    })
+}
+
 /// Where an [`error_line`] sets its icon.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ErrorIcon {

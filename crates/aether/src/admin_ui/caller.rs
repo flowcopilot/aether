@@ -26,7 +26,8 @@ use super::{
 use crate::{
     admin_components::{
         CHEVRON, CopyTone, Tone, copy_field, days_label, days_select, error_line,
-        key_code, page_title, presence_dot, section_heading, state_badge, step,
+        key_code, page_title, post_button, presence_dot, section_heading, state_badge,
+        step,
     },
     components::{
         avatar::{AvatarSize, avatar, avatar_fallback},
@@ -166,15 +167,14 @@ pub(super) async fn caller_screen(
                                         Some(days) => <span class="text-[13px] text-muted-foreground">"Access ends in " (days_label(days))</span>,
                                         None => <span class="text-[13px] font-medium text-destructive">"Invite expired. Ask for a new one."</span>,
                                     }
-                                    <form method="post" action="/contacts/remove">
-                                        <input type="hidden" name="agent" value=(&contact.name)>
-                                        button(
-                                            variant: ButtonVariant::Outline,
-                                            size: ButtonSize::Sm,
-                                            attrs: attributes! { type="submit" aria-label=(format!("Remove {}", contact.name)) },
-                                            "Remove"
-                                        )
-                                    </form>
+                                    post_button(
+                                        action: "/contacts/remove",
+                                        fields: vec![("agent", contact.name.clone())],
+                                        variant: ButtonVariant::Outline,
+                                        size: ButtonSize::Sm,
+                                        aria_label: format!("Remove {}", contact.name),
+                                        "Remove"
+                                    )
                                 </div>
                                 if contact.days_left.is_some() {
                                     <div class="sm:pl-11">
@@ -367,15 +367,13 @@ async fn request_draft(
                     )
                     button(size: ButtonSize::Sm, attrs: attributes! { type="submit" }, "Confirm")
                 </form>
-                <form method="post" action="/requests/discard">
-                    <input type="hidden" name="id" value=(&draft.id)>
-                    button(
-                        variant: ButtonVariant::Outline,
-                        size: ButtonSize::Sm,
-                        attrs: attributes! { type="submit" },
-                        "Discard"
-                    )
-                </form>
+                post_button(
+                    action: "/requests/discard",
+                    fields: vec![("id", draft.id.clone())],
+                    variant: ButtonVariant::Outline,
+                    size: ButtonSize::Sm,
+                    "Discard"
+                )
             </div>
         </li>
     })

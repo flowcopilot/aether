@@ -32,8 +32,8 @@ use crate::{
     admin::SharedAdministration,
     admin_components::{
         ALERT, CHECK, CHEVRON, CopyTone, ErrorIcon, Tone, ago, copy_field, days_label,
-        days_select, error_line, field, page_title, presence_dot, section_heading,
-        state_badge,
+        days_select, error_line, field, page_title, post_button, presence_dot,
+        section_heading, state_badge,
     },
     components::{
         alert::{AlertVariant, alert, alert_description, alert_title},
@@ -677,15 +677,12 @@ async fn people(
                                             "Revoke " (&friend.name) "'s access? A task that is running still finishes. The next one fails."
                                         </p>
                                         <a href="/" class="px-3 py-2 text-sm">"Keep access"</a>
-                                        <form method="post" action="/revoke">
-                                            <input type="hidden" name="grant_id" value=(&friend.grant_id)>
-                                            <input type="hidden" name="confirm" value="yes">
-                                            button(
-                                                variant: ButtonVariant::Destructive,
-                                                attrs: attributes! { type="submit" },
-                                                "Revoke"
-                                            )
-                                        </form>
+                                        post_button(
+                                            action: "/revoke",
+                                            fields: vec![("grant_id", friend.grant_id.clone()), ("confirm", "yes".to_owned())],
+                                            variant: ButtonVariant::Destructive,
+                                            "Revoke"
+                                        )
                                     </div>
                                 )
                             )
@@ -704,14 +701,13 @@ async fn people(
                                 table_cell((access_ends(friend.days_left)))
                                 table_cell(
                                     attrs: attributes! { class="text-right" },
-                                    <form method="post" action="/revoke">
-                                        <input type="hidden" name="grant_id" value=(&friend.grant_id)>
-                                        button(
-                                            variant: ButtonVariant::Outline,
-                                            attrs: attributes! { type="submit" aria-label=(format!("Revoke {}", friend.name)) },
-                                            "Revoke"
-                                        )
-                                    </form>
+                                    post_button(
+                                        action: "/revoke",
+                                        fields: vec![("grant_id", friend.grant_id.clone())],
+                                        variant: ButtonVariant::Outline,
+                                        aria_label: format!("Revoke {}", friend.name),
+                                        "Revoke"
+                                    )
                                 )
                             )
                         }

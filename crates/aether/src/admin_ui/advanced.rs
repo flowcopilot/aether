@@ -24,7 +24,7 @@ use super::{
 };
 use crate::{
     admin::AdminStoreAccess,
-    admin_components::{page_title, section_heading},
+    admin_components::{page_title, post_button, section_heading},
     components::{
         alert::{AlertVariant, alert, alert_description, alert_title},
         button::{ButtonSize, ButtonVariant, button, button_variants},
@@ -129,14 +129,12 @@ pub(super) async fn dashboard(
                                     <p class="font-semibold">"Local change"</p>
                                     <p class="text-sm text-muted-foreground">"Review and confirm this change."</p>
                                 </div>
-                                <form method="post" action="/confirm">
-                                    <input type="hidden" name="id" value=(entry)>
-                                    button(
-                                        variant: ButtonVariant::Primary,
-                                        attrs: attributes! { type="submit" },
-                                        "Confirm change"
-                                    )
-                                </form>
+                                post_button(
+                                    action: "/confirm",
+                                    fields: vec![("id", entry.clone())],
+                                    variant: ButtonVariant::Primary,
+                                    "Confirm change"
+                                )
                             </li>
                         }
                     </ul>
