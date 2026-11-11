@@ -3,6 +3,7 @@ pub mod cli;
 use std::path::Path;
 
 use hex::FromHex;
+use reqwest::StatusCode;
 
 use aether_store::ManagedEventType;
 
@@ -66,17 +67,14 @@ impl ManagedClient {
         validate_record(&signed).map_err(|_| ManagedClientError::InvalidRecord)?;
         let expires_at = aether_core::time::unix_timestamp(signed.expires_at)
             .ok_or(ManagedClientError::InvalidRecord)?;
-        let member = self
-            .http
-            .post_json(
-                self.redeem_url()?,
-                &WireManagedRedeem {
-                    token: hex::encode(token),
-                    record: record.clone(),
-                },
-                reqwest::StatusCode::CREATED,
-            )
-            .await?;
+        let member = pinned_json::json(
+            self.http.client().post(self.redeem_url()?).json(&WireManagedRedeem {
+                token: hex::encode(token),
+                record: record.clone(),
+            }),
+            &[StatusCode::CREATED],
+        )
+        .await?;
         Self::validate_member(&member)?;
         if member.scope_id != record.scope_id
             || member.agent_id != record.agent_id
@@ -92,8 +90,11 @@ impl ManagedClient {
         &self,
         scope_id: &str,
     ) -> Result<Vec<aether_store::ManagedMember>, ManagedClientError> {
-        let members: Vec<aether_store::ManagedMember> =
-            self.http.get_json(self.members_url(scope_id)?).await?;
+        let members: Vec<aether_store::ManagedMember> = pinned_json::json(
+            self.http.client().get(self.members_url(scope_id)?),
+            &[StatusCode::OK],
+        )
+        .await?;
         for member in &members {
             if member.scope_id != scope_id {
                 return Err(ManagedClientError::InvalidRecord);
@@ -111,13 +112,14 @@ impl ManagedClient {
         if cursor < 0 {
             return Err(ManagedClientError::InvalidRecord);
         }
-        let events: Vec<WireManagedEvent> = self
-            .http
-            .get_json_query(
-                self.events_url(scope_id)?,
-                &[("after", &cursor.to_string())],
-            )
-            .await?;
+        let events: Vec<WireManagedEvent> = pinned_json::json(
+            self.http
+                .client()
+                .get(self.events_url(scope_id)?)
+                .query(&[("after", &cursor.to_string())]),
+            &[StatusCode::OK],
+        )
+        .await?;
         if !pinned_json::monotonic_cursors(
             cursor,
             events.iter().map(|event| event.cursor),

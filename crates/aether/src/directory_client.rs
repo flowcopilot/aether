@@ -66,14 +66,11 @@ impl DirectoryClient {
         &self,
         record: &WireRecord,
     ) -> Result<WireRecord, DirectoryClientError> {
-        let record = self
-            .http
-            .post_json_any(
-                self.records_url()?,
-                record,
-                &[StatusCode::CREATED, StatusCode::OK],
-            )
-            .await?;
+        let record = pinned_json::json(
+            self.http.client().post(self.records_url()?).json(record),
+            &[StatusCode::CREATED, StatusCode::OK],
+        )
+        .await?;
         self.validate(&record)?;
         Ok(record)
     }
@@ -82,7 +79,11 @@ impl DirectoryClient {
         &self,
         agent_id: &str,
     ) -> Result<WireRecord, DirectoryClientError> {
-        let record = self.http.get_json(self.record_url(agent_id)?).await?;
+        let record = pinned_json::json(
+            self.http.client().get(self.record_url(agent_id)?),
+            &[StatusCode::OK],
+        )
+        .await?;
         self.validate(&record)?;
         Ok(record)
     }
@@ -94,10 +95,14 @@ impl DirectoryClient {
         if capability.is_empty() {
             return Err(DirectoryClientError::InvalidRecord);
         }
-        let records: Vec<WireRecord> = self
-            .http
-            .get_json_query(self.records_url()?, &[("capability", capability)])
-            .await?;
+        let records: Vec<WireRecord> = pinned_json::json(
+            self.http
+                .client()
+                .get(self.records_url()?)
+                .query(&[("capability", capability)]),
+            &[StatusCode::OK],
+        )
+        .await?;
         for record in &records {
             self.validate(record)?;
         }
@@ -108,7 +113,11 @@ impl DirectoryClient {
         &self,
         record: &WireRecord,
     ) -> Result<(), DirectoryClientError> {
-        self.http.delete_json(self.record_url(&record.agent_id)?, record).await?;
+        pinned_json::send(
+            self.http.client().delete(self.record_url(&record.agent_id)?).json(record),
+            &[StatusCode::NO_CONTENT],
+        )
+        .await?;
         Ok(())
     }
 
@@ -119,10 +128,14 @@ impl DirectoryClient {
         if cursor < 0 {
             return Err(DirectoryClientError::InvalidRecord);
         }
-        let events: Vec<WireDirectoryEvent> = self
-            .http
-            .get_json_query(self.events_url()?, &[("after", &cursor.to_string())])
-            .await?;
+        let events: Vec<WireDirectoryEvent> = pinned_json::json(
+            self.http
+                .client()
+                .get(self.events_url()?)
+                .query(&[("after", &cursor.to_string())]),
+            &[StatusCode::OK],
+        )
+        .await?;
         if !pinned_json::monotonic_cursors(
             cursor,
             events.iter().map(|event| event.cursor),

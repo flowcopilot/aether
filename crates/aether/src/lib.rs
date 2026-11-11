@@ -45,7 +45,6 @@ mod node_serve_context;
 pub mod node_service;
 pub mod outbox;
 pub mod pact;
-mod pinned_https;
 mod pinned_json;
 pub mod policy;
 pub mod proof;

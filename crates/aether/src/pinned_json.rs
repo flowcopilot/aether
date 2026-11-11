@@ -1,10 +1,16 @@
-use reqwest::{StatusCode, Url};
-use serde::{Serialize, de::DeserializeOwned};
+//! HTTPS JSON clients for the directory and the managed control, which
+//! trust one pinned certificate and nothing else.
 
-use crate::pinned_https::{self, PinnedError, PinnedOrigin};
+use std::time::Duration;
+
+use reqwest::{
+    Certificate, Client, RequestBuilder, Response, StatusCode, Url, redirect::Policy,
+};
+use serde::de::DeserializeOwned;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum HttpError {
+    /// The URL is not a bare HTTPS origin.
     Origin,
     Certificate,
     Client,
@@ -13,123 +19,88 @@ pub enum HttpError {
     Body,
 }
 
-impl From<PinnedError> for HttpError {
-    fn from(error: PinnedError) -> Self {
-        match error {
-            PinnedError::Origin => Self::Origin,
-            PinnedError::Certificate => Self::Certificate,
-            PinnedError::Client => Self::Client,
-        }
-    }
-}
-
 #[derive(Clone)]
 pub struct PinnedJsonClient {
-    pinned: PinnedOrigin,
+    client: Client,
+    origin: Url,
 }
 
 impl PinnedJsonClient {
+    /// A client that trusts only `certificate_der`, for `origin`. The origin
+    /// must be HTTPS with a host and nothing after it: no credentials, query
+    /// or fragment. Any path is dropped.
     pub fn open(origin: &str, certificate_der: &[u8]) -> Result<Self, HttpError> {
-        Ok(Self { pinned: PinnedOrigin::open(origin, certificate_der)? })
+        let mut origin = Url::parse(origin).map_err(|_| HttpError::Origin)?;
+        if origin.scheme() != "https"
+            || origin.host().is_none()
+            || origin.username() != ""
+            || origin.password().is_some()
+            || origin.query().is_some()
+            || origin.fragment().is_some()
+        {
+            return Err(HttpError::Origin);
+        }
+        origin.set_path("/");
+        let certificate = Certificate::from_der(certificate_der)
+            .map_err(|_| HttpError::Certificate)?;
+        let client = Client::builder()
+            .add_root_certificate(certificate)
+            .redirect(Policy::none())
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|_| HttpError::Client)?;
+        Ok(Self { client, origin })
     }
 
+    pub const fn client(&self) -> &Client {
+        &self.client
+    }
+
+    /// The origin with `segments` as its path, each one percent-encoded, so
+    /// `?`, `#` and `%` in an id cannot change the URL.
     pub fn url(&self, segments: &[&str]) -> Result<Url, HttpError> {
-        self.pinned.url(segments).ok_or(HttpError::Origin)
+        let mut url = self.origin.clone();
+        url.path_segments_mut()
+            .map_err(|()| HttpError::Origin)?
+            .clear()
+            .extend(segments);
+        Ok(url)
     }
 
+    /// Whether `segment` can be one path segment that names the same id on
+    /// the server. `/` is refused because the server decodes `%2F` back to
+    /// `/`, and `.` and `..` because a URL parser collapses them.
     pub fn require_segment(segment: &str) -> Result<(), HttpError> {
-        if pinned_https::valid_segment(segment) { Ok(()) } else { Err(HttpError::Body) }
-    }
-
-    pub async fn get_json<T: DeserializeOwned>(
-        &self,
-        url: Url,
-    ) -> Result<T, HttpError> {
-        let response =
-            self.pinned.client.get(url).send().await.map_err(|_| HttpError::Request)?;
-        if response.status() != StatusCode::OK {
-            return Err(HttpError::Status);
-        }
-        response.json().await.map_err(|_| HttpError::Body)
-    }
-
-    pub async fn get_json_query<T: DeserializeOwned>(
-        &self,
-        url: Url,
-        query: &[(&str, &str)],
-    ) -> Result<T, HttpError> {
-        let response = self
-            .pinned
-            .client
-            .get(url)
-            .query(query)
-            .send()
-            .await
-            .map_err(|_| HttpError::Request)?;
-        if response.status() != StatusCode::OK {
-            return Err(HttpError::Status);
-        }
-        response.json().await.map_err(|_| HttpError::Body)
-    }
-
-    pub async fn post_json<T: DeserializeOwned, B: Serialize + Sync>(
-        &self,
-        url: Url,
-        body: &B,
-        expected: StatusCode,
-    ) -> Result<T, HttpError> {
-        let response = self
-            .pinned
-            .client
-            .post(url)
-            .json(body)
-            .send()
-            .await
-            .map_err(|_| HttpError::Request)?;
-        if response.status() != expected {
-            return Err(HttpError::Status);
-        }
-        response.json().await.map_err(|_| HttpError::Body)
-    }
-
-    pub async fn post_json_any<T: DeserializeOwned, B: Serialize + Sync>(
-        &self,
-        url: Url,
-        body: &B,
-        expected: &[StatusCode],
-    ) -> Result<T, HttpError> {
-        let response = self
-            .pinned
-            .client
-            .post(url)
-            .json(body)
-            .send()
-            .await
-            .map_err(|_| HttpError::Request)?;
-        if !expected.contains(&response.status()) {
-            return Err(HttpError::Status);
-        }
-        response.json().await.map_err(|_| HttpError::Body)
-    }
-
-    pub async fn delete_json<B: Serialize + Sync>(
-        &self,
-        url: Url,
-        body: &B,
-    ) -> Result<(), HttpError> {
-        let response = self
-            .pinned
-            .client
-            .delete(url)
-            .json(body)
-            .send()
-            .await
-            .map_err(|_| HttpError::Request)?;
-        if response.status() != StatusCode::NO_CONTENT {
-            return Err(HttpError::Status);
+        if matches!(segment, "" | "." | "..")
+            || segment.contains('/')
+            || segment.contains('\0')
+        {
+            return Err(HttpError::Body);
         }
         Ok(())
     }
+}
+
+/// Sends `request` and returns its response when the status is one of
+/// `accepted`.
+pub async fn send(
+    request: RequestBuilder,
+    accepted: &[StatusCode],
+) -> Result<Response, HttpError> {
+    let response = request.send().await.map_err(|_| HttpError::Request)?;
+    if !accepted.contains(&response.status()) {
+        return Err(HttpError::Status);
+    }
+    Ok(response)
+}
+
+/// Sends `request` and decodes its JSON body when the status is one of
+/// `accepted`.
+pub async fn json<T: DeserializeOwned>(
+    request: RequestBuilder,
+    accepted: &[StatusCode],
+) -> Result<T, HttpError> {
+    send(request, accepted).await?.json().await.map_err(|_| HttpError::Body)
 }
 
 pub fn monotonic_cursors(after: i64, cursors: impl IntoIterator<Item = i64>) -> bool {
