@@ -221,7 +221,19 @@ pub fn text_request_payload(
     request_nonce: &str,
     text: &str,
 ) -> serde_json::Value {
-    payload(A2aRequest {
+    payload(text_request(task_id, idempotency_key, request_nonce, text))
+}
+
+/// The request of one text task, without an authorization or an event
+/// cursor.
+#[must_use]
+pub fn text_request(
+    task_id: &str,
+    idempotency_key: &str,
+    request_nonce: &str,
+    text: &str,
+) -> A2aRequest {
+    A2aRequest {
         a2a_version: A2A_PROTOCOL_VERSION.to_owned(),
         idempotency_key: idempotency_key.to_owned(),
         request_nonce: request_nonce.to_owned(),
@@ -248,7 +260,7 @@ pub fn text_request_payload(
         },
         authorization: None,
         last_event_sequence: None,
-    })
+    }
 }
 
 impl A2aRequest {
