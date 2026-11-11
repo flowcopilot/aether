@@ -25,18 +25,8 @@ impl FullName {
     }
 
     #[must_use]
-    pub fn name_part(&self) -> &str {
-        &self.name
-    }
-
-    #[must_use]
     pub const fn number(&self) -> u16 {
         self.number
-    }
-
-    #[must_use]
-    pub fn path_under(&self, base: &str) -> String {
-        format!("{base}/{}/{:04}", self.name, self.number)
     }
 }
 

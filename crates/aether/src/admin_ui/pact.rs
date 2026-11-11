@@ -107,9 +107,8 @@ fn pact_consent(cx: &Cx) -> TopcoatResult<Arc<PactConsent>> {
     consent.clone().ok_or_else(|| bad_request("this node does not offer PACT").into())
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub(super) enum Outcome {
-    #[default]
     Approved,
     Denied,
     Expired,

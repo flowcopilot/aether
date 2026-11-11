@@ -7,9 +7,8 @@ use topcoat::{
 use super::{Page, PageContext, UiMode, administration, shared};
 use crate::admin_components::count_badge;
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Tab {
-    #[default]
     Sharing,
     Agents,
     Advanced,

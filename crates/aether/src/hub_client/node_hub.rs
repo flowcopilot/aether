@@ -5,7 +5,7 @@ use std::{
 
 use aether_store::StoreError;
 
-use super::{HubClient, HubError, hub_setting, resolve_url, settings::Hub};
+use super::{HubClient, HubError, resolve_url, settings::Hub};
 use crate::settings::setting;
 
 #[derive(Clone)]
@@ -34,11 +34,6 @@ impl NodeHub {
         Self { data_dir, flag: Arc::new(flag), state: Arc::new(Mutex::new(None)) }
     }
 
-    #[must_use]
-    pub fn with_flag(self, flag: Option<String>) -> Self {
-        Self { flag: Arc::new(flag), ..self }
-    }
-
     pub fn resolve_url(&self) -> Result<Option<String>, StoreError> {
         let stored = setting::<Hub>(&self.data_dir)?;
         Ok(resolve_url(self.flag.as_deref(), stored))
@@ -63,14 +58,6 @@ impl NodeHub {
         Ok(client)
     }
 
-    pub fn set_stored_url(&self, url: &str) -> Result<Option<HubClient>, HubError> {
-        let stored = hub_setting(url)?;
-        super::set_hub_url(&self.data_dir, &stored)
-            .map_err(|_| HubError::Unexpected)?;
-        *self.slot() = None;
-        self.client()
-    }
-
     pub fn prime(&self, client: HubClient) -> Result<(), StoreError> {
         let stored = setting::<Hub>(&self.data_dir)?;
         *self.slot() = Some(HubState { stored, client: Some(client) });
@@ -89,11 +76,6 @@ impl NodeHub {
             Err(_) => HubAccess::Unavailable,
         }
     }
-}
-
-#[must_use]
-pub fn hub_access(hub: &NodeHub) -> HubAccess {
-    hub.access()
 }
 
 impl Default for NodeHub {

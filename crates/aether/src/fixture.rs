@@ -175,8 +175,6 @@ fn authorization_json(
     }
 }
 
-pub const FAKE_CODEX_SCRIPT: &str = fake_codex_script(false, false);
-
 #[must_use]
 pub const fn fake_codex_script(slow_turn: bool, mcp_probe: bool) -> &'static str {
     if mcp_probe {
