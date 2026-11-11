@@ -323,7 +323,7 @@ impl Node {
 
     fn try_start(pact_port: u16) -> Option<Self> {
         let node_dir = TestNodeDir::new();
-        let fake_codex = node_dir.write_fake_codex(FakeCodex::Standard);
+        let fake_codex = FakeCodex::Standard.write_in(&node_dir.root);
         let public = format!("http://127.0.0.1:{pact_port}");
         let brand = format!("{public}/a2a/review");
         let limits = PolicyLimits {

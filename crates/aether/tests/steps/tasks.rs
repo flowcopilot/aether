@@ -435,17 +435,12 @@ impl State {
         let root = self.root();
         let server_data = self.server_data();
         let policy = self.write_policy();
-        let codex_kind = match self.agent {
-            Agent::Codex => Some(FakeCodex::Standard),
-            Agent::SlowCodex => Some(FakeCodex::Slow),
-            Agent::McpProbe => Some(FakeCodex::McpProbe),
-            Agent::Connected => None,
+        let codex_bin = match self.agent {
+            Agent::Codex => FakeCodex::Standard.write_in(&root),
+            Agent::SlowCodex => FakeCodex::Slow.write_in(&root),
+            Agent::McpProbe => FakeCodex::McpProbe.write_in(&root),
+            Agent::Connected => root.join("no-codex-here"),
         };
-        let codex_bin = root.join("fake-codex");
-        if let Some(kind) = codex_kind {
-            aether::fixture::write_executable(&codex_bin, kind.script())
-                .expect("fake Codex must write");
-        }
         let mut command = aether_command();
         command
             .args([
@@ -457,14 +452,7 @@ impl State {
                 utf8(&server_data),
             ])
             .args(["--port", "0", "--admin-port", "0"])
-            .env(
-                "AETHER_CODEX_BIN",
-                if codex_kind.is_some() {
-                    codex_bin
-                } else {
-                    root.join("no-codex-here")
-                },
-            );
+            .env("AETHER_CODEX_BIN", codex_bin);
         if let Some(home) = &self.owner_codex_home {
             command.env("CODEX_HOME", home);
         }
