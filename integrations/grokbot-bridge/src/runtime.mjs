@@ -2,7 +2,7 @@ import net from 'node:net';
 import path from 'node:path';
 import { chmodSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { OPERATIONS, forwardOperations, publicError } from './server.mjs';
+import { MAX_REQUEST_BYTES, OPERATIONS, forwardOperations, publicError } from './server.mjs';
 
 // One bridge owns the local node: it holds `runtime.lock`, runs the node and
 // its mailbox, and serves the executor tools on `bridge.sock`. A client can
@@ -11,7 +11,6 @@ import { OPERATIONS, forwardOperations, publicError } from './server.mjs';
 
 export const UNAVAILABLE = 'Bridge is not connected to its node runtime yet; retry shortly';
 const OWNER = 'owner.json';
-const MAX_LINE = 256 * 1024;
 // An owner writes owner.json right after making the lock. A lock still without
 // one after this long was left by a bridge that stopped in between.
 const OWNERLESS_MS = 2000;
@@ -149,7 +148,7 @@ function lines(socket, receive) {
       try { message = JSON.parse(line); } catch { socket.destroy(); return; }
       receive(message);
     }
-    if (buffer.length > MAX_LINE) socket.destroy();
+    if (buffer.length > MAX_REQUEST_BYTES) socket.destroy();
   });
   socket.on('error', () => {});
 }

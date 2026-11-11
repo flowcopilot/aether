@@ -4,6 +4,9 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 
+// The largest HTTP request body, and the longest line on the bridge socket.
+export const MAX_REQUEST_BYTES = 256 * 1024;
+
 // Task text, credentials and internal filesystem paths never enter errors.
 export function publicError(error) {
   return error?.code ? 'Bridge storage unavailable; stop work and contact the owner' : String(error?.message ?? error);
@@ -92,7 +95,7 @@ export function createBridgeServer({ mailbox, executor = localExecutor(mailbox),
       const chunks = [];
       for await (const chunk of req) {
         size += chunk.length;
-        if (size > 256 * 1024) {
+        if (size > MAX_REQUEST_BYTES) {
           res.setHeader('Connection', 'close');
           return deny(413, 'Request too large');
         }
