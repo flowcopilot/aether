@@ -9,7 +9,7 @@ defmodule AetherHub.Presence do
   """
   use GenServer
 
-  alias AetherHub.Clock
+  alias AetherHub.{Clock, Notify}
 
   @table :aether_hub_presence
   @window AetherHub.Protocol.limit(:online_seconds)
@@ -32,10 +32,8 @@ defmodule AetherHub.Presence do
   end
 
   def online?(endpoint) do
-    waiting?(endpoint) or recent?(last_seen(endpoint))
+    Notify.waiting?(endpoint) or recent?(last_seen(endpoint))
   end
-
-  defp waiting?(endpoint), do: Registry.lookup(AetherHub.Waiters, endpoint) != []
 
   defp recent?(nil), do: false
   defp recent?(time), do: Clock.now() - time <= @window
