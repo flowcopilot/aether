@@ -12,7 +12,7 @@ use std::{
 use aether_core::{
     Denial, PolicyEngine, Scope, ScopeId, ScopeKind, TrustProvider, WorkspaceId,
 };
-use aether_store::{TaskExecutionData, TaskState};
+use aether_store::{NodeStore, StoreError, TaskExecutionData, TaskState};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
@@ -39,6 +39,40 @@ enum DispatchBlock {
 enum TaskOutcome {
     Succeeded(String),
     Failed,
+}
+
+/// Holds the scheduler's single execution slot for one task. Dropping it
+/// clears the active task if it still names this one, frees the slot and
+/// wakes the scheduler, on every exit of the run.
+struct ExecutionSlot {
+    executing: Arc<AtomicBool>,
+    active_task: Arc<Mutex<Option<String>>>,
+    scheduler_wake: SyncSender<()>,
+    task_id: String,
+}
+
+impl ExecutionSlot {
+    fn activate(&self) {
+        if let Ok(mut active) = self.active_task.lock() {
+            *active = Some(self.task_id.clone());
+        }
+    }
+
+    fn deactivate(&self) {
+        if let Ok(mut active) = self.active_task.lock()
+            && active.as_deref() == Some(self.task_id.as_str())
+        {
+            *active = None;
+        }
+    }
+}
+
+impl Drop for ExecutionSlot {
+    fn drop(&mut self) {
+        self.deactivate();
+        self.executing.store(false, Ordering::Release);
+        let _ = self.scheduler_wake.try_send(());
+    }
 }
 
 pub(in crate::proof) struct SchedulerContext<T, P> {
@@ -90,11 +124,7 @@ where
             .ok_or(DispatchBlock::Policy(Denial::ScopeMismatch))?;
         policy.permits_dispatch(&data.request, scope).map_err(DispatchBlock::Policy)?;
         drop(policy);
-        if self
-            .scopes
-            .get(&data.request.scope_id)
-            .is_some_and(|scope| scope.kind == ScopeKind::Direct)
-        {
+        if scope.kind == ScopeKind::Direct {
             let agent = data.request.caller_agent_id.as_str().to_owned();
             let endpoint = data.request.caller_endpoint_id.as_str().to_owned();
             let allowed = self
@@ -120,15 +150,18 @@ where
         }
     }
 
-    fn reject_leased(
+    /// Ends a leased task that will not run with `end`
+    /// (`NodeStore::mark_rejected` or `NodeStore::mark_failed`).
+    fn end_leased(
         &self,
         task_id: &str,
         execution_id: &str,
+        end: fn(&mut NodeStore, &str, &str) -> Result<(), StoreError>,
     ) -> Result<(), ProofError> {
         let task_id = task_id.to_owned();
         let execution_id = execution_id.to_owned();
         let notify = task_id.clone();
-        self.store.call(move |store| store.mark_rejected(&task_id, &execution_id))?;
+        self.store.call(move |store| end(store, &task_id, &execution_id))?;
         self.notify_task(&notify);
         Ok(())
     }
@@ -154,15 +187,6 @@ where
                 }
             }
         })
-    }
-
-    fn fail_leased(&self, task_id: &str, execution_id: &str) -> Result<(), ProofError> {
-        let task_id = task_id.to_owned();
-        let execution_id = execution_id.to_owned();
-        let notify = task_id.clone();
-        self.store.call(move |store| store.mark_failed(&task_id, &execution_id))?;
-        self.notify_task(&notify);
-        Ok(())
     }
 
     fn prepare_execution(&self) -> Result<Option<ExecutionBundle>, ProofError> {
@@ -196,10 +220,7 @@ where
             let task_id = task_id.clone();
             move |store| store.state(&task_id)
         })?;
-        if state == TaskState::Cancelled {
-            let _ = self.store.call(move |store| store.requeue_leased(&task_id));
-            return Ok(None);
-        }
+        // A task cancelled after it was leased has no lease left to return.
         if state != TaskState::Leased {
             return Ok(None);
         }
@@ -211,7 +232,7 @@ where
         if !WorkspaceId::allows_path_token(workspace_id) {
             Self::log_store(
                 "invalid workspace id",
-                self.fail_leased(&task_id, &execution_id),
+                self.end_leased(&task_id, &execution_id, NodeStore::mark_failed),
             );
             return Ok(None);
         }
@@ -220,14 +241,14 @@ where
             Err(DispatchBlock::Policy(denial)) => {
                 Self::log_store(
                     "reject leased",
-                    self.reject_leased(&task_id, &execution_id),
+                    self.end_leased(&task_id, &execution_id, NodeStore::mark_rejected),
                 );
                 return Err(ProofError::Denied(denial));
             }
             Err(DispatchBlock::Group) => {
                 Self::log_store(
                     "reject leased",
-                    self.reject_leased(&task_id, &execution_id),
+                    self.end_leased(&task_id, &execution_id, NodeStore::mark_rejected),
                 );
                 return Err(ProofError::GroupDenied);
             }
@@ -243,18 +264,21 @@ where
 
     fn run_execution(&self, bundle: ExecutionBundle) {
         let ExecutionBundle { task_id, execution_id, task } = bundle;
+        let slot = ExecutionSlot {
+            executing: Arc::clone(&self.executing),
+            active_task: Arc::clone(&self.active_task),
+            scheduler_wake: self.scheduler_wake.clone(),
+            task_id: task_id.clone(),
+        };
         if self.shutdown.load(Ordering::Acquire) {
             // Shutdown landed before this worker could register as the
             // active task or touch the executor. The lease was never
             // confirmed as started, so the task can go straight back to the
             // queue for a future node run instead of being marked failed.
             let _ = self.store.call(move |store| store.requeue_leased(&task_id));
-            self.finish_execution();
             return;
         }
-        if let Ok(mut active) = self.active_task.lock() {
-            *active = Some(task_id.clone());
-        }
+        slot.activate();
         let renewal_failed = Arc::new(AtomicBool::new(false));
         let renewal = {
             let store = self.store.clone();
@@ -274,9 +298,6 @@ where
                         match stop_rx.recv_timeout(LEASE_RENEWAL_INTERVAL) {
                             Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
                             Err(RecvTimeoutError::Timeout) => {
-                                if renewal_failed.load(Ordering::Acquire) {
-                                    continue;
-                                }
                                 if store
                                     .call({
                                         let task_id = task_id.clone();
@@ -299,6 +320,7 @@ where
                                     // pass. A cancel also deletes the lease,
                                     // so this is the cancel's second signal.
                                     canceller.cancel(&task_id);
+                                    break;
                                 }
                             }
                         }
@@ -312,7 +334,6 @@ where
                 // Without a renewal thread the lease would lapse mid-run:
                 // give the task back to the queue instead of starting it.
                 let _ = self.store.call(move |store| store.requeue_leased(&task_id));
-                self.finish_execution();
                 return;
             }
         };
@@ -322,14 +343,8 @@ where
         if self.workspace.path().is_err() {
             Self::log_store(
                 "workspace path",
-                self.fail_leased(&task_id, &execution_id),
+                self.end_leased(&task_id, &execution_id, NodeStore::mark_failed),
             );
-            if let Ok(mut active) = self.active_task.lock()
-                && active.as_deref() == Some(task_id.as_str())
-            {
-                *active = None;
-            }
-            self.finish_execution();
             return;
         }
         let dispatch_task_id = task_id.clone();
@@ -361,9 +376,10 @@ where
                         if dispatch_ctx.dispatch_allowed(&execution_data).is_err() {
                             Self::log_store(
                                 "reject at start",
-                                dispatch_ctx.reject_leased(
+                                dispatch_ctx.end_leased(
                                     &dispatch_task_id,
                                     &start_execution_id,
+                                    NodeStore::mark_rejected,
                                 ),
                             );
                             return Err(ExecutionError::Unavailable);
@@ -423,11 +439,7 @@ where
         );
         let _ = renewal.0.send(());
         let _ = renewal.1.join();
-        if let Ok(mut active) = self.active_task.lock()
-            && active.as_deref() == Some(task_id.as_str())
-        {
-            *active = None;
-        }
+        slot.deactivate();
         let start_confirmed = start_confirmed.load(Ordering::Acquire);
         if renewal_failed.load(Ordering::Acquire) {
             if let Ok(late_result) = &result {
@@ -448,7 +460,6 @@ where
                 }),
                 Ok(TaskState::Cancelled)
             ) {
-                self.finish_execution();
                 return;
             }
             Self::log_store(
@@ -461,7 +472,6 @@ where
                 ),
             );
             self.notify_task(&task_id);
-            self.finish_execution();
             return;
         }
         if event_error {
@@ -475,7 +485,6 @@ where
                 ),
             );
             self.notify_task(&task_id);
-            self.finish_execution();
             return;
         }
         match result {
@@ -504,12 +513,6 @@ where
             }
         }
         self.notify_task(&task_id);
-        self.finish_execution();
-    }
-
-    fn finish_execution(&self) {
-        self.executing.store(false, Ordering::Release);
-        let _ = self.scheduler_wake.try_send(());
     }
 
     fn dispatch_one(&self) {
