@@ -12,16 +12,16 @@ use aether_store::NodeStore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-/// The most characters of the card description.
-pub const MAX_DESCRIPTION: usize = 500;
-/// The most characters of the skill name.
-pub const MAX_SKILL_NAME: usize = 64;
-/// The most characters of the skill description.
-pub const MAX_SKILL_DESCRIPTION: usize = 300;
-/// The most tags of the skill.
-pub const MAX_TAGS: usize = 5;
-/// The most characters of one tag, from `[a-z0-9-]`.
-pub const MAX_TAG: usize = 24;
+// The card text is also the hub listing, so it has the limits of a listing:
+// the most characters of the description, the skill name and the skill
+// description, the most tags, and the most characters of one tag, from
+// `[a-z0-9-]`.
+pub use crate::hub_client::protocol::{
+    MAX_LISTING_DESCRIPTION as MAX_DESCRIPTION,
+    MAX_LISTING_SKILL_DESCRIPTION as MAX_SKILL_DESCRIPTION,
+    MAX_LISTING_SKILL_NAME as MAX_SKILL_NAME, MAX_LISTING_TAG as MAX_TAG,
+    MAX_LISTING_TAGS as MAX_TAGS,
+};
 /// The most bytes of a card.
 pub const MAX_CARD_BYTES: usize = 2048;
 /// The A2A binding of an Aether node over Iroh.

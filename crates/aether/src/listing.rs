@@ -13,39 +13,23 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::{agent_card::CardSettings, untrusted};
-
-pub use crate::hub_client::protocol::{
-    ListingError, MAX_LISTING_BYTES, MAX_LISTING_DAYS,
-    MAX_LISTING_DESCRIPTION as MAX_DESCRIPTION,
-    MAX_LISTING_SKILL_DESCRIPTION as MAX_SKILL_DESCRIPTION,
-    MAX_LISTING_SKILL_ID as MAX_SKILL_ID, MAX_LISTING_SKILL_NAME as MAX_SKILL_NAME,
-    MAX_LISTING_SKILLS as MAX_SKILLS, MAX_LISTING_TAG as MAX_TAG,
-    MAX_LISTING_TAGS as MAX_TAGS, OWNER_LINK_MAX_DAYS,
+use crate::{
+    agent_card::CardSettings,
+    hub_client::protocol::{
+        self, MAX_LISTING_DAYS, MAX_LISTING_DESCRIPTION, MAX_LISTING_SKILL_DESCRIPTION,
+        MAX_LISTING_SKILL_ID, MAX_LISTING_SKILL_NAME, MAX_LISTING_TAG,
+        OWNER_LINK_MAX_DAYS,
+    },
+    untrusted,
 };
+
+pub use crate::hub_client::protocol::{Listing, ListingError};
 
 /// How long a new listing stays on the hub. The hub accepts 30 days at most.
 pub const LISTING_LIFETIME: Duration =
     Duration::from_hours(MAX_LISTING_DAYS.saturating_mul(24));
 /// A listing with less time left than this is signed again.
 pub const RENEW_BEFORE: Duration = Duration::from_hours(7 * 24);
-
-/// A listing that passed the checks. Every text is from a stranger.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct Listing {
-    /// The full name, such as `law#0042`.
-    pub name: String,
-    pub description: String,
-    pub skills: Vec<ListingSkill>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct ListingSkill {
-    pub id: String,
-    pub name: String,
-    pub description: String,
-    pub tags: Vec<String>,
-}
 
 /// What this node last sent to the hub, kept under the setting
 /// [`settings::ListingState`].
@@ -81,7 +65,7 @@ pub fn listing_bytes(settings: &CardSettings, full_name: &str) -> Vec<u8> {
 /// unpadded base64url.
 #[must_use]
 pub fn sign(key: &iroh::SecretKey, bytes: &[u8], expires_at: u64) -> String {
-    crate::hub_client::protocol::sign_listing(key, bytes, expires_at)
+    protocol::sign_listing(key, bytes, expires_at)
 }
 
 /// Checks that the endpoint `endpoint` signed the listing `text` until
@@ -93,9 +77,7 @@ pub fn verify(
     expires_at: u64,
     at: u64,
 ) -> Result<(), ListingError> {
-    crate::hub_client::protocol::verify_listing(
-        text, signature, endpoint, expires_at, at,
-    )
+    protocol::verify_listing(text, signature, endpoint, expires_at, at)
 }
 
 /// How long an owner link lasts. The hub accepts 365 days at most.
@@ -110,7 +92,7 @@ pub fn sign_owner_claim(
     service_handle: &str,
     expires_at: u64,
 ) -> String {
-    let message = crate::hub_client::protocol::owner_claim_message(
+    let message = protocol::owner_claim_message(
         &key.public().to_string(),
         service_handle,
         expires_at,
@@ -126,7 +108,7 @@ pub fn sign_owner_confirm(
     personal: &str,
     expires_at: u64,
 ) -> String {
-    let message = crate::hub_client::protocol::owner_confirm_message(
+    let message = protocol::owner_confirm_message(
         &key.public().to_string(),
         personal,
         expires_at,
@@ -138,28 +120,22 @@ pub fn sign_owner_confirm(
 /// names `handle`. Every text is cleaned for display.
 pub fn parse(text: &str, handle: &str) -> Result<Listing, ListingError> {
     let bytes = URL_SAFE_NO_PAD.decode(text).map_err(|_| ListingError)?;
-    let raw = crate::hub_client::protocol::parse_listing_bytes(&bytes, handle)?;
-    Ok(Listing {
-        name: untrusted::single_line(&raw.name, raw.name.chars().count()),
-        description: untrusted::single_line(&raw.description, MAX_DESCRIPTION),
-        skills: raw
-            .skills
-            .into_iter()
-            .map(|skill| ListingSkill {
-                id: untrusted::single_line(&skill.id, MAX_SKILL_ID),
-                name: untrusted::single_line(&skill.name, MAX_SKILL_NAME),
-                description: untrusted::single_line(
-                    &skill.description,
-                    MAX_SKILL_DESCRIPTION,
-                ),
-                tags: skill
-                    .tags
-                    .iter()
-                    .map(|tag| untrusted::single_line(tag, MAX_TAG))
-                    .collect(),
-            })
-            .collect(),
-    })
+    let mut listing = protocol::parse_listing_bytes(&bytes, handle)?;
+    let clean = |text: &mut String, max: usize| {
+        *text = untrusted::single_line(text, max);
+    };
+    let name_chars = listing.name.chars().count();
+    clean(&mut listing.name, name_chars);
+    clean(&mut listing.description, MAX_LISTING_DESCRIPTION);
+    for skill in &mut listing.skills {
+        clean(&mut skill.id, MAX_LISTING_SKILL_ID);
+        clean(&mut skill.name, MAX_LISTING_SKILL_NAME);
+        clean(&mut skill.description, MAX_LISTING_SKILL_DESCRIPTION);
+        for tag in &mut skill.tags {
+            clean(tag, MAX_LISTING_TAG);
+        }
+    }
+    Ok(listing)
 }
 
 pub mod settings {

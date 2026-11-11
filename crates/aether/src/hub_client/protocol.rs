@@ -57,15 +57,19 @@ pub const OWNER_CLAIM_SECONDS: i64 = 604_800;
 pub const MAX_OPEN_CLAIMS: u64 = 5;
 pub const MAX_OWNER_LINKS: u64 = 20;
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct ListingPayload {
+/// A listing as its bytes hold it. Every text is from a stranger.
+#[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Listing {
+    /// The full name, such as `law#0042`.
     pub name: String,
     pub description: String,
-    pub skills: Vec<ListingSkillPayload>,
+    pub skills: Vec<ListingSkill>,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct ListingSkillPayload {
+#[derive(Debug, Clone, Eq, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListingSkill {
     pub id: String,
     pub name: String,
     pub description: String,
@@ -120,57 +124,27 @@ pub fn listing_bytes_match_handle(
 pub fn parse_listing_bytes(
     bytes: &[u8],
     handle: &str,
-) -> Result<ListingPayload, ListingError> {
+) -> Result<Listing, ListingError> {
     if bytes.len() > MAX_LISTING_BYTES {
         return Err(ListingError);
     }
-    let raw: RawListing = serde_json::from_slice(bytes).map_err(|_| ListingError)?;
-    if !listing_payload_valid(&raw, handle) {
+    let listing: Listing = serde_json::from_slice(bytes).map_err(|_| ListingError)?;
+    if !listing_valid(&listing, handle) {
         return Err(ListingError);
     }
-    Ok(ListingPayload {
-        name: raw.name,
-        description: raw.description,
-        skills: raw
-            .skills
-            .into_iter()
-            .map(|skill| ListingSkillPayload {
-                id: skill.id,
-                name: skill.name,
-                description: skill.description,
-                tags: skill.tags,
-            })
-            .collect(),
-    })
+    Ok(listing)
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawListing {
-    name: String,
-    description: String,
-    skills: Vec<RawSkill>,
+fn listing_valid(listing: &Listing, handle: &str) -> bool {
+    let ids: BTreeSet<&String> = listing.skills.iter().map(|skill| &skill.id).collect();
+    listing.name == handle
+        && valid_listing_text(&listing.description, MAX_LISTING_DESCRIPTION)
+        && (1..=MAX_LISTING_SKILLS).contains(&listing.skills.len())
+        && ids.len() == listing.skills.len()
+        && listing.skills.iter().all(valid_listing_skill)
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawSkill {
-    id: String,
-    name: String,
-    description: String,
-    tags: Vec<String>,
-}
-
-fn listing_payload_valid(raw: &RawListing, handle: &str) -> bool {
-    let ids: BTreeSet<&String> = raw.skills.iter().map(|skill| &skill.id).collect();
-    raw.name == handle
-        && valid_listing_text(&raw.description, MAX_LISTING_DESCRIPTION)
-        && (1..=MAX_LISTING_SKILLS).contains(&raw.skills.len())
-        && ids.len() == raw.skills.len()
-        && raw.skills.iter().all(valid_listing_skill)
-}
-
-fn valid_listing_skill(skill: &RawSkill) -> bool {
+fn valid_listing_skill(skill: &ListingSkill) -> bool {
     let tags: BTreeSet<&String> = skill.tags.iter().collect();
     valid_listing_word(&skill.id, MAX_LISTING_SKILL_ID)
         && valid_listing_text(&skill.name, MAX_LISTING_SKILL_NAME)
