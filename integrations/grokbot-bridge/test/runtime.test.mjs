@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import path from 'node:path';
@@ -110,6 +110,17 @@ test('a lock without an owner record, or whose live owner does not answer, is re
   writeFileSync(path.join(lock, 'owner.json'), JSON.stringify({ pid: process.pid }));
   await assert.rejects(acquireRuntime({ stateDir, dataDir: stateDir, waitMs: 300 }), { message: new RegExp(`Bridge process ${process.pid} .* does not answer`) });
   assert.equal(existsSync(lock), true);
+});
+
+test('a lock left without an owner record by a bridge that crashed while starting is taken over', async t => {
+  const stateDir = directory(t);
+  const lock = staleLock(stateDir);
+  const past = new Date(Date.now() - 60_000);
+  utimesSync(lock, past, past);
+  const runtime = await acquireRuntime({ stateDir, dataDir: stateDir, waitMs: 500 });
+  assert.equal(runtime.role, 'owner');
+  assert.equal(JSON.parse(readFileSync(path.join(lock, 'owner.json'), 'utf8')).pid, process.pid);
+  runtime.release();
 });
 
 test('the exit message carries the node\'s last stderr line and the lock is released', async t => {
