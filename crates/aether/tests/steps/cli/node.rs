@@ -94,7 +94,6 @@ async fn expired_outbox_task(world: &mut World) {
     .await;
 }
 
-#[when("the node starts")]
 async fn node_starts(world: &mut World) {
     let command = node_serve(world);
     start(world, command).await;

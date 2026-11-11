@@ -23,16 +23,10 @@ async fn ask_for_spec(world: &mut crate::steps::World) {
     world.cli.output = Some(run(aether).await);
 }
 
-#[then(expr = "the help matches the reviewed {string} page")]
-fn help_matches(world: &mut crate::steps::World, page: String) {
-    assert_success(world.cli.output());
-    insta::assert_snapshot!(page, world.cli.stdout());
-}
-
-#[then(expr = "the spec matches the reviewed {string} page")]
-fn spec_matches(world: &mut crate::steps::World, page: String) {
+#[then(regex = r#"^the (?:help|spec) matches the reviewed "([^"]*)" page$"#)]
+fn page_matches(world: &mut crate::steps::World, page: String) {
     assert_success(world.cli.output());
     // The version changes with every release and is not part of the shape.
-    let spec = world.cli.stdout().replace(env!("CARGO_PKG_VERSION"), "[version]");
-    insta::assert_snapshot!(page, spec);
+    let output = world.cli.stdout().replace(env!("CARGO_PKG_VERSION"), "[version]");
+    insta::assert_snapshot!(page, output);
 }
