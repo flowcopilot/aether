@@ -10,7 +10,7 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
-use crate::{StoreError, migrate::open_connection};
+use crate::{StoreError, migrate::open_connection, sql_named};
 
 pub const PACT_DATABASE: &str = "pact.sqlite";
 
@@ -299,7 +299,7 @@ impl PactStore {
                 authorization.interval_seconds,
                 authorization.created_at,
                 authorization.expires_at,
-                DeviceStatus::Pending.as_str(),
+                DeviceStatus::Pending,
             ],
         )?;
         Ok(())
@@ -315,7 +315,7 @@ impl PactStore {
             .connection
             .query_row(
                 "SELECT user_code, brand_id, pa_issuer, pa_subject, scopes, expires_at FROM pact_device_authorizations WHERE user_code=?1 AND status=?3 AND expires_at > ?2",
-                params![user_code, now, DeviceStatus::Pending.as_str()],
+                params![user_code, now, DeviceStatus::Pending],
                 |row| {
                     Ok(PendingDevice {
                         user_code: row.get(0)?,
@@ -345,8 +345,8 @@ impl PactStore {
                 user_code,
                 grant.grant_id,
                 now,
-                DeviceStatus::Approved.as_str(),
-                DeviceStatus::Pending.as_str(),
+                DeviceStatus::Approved,
+                DeviceStatus::Pending,
             ],
         )?;
         if changed != 1 {
@@ -357,11 +357,12 @@ impl PactStore {
         Ok(())
     }
 
-    /// Denies the pending authorization `user_code`.
-    pub fn deny_device(&self, user_code: &str) -> Result<(), StoreError> {
+    /// Denies the pending authorization `user_code`. `NotFound` when it is
+    /// no longer pending, or has expired.
+    pub fn deny_device(&self, user_code: &str, now: i64) -> Result<(), StoreError> {
         let changed = self.connection.execute(
-            "UPDATE pact_device_authorizations SET status=?2 WHERE user_code=?1 AND status=?3",
-            params![user_code, DeviceStatus::Denied.as_str(), DeviceStatus::Pending.as_str()],
+            "UPDATE pact_device_authorizations SET status=?2 WHERE user_code=?1 AND status=?3 AND expires_at > ?4",
+            params![user_code, DeviceStatus::Denied, DeviceStatus::Pending, now],
         )?;
         if changed == 1 { Ok(()) } else { Err(StoreError::NotFound) }
     }
@@ -405,24 +406,32 @@ impl PactStore {
         let poll = if expires_at <= now {
             DevicePoll::Expired
         } else {
-            match DeviceStatus::parse(&status).ok_or(StoreError::InvalidState)? {
+            match status {
                 DeviceStatus::Denied => DevicePoll::Denied,
                 DeviceStatus::Consumed => DevicePoll::Consumed,
                 DeviceStatus::Pending => {
                     let slow_down = last_polled_at
                         .is_some_and(|last| now.saturating_sub(last) < interval);
                     transaction.execute(
-                        "UPDATE pact_device_authorizations SET last_polled_at=?2 WHERE device_code_hash=?1",
-                        params![device_code_hash, now],
+                        "UPDATE pact_device_authorizations SET last_polled_at=?2 WHERE device_code_hash=?1 AND status=?3",
+                        params![device_code_hash, now, DeviceStatus::Pending],
                     )?;
                     DevicePoll::Pending { slow_down }
                 }
                 DeviceStatus::Approved => {
-                    transaction.execute(
-                        "UPDATE pact_device_authorizations SET status=?2 WHERE device_code_hash=?1",
-                        params![device_code_hash, DeviceStatus::Consumed.as_str()],
+                    // Like every transition here, the update names the state
+                    // it leaves, so only one poll can consume an approval.
+                    let consumed = transaction.execute(
+                        "UPDATE pact_device_authorizations SET status=?2 WHERE device_code_hash=?1 AND status=?3 AND expires_at > ?4",
+                        params![
+                            device_code_hash,
+                            DeviceStatus::Consumed,
+                            DeviceStatus::Approved,
+                            now,
+                        ],
                     )?;
                     let grant = grant_id
+                        .filter(|_| consumed == 1)
                         .map(|grant_id| query_grant(&transaction, &grant_id))
                         .transpose()?
                         .flatten();
@@ -454,10 +463,15 @@ impl PactStore {
     }
 
     /// Spends an unused, unexpired refresh token and returns its grant.
-    /// A second use of the same token returns `None`.
+    /// A second use of the same token returns `None`. Only the personal
+    /// agent and user the grant belongs to, for its Brand, can spend it;
+    /// anyone else gets `None` and the token stays unused.
     pub fn use_refresh_token(
         &mut self,
         token_hash: &str,
+        brand_id: &str,
+        pa_issuer: &str,
+        pa_subject: &str,
         now: i64,
     ) -> Result<Option<PactGrant>, StoreError> {
         let transaction = rusqlite::Transaction::new_unchecked(
@@ -466,8 +480,8 @@ impl PactStore {
         )?;
         let grant_id: Option<String> = transaction
             .query_row(
-                "UPDATE pact_refresh_tokens SET used_at=?2 WHERE token_hash=?1 AND used_at IS NULL AND expires_at > ?2 RETURNING grant_id",
-                params![token_hash, now],
+                "UPDATE pact_refresh_tokens SET used_at=?2 WHERE token_hash=?1 AND used_at IS NULL AND expires_at > ?2 AND grant_id IN (SELECT grant_id FROM pact_grants WHERE brand_id=?3 AND pa_issuer=?4 AND pa_subject=?5) RETURNING grant_id",
+                params![token_hash, now, brand_id, pa_issuer, pa_subject],
                 |row| row.get(0),
             )
             .optional()?;
@@ -526,9 +540,11 @@ aether_core::named!(DeviceStatus {
     Consumed => "consumed",
 });
 
+sql_named!(DeviceStatus);
+
 /// The device-authorization columns `poll_device` decides on.
 struct DeviceRow {
-    status: String,
+    status: DeviceStatus,
     grant_id: Option<String>,
     interval: i64,
     last_polled_at: Option<i64>,
@@ -769,7 +785,7 @@ mod tests {
         let (_directory, mut store) = store();
         store.create_device_authorization(&device("AAAA-AAAA", "one")).unwrap();
         store.create_device_authorization(&device("BBBB-BBBB", "two")).unwrap();
-        store.deny_device("AAAA-AAAA").unwrap();
+        store.deny_device("AAAA-AAAA", 200).unwrap();
         assert_eq!(
             store.approve_device("AAAA-AAAA", &grant("g1"), 200),
             Err(StoreError::NotFound),
@@ -789,16 +805,65 @@ mod tests {
     }
 
     #[test]
+    fn an_expired_authorization_cannot_be_denied() {
+        let (_directory, mut store) = store();
+        store.create_device_authorization(&device("AAAA-AAAA", "one")).unwrap();
+        assert_eq!(store.deny_device("AAAA-AAAA", 700), Err(StoreError::NotFound));
+        assert_eq!(
+            store
+                .poll_device("one", "review", "https://pa.example", "user-1", 800)
+                .unwrap(),
+            DevicePoll::Expired,
+        );
+    }
+
+    #[test]
     fn a_refresh_token_works_once_and_not_after_it_expires() {
         let (_directory, mut store) = store();
         store.create_device_authorization(&device("ABCD-EFGH", "hash")).unwrap();
         store.approve_device("ABCD-EFGH", &grant("g"), 200).unwrap();
         store.put_refresh_token("once", "g", 5_000).unwrap();
         store.put_refresh_token("late", "g", 5_000).unwrap();
-        assert_eq!(store.use_refresh_token("once", 300).unwrap(), Some(grant("g")));
-        assert_eq!(store.use_refresh_token("once", 301).unwrap(), None);
-        assert_eq!(store.use_refresh_token("late", 5_000).unwrap(), None);
-        assert_eq!(store.use_refresh_token("unknown", 300).unwrap(), None);
+        let spend = |store: &mut PactStore, token: &str, now: i64| {
+            store
+                .use_refresh_token(token, "review", "https://pa.example", "user-1", now)
+                .unwrap()
+        };
+        assert_eq!(spend(&mut store, "once", 300), Some(grant("g")));
+        assert_eq!(spend(&mut store, "once", 301), None);
+        assert_eq!(spend(&mut store, "late", 5_000), None);
+        assert_eq!(spend(&mut store, "unknown", 300), None);
+    }
+
+    #[test]
+    fn only_the_grant_owner_can_spend_its_refresh_token() {
+        let (_directory, mut store) = store();
+        store.create_device_authorization(&device("ABCD-EFGH", "hash")).unwrap();
+        store.approve_device("ABCD-EFGH", &grant("g"), 200).unwrap();
+        store.put_refresh_token("token", "g", 5_000).unwrap();
+        for (brand, issuer, subject) in [
+            ("review", "https://other.example", "user-1"),
+            ("other", "https://pa.example", "user-1"),
+            ("review", "https://pa.example", "user-2"),
+        ] {
+            assert_eq!(
+                store.use_refresh_token("token", brand, issuer, subject, 300).unwrap(),
+                None,
+            );
+        }
+        // Nobody else's attempt spent it.
+        assert_eq!(
+            store
+                .use_refresh_token(
+                    "token",
+                    "review",
+                    "https://pa.example",
+                    "user-1",
+                    300
+                )
+                .unwrap(),
+            Some(grant("g")),
+        );
     }
 
     #[test]

@@ -184,37 +184,7 @@ fn fixture() -> Fixture {
 }
 
 fn fixture_with(setup: impl FnOnce(&FakeNode)) -> Fixture {
-    let directory = tempfile::tempdir().expect("directory must create");
-    let agent = TestAgent::new("k1");
-    let key = Arc::new(ProviderKey::load_or_create(directory.path()).expect("key"));
-    let node = Arc::new(FakeNode::default());
-    setup(&node);
-    let link = Arc::new(ConsentLink::default());
-    link.set("https://127.0.0.1:3000".to_owned());
-    let path = directory.path().join(aether_store::pact::PACT_DATABASE);
-    let store: SharedPactStore =
-        Arc::new(Mutex::new(PactStore::open(&path).expect("store must open")));
-    let gateway = Gateway::new(
-        config(),
-        PaVerifier::new(
-            AUDIENCE.to_owned(),
-            UrlPolicy { allow_insecure_local: false },
-            StaticKeys::new(agent.jwks.clone()),
-        ),
-        Arc::clone(&key),
-        Arc::clone(&store),
-        node.clone(),
-        link,
-    )
-    .with_poll_interval(Duration::from_millis(1));
-    Fixture {
-        app: router(Arc::new(gateway)),
-        agent,
-        node,
-        key,
-        _directory: directory,
-        store,
-    }
+    fixture_with_gateway(setup, |gateway| gateway)
 }
 
 fn fixture_with_gateway(
@@ -668,7 +638,7 @@ async fn the_device_flow_follows_rfc_8628() {
     // Another user of the same personal agent cannot use the code.
     assert_eq!(poll("someone-else").await.body["error"], "invalid_grant");
     let user_code = started.body["user_code"].as_str().expect("user code");
-    fixture.store().deny_device(user_code).expect("deny must store");
+    fixture.store().deny_device(user_code, now()).expect("deny must store");
     assert_eq!(poll("u").await.body["error"], "access_denied");
     let unsupported = fixture
         .call(
@@ -729,6 +699,30 @@ async fn a_task_that_never_finishes_times_out() {
         reply.body["error"]["message"],
         "The task is still running. Send the same message again to read its result."
     );
+}
+
+#[tokio::test]
+async fn a_send_dropped_while_its_task_runs_can_be_retried() {
+    let fixture = fixture_with(FakeNode::keep_running);
+    let started = fixture.send("u", None, user_message("m0", "hello")).await;
+    let context_id = started.body["task"]["contextId"].as_str().expect("context");
+    let tokens = fixture.delegate("u").await;
+    let access = tokens["access_token"].as_str().expect("access token");
+    let mut message = user_message("m1", "Review main.rs");
+    message["contextId"] = context_id.into();
+
+    // The client goes away while the task runs.
+    let dropped = tokio::time::timeout(
+        Duration::from_millis(200),
+        fixture.send("u", Some(access), message.clone()),
+    )
+    .await;
+    assert!(dropped.is_err(), "the task must still be running");
+
+    fixture.node.always_running.store(false, Ordering::Release);
+    let retry = fixture.send("u", Some(access), message).await;
+    assert_eq!(retry.status, StatusCode::OK, "{}", retry.body);
+    assert_eq!(retry.body["message"]["parts"], json!([{ "text": "answer 2" }]));
 }
 
 #[tokio::test]
@@ -863,6 +857,31 @@ async fn a_revoked_or_foreign_delegation_is_an_invalid_token() {
         )
         .await;
     assert_eq!(after.body["error"], "invalid_grant");
+}
+
+#[tokio::test]
+async fn another_caller_cannot_spend_a_refresh_token() {
+    let fixture = fixture();
+    let tokens = fixture.delegate("u").await;
+    let refresh = tokens["refresh_token"].as_str().expect("refresh token");
+    let body =
+        format!("grant_type=refresh_token&refresh_token={refresh}&client_id={ISSUER}");
+    let fixture = &fixture;
+    let refresh_as = |sub: &str| {
+        let token = fixture.agent.token_for(sub);
+        let body = &body;
+        async move {
+            fixture
+                .call(Method::POST, "/a2a/review/oauth/token", Some(&token), None, body)
+                .await
+        }
+    };
+    let foreign = refresh_as("someone-else").await;
+    assert_eq!(foreign.status, StatusCode::BAD_REQUEST);
+    assert_eq!(foreign.body["error"], "invalid_grant");
+    // The owner's token is still unused.
+    let owner = refresh_as("u").await;
+    assert_eq!(owner.status, StatusCode::OK, "{}", owner.body);
 }
 
 #[tokio::test]
