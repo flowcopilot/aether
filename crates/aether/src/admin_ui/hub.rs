@@ -23,7 +23,9 @@ use topcoat::{
 };
 
 use super::{
-    Page, PageContext, UiMode, hub_form_screen,
+    Page, PageContext, UiMode,
+    caller::caller_screen,
+    host::host_screen,
     layout::page_data_dir,
     require_admin_session,
     shared::{self, Notice},
@@ -666,6 +668,20 @@ async fn invite_row(invite: Invite, approved: bool) -> TopcoatResult<impl View> 
                 </form>
             }
         </li>
+    })
+}
+
+/// The screen to show after a hub form: the host screen when the page has
+/// one, else the caller screen.
+#[component]
+async fn hub_form_screen(cx: &Cx, notice: Notice) -> TopcoatResult<impl View> {
+    let hosting = app_context::<Page>(cx).mode().is_some_and(UiMode::hosts);
+    Ok(view! {
+        if hosting {
+            host_screen(notice: notice.clone())
+        } else {
+            caller_screen(notice: notice.clone())
+        }
     })
 }
 

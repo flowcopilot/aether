@@ -6,7 +6,7 @@ use topcoat::{
     view::{View, component, view},
 };
 
-use super::{Page, UiMode, shared};
+use super::{Page, PageContext, UiMode, shared};
 use crate::admin::SharedAdministration;
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -22,22 +22,45 @@ pub(super) fn page_data_dir(cx: &Cx) -> Option<std::path::PathBuf> {
     page.as_ref().map(|page| page.data_dir.clone())
 }
 
+/// What waits for the person, as counts on the tabs.
+#[derive(Clone, Copy, Default)]
+pub(super) struct Waiting {
+    /// Access requests that the agent prepared.
+    pub drafts: usize,
+    /// Changes that wait for confirmation.
+    pub pending: usize,
+}
+
+impl Waiting {
+    fn read(cx: &Cx, page: Option<&PageContext>) -> Self {
+        let drafts = page.filter(|page| page.mode.calls()).map_or(0, |page| {
+            let now = aether_core::time::now_seconds();
+            shared::request_drafts_of(&page.data_dir, now).len()
+        });
+        let pending = app_context::<SharedAdministration>(cx)
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pending()
+            .map_or(0, |pending| pending.len());
+        Self { drafts, pending }
+    }
+}
+
+/// The bar on top of a node page. `waiting` saves a second read when the
+/// screen already counted what waits.
 #[component]
-pub(super) async fn node_header(cx: &Cx, current: Tab) -> TopcoatResult<impl View> {
+pub(super) async fn node_header(
+    cx: &Cx,
+    current: Tab,
+    #[default] waiting: Option<Waiting>,
+) -> TopcoatResult<impl View> {
     let Page(page) = app_context::<Page>(cx);
     let mode = app_context::<Page>(cx).mode();
     let hosts = mode.is_some_and(UiMode::hosts);
     let calls = mode.is_some_and(UiMode::calls);
     let data_dir = page_data_dir(cx);
-    let drafts = page.as_ref().filter(|page| page.mode.calls()).map_or(0, |page| {
-        let now = aether_core::time::now_seconds();
-        shared::request_drafts_of(&page.data_dir, now).len()
-    });
-    let pending = app_context::<SharedAdministration>(cx)
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .pending()
-        .map_or(0, |pending| pending.len());
+    let Waiting { drafts, pending } =
+        waiting.unwrap_or_else(|| Waiting::read(cx, page.as_deref()));
     let relay_host = page.as_ref().filter(|page| page.mode.hosts()).map(|page| {
         page.relay_url().map(|url| {
             reqwest::Url::parse(&url)

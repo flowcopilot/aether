@@ -30,7 +30,7 @@ use topcoat::{
         route,
     },
     session::{self, RouterBuilderSessionExt, SessionConfig, TokenHash},
-    view::{View, component, view},
+    view::{View, view},
 };
 use tower::util::MapResponse;
 
@@ -48,7 +48,6 @@ use crate::admin::SharedAdministration;
 use advanced::dashboard;
 use caller::caller_screen;
 use host::host_screen;
-use shared::Notice;
 
 const UI_SESSION_LIFETIME: Duration = Duration::from_secs(3_600);
 /// Matches the `DefaultBodyLimit` of `UI_HARDENING`: both cap the same
@@ -298,18 +297,6 @@ async fn root_layout(slot: Slot<'_>) -> TopcoatResult<impl View> {
                 <script defer="" src="/admin.js"></script>
             </body>
         </html>
-    })
-}
-
-#[component]
-async fn hub_form_screen(cx: &Cx, notice: Notice) -> TopcoatResult<impl View> {
-    let hosting = app_context::<Page>(cx).mode().is_some_and(UiMode::hosts);
-    Ok(view! {
-        if hosting {
-            host_screen(notice: notice.clone())
-        } else {
-            caller_screen(notice: notice.clone())
-        }
     })
 }
 
@@ -625,9 +612,7 @@ impl PageContext {
 
     #[must_use]
     pub fn with_hub(self, hub: Option<crate::hub_client::HubClient>) -> Self {
-        if let Some(client) = hub {
-            let _ = self.hub.as_ref().prime(client);
-        }
+        self.set_hub(hub);
         self
     }
 

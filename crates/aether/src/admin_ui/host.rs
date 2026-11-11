@@ -21,7 +21,7 @@ use topcoat::{
 use super::{
     Page, PageContext, ensure_admin_session,
     hub::{hub_section, hub_setting},
-    layout::{Tab, node_header},
+    layout::{Tab, Waiting, node_header},
     listing::listing_section,
     require_admin_session,
     shared::{self, Notice},
@@ -83,12 +83,6 @@ pub(super) async fn host_screen(
         0
     };
     let relay_url = page.relay_url();
-    let relay_host = relay_url.as_deref().map(|url| {
-        reqwest::Url::parse(url)
-            .ok()
-            .and_then(|url| url.host_str().map(str::to_owned))
-            .unwrap_or_else(|| url.to_owned())
-    });
     let (grants, last_tasks, folder, pending) = {
         let administration = app_context::<SharedAdministration>(cx)
             .lock()
@@ -156,7 +150,7 @@ pub(super) async fn host_screen(
         if refused {
             (StatusCode::BAD_REQUEST)
         }
-        node_header(current: Tab::Sharing)
+        node_header(current: Tab::Sharing, waiting: Some(Waiting { drafts, pending }))
         <main id="main" class="mx-auto flex max-w-6xl flex-col gap-12 px-4 py-10 sm:px-8">
             <div class="grid items-start gap-10 lg:grid-cols-[minmax(0,1fr)_24rem]">
                 <section aria-labelledby="people" class="flex min-w-0 flex-col gap-7">
@@ -208,7 +202,7 @@ pub(super) async fn host_screen(
                                 hub: hub.clone(),
                                 role: Role::Sender,
                                 error: notice.hub_error(),
-                                relay_missing: relay_host.is_none(),
+                                relay_missing: relay_url.is_none(),
                                 <details class="group border-t border-border pt-4" open=(code_open.then_some(""))>
                                     <summary class="flex cursor-pointer list-none items-center gap-2 text-sm text-muted-foreground">
                                         <span class="transition-transform group-open:rotate-90">icon(data: CHEVRON)</span>
@@ -229,7 +223,7 @@ pub(super) async fn host_screen(
                                     <h2 id="invite-title" class="text-lg leading-tight font-semibold">"Invite someone"</h2>
                                     <p class="text-sm text-muted-foreground">"Ask them for the connect code on their Aether page. The invite works only on their computer."</p>
                                 </div>
-                                if relay_host.is_none() {
+                                if relay_url.is_none() {
                                     shared::relay_notice()
                                 }
                                 invite_form(error: notice.invite_error())
