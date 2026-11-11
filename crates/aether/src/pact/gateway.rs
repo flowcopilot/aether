@@ -161,6 +161,14 @@ async fn provider_jwks(State(gateway): State<Arc<Gateway>>) -> Response {
 enum Route {
     Card,
     Metadata,
+    MethodNotAllowed,
+    NotFound,
+    /// A route that needs a personal-agent JWT.
+    Call(Call),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum Call {
     DeviceAuthorization,
     Token,
     Send,
@@ -168,8 +176,6 @@ enum Route {
     PushUnsupported,
     ListTasks,
     TaskNotFound(String),
-    MethodNotAllowed,
-    NotFound,
 }
 
 /// Matches a path below the interface URL. A known path with another
@@ -178,19 +184,20 @@ fn route(method: &Method, rest: &str) -> Route {
     let only = |allowed: &[Method], route: Route| {
         if allowed.contains(method) { route } else { Route::MethodNotAllowed }
     };
+    let call = |allowed: &[Method], call: Call| only(allowed, Route::Call(call));
     match rest {
         ".well-known/agent-card.json" => return only(&[Method::GET], Route::Card),
         "oauth/.well-known/oauth-authorization-server" => {
             return only(&[Method::GET], Route::Metadata);
         }
         "oauth/device_authorization" => {
-            return only(&[Method::POST], Route::DeviceAuthorization);
+            return call(&[Method::POST], Call::DeviceAuthorization);
         }
-        "oauth/token" => return only(&[Method::POST], Route::Token),
-        "message:send" => return only(&[Method::POST], Route::Send),
-        "message:stream" => return only(&[Method::POST], Route::Unsupported),
-        "tasks" => return only(&[Method::GET], Route::ListTasks),
-        "extendedAgentCard" => return only(&[Method::GET], Route::Unsupported),
+        "oauth/token" => return call(&[Method::POST], Call::Token),
+        "message:send" => return call(&[Method::POST], Call::Send),
+        "message:stream" => return call(&[Method::POST], Call::Unsupported),
+        "tasks" => return call(&[Method::GET], Call::ListTasks),
+        "extendedAgentCard" => return call(&[Method::GET], Call::Unsupported),
         _ => {}
     }
     let Some(task) = rest.strip_prefix("tasks/") else {
@@ -200,21 +207,21 @@ fn route(method: &Method, rest: &str) -> Route {
     match segments.as_slice() {
         [id] if !id.is_empty() => match id.rsplit_once(':') {
             Some((id, "cancel")) if !id.is_empty() => {
-                only(&[Method::POST], Route::TaskNotFound(id.to_owned()))
+                call(&[Method::POST], Call::TaskNotFound(id.to_owned()))
             }
             Some((id, "subscribe")) if !id.is_empty() => {
-                only(&[Method::GET, Method::POST], Route::Unsupported)
+                call(&[Method::GET, Method::POST], Call::Unsupported)
             }
             Some(_) => Route::NotFound,
-            None => only(&[Method::GET], Route::TaskNotFound((*id).to_owned())),
+            None => call(&[Method::GET], Call::TaskNotFound((*id).to_owned())),
         },
         [id, "pushNotificationConfigs"] if !id.is_empty() => {
-            only(&[Method::GET, Method::POST], Route::PushUnsupported)
+            call(&[Method::GET, Method::POST], Call::PushUnsupported)
         }
         [id, "pushNotificationConfigs", config]
             if !id.is_empty() && !config.is_empty() =>
         {
-            only(&[Method::GET, Method::DELETE], Route::PushUnsupported)
+            call(&[Method::GET, Method::DELETE], Call::PushUnsupported)
         }
         _ => Route::NotFound,
     }
@@ -231,16 +238,15 @@ async fn brand_route(
     let Some(brand) = gateway.config.brand(&brand) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let route = route(&method, &rest);
-    match route {
+    let call = match route(&method, &rest) {
         Route::NotFound => return StatusCode::NOT_FOUND.into_response(),
         Route::MethodNotAllowed => {
             return StatusCode::METHOD_NOT_ALLOWED.into_response();
         }
         Route::Card => return card(&gateway.config, brand),
         Route::Metadata => return metadata(&gateway.config, brand),
-        _ => {}
-    }
+        Route::Call(call) => call,
+    };
     let authorization =
         headers.get(header::AUTHORIZATION).and_then(|value| value.to_str().ok());
     let Some(caller) = gateway.verifier.verify(authorization).await else {
@@ -254,32 +260,31 @@ async fn brand_route(
         return response;
     }
     let brand = brand.clone();
-    match route {
-        Route::Send => Gateway::send(&gateway, brand, caller, headers, body).await,
-        Route::DeviceAuthorization => blocking(&gateway, move |gateway| {
-            gateway.device_authorization(&brand, &caller, &body)
-        })
-        .await
-        .unwrap_or_else(IntoResponse::into_response),
-        Route::Token => {
-            blocking(&gateway, move |gateway| gateway.token(&brand, &caller, &body))
-                .await
-                .unwrap_or_else(IntoResponse::into_response)
+    match call {
+        Call::Send => Gateway::send(&gateway, brand, caller, headers, body).await,
+        Call::DeviceAuthorization => {
+            blocking_response(&gateway, move |gateway| {
+                gateway.device_authorization(&brand, &caller, &body)
+            })
+            .await
         }
-        Route::ListTasks => list_tasks(query.as_deref()),
-        Route::TaskNotFound(id) => {
+        Call::Token => {
+            blocking_response(&gateway, move |gateway| {
+                gateway.token(&brand, &caller, &body)
+            })
+            .await
+        }
+        Call::ListTasks => list_tasks(query.as_deref()),
+        Call::TaskNotFound(id) => {
             a2a_error(A2aError::TaskNotFound, &format!("Task not found: {id}"))
         }
-        Route::Unsupported => {
+        Call::Unsupported => {
             a2a_error(A2aError::UnsupportedOperation, "Operation not supported")
         }
-        Route::PushUnsupported => a2a_error(
+        Call::PushUnsupported => a2a_error(
             A2aError::PushNotificationNotSupported,
             "Push notifications are not supported",
         ),
-        Route::Card | Route::Metadata | Route::MethodNotAllowed | Route::NotFound => {
-            StatusCode::NOT_FOUND.into_response()
-        }
     }
 }
 
@@ -509,16 +514,35 @@ fn challenge(value: &'static str) -> Response {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum Failure {
     A2a(A2aError, &'static str),
+    /// `401`: the delegation token is not valid for this request (§5.5).
+    InvalidToken,
     /// `429`: the node's queue is full.
     Overloaded,
     /// An OAuth error and its description.
     OAuth(OAuthError, &'static str),
 }
 
+impl From<Failure> for Response {
+    fn from(failure: Failure) -> Self {
+        failure.into_response()
+    }
+}
+
+/// A response that ends `message:send` before its task runs, boxed because
+/// a `Response` is large.
+type Answered = Box<Response>;
+
+impl From<Failure> for Answered {
+    fn from(failure: Failure) -> Self {
+        Self::new(failure.into_response())
+    }
+}
+
 impl IntoResponse for Failure {
     fn into_response(self) -> Response {
         match self {
             Self::A2a(error, message) => a2a_error(error, message),
+            Self::InvalidToken => invalid_token(),
             Self::Overloaded => {
                 let mut response = StatusCode::TOO_MANY_REQUESTS.into_response();
                 response
@@ -537,6 +561,11 @@ impl IntoResponse for Failure {
 const fn internal(message: &'static str) -> Failure {
     Failure::A2a(A2aError::Internal, message)
 }
+
+const STORE_FAILED: &str = "The conversation cannot be stored";
+const READ_FAILED: &str = "The conversation cannot be read";
+const NODE_STOPPED: &str = "The node stopped";
+const CONTEXT_CLOSED: &str = "The conversation is closed";
 
 /// The node could not read its own policy.
 #[derive(Debug)]
@@ -579,11 +608,6 @@ fn list_tasks(query: Option<&str>) -> Response {
 
 // -- message:send (§4, §5.5, §5.6) --
 
-/// A verified delegation for one request.
-struct Delegation {
-    claims: DelegationClaims,
-}
-
 struct Turn<'a> {
     brand: &'a Brand,
     caller: &'a PaIdentity,
@@ -594,10 +618,21 @@ struct Turn<'a> {
 /// A turn's reply text (for later transcripts) and its response body.
 type TurnOutcome = Result<(Option<String>, Value), Failure>;
 
-/// What checking a message gave: a task to run, or the response.
-enum Begun {
-    Run(Box<PendingTurn>),
-    Answered(Response),
+/// A `message:send` message that passed the checks of §4.
+struct CheckedMessage {
+    message_id: String,
+    context_id: Option<String>,
+    text: String,
+}
+
+/// The Aether task for one delegated turn.
+struct PreparedTask {
+    request: Request,
+    /// The idempotency key the node admits the task under.
+    key: String,
+    task: Task,
+    /// The hash of the text the task gets, for the receipt.
+    args_hash: String,
 }
 
 /// A stored message whose delegated task has not run yet.
@@ -606,11 +641,8 @@ struct PendingTurn {
     caller: PaIdentity,
     context_id: String,
     message_id: String,
-    delegation: Delegation,
-    request: Request,
-    key: String,
-    task: Task,
-    args_hash: String,
+    delegation: DelegationClaims,
+    prepared: PreparedTask,
 }
 
 impl PendingTurn {
@@ -632,7 +664,15 @@ async fn blocking<R: Send + 'static>(
     let gateway = Arc::clone(gateway);
     tokio::task::spawn_blocking(move || work(&gateway))
         .await
-        .map_err(|_| internal("The node stopped"))
+        .map_err(|_| internal(NODE_STOPPED))
+}
+
+/// [`blocking`] for work that answers with a response.
+async fn blocking_response(
+    gateway: &Arc<Gateway>,
+    work: impl FnOnce(&Gateway) -> Response + Send + 'static,
+) -> Response {
+    blocking(gateway, work).await.unwrap_or_else(Response::from)
 }
 
 /// Returns when `events` names `task_id`, or when some events were lost.
@@ -732,17 +772,16 @@ impl Gateway {
         })
         .await;
         let pending = match begun {
-            Ok(Begun::Run(pending)) => pending,
-            Ok(Begun::Answered(response)) => return response,
-            Err(failure) => return failure.into_response(),
+            Ok(Ok(pending)) => pending,
+            Ok(Err(answered)) => return *answered,
+            Err(failure) => return failure.into(),
         };
         let reply = gateway.run_task(&pending).await;
-        blocking(gateway, move |gateway| {
+        blocking_response(gateway, move |gateway| {
             let outcome = reply.and_then(|reply| gateway.turn_reply(&pending, reply));
             gateway.finish_send(&pending.turn(), outcome)
         })
         .await
-        .unwrap_or_else(IntoResponse::into_response)
     }
 
     /// Checks and stores the message. Returns the task to run for a
@@ -753,126 +792,25 @@ impl Gateway {
         caller: PaIdentity,
         headers: &HeaderMap,
         body: &[u8],
-    ) -> Begun {
-        let delegation = match headers.get(DELEGATION_HEADER) {
-            None => None,
-            Some(value) => {
-                match self.verify_delegation_header(&brand, &caller, value) {
-                    Ok(Some(delegation)) => Some(delegation),
-                    Ok(None) => return Begun::Answered(invalid_token()),
-                    Err(failure) => return Begun::Answered(failure.into_response()),
-                }
-            }
-        };
-        let Ok(request) = serde_json::from_slice::<a2a::SendMessageRequest>(body)
-        else {
-            return Begun::Answered(a2a_error(
-                A2aError::InvalidParams,
-                "Invalid request",
-            ));
-        };
-        let message = request.message;
-        if message.task_id.is_some() {
-            return Begun::Answered(a2a_error(
-                A2aError::TaskNotFound,
-                "Task not found",
-            ));
-        }
-        if message.role != a2a::Role::User || message.message_id.is_empty() {
-            return Begun::Answered(a2a_error(
-                A2aError::InvalidParams,
-                "Invalid message",
-            ));
-        }
-        let mut texts = Vec::with_capacity(message.parts.len());
-        for part in &message.parts {
-            match &part.content {
-                a2a::PartContent::Text(text) => texts.push(text.as_str()),
-                _ => {
-                    return Begun::Answered(a2a_error(
-                        A2aError::ContentTypeNotSupported,
-                        "Only text parts are supported",
-                    ));
-                }
-            }
-        }
-        let text = texts.join("\n");
-        if text.trim().is_empty() {
-            return Begun::Answered(a2a_error(
-                A2aError::InvalidParams,
-                "The message has no text",
-            ));
-        }
-        if text.chars().count() > character_budget(&self.config, &brand) {
-            return Begun::Answered(a2a_error(
-                A2aError::InvalidParams,
-                "The message is too long",
-            ));
-        }
-
+    ) -> Result<PendingTurn, Answered> {
+        let delegation = headers
+            .get(DELEGATION_HEADER)
+            .map(|value| self.verify_delegation_header(&brand, &caller, value))
+            .transpose()?;
+        let message = check_message(body, character_budget(&self.config, &brand))?;
         let context_id =
-            match self.open_context(&brand, &caller, message.context_id.as_deref()) {
-                Ok(context_id) => context_id,
-                Err(failure) => return Begun::Answered(failure.into_response()),
-            };
-        if let Some(delegation) = &delegation {
-            let bound =
-                self.store().bind_context_user(&context_id, &delegation.claims.sub);
-            match bound {
-                Ok(()) => {}
-                Err(StoreError::Unauthorized) => {
-                    return Begun::Answered(a2a_error(
-                        A2aError::InvalidParams,
-                        "Unknown contextId",
-                    ));
-                }
-                Err(_) => {
-                    return Begun::Answered(
-                        internal("The conversation cannot be stored").into_response(),
-                    );
-                }
-            }
+            self.open_context(&brand, &caller, message.context_id.as_deref())?;
+        if let Some(claims) = &delegation {
+            self.store().bind_context_user(&context_id, &claims.sub).map_err(
+                |error| match error {
+                    StoreError::Unauthorized => {
+                        Failure::A2a(A2aError::InvalidParams, "Unknown contextId")
+                    }
+                    _ => internal(STORE_FAILED),
+                },
+            )?;
         }
-        let reservation = self.store().reserve_message(
-            &context_id,
-            &message.message_id,
-            &text,
-            now(),
-        );
-        match reservation {
-            Ok(Reservation::New) => {}
-            Ok(Reservation::Existing(Some(stored))) => {
-                return Begun::Answered(
-                    serde_json::from_str::<Value>(&stored).map_or_else(
-                        |_| {
-                            a2a_error(
-                                A2aError::Internal,
-                                "The stored reply is unreadable",
-                            )
-                        },
-                        |stored| a2a_json(StatusCode::OK, &stored),
-                    ),
-                );
-            }
-            Ok(Reservation::Existing(None)) => {
-                return Begun::Answered(a2a_error(
-                    A2aError::InvalidParams,
-                    "The message is still being answered",
-                ));
-            }
-            Err(StoreError::NotFound) => {
-                return Begun::Answered(a2a_error(
-                    A2aError::UnsupportedOperation,
-                    "The conversation is closed",
-                ));
-            }
-            Err(_) => {
-                return Begun::Answered(a2a_error(
-                    A2aError::Internal,
-                    "The conversation cannot be stored",
-                ));
-            }
-        }
+        self.reserve(&context_id, &message)?;
 
         let turn = Turn {
             brand: &brand,
@@ -881,34 +819,58 @@ impl Gateway {
             message_id: &message.message_id,
         };
         let delegation = match delegation {
-            Some(delegation)
-                if delegation.claims.scopes().any(|scope| scope == brand.scope_id) =>
-            {
-                delegation
+            Some(claims) if claims.scopes().any(|scope| scope == brand.scope_id) => {
+                claims
             }
             other => {
                 let outcome = self.step_up(&turn, other.as_ref());
-                return Begun::Answered(self.finish_send(&turn, outcome));
+                return Err(Box::new(self.finish_send(&turn, outcome)));
             }
         };
-        let prepared = self.prepare_task(&turn, &text);
-        let (request, key, task, args_hash) = match prepared {
-            Ok(prepared) => prepared,
-            Err(failure) => {
-                return Begun::Answered(self.finish_send(&turn, Err(failure)));
-            }
-        };
-        Begun::Run(Box::new(PendingTurn {
+        let prepared = self
+            .prepare_task(&turn, &message.text)
+            .map_err(|failure| Box::new(self.finish_send(&turn, Err(failure))))?;
+        Ok(PendingTurn {
             brand,
             caller,
             context_id,
             message_id: message.message_id,
             delegation,
-            request,
-            key,
-            task,
-            args_hash,
-        }))
+            prepared,
+        })
+    }
+
+    /// Records the message in its context. A message seen before answers
+    /// with its stored reply.
+    fn reserve(
+        &self,
+        context_id: &str,
+        message: &CheckedMessage,
+    ) -> Result<(), Answered> {
+        let reservation = self.store().reserve_message(
+            context_id,
+            &message.message_id,
+            &message.text,
+            now(),
+        );
+        let failure = match reservation {
+            Ok(Reservation::New) => return Ok(()),
+            Ok(Reservation::Existing(Some(stored))) => {
+                return Err(serde_json::from_str::<Value>(&stored).map_or_else(
+                    |_| Answered::from(internal("The stored reply is unreadable")),
+                    |stored| Box::new(a2a_json(StatusCode::OK, &stored)),
+                ));
+            }
+            Ok(Reservation::Existing(None)) => Failure::A2a(
+                A2aError::InvalidParams,
+                "The message is still being answered",
+            ),
+            Err(StoreError::NotFound) => {
+                Failure::A2a(A2aError::UnsupportedOperation, CONTEXT_CLOSED)
+            }
+            Err(_) => internal(STORE_FAILED),
+        };
+        Err(failure.into())
     }
 
     /// Stores the reply of a turn, or forgets the message when the turn
@@ -926,7 +888,7 @@ impl Gateway {
                     )
                     .is_err()
                 {
-                    return a2a_error(A2aError::Internal, "The reply cannot be stored");
+                    return internal("The reply cannot be stored").into();
                 }
                 a2a_json(StatusCode::OK, &response)
             }
@@ -952,33 +914,28 @@ impl Gateway {
         brand: &Brand,
         caller: &PaIdentity,
         value: &HeaderValue,
-    ) -> Result<Option<Delegation>, Failure> {
-        let token = value.to_str().ok();
-        let Some(token) = token else {
-            return Ok(None);
-        };
-        let Some((scheme, token)) = token.split_once(' ') else {
-            return Ok(None);
-        };
+    ) -> Result<DelegationClaims, Failure> {
+        let (scheme, token) = value
+            .to_str()
+            .ok()
+            .and_then(|token| token.split_once(' '))
+            .ok_or(Failure::InvalidToken)?;
         if !scheme.eq_ignore_ascii_case("bearer") {
-            return Ok(None);
+            return Err(Failure::InvalidToken);
         }
-        let Some(claims) = verify_delegation(
+        let claims = verify_delegation(
             &self.key,
             token.trim(),
             &self.config.oauth_issuer(brand),
             &self.config.interface_url(brand),
-        ) else {
-            return Ok(None);
-        };
-        if claims.client_id != caller.issuer {
-            return Ok(None);
-        }
-        let grant =
-            self.store().grant(&claims.grant_id).map_err(|_| oauth_store_error())?;
-        let Some(grant) = grant else {
-            return Ok(None);
-        };
+        )
+        .filter(|claims| claims.client_id == caller.issuer)
+        .ok_or(Failure::InvalidToken)?;
+        let grant = self
+            .store()
+            .grant(&claims.grant_id)
+            .map_err(|_| oauth_store_error())?
+            .ok_or(Failure::InvalidToken)?;
         let at = now();
         let live = grant_binds(
             &grant,
@@ -988,7 +945,7 @@ impl Gateway {
             GrantBinding::Delegation { brand_user: &claims.sub },
             self.node.has_grant(&grant.grant_id).map_err(|_| oauth_store_error())?,
         );
-        Ok(live.then_some(Delegation { claims }))
+        if live { Ok(claims) } else { Err(Failure::InvalidToken) }
     }
 
     /// The context to answer in: a new one, or the caller's own open one.
@@ -1008,7 +965,7 @@ impl Gateway {
                     &caller.subject,
                     now(),
                 )
-                .map_err(|_| internal("The conversation cannot be stored"))?;
+                .map_err(|_| internal(STORE_FAILED))?;
             return Ok(context_id);
         };
         // §4.2: another owner's context is refused exactly like an unknown
@@ -1016,7 +973,7 @@ impl Gateway {
         let context = self
             .store()
             .context(context_id)
-            .map_err(|_| internal("The conversation cannot be read"))?
+            .map_err(|_| internal(READ_FAILED))?
             .filter(|context| {
                 context.brand_id == brand.id
                     && context.pa_issuer == caller.issuer
@@ -1024,17 +981,18 @@ impl Gateway {
             })
             .ok_or(Failure::A2a(A2aError::InvalidParams, "Unknown contextId"))?;
         if context.closed {
-            return Err(Failure::A2a(
-                A2aError::UnsupportedOperation,
-                "The conversation is closed",
-            ));
+            return Err(Failure::A2a(A2aError::UnsupportedOperation, CONTEXT_CLOSED));
         }
         Ok(context.context_id)
     }
 
     /// §5.5 step-up: a task in `TASK_STATE_AUTH_REQUIRED` with the missing
     /// scope and a new login link. The conversation stays open.
-    fn step_up(&self, turn: &Turn<'_>, delegation: Option<&Delegation>) -> TurnOutcome {
+    fn step_up(
+        &self,
+        turn: &Turn<'_>,
+        delegation: Option<&DelegationClaims>,
+    ) -> TurnOutcome {
         let mut metadata = serde_json::Map::new();
         metadata.insert("pact.missingScopes".to_owned(), json!([turn.brand.scope_id]));
         if let Ok(authorization) = self.create_device_authorization(
@@ -1076,17 +1034,16 @@ impl Gateway {
         Ok((None, task))
     }
 
-    /// The Aether task for one delegated turn: its request, idempotency key,
-    /// task and the hash of its text.
+    /// The Aether task for one delegated turn.
     fn prepare_task(
         &self,
         turn: &Turn<'_>,
         text: &str,
-    ) -> Result<(Request, String, Task, String), Failure> {
+    ) -> Result<PreparedTask, Failure> {
         let transcript = self
             .store()
             .transcript(turn.context_id, turn.message_id, MAX_TRANSCRIPT_TURNS)
-            .map_err(|_| internal("The conversation cannot be read"))?;
+            .map_err(|_| internal(READ_FAILED))?;
         let remote_text =
             prompt(&transcript, text, character_budget(&self.config, turn.brand));
         let args_hash = sha256(&remote_text);
@@ -1110,18 +1067,18 @@ impl Gateway {
             workspace_id: turn.brand.workspace.clone(),
             remote_text,
         };
-        Ok((request, key, task, args_hash))
+        Ok(PreparedTask { request, key, task, args_hash })
     }
 
     /// Runs the task of one delegated turn and waits for its result.
     async fn run_task(&self, pending: &PendingTurn) -> Result<String, Failure> {
         let node = Arc::clone(&self.node);
-        let (request, key, task) =
-            (pending.request.clone(), pending.key.clone(), pending.task.clone());
+        let PreparedTask { request, key, task, .. } = &pending.prepared;
+        let (request, key, task) = (request.clone(), key.clone(), task.clone());
         let admitted =
             tokio::task::spawn_blocking(move || node.admit(&request, &key, &task))
                 .await
-                .map_err(|_| internal("The node stopped"))?;
+                .map_err(|_| internal(NODE_STOPPED))?;
         let task_id = match admitted {
             Ok(task_id) => task_id,
             Err(ProofError::Store(StoreError::Overloaded)) => {
@@ -1137,7 +1094,7 @@ impl Gateway {
         let turn = pending.turn();
         let actions = vec![ReceiptAction {
             tool: format!("aether.{}", turn.brand.capability),
-            args_hash: Some(pending.args_hash.clone()),
+            args_hash: Some(pending.prepared.args_hash.clone()),
         }];
         let receipt = self.receipt(
             &turn,
@@ -1179,7 +1136,7 @@ impl Gateway {
             let id = task_id.to_owned();
             let snapshot = tokio::task::spawn_blocking(move || node.snapshot(&id))
                 .await
-                .map_err(|_| internal("The node stopped"))?
+                .map_err(|_| internal(NODE_STOPPED))?
                 .map_err(|_| internal("The task cannot be read"))?;
             let text = match snapshot {
                 (TaskState::Succeeded, result) => Some(result.unwrap_or_default()),
@@ -1219,13 +1176,13 @@ impl Gateway {
     fn receipt(
         &self,
         turn: &Turn<'_>,
-        delegation: &Delegation,
+        delegation: &DelegationClaims,
         scopes_used: Vec<String>,
         actions: Vec<ReceiptAction>,
     ) -> Result<Value, Failure> {
         let claims = ReceiptClaims {
-            grant_id: delegation.claims.grant_id.clone(),
-            user: delegation.claims.sub.clone(),
+            grant_id: delegation.grant_id.clone(),
+            user: delegation.sub.clone(),
             pa: turn.caller.issuer.clone(),
             brand: self.config.interface_url(turn.brand),
             scopes_used,
@@ -1473,6 +1430,43 @@ pub(crate) fn approved_grant(
         }
         Err(_) => Err(oauth_store_error()),
     }
+}
+
+/// Parses a `message:send` body and checks its message: a new user
+/// message of text parts, neither blank nor longer than `budget`.
+fn check_message(body: &[u8], budget: usize) -> Result<CheckedMessage, Failure> {
+    let request = serde_json::from_slice::<a2a::SendMessageRequest>(body)
+        .map_err(|_| Failure::A2a(A2aError::InvalidParams, "Invalid request"))?;
+    let message = request.message;
+    if message.task_id.is_some() {
+        return Err(Failure::A2a(A2aError::TaskNotFound, "Task not found"));
+    }
+    if message.role != a2a::Role::User || message.message_id.is_empty() {
+        return Err(Failure::A2a(A2aError::InvalidParams, "Invalid message"));
+    }
+    let texts = message
+        .parts
+        .iter()
+        .map(|part| match &part.content {
+            a2a::PartContent::Text(text) => Ok(text.as_str()),
+            _ => Err(Failure::A2a(
+                A2aError::ContentTypeNotSupported,
+                "Only text parts are supported",
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let text = texts.join("\n");
+    if text.trim().is_empty() {
+        return Err(Failure::A2a(A2aError::InvalidParams, "The message has no text"));
+    }
+    if text.chars().count() > budget {
+        return Err(Failure::A2a(A2aError::InvalidParams, "The message is too long"));
+    }
+    Ok(CheckedMessage {
+        message_id: message.message_id,
+        context_id: message.context_id,
+        text,
+    })
 }
 
 /// The characters one turn may send to Codex: the policy's context limit
