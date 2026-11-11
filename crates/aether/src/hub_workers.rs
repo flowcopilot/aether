@@ -63,12 +63,12 @@ where
 /// The local approval of `invite` and whether the owner blocked the
 /// endpoint that it names.
 fn host_inputs(
-    store: &crate::hub_store::HubStore,
+    store: &aether_store::NodeStore,
     invite: &Invite,
 ) -> Result<(Option<HubApproval>, bool), aether_store::StoreError> {
-    let approval = store.approval(&invite.id)?;
+    let approval = store.hub_approval(&invite.id)?;
     let blocked = match invite.receiver_endpoint.as_deref() {
-        Some(endpoint) => store.is_blocked(endpoint)?,
+        Some(endpoint) => store.hub_blocked(endpoint)?,
         None => false,
     };
     Ok((approval, blocked))
@@ -81,7 +81,7 @@ fn host_inputs(
 fn sign_and_pin(
     administration: &SharedAdministration,
     data_dir: &Path,
-    store: &crate::hub_store::HubStore,
+    store: &aether_store::NodeStore,
     own_name: &str,
     approval: &HubApproval,
     friend_name: &str,
@@ -104,7 +104,7 @@ fn sign_and_pin(
         AuditActor::Ui,
     )
     .ok()?;
-    if store.pin_approval(approval, endpoint, &line).is_err() {
+    if store.pin_hub_approval(approval, endpoint, &line).is_err() {
         let _ = administration
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -136,7 +136,7 @@ enum HostSend {
 fn host_send(
     administration: &SharedAdministration,
     ctx: &NodeServeContext,
-    store: &crate::hub_store::HubStore,
+    store: &aether_store::NodeStore,
     invite: &Invite,
     own_name: Option<&str>,
 ) -> Option<HostSend> {
@@ -185,11 +185,11 @@ pub async fn host_worker(
         let administration = administration.clone();
         let ctx = Arc::clone(&ctx);
         async move {
-            let Ok(store) = crate::hub_store::HubStore::open(&ctx.data_dir) else {
+            let Ok(store) = aether_store::NodeStore::in_dir(&ctx.data_dir) else {
                 println!("{}", serde_json::json!({ "event": "hub_store_unavailable" }));
                 return;
             };
-            if store.clear_expired_approvals(now()).is_err() {
+            if store.clear_expired_hub_approvals(now()).is_err() {
                 println!("{}", serde_json::json!({ "event": "hub_store_unavailable" }));
                 return;
             }
@@ -224,12 +224,12 @@ pub async fn caller_worker(ctx: Arc<NodeServeContext>) {
     follow(&Arc::clone(&ctx), move |hub, invites| {
         let ctx = Arc::clone(&ctx);
         async move {
-            let Ok(store) = crate::hub_store::HubStore::open(&ctx.data_dir) else {
+            let Ok(store) = aether_store::NodeStore::in_dir(&ctx.data_dir) else {
                 println!("{}", serde_json::json!({ "event": "hub_store_unavailable" }));
                 return;
             };
             for invite in invites {
-                let Ok(approval) = store.approval(&invite.id) else {
+                let Ok(approval) = store.hub_approval(&invite.id) else {
                     continue;
                 };
                 match caller_step(&invite, approval.as_ref()) {
@@ -250,7 +250,7 @@ pub async fn caller_worker(ctx: Arc<NodeServeContext>) {
                         log_reason("hub_invite_refused", &invite, reason);
                     }
                 }
-                let _ = store.remove_approval(&invite.id);
+                let _ = store.remove_hub_approval(&invite.id);
                 if hub.remove(&invite.id).await.is_err() {
                     log("hub_invite_failed", &invite);
                 }
@@ -308,8 +308,7 @@ mod tests {
         let administration = shared_in(data_dir);
         let node = Arc::new(FakeNode::default().with_workspace("/start"));
         administration.lock().expect("administration must lock").set_live(node);
-        let store =
-            crate::hub_store::HubStore::open(data_dir).expect("store must open");
+        let store = aether_store::NodeStore::in_dir(data_dir).expect("store must open");
         let group = crate::access_groups::REQUESTS_GROUP;
         // This approval was never kept, so no line can be pinned to it.
         let approval = crate::hub_membership::new_approval(

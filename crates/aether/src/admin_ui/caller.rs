@@ -440,7 +440,7 @@ async fn confirm(
         return Err("Choose 1 to 30 days.");
     }
     let now = aether_core::time::now();
-    let store = crate::hub_store::HubStore::open(data_dir)
+    let store = aether_store::NodeStore::in_dir(data_dir)
         .map_err(|_| "The requests are unavailable.")?;
     let draft = store
         .access_request_draft(id)
@@ -471,7 +471,7 @@ async fn confirm(
             now,
         )
     };
-    if store.put_approval(&approval).is_err() {
+    if store.put_hub_approval(&approval).is_err() {
         let _ = hub.remove(&invite.id).await;
         return Err("This node cannot keep the request. Try again.");
     }
