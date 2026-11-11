@@ -19,6 +19,9 @@ defmodule AetherHub.Notify do
     flush()
   end
 
+  @doc "Whether a request of `endpoint` waits for a wake-up now."
+  def waiting?(endpoint), do: Registry.lookup(@registry, endpoint) != []
+
   @doc "Blocks until a wake-up arrives or `timeout_ms` passes."
   def await(timeout_ms) do
     receive do

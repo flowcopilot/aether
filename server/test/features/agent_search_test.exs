@@ -1,12 +1,10 @@
 defmodule AetherHub.Features.AgentSearchTest do
   use AetherHub.Feature, file: "agent-search.feature", async: true
 
-  alias AetherHub.{Clock, Contract}
+  alias AetherHub.Contract
 
   # The scenario's own word. Every listing and every search in a scenario has it.
   defp word(state), do: state[:word] || unique_name()
-
-  defp search(asker, query), do: http_get(asker, "/v1/agents", query)
 
   defp searcher(_state, "a person"), do: claimed_node()
   defp searcher(state, name), do: actor(state, name)
@@ -52,20 +50,20 @@ defmodule AetherHub.Features.AgentSearchTest do
 
   defstep ~r/^(?<who>.+?) searches for "(?<words>.*)"$/, %{who: who, words: words}, state do
     query = "q=#{word(state)}+#{URI.encode_www_form(words)}"
-    {:ok, %{found: found(search(searcher(state, who), query))}}
+    {:ok, %{found: found(search_agents(searcher(state, who), query))}}
   end
 
   defstep ~r/^(?<who>.+?) searches for all of them$/, %{who: who}, state do
-    {:ok, %{found: found(search(searcher(state, who), "q=#{word(state)}"))}}
+    {:ok, %{found: found(search_agents(searcher(state, who), "q=#{word(state)}"))}}
   end
 
   defstep ~r/^a person sends the search query "(?<query>[^"]+)"$/, %{query: query}, state do
     query = String.replace(query, "{word}", word(state))
-    {:ok, %{found: found(search(claimed_node(), query))}}
+    {:ok, %{found: found(search_agents(claimed_node(), query))}}
   end
 
   defstep ~r/^a person searches with (?<search>.+)$/, %{search: search}, _state do
-    {:ok, %{conn: search(claimed_node(), raw_query(search))}}
+    {:ok, %{conn: search_agents(claimed_node(), raw_query(search))}}
   end
 
   defstep ~r/^the search finds (?<result>nothing|\d+ agents|\w+(?:, \w+)*)$/,
@@ -141,13 +139,12 @@ defmodule AetherHub.Features.AgentSearchTest do
   end
 
   defstep ~r/^the person searches 30 times$/, _, %{asker: asker} do
-    {_limit, seconds} = AetherHub.RateLimit.limit(:search)
-    Clock.set(div(Clock.now(), seconds) * seconds)
-    {:ok, %{statuses: for(_ <- 1..30, do: search(asker, "q=law").status)}}
+    start_of_window(:search)
+    {:ok, %{statuses: for(_ <- 1..30, do: search_agents(asker, "q=law").status)}}
   end
 
   defstep ~r/^the person searches once more$/, _, %{asker: asker} do
-    {:ok, %{conn: search(asker, "q=law")}}
+    {:ok, %{conn: search_agents(asker, "q=law")}}
   end
 
   defstep ~r/^the person searches for people$/, _, %{asker: asker} do

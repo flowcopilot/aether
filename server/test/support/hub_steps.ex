@@ -134,8 +134,14 @@ defmodule AetherHub.HubSteps do
     assert invites(actor(state, who))["invites"] == []
   end
 
-  @doc "The invite list of `node`, decoded."
-  def invites(node), do: json(request(node, "GET", "/v1/invites"))
+  @doc "The invite list of `node`, decoded, with an optional query map or string."
+  def invites(node, query \\ nil), do: json(http_get(node, "/v1/invites", query))
+
+  @doc "A search of the listed service agents: `GET /v1/agents` with `query`."
+  def search_agents(node, query), do: http_get(node, "/v1/agents", query)
+
+  @doc "A search of the people: `GET /v1/people` with `query`."
+  def search_people(node, query), do: http_get(node, "/v1/people", query)
 
   @doc "GET `path` with an optional query map or string."
   def http_get(node, path, query \\ nil), do: AetherHub.HubRequests.get(node, path, query)
@@ -225,9 +231,22 @@ defmodule AetherHub.HubSteps do
   end
 
   defstep ~r/^it is the start of an? (?<unit>minute|hour|day)$/, %{unit: unit}, _state do
-    seconds = @units[unit]
-    Clock.set(div(System.system_time(:second), seconds) * seconds)
+    Clock.set(nil)
+    start_of(@units[unit])
   end
+
+  @doc """
+  Sets the clock of this process to the start of the current window of the
+  rate-limit `bucket`, so the steps that follow fall in one window. Returns
+  the limit of the bucket.
+  """
+  def start_of_window(bucket) do
+    {limit, seconds} = AetherHub.RateLimit.limit(bucket)
+    start_of(seconds)
+    limit
+  end
+
+  defp start_of(seconds), do: Clock.set(div(Clock.now(), seconds) * seconds)
 
   @doc "Runs `fun` at the Unix time `time` in this process, then returns to the time before."
   def at(time, fun) do

@@ -1,6 +1,7 @@
 defmodule AetherHub.Versions do
   @moduledoc """
-  The version counter of each account. A write bumps the versions of the
+  The version counter of each account. A write that changes what an
+  endpoint sees runs through `commit/1`: it bumps the versions of the
   endpoints that it touched in its transaction, and wakes their long polls
   after the commit.
   """
@@ -12,24 +13,35 @@ defmodule AetherHub.Versions do
   def current(endpoint),
     do: Repo.one(from a in Account, where: a.endpoint == ^endpoint, select: a.version)
 
-  def bump([]), do: :ok
+  @doc """
+  Runs `fun` in a transaction. `fun` returns `{value, touched}`: the
+  versions of the endpoints in `touched` go up in the same transaction, and
+  their long polls wake after the commit. `{:ok, value}`, or `:ok` when
+  `value` is `:ok`; `{:error, reason}` after `Repo.rollback(reason)`.
+  """
+  def commit(fun) do
+    Repo.atomic(fn ->
+      {value, touched} = fun.()
+      bump(touched)
+      {value, touched}
+    end)
+    |> case do
+      {:ok, {value, touched}} ->
+        Notify.changed(touched)
+        if value == :ok, do: :ok, else: {:ok, value}
 
-  def bump(endpoints) do
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  defp bump([]), do: :ok
+
+  defp bump(endpoints) do
     Repo.update_all(from(a in Account, where: a.endpoint in ^Enum.uniq(endpoints)),
       inc: [version: 1]
     )
 
     :ok
   end
-
-  @doc """
-  Wakes the endpoints of a transaction result `{:ok, {value, touched}}` and
-  returns `{:ok, value}`. An error passes through.
-  """
-  def notify({:ok, {value, touched}}) do
-    Notify.changed(touched)
-    {:ok, value}
-  end
-
-  def notify({:error, _} = error), do: error
 end

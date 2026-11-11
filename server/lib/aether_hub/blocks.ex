@@ -13,7 +13,7 @@ defmodule AetherHub.Blocks do
 
   @max AetherHub.Protocol.limit(:max_blocks)
 
-  def blocked?(owner, other) do
+  defp blocked?(owner, other) do
     Repo.exists?(
       from b in Block, where: b.owner_endpoint == ^owner and b.blocked_endpoint == ^other
     )

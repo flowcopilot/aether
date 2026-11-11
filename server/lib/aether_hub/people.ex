@@ -10,7 +10,7 @@ defmodule AetherHub.People do
 
   import Ecto.Query
 
-  alias AetherHub.{Account, Contacts, Params, Presence, Protocol, Repo}
+  alias AetherHub.{Account, Contacts, Names, Params, Presence, Protocol, Repo}
 
   # Every character of the name alphabet sorts before "{", so the names that
   # start with `q` are the range from `q` up to `q <> "{"`.
@@ -24,7 +24,9 @@ defmodule AetherHub.People do
   def lookup(%Account{endpoint: asker}, name, number) do
     case Repo.one(
            from a in Account,
-             where: a.name == ^name and a.number == ^number and a.kind == ^@personal
+             as: :account,
+             where: ^Names.named(name, number),
+             where: a.kind == ^@personal
          ) do
       nil -> {:error, :not_found}
       account -> {:ok, row(account, Contacts.known(asker, [account.endpoint]))}
