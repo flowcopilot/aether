@@ -187,15 +187,6 @@ pub(crate) const fn default_sandbox() -> PolicySandbox {
     PolicySandbox::TaskFolder
 }
 
-impl PolicySandbox {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::TaskFolder => "task-folder",
-            Self::WorkspaceWrite => "workspace-write",
-        }
-    }
-}
-
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ScopeFile {

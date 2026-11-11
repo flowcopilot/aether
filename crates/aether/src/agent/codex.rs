@@ -26,21 +26,28 @@ use crate::{
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct CodexLimits {
-    pub sandbox: String,
-    pub approval: String,
+    pub sandbox: CodexSandbox,
     pub allow_network: bool,
     pub environment: BTreeMap<String, String>,
 }
 
+/// Where a task's Codex may write.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum CodexSandbox {
+    /// Each task runs in a new empty folder under the turn's workspace,
+    /// removed when the task ends. Codex can read and write only that folder
+    /// and the system files that a command needs.
+    TaskFolder,
+    /// Codex can write the turn's workspace.
+    WorkspaceWrite,
+}
+
+/// Codex's approval policy for a task: it never asks, because no person
+/// reads a remote task. An approval request that comes anyway is declined.
+const APPROVAL_POLICY: &str = "never";
+
 /// The most environment variables a spawned Codex process may receive.
 pub(crate) const MAX_ENVIRONMENT: usize = 16;
-
-/// The sandbox value of an ephemeral session.
-///
-/// Each task runs in a new empty folder under `CodexLimits::workspace`,
-/// removed when the task ends. Codex can read and write only that folder and
-/// the system files that a command needs.
-pub const TASK_FOLDER: &str = "task-folder";
 
 /// The name of the Codex permission profile of a task folder.
 const TASK_PROFILE: &str = "aether-task";
@@ -56,21 +63,26 @@ pub(crate) const RESERVED_ENVIRONMENT: &[&str] = &[
     "TMPDIR",
 ];
 
+/// The variables a task folder sets in the spawned environment.
+const TASK_FOLDER_ENVIRONMENT: [&str; 2] = ["TMPDIR", "HOME"];
+
 const fn reserved_slots(task_folder: bool) -> usize {
     if task_folder { 3 } else { 2 }
 }
 
-fn codex_limits_are_valid(limits: &CodexLimits) -> bool {
-    spawn_environment_valid(&limits.environment)
-        && matches!(
-            limits.sandbox.as_str(),
-            "read-only" | "workspace-write" | TASK_FOLDER
-        )
-        && matches!(limits.approval.as_str(), "untrusted" | "on-request" | "never")
-}
-
-fn spawn_environment_valid(environment: &BTreeMap<String, String>) -> bool {
-    environment.len() <= MAX_ENVIRONMENT
+/// Whether the environment that `spawn_environment` makes from `limits`
+/// fits `MAX_ENVIRONMENT` and holds only valid names and values.
+fn spawn_environment_valid(limits: &CodexLimits) -> bool {
+    let environment = &limits.environment;
+    let added = if limits.sandbox == CodexSandbox::TaskFolder {
+        TASK_FOLDER_ENVIRONMENT
+            .iter()
+            .filter(|name| !environment.contains_key(**name))
+            .count()
+    } else {
+        0
+    };
+    environment.len().saturating_add(added) <= MAX_ENVIRONMENT
         && environment.iter().all(|(key, value)| {
             valid_environment_key(key) && valid_environment_value(value)
         })
@@ -88,11 +100,7 @@ pub(crate) fn build_node_environment(
         let path = path.to_str().ok_or(PolicyError::Invalid)?;
         environment.insert(name.to_owned(), path.to_owned());
     }
-    if spawn_environment_valid(&environment) {
-        Ok(environment)
-    } else {
-        Err(PolicyError::InvalidField("environmentAllowlist".to_owned()))
-    }
+    Ok(environment)
 }
 
 fn allowed_environment(
@@ -121,27 +129,23 @@ fn allowed_environment(
         .collect()
 }
 
+/// The environment of a spawned Codex: the node's, with the task folder's
+/// own temporary and home folders. `CodexAppServer::new` checked its size.
 fn spawn_environment(
     base: &BTreeMap<String, String>,
     task_folder: Option<&TaskFolder>,
-) -> Result<BTreeMap<String, String>, ExecutionError> {
+) -> BTreeMap<String, String> {
     let mut environment = base.clone();
     if let Some(folder) = task_folder {
+        let [tmpdir, home] = TASK_FOLDER_ENVIRONMENT;
         environment
-            .insert("TMPDIR".to_owned(), folder.0.join("tmp").display().to_string());
+            .insert(tmpdir.to_owned(), folder.0.join("tmp").display().to_string());
         environment.insert(
-            "HOME".to_owned(),
+            home.to_owned(),
             folder.0.join("tmp").join("home").display().to_string(),
         );
     }
-    if environment.len() > MAX_ENVIRONMENT
-        || !environment.iter().all(|(key, value)| {
-            valid_environment_key(key) && valid_environment_value(value)
-        })
-    {
-        return Err(ExecutionError::Limits);
-    }
-    Ok(environment)
+    environment
 }
 
 #[derive(Clone)]
@@ -199,15 +203,31 @@ fn app_server_arguments() -> Vec<String> {
 }
 
 impl CodexAppServer {
-    #[must_use]
-    pub fn new(binary: PathBuf, limits: CodexLimits) -> Self {
-        Self {
+    /// A Codex adapter that runs `binary` within `limits`.
+    ///
+    /// # Errors
+    ///
+    /// `ExecutionError::Limits` when the environment that a task would get
+    /// is too large or holds an invalid name or value.
+    pub fn new(binary: PathBuf, limits: CodexLimits) -> Result<Self, ExecutionError> {
+        Self::with_arguments(binary, app_server_arguments(), limits)
+    }
+
+    fn with_arguments(
+        binary: PathBuf,
+        arguments: Vec<String>,
+        limits: CodexLimits,
+    ) -> Result<Self, ExecutionError> {
+        if !spawn_environment_valid(&limits) {
+            return Err(ExecutionError::Limits);
+        }
+        Ok(Self {
             source: resolve_binary(&binary).ok(),
             binary,
-            arguments: app_server_arguments(),
+            arguments,
             limits,
             active_turns: Arc::new(Mutex::new(BTreeMap::new())),
-        }
+        })
     }
 
     /// The Codex binary in `folder`. When the file found at start is gone
@@ -230,9 +250,6 @@ impl CodexAppServer {
         workspace: &Path,
         instruction: &str,
     ) -> Result<String, ExecutionError> {
-        if !codex_limits_are_valid(&self.limits) {
-            return Err(ExecutionError::Limits);
-        }
         let response = session.request(
             "thread/start",
             &thread_start_params(&self.limits, workspace, instruction),
@@ -302,16 +319,16 @@ fn thread_start_params(
 ) -> Value {
     let mut params = json!({
         "cwd": workspace,
-        "approvalPolicy": limits.approval,
+        "approvalPolicy": APPROVAL_POLICY,
         "developerInstructions": agent_instructions(instruction),
         "ephemeral": true,
     });
     // A task folder's sandbox is the permission profile given at start; a
     // `sandbox` here would replace it.
-    if limits.sandbox != TASK_FOLDER
+    if limits.sandbox == CodexSandbox::WorkspaceWrite
         && let Some(params) = params.as_object_mut()
     {
-        params.insert("sandbox".to_owned(), json!(limits.sandbox));
+        params.insert("sandbox".to_owned(), json!("workspace-write"));
     }
     params
 }
@@ -325,14 +342,23 @@ fn turn_start_params(
     let mut params = json!({
         "threadId": thread_id,
         "input": [{"type": "text", "text": remote_text, "text_elements": []}],
-        "approvalPolicy": limits.approval,
+        "approvalPolicy": APPROVAL_POLICY,
         "cwd": workspace,
         "turnTrigger": "aether",
     });
-    if limits.sandbox != TASK_FOLDER
+    if limits.sandbox == CodexSandbox::WorkspaceWrite
         && let Some(params) = params.as_object_mut()
     {
-        params.insert("sandboxPolicy".to_owned(), sandbox_policy(limits, workspace));
+        params.insert(
+            "sandboxPolicy".to_owned(),
+            json!({
+                "type": "workspaceWrite",
+                "writableRoots": [workspace],
+                "networkAccess": limits.allow_network,
+                "excludeTmpdirEnvVar": true,
+                "excludeSlashTmp": true,
+            }),
+        );
     }
     params
 }
@@ -465,14 +491,11 @@ impl Agent for CodexAppServer {
         ctx: &TurnContext,
         events: &mut dyn FnMut(ExecutionEvent),
     ) -> Result<String, ExecutionError> {
-        if !codex_limits_are_valid(&self.limits) {
-            return Err(ExecutionError::Limits);
-        }
         let timeout = ctx
             .deadline
             .checked_duration_since(Instant::now())
             .ok_or(ExecutionError::Timeout)?;
-        let task_folder = if self.limits.sandbox == TASK_FOLDER {
+        let task_folder = if self.limits.sandbox == CodexSandbox::TaskFolder {
             Some(TaskFolder::create(&ctx.workspace, &ctx.task_id)?)
         } else {
             None
@@ -489,13 +512,13 @@ impl Agent for CodexAppServer {
                 (
                     self.task_binary(folder)?,
                     arguments,
-                    spawn_environment(&self.limits.environment, Some(folder))?,
+                    spawn_environment(&self.limits.environment, Some(folder)),
                 )
             }
             None => (
                 self.binary.clone(),
                 self.arguments.clone(),
-                spawn_environment(&self.limits.environment, None)?,
+                spawn_environment(&self.limits.environment, None),
             ),
         };
         let session =
@@ -521,23 +544,6 @@ impl Agent for CodexAppServer {
     }
 }
 
-#[cfg(test)]
-impl CodexAppServer {
-    fn with_arguments(
-        binary: PathBuf,
-        arguments: Vec<String>,
-        limits: CodexLimits,
-    ) -> Self {
-        Self {
-            source: resolve_binary(&binary).ok(),
-            binary,
-            arguments,
-            limits,
-            active_turns: Arc::new(Mutex::new(BTreeMap::new())),
-        }
-    }
-}
-
 pub(crate) fn valid_environment_value(value: &str) -> bool {
     !value.contains('\0')
 }
@@ -547,23 +553,6 @@ pub(crate) fn valid_environment_key(key: &str) -> bool {
     matches!(bytes.next(), Some(b'A'..=b'Z' | b'a'..=b'z' | b'_'))
         && bytes
             .all(|byte| matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_'))
-}
-
-fn sandbox_policy(limits: &CodexLimits, workspace: &Path) -> Value {
-    match limits.sandbox.as_str() {
-        "read-only" => json!({
-            "type": "readOnly",
-            "networkAccess": limits.allow_network,
-        }),
-        "workspace-write" => json!({
-            "type": "workspaceWrite",
-            "writableRoots": [workspace],
-            "networkAccess": limits.allow_network,
-            "excludeTmpdirEnvVar": true,
-            "excludeSlashTmp": true,
-        }),
-        _ => Value::Null,
-    }
 }
 
 struct AppServerSession {
@@ -811,7 +800,7 @@ impl Drop for AppServerSession {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppServerSession, CodexAppServer, CodexLimits, TASK_FOLDER, TaskFolder,
+        AppServerSession, CodexAppServer, CodexLimits, CodexSandbox, TaskFolder,
         app_server_arguments, initialize_params, thread_start_params,
         turn_start_params,
     };
@@ -892,8 +881,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("directory must create");
         let workspace = directory.path().to_path_buf();
         let limits = CodexLimits {
-            sandbox: "workspace-write".to_owned(),
-            approval: "never".to_owned(),
+            sandbox: CodexSandbox::WorkspaceWrite,
             allow_network: false,
             environment: BTreeMap::new(),
         };
@@ -921,8 +909,7 @@ mod tests {
     fn the_general_skill_asks_for_the_sent_task_and_keeps_the_setup_private() {
         let directory = tempfile::tempdir().expect("directory must create");
         let limits = CodexLimits {
-            sandbox: TASK_FOLDER.to_owned(),
-            approval: "never".to_owned(),
+            sandbox: CodexSandbox::TaskFolder,
             allow_network: false,
             environment: BTreeMap::new(),
         };
@@ -950,8 +937,7 @@ mod tests {
         let expected_cwd =
             workspace.path().canonicalize().expect("workspace must canonicalize");
         let limits = CodexLimits {
-            sandbox: "workspace-write".to_owned(),
-            approval: "never".to_owned(),
+            sandbox: CodexSandbox::WorkspaceWrite,
             allow_network: false,
             environment: BTreeMap::new(),
         };
@@ -983,7 +969,8 @@ done
             PathBuf::from("sh"),
             vec!["-c".to_owned(), script],
             limits,
-        );
+        )
+        .expect("limits must be valid");
         assert_eq!(
             server.start_turn(&turn_ctx(
                 &expected_cwd,
@@ -1001,8 +988,7 @@ done
     fn app_server_runs_one_thread_and_turn() {
         let directory = tempfile::tempdir().expect("directory must create");
         let limits = CodexLimits {
-            sandbox: "workspace-write".to_owned(),
-            approval: "never".to_owned(),
+            sandbox: CodexSandbox::WorkspaceWrite,
             allow_network: false,
             environment: BTreeMap::from([(
                 "AETHER_ALLOWED".to_owned(),
@@ -1027,7 +1013,8 @@ done
             PathBuf::from("sh"),
             vec!["-c".to_owned(), script.to_owned()],
             limits,
-        );
+        )
+        .expect("limits must be valid");
         let mut events = Vec::new();
         assert_eq!(
             server.start_turn_with_events(
@@ -1044,8 +1031,7 @@ done
     fn app_server_returns_only_the_final_answer_not_the_commentary() {
         let directory = tempfile::tempdir().expect("directory must create");
         let limits = CodexLimits {
-            sandbox: "workspace-write".to_owned(),
-            approval: "never".to_owned(),
+            sandbox: CodexSandbox::WorkspaceWrite,
             allow_network: false,
             environment: BTreeMap::new(),
         };
@@ -1072,7 +1058,8 @@ done
             PathBuf::from("sh"),
             vec!["-c".to_owned(), script.to_owned()],
             limits,
-        );
+        )
+        .expect("limits must be valid");
         assert_eq!(
             server.start_turn(&turn_ctx(
                 directory.path(),
@@ -1140,8 +1127,7 @@ done
     fn app_server_interrupts_an_active_turn() {
         let directory = tempfile::tempdir().expect("directory must create");
         let limits = CodexLimits {
-            sandbox: "workspace-write".to_owned(),
-            approval: "never".to_owned(),
+            sandbox: CodexSandbox::WorkspaceWrite,
             allow_network: false,
             environment: BTreeMap::new(),
         };
@@ -1171,7 +1157,8 @@ done
             PathBuf::from("sh"),
             vec!["-c".to_owned(), script.to_owned()],
             limits,
-        );
+        )
+        .expect("limits must be valid");
         let mut running = server.clone();
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let turn = std::thread::spawn(move || {
@@ -1199,8 +1186,7 @@ done
     fn app_server_time_limit_covers_the_full_turn() {
         let directory = tempfile::tempdir().expect("directory must create");
         let limits = CodexLimits {
-            sandbox: "workspace-write".to_owned(),
-            approval: "never".to_owned(),
+            sandbox: CodexSandbox::WorkspaceWrite,
             allow_network: false,
             environment: BTreeMap::from([(
                 "PATH".to_owned(),
@@ -1226,7 +1212,8 @@ done
             PathBuf::from("sh"),
             vec!["-c".to_owned(), script.to_owned()],
             limits,
-        );
+        )
+        .expect("limits must be valid");
         assert_eq!(
             server.start_turn(&turn_ctx(
                 directory.path(),
@@ -1244,8 +1231,7 @@ done
     fn app_server_denies_and_reports_approval_requests() {
         let directory = tempfile::tempdir().expect("directory must create");
         let limits = CodexLimits {
-            sandbox: "workspace-write".to_owned(),
-            approval: "on-request".to_owned(),
+            sandbox: CodexSandbox::WorkspaceWrite,
             allow_network: false,
             environment: BTreeMap::new(),
         };
@@ -1271,7 +1257,8 @@ done
             PathBuf::from("sh"),
             vec!["-c".to_owned(), script.to_owned()],
             limits,
-        );
+        )
+        .expect("limits must be valid");
         let mut events = Vec::new();
         assert_eq!(
             server.start_turn_with_events(
@@ -1290,8 +1277,7 @@ done
     fn app_server_declines_an_mcp_elicitation_request() {
         let directory = tempfile::tempdir().expect("directory must create");
         let limits = CodexLimits {
-            sandbox: "workspace-write".to_owned(),
-            approval: "never".to_owned(),
+            sandbox: CodexSandbox::WorkspaceWrite,
             allow_network: false,
             environment: BTreeMap::new(),
         };
@@ -1317,7 +1303,8 @@ done
             PathBuf::from("sh"),
             vec!["-c".to_owned(), script.to_owned()],
             limits,
-        );
+        )
+        .expect("limits must be valid");
         let mut events = Vec::new();
         assert_eq!(
             server.start_turn_with_events(
@@ -1334,27 +1321,41 @@ done
 
     #[test]
     fn invalid_environment_rejects_the_app_server_before_start() {
-        let directory = tempfile::tempdir().expect("directory must create");
         let limits = CodexLimits {
-            sandbox: "read-only".to_owned(),
-            approval: "never".to_owned(),
+            sandbox: CodexSandbox::WorkspaceWrite,
             allow_network: false,
             environment: BTreeMap::from([(
                 "INVALID-NAME".to_owned(),
                 "value".to_owned(),
             )]),
         };
-        let mut server =
-            CodexAppServer::new(PathBuf::from("not-a-codex-binary"), limits);
         assert_eq!(
-            server.start_turn(&turn_ctx(
-                directory.path(),
-                "task",
-                "review",
-                "untrusted",
-                30
-            )),
-            Err(ExecutionError::Limits)
+            CodexAppServer::new(PathBuf::from("not-a-codex-binary"), limits).err(),
+            Some(ExecutionError::Limits)
+        );
+    }
+
+    #[test]
+    fn the_task_folder_variables_count_toward_the_environment_limit() {
+        let full = |sandbox| CodexLimits {
+            sandbox,
+            allow_network: false,
+            environment: (0..super::MAX_ENVIRONMENT.saturating_sub(1))
+                .map(|index| (format!("NAME_{index}"), String::new()))
+                .collect(),
+        };
+        assert!(
+            CodexAppServer::new(
+                PathBuf::from("sh"),
+                full(CodexSandbox::WorkspaceWrite)
+            )
+            .is_ok()
+        );
+        // A task folder adds TMPDIR and HOME.
+        assert_eq!(
+            CodexAppServer::new(PathBuf::from("sh"), full(CodexSandbox::TaskFolder))
+                .err(),
+            Some(ExecutionError::Limits)
         );
     }
 
@@ -1449,8 +1450,7 @@ done
         let quoted = forbidden.replace('\'', "'\\''");
         let directory = tempfile::tempdir().expect("workspace must create");
         let limits = CodexLimits {
-            sandbox: TASK_FOLDER.to_owned(),
-            approval: "never".to_owned(),
+            sandbox: CodexSandbox::TaskFolder,
             allow_network: false,
             environment: ["HOME", "PATH", "CODEX_HOME"]
                 .into_iter()
@@ -1459,7 +1459,8 @@ done
                 })
                 .collect(),
         };
-        let mut server = CodexAppServer::new(PathBuf::from("codex"), limits);
+        let mut server = CodexAppServer::new(PathBuf::from("codex"), limits)
+            .expect("limits must be valid");
         let answer = server
             .start_turn(&turn_ctx(
                 directory.path(),
