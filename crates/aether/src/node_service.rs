@@ -441,7 +441,12 @@ mod tests {
     struct Fake;
 
     impl Agent for Fake {
-        fn start_turn(&mut self, ctx: &TurnContext) -> Result<String, ExecutionError> {
+        fn start_turn_with_events(
+            &mut self,
+            ctx: &TurnContext,
+            events: &mut dyn FnMut(crate::execution::ExecutionEvent),
+        ) -> Result<String, ExecutionError> {
+            events(crate::execution::ExecutionEvent::Completed);
             Ok(format!("{}:{}", ctx.skill, ctx.text))
         }
 
@@ -735,10 +740,6 @@ mod tests {
     struct ManyProgressEvents;
 
     impl Agent for ManyProgressEvents {
-        fn start_turn(&mut self, ctx: &TurnContext) -> Result<String, ExecutionError> {
-            Ok(format!("{}:{}", ctx.skill, ctx.text))
-        }
-
         fn start_turn_with_events(
             &mut self,
             ctx: &TurnContext,

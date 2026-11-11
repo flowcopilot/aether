@@ -5,8 +5,8 @@
 //! and the transcript that the tests replay are in `protocol/agent-socket/`.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    io::{self, BufRead, BufReader, Read, Write},
+    collections::BTreeMap,
+    io::{self, BufRead, BufReader, Read},
     net::Shutdown,
     os::unix::{
         fs::{FileTypeExt, PermissionsExt},
@@ -24,6 +24,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use super::{EarlyCancels, write_json_line};
 use crate::execution::{
     Agent, ExecutionError, ExecutionEvent, TurnContext, agent_instructions,
 };
@@ -42,7 +43,7 @@ pub struct ConnectedAgent {
 struct Shared {
     connection: Mutex<Option<Connection>>,
     generation: AtomicU64,
-    early_cancels: Mutex<BTreeSet<String>>,
+    cancels: Mutex<EarlyCancels>,
 }
 
 type Writer = Arc<Mutex<UnixStream>>;
@@ -102,7 +103,7 @@ impl ConnectedAgent {
             shared: Arc::new(Shared {
                 connection: Mutex::new(None),
                 generation: AtomicU64::new(0),
-                early_cancels: Mutex::new(BTreeSet::new()),
+                cancels: Mutex::new(EarlyCancels::default()),
             }),
         };
         let shared = Arc::clone(&agent.shared);
@@ -177,7 +178,7 @@ impl Shared {
         if let Some(replaced) = replaced {
             if let Ok(pending) = replaced.pending.lock() {
                 for (task_id, sender) in pending.iter() {
-                    let _ = write_line(
+                    let _ = write_json_line(
                         &replaced.writer,
                         &NodeMessage::Cancel { id: task_id.as_str() },
                     );
@@ -226,48 +227,35 @@ fn read_message(reader: &mut impl BufRead) -> Option<AgentMessage> {
     }
 }
 
-fn write_line(
-    writer: &Mutex<UnixStream>,
-    message: &NodeMessage<'_>,
-) -> Result<(), ExecutionError> {
-    let mut writer = writer.lock().map_err(|_| ExecutionError::Unavailable)?;
-    let mut line = serde_json::to_vec(message).map_err(|_| ExecutionError::Protocol)?;
-    line.push(b'\n');
-    writer.write_all(&line).map_err(|_| ExecutionError::Unavailable)?;
-    writer.flush().map_err(|_| ExecutionError::Unavailable)
-}
-
-impl Agent for ConnectedAgent {
-    fn start_turn(&mut self, ctx: &TurnContext) -> Result<String, ExecutionError> {
-        self.start_turn_with_events(ctx, &mut |_| {})
-    }
-
-    fn start_turn_with_events(
-        &mut self,
+impl ConnectedAgent {
+    fn run_turn(
+        &self,
         ctx: &TurnContext,
         events: &mut dyn FnMut(ExecutionEvent),
     ) -> Result<String, ExecutionError> {
-        if self
-            .shared
-            .early_cancels
-            .lock()
-            .map_err(|_| ExecutionError::Unavailable)?
-            .remove(&ctx.task_id)
-        {
-            return Err(ExecutionError::Cancelled);
-        }
-        let (writer, pending) = self.connection()?;
-        let (sender, receiver) = mpsc::channel();
-        {
-            let mut pending =
-                pending.lock().map_err(|_| ExecutionError::Unavailable)?;
-            if pending.contains_key(&ctx.task_id) {
-                return Err(ExecutionError::Protocol);
+        let (writer, pending, receiver) = {
+            // Held until the turn is pending, so that a cancel either finds
+            // it pending or is kept for this check.
+            let mut cancels =
+                self.shared.cancels.lock().map_err(|_| ExecutionError::Unavailable)?;
+            if cancels.take(&ctx.task_id) {
+                return Err(ExecutionError::Cancelled);
             }
-            pending.insert(ctx.task_id.clone(), sender);
-        }
+            let (writer, pending) = self.connection()?;
+            let (sender, receiver) = mpsc::channel();
+            {
+                let mut pending =
+                    pending.lock().map_err(|_| ExecutionError::Unavailable)?;
+                if pending.contains_key(&ctx.task_id) {
+                    return Err(ExecutionError::Protocol);
+                }
+                pending.insert(ctx.task_id.clone(), sender);
+            }
+            drop(cancels);
+            (writer, pending, receiver)
+        };
         let result = (|| {
-            write_line(
+            write_json_line(
                 &writer,
                 &NodeMessage::Task {
                     id: &ctx.task_id,
@@ -301,25 +289,35 @@ impl Agent for ConnectedAgent {
             pending.remove(&ctx.task_id);
         }
         if result == Err(ExecutionError::Timeout) {
-            write_line(&writer, &NodeMessage::Cancel { id: &ctx.task_id })?;
+            write_json_line(&writer, &NodeMessage::Cancel { id: &ctx.task_id })?;
+        }
+        result
+    }
+}
+
+impl Agent for ConnectedAgent {
+    fn start_turn_with_events(
+        &mut self,
+        ctx: &TurnContext,
+        events: &mut dyn FnMut(ExecutionEvent),
+    ) -> Result<String, ExecutionError> {
+        let result = self.run_turn(ctx, events);
+        if let Ok(mut cancels) = self.shared.cancels.lock() {
+            cancels.end(&ctx.task_id);
         }
         result
     }
 
     fn cancel(&self, task_id: &str) {
+        let Ok(mut cancels) = self.shared.cancels.lock() else { return };
         if let Ok((writer, pending)) = self.connection()
             && pending.lock().is_ok_and(|pending| pending.contains_key(task_id))
         {
-            let _ = write_line(&writer, &NodeMessage::Cancel { id: task_id });
+            drop(cancels);
+            let _ = write_json_line(&writer, &NodeMessage::Cancel { id: task_id });
             return;
         }
-        if let Ok(mut early) = self.shared.early_cancels.lock() {
-            early.insert(task_id.to_owned());
-        }
-    }
-
-    fn supports_workspace_change(&self) -> bool {
-        false
+        cancels.cancel(task_id);
     }
 }
 
@@ -375,10 +373,12 @@ mod tests {
         }
 
         fn write(&mut self, message: &Value) {
-            self.write_line(&serde_json::to_string(message).expect("message encodes"));
+            self.write_json_line(
+                &serde_json::to_string(message).expect("message encodes"),
+            );
         }
 
-        fn write_line(&mut self, line: &str) {
+        fn write_json_line(&mut self, line: &str) {
             self.stream
                 .write_all(format!("{line}\n").as_bytes())
                 .expect("the line must send");
@@ -479,7 +479,7 @@ mod tests {
             } else if let Some(line) = step.get("agent_line") {
                 peer.as_mut()
                     .expect("a connection")
-                    .write_line(line.as_str().expect("a line"));
+                    .write_json_line(line.as_str().expect("a line"));
             } else if let Some(bytes) = step.get("agent_line_bytes") {
                 let line = noise(bytes.as_u64().expect("a size"));
                 let _ = peer.as_mut().expect("a connection").stream.write_all(&line);
@@ -643,6 +643,34 @@ mod tests {
             agent.start_turn(&turn_ctx("task-early", "hello", deadline)),
             Err(ExecutionError::Cancelled)
         );
+    }
+
+    #[test]
+    fn a_cancel_after_the_turn_ended_is_not_kept_for_a_later_start() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let path = crate::data_dir::DataDir::new(directory.path()).agent_socket();
+        let agent = ConnectedAgent::listen(&path).expect("listen");
+        let mut peer =
+            Peer::attach(&agent, &path, &json!({"type": "ready", "protocol": 1}));
+        peer.stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout must set");
+        let deadline =
+            Instant::now().checked_add(Duration::from_secs(5)).expect("deadline");
+        let answer = |peer: &mut Peer| {
+            let mut runner = agent.clone();
+            let turn = std::thread::spawn(move || {
+                runner.start_turn(&turn_ctx("task-1", "hello", deadline))
+            });
+            assert_eq!(peer.read()["type"], "task");
+            peer.write(&json!({"type": "result", "id": "task-1", "text": "answer"}));
+            turn.join().expect("turn joins")
+        };
+        assert_eq!(answer(&mut peer), Ok("answer".to_owned()));
+        // The node may cancel a task that already ended; that cancel is
+        // not an early one for a turn that starts later.
+        agent.cancel("task-1");
+        assert_eq!(answer(&mut peer), Ok("answer".to_owned()));
     }
 
     #[test]
