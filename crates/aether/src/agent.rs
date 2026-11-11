@@ -11,7 +11,9 @@
 pub mod codex;
 pub mod connected;
 
-use std::collections::VecDeque;
+use std::{collections::VecDeque, io::Write, sync::Mutex};
+
+use serde::Serialize;
 
 use crate::{
     execution::{Agent, ExecutionError, ExecutionEvent, TurnContext},
@@ -53,6 +55,18 @@ impl Agent for NodeAgent {
             Self::Connected(agent) => agent.cancel(task_id),
         }
     }
+}
+
+/// Writes `message` to `writer` as one line of JSON.
+fn write_json_line<W: Write>(
+    writer: &Mutex<W>,
+    message: &impl Serialize,
+) -> Result<(), ExecutionError> {
+    let mut line = serde_json::to_vec(message).map_err(|_| ExecutionError::Protocol)?;
+    line.push(b'\n');
+    let mut writer = writer.lock().map_err(|_| ExecutionError::Unavailable)?;
+    writer.write_all(&line).map_err(|_| ExecutionError::Unavailable)?;
+    writer.flush().map_err(|_| ExecutionError::Unavailable)
 }
 
 /// How many task IDs `EarlyCancels` keeps in each of its lists.

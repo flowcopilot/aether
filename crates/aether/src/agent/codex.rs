@@ -3,7 +3,7 @@
 
 use std::{
     collections::BTreeMap,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{ChildStdin, Stdio},
     sync::{
@@ -17,7 +17,7 @@ use std::{
 use process_wrap::std::{ChildWrapper, CommandWrap};
 use serde_json::{Value, json};
 
-use super::EarlyCancels;
+use super::{EarlyCancels, write_json_line};
 use crate::{
     execution::{
         Agent, ExecutionError, ExecutionEvent, TurnContext, agent_instructions,
@@ -581,7 +581,7 @@ impl Agent for CodexAppServer {
             "method": "turn/interrupt",
             "params": {"threadId": active.thread_id, "turnId": active.turn_id},
         });
-        let _ = write_json(&active.input, &request);
+        let _ = write_json_line(&active.input, &request);
     }
 }
 
@@ -665,7 +665,7 @@ impl AppServerSession {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let request =
             json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        write_json(&self.input, &request)?;
+        write_json_line(&self.input, &request)?;
         loop {
             let response = self.receive()?;
             if self.decline_approval(&response, events)?
@@ -723,7 +723,9 @@ impl AppServerSession {
                     if params.get("turnId").and_then(Value::as_str)
                         == Some(turn_id) =>
                 {
-                    if let Some(message) = final_answer_text(params.get("item")) {
+                    if let Some(message) =
+                        params.get("item").and_then(final_answer_text)
+                    {
                         final_answer.get_or_insert_with(String::new).push_str(message);
                     }
                 }
@@ -736,40 +738,19 @@ impl AppServerSession {
                         Some("interrupted") => return Err(ExecutionError::Cancelled),
                         _ => return Err(ExecutionError::Unavailable),
                     }
-                    if final_answer.is_none() {
-                        for item in params
-                            .pointer("/turn/items")
-                            .and_then(Value::as_array)
-                            .into_iter()
-                            .flatten()
-                        {
-                            if let Some(message) = final_answer_text(Some(item)) {
-                                final_answer
-                                    .get_or_insert_with(String::new)
-                                    .push_str(message);
-                            }
-                        }
-                    }
-                    if let Some(answer) = final_answer {
-                        text = answer;
-                    } else if text.is_empty() {
-                        for item in params
-                            .pointer("/turn/items")
-                            .and_then(Value::as_array)
-                            .into_iter()
-                            .flatten()
-                        {
-                            if item.get("type").and_then(Value::as_str)
-                                == Some("agentMessage")
-                                && let Some(message) =
-                                    item.get("text").and_then(Value::as_str)
-                            {
-                                text.push_str(message);
-                            }
-                        }
-                    }
+                    let items = params
+                        .pointer("/turn/items")
+                        .and_then(Value::as_array)
+                        .map_or(&[][..], Vec::as_slice);
+                    let answer = match final_answer
+                        .or_else(|| joined(items, final_answer_text))
+                    {
+                        Some(answer) => answer,
+                        None if !text.is_empty() => text,
+                        None => joined(items, agent_message_text).unwrap_or_default(),
+                    };
                     events(ExecutionEvent::Completed);
-                    return Ok(text);
+                    return Ok(answer);
                 }
                 _ => {}
             }
@@ -818,27 +799,34 @@ impl AppServerSession {
             "mcpServer/elicitation/request" => json!({"action": "decline"}),
             _ => json!({"decision": "decline"}),
         };
-        write_json(&self.input, &json!({"jsonrpc": "2.0", "id": id, "result": result}))
+        write_json_line(
+            &self.input,
+            &json!({"jsonrpc": "2.0", "id": id, "result": result}),
+        )
     }
 }
 
-fn write_json(
-    input: &Arc<Mutex<ChildStdin>>,
-    message: &Value,
-) -> Result<(), ExecutionError> {
-    let mut input = input.lock().map_err(|_| ExecutionError::Unavailable)?;
-    serde_json::to_writer(&mut *input, message)
-        .map_err(|_| ExecutionError::Protocol)?;
-    input.write_all(b"\n").map_err(|_| ExecutionError::Unavailable)?;
-    input.flush().map_err(|_| ExecutionError::Unavailable)
+fn agent_message_text(item: &Value) -> Option<&str> {
+    (item.get("type").and_then(Value::as_str) == Some("agentMessage"))
+        .then(|| item.get("text").and_then(Value::as_str))
+        .flatten()
 }
 
-fn final_answer_text(item: Option<&Value>) -> Option<&str> {
-    let item = item?;
-    (item.get("type").and_then(Value::as_str) == Some("agentMessage")
-        && item.get("phase").and_then(Value::as_str) == Some("final_answer"))
-    .then(|| item.get("text").and_then(Value::as_str))
-    .flatten()
+fn final_answer_text(item: &Value) -> Option<&str> {
+    (item.get("phase").and_then(Value::as_str) == Some("final_answer"))
+        .then(|| agent_message_text(item))
+        .flatten()
+}
+
+/// The texts that `text_of` finds in `items`, joined; `None` when it finds
+/// none.
+fn joined<'a>(
+    items: &'a [Value],
+    text_of: impl Fn(&'a Value) -> Option<&'a str>,
+) -> Option<String> {
+    let mut texts = items.iter().filter_map(text_of).peekable();
+    texts.peek()?;
+    Some(texts.collect())
 }
 
 fn approval_request(message: &Value) -> bool {
@@ -1165,6 +1153,48 @@ done
         assert_eq!(
             session.request("initialize", &initialize_params(), &mut |_| {}),
             Err(ExecutionError::Timeout)
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn app_server_takes_the_final_answer_from_the_completed_turn() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let limits = CodexLimits {
+            sandbox: CodexSandbox::WorkspaceWrite,
+            allow_network: false,
+            environment: BTreeMap::new(),
+        };
+        // No `item/completed`: only the completed turn's items say which
+        // message is the answer.
+        let script = r#"
+while IFS= read -r request; do
+  case "$request" in
+    *'"id":1'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}' ;;
+    *'"id":2'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread"}}}' ;;
+    *'"id":3'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn"}}}'
+      printf '%s\n' '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thread","turnId":"turn","delta":"I will look."}}'
+      printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread","turn":{"id":"turn","status":"completed","items":[{"type":"agentMessage","phase":"commentary","text":"I will look."},{"type":"agentMessage","phase":"final_answer","text":"teal"}]}}}'
+      ;;
+  esac
+done
+"#;
+        let mut server = CodexAppServer::with_arguments(
+            PathBuf::from("sh"),
+            vec!["-c".to_owned(), script.to_owned()],
+            limits,
+        )
+        .expect("limits must be valid");
+        assert_eq!(
+            server.start_turn(&turn_ctx(
+                directory.path(),
+                "task",
+                "review",
+                "untrusted",
+                30
+            )),
+            Ok("teal".to_owned())
         );
     }
 

@@ -6,7 +6,7 @@
 
 use std::{
     collections::BTreeMap,
-    io::{self, BufRead, BufReader, Read, Write},
+    io::{self, BufRead, BufReader, Read},
     net::Shutdown,
     os::unix::{
         fs::{FileTypeExt, PermissionsExt},
@@ -24,7 +24,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use super::EarlyCancels;
+use super::{EarlyCancels, write_json_line};
 use crate::execution::{
     Agent, ExecutionError, ExecutionEvent, TurnContext, agent_instructions,
 };
@@ -178,7 +178,7 @@ impl Shared {
         if let Some(replaced) = replaced {
             if let Ok(pending) = replaced.pending.lock() {
                 for (task_id, sender) in pending.iter() {
-                    let _ = write_line(
+                    let _ = write_json_line(
                         &replaced.writer,
                         &NodeMessage::Cancel { id: task_id.as_str() },
                     );
@@ -227,17 +227,6 @@ fn read_message(reader: &mut impl BufRead) -> Option<AgentMessage> {
     }
 }
 
-fn write_line(
-    writer: &Mutex<UnixStream>,
-    message: &NodeMessage<'_>,
-) -> Result<(), ExecutionError> {
-    let mut writer = writer.lock().map_err(|_| ExecutionError::Unavailable)?;
-    let mut line = serde_json::to_vec(message).map_err(|_| ExecutionError::Protocol)?;
-    line.push(b'\n');
-    writer.write_all(&line).map_err(|_| ExecutionError::Unavailable)?;
-    writer.flush().map_err(|_| ExecutionError::Unavailable)
-}
-
 impl ConnectedAgent {
     fn run_turn(
         &self,
@@ -266,7 +255,7 @@ impl ConnectedAgent {
             (writer, pending, receiver)
         };
         let result = (|| {
-            write_line(
+            write_json_line(
                 &writer,
                 &NodeMessage::Task {
                     id: &ctx.task_id,
@@ -300,7 +289,7 @@ impl ConnectedAgent {
             pending.remove(&ctx.task_id);
         }
         if result == Err(ExecutionError::Timeout) {
-            write_line(&writer, &NodeMessage::Cancel { id: &ctx.task_id })?;
+            write_json_line(&writer, &NodeMessage::Cancel { id: &ctx.task_id })?;
         }
         result
     }
@@ -325,7 +314,7 @@ impl Agent for ConnectedAgent {
             && pending.lock().is_ok_and(|pending| pending.contains_key(task_id))
         {
             drop(cancels);
-            let _ = write_line(&writer, &NodeMessage::Cancel { id: task_id });
+            let _ = write_json_line(&writer, &NodeMessage::Cancel { id: task_id });
             return;
         }
         cancels.cancel(task_id);
@@ -384,10 +373,12 @@ mod tests {
         }
 
         fn write(&mut self, message: &Value) {
-            self.write_line(&serde_json::to_string(message).expect("message encodes"));
+            self.write_json_line(
+                &serde_json::to_string(message).expect("message encodes"),
+            );
         }
 
-        fn write_line(&mut self, line: &str) {
+        fn write_json_line(&mut self, line: &str) {
             self.stream
                 .write_all(format!("{line}\n").as_bytes())
                 .expect("the line must send");
@@ -488,7 +479,7 @@ mod tests {
             } else if let Some(line) = step.get("agent_line") {
                 peer.as_mut()
                     .expect("a connection")
-                    .write_line(line.as_str().expect("a line"));
+                    .write_json_line(line.as_str().expect("a line"));
             } else if let Some(bytes) = step.get("agent_line_bytes") {
                 let line = noise(bytes.as_u64().expect("a size"));
                 let _ = peer.as_mut().expect("a connection").stream.write_all(&line);
