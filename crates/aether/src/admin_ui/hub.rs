@@ -23,8 +23,8 @@ use topcoat::{
 };
 
 use super::{
-    Page, PageContext, hub_form_screen, layout::page_data_dir, require_admin_session,
-    shared,
+    Page, PageContext, UiMode, hub_form_screen, layout::page_data_dir,
+    require_admin_session, shared,
 };
 use crate::hub_client::protocol::{DEFAULT_ACCESS_DAYS, OFFER_DAYS};
 use aether_store::{ApprovalKind, ApprovalSide, HubApproval};
@@ -96,8 +96,7 @@ pub(super) async fn hub_section(
     #[default]
     child: topcoat::view::Child<'_>,
 ) -> TopcoatResult<impl View> {
-    let Page(page) = app_context::<Page>(cx);
-    let hosting = page.as_ref().is_some_and(|page| page.host_ui);
+    let hosting = app_context::<Page>(cx).mode().is_some_and(UiMode::hosts);
     let state = load(&hub).await;
     if let (HubState::Ready { account: Some(account), .. }, Some(data_dir)) =
         (&state, page_data_dir(cx))
@@ -700,11 +699,10 @@ pub(super) async fn claim_name(
 ) -> TopcoatResult<impl View> {
     require_admin_session(cx).await?;
     let hub = page_hub(cx)?;
-    let Page(page) = app_context::<Page>(cx);
     let data_dir = page_data_dir(cx);
     let name = form.name.trim();
     // A page without a host has only a personal agent.
-    let host_ui = page.as_ref().is_some_and(|page| page.host_ui);
+    let host_ui = app_context::<Page>(cx).mode().is_some_and(UiMode::hosts);
     let chosen = match (host_ui, form.kind.as_deref()) {
         (false, _) | (true, None) => Some(AgentKind::Personal),
         (true, Some(kind)) => AgentKind::parse(kind),

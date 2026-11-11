@@ -165,7 +165,7 @@ pub(super) async fn dashboard(
 
             <section id="permissions" class="flex scroll-mt-6 flex-col gap-3">
                 <h2 class="text-xl font-semibold tracking-tight">"Permissions"</h2>
-                if page.as_ref().is_some_and(|page| page.host_ui) {
+                if page.as_ref().is_some_and(|page| page.mode.hosts()) {
                     <p class="text-muted-foreground">"Invite a person to send tasks to your agent. Access groups control who can send tasks."</p>
                     <div class="flex flex-wrap gap-2">
                         <a href="/#invite" class=(class!(button_variants(ButtonVariant::Primary, ButtonSize::Md), "no-underline"))>"Invite someone"</a>

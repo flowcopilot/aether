@@ -100,7 +100,7 @@ pub(super) async fn host_screen(
         ))
         .into());
     };
-    let drafts = if page.caller {
+    let drafts = if page.mode.calls() {
         let now = aether_core::time::now_seconds();
         super::shared::request_drafts_of(&page.data_dir, now).len()
     } else {

@@ -61,7 +61,7 @@ pub(super) async fn caller_screen(
         ))
         .into());
     };
-    if !page.caller {
+    if !page.mode.calls() {
         return Err(internal_server_error(std::io::Error::other(
             "the caller screen needs a data directory",
         ))
@@ -403,7 +403,7 @@ pub(super) async fn accept_invite(
     let Page(Some(page)) = app_context::<Page>(cx) else {
         return Err(bad_request("this node cannot accept invites").into());
     };
-    if !page.caller {
+    if !page.mode.calls() {
         return Err(bad_request("this node cannot accept invites").into());
     }
     let Some(hub) = page.current_hub() else {

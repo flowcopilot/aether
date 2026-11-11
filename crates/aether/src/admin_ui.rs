@@ -306,8 +306,7 @@ async fn hub_form_screen(
     #[default] error: String,
     #[default] setting_error: String,
 ) -> TopcoatResult<impl View> {
-    let Page(page) = app_context::<Page>(cx);
-    let hosting = page.as_ref().is_some_and(|page| page.host_ui);
+    let hosting = app_context::<Page>(cx).mode().is_some_and(UiMode::hosts);
     Ok(view! {
         if hosting {
             host_screen(notice: Notice::hub(error.clone(), setting_error.clone()))
@@ -322,11 +321,11 @@ async fn hub_form_screen(
 /// set.
 #[page("/")]
 async fn home(cx: &Cx) -> TopcoatResult<impl View> {
-    let Page(page) = app_context::<Page>(cx);
+    let mode = app_context::<Page>(cx).mode();
     Ok(view! {
-        if page.as_ref().is_some_and(|page| page.host_ui) {
+        if mode.is_some_and(UiMode::hosts) {
             host_screen()
-        } else if page.as_ref().is_some_and(|page| page.caller) {
+        } else if mode.is_some_and(UiMode::calls) {
             caller_screen()
         } else {
             dashboard()
@@ -336,10 +335,7 @@ async fn home(cx: &Cx) -> TopcoatResult<impl View> {
 
 #[page("/agents")]
 async fn agents(cx: &Cx) -> TopcoatResult<impl View> {
-    let Page(Some(page)) = app_context::<Page>(cx) else {
-        return Err(forbidden().into());
-    };
-    if !page.caller {
+    if !app_context::<Page>(cx).mode().is_some_and(UiMode::calls) {
         return Err(forbidden().into());
     }
     Ok(view! { caller_screen() })
@@ -542,11 +538,34 @@ pub type RelaySwitcher =
 
 pub use crate::hub_client::HubAccess;
 
+/// The screens of a page: the host screen of `node serve`, the caller screen
+/// of `node admin`, or both on one node. A UI without a page has neither and
+/// shows the Advanced page at `/`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UiMode {
+    Host,
+    Caller,
+    HostAndCaller,
+}
+
+impl UiMode {
+    /// Whether the page has the host screen.
+    #[must_use]
+    pub const fn hosts(self) -> bool {
+        matches!(self, Self::Host | Self::HostAndCaller)
+    }
+
+    /// Whether the page has the caller screen.
+    #[must_use]
+    pub const fn calls(self) -> bool {
+        matches!(self, Self::Caller | Self::HostAndCaller)
+    }
+}
+
 pub struct PageContext {
     pub data_dir: PathBuf,
     pub task_folder_mode: bool,
-    pub host_ui: bool,
-    pub caller: bool,
+    pub mode: UiMode,
     name: Option<String>,
     relay_url: Mutex<Option<String>>,
     switch_relay: RelaySwitcher,
@@ -567,8 +586,7 @@ impl PageContext {
         Self {
             data_dir,
             task_folder_mode: false,
-            host_ui: true,
-            caller: false,
+            mode: UiMode::Host,
             name,
             relay_url: Mutex::new(relay_url),
             switch_relay,
@@ -583,8 +601,7 @@ impl PageContext {
         Self {
             data_dir,
             task_folder_mode: false,
-            host_ui: false,
-            caller: true,
+            mode: UiMode::Caller,
             name: None,
             relay_url: Mutex::new(None),
             switch_relay: Arc::new(|_, _| Box::pin(async { Ok(()) })),
@@ -593,10 +610,15 @@ impl PageContext {
         }
     }
 
+    /// Adds the caller screen to a host page, or takes it away. A page
+    /// without a host keeps its caller screen.
     #[must_use]
-    #[allow(clippy::missing_const_for_fn)]
-    pub fn with_caller(mut self, enabled: bool) -> Self {
-        self.caller = enabled;
+    pub const fn with_caller(mut self, enabled: bool) -> Self {
+        self.mode = match (self.mode, enabled) {
+            (UiMode::Host | UiMode::HostAndCaller, true) => UiMode::HostAndCaller,
+            (UiMode::Host | UiMode::HostAndCaller, false) => UiMode::Host,
+            (UiMode::Caller, _) => UiMode::Caller,
+        };
         self
     }
 
@@ -647,7 +669,7 @@ impl PageContext {
             data_dir: self.data_dir.clone(),
             hub: Arc::clone(&self.hub),
             hub_sign: Arc::clone(&self.hub_sign),
-            caller: self.caller,
+            caller: self.mode.calls(),
         })
     }
 
@@ -689,6 +711,13 @@ pub struct PactUi {
 }
 
 pub(super) struct Page(pub Option<Arc<PageContext>>);
+
+impl Page {
+    /// The screens of this UI; `None` when it has no page.
+    fn mode(&self) -> Option<UiMode> {
+        self.0.as_ref().map(|page| page.mode)
+    }
+}
 
 struct Pact(Option<Arc<crate::pact::consent::PactConsent>>);
 

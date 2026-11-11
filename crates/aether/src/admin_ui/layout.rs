@@ -6,7 +6,7 @@ use topcoat::{
     view::{View, component, view},
 };
 
-use super::{Page, shared};
+use super::{Page, UiMode, shared};
 use crate::admin::SharedAdministration;
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -25,8 +25,11 @@ pub(super) fn page_data_dir(cx: &Cx) -> Option<std::path::PathBuf> {
 #[component]
 pub(super) async fn node_header(cx: &Cx, current: Tab) -> TopcoatResult<impl View> {
     let Page(page) = app_context::<Page>(cx);
+    let mode = app_context::<Page>(cx).mode();
+    let hosts = mode.is_some_and(UiMode::hosts);
+    let calls = mode.is_some_and(UiMode::calls);
     let data_dir = page_data_dir(cx);
-    let drafts = page.as_ref().filter(|page| page.caller).map_or(0, |page| {
+    let drafts = page.as_ref().filter(|page| page.mode.calls()).map_or(0, |page| {
         let now = aether_core::time::now_seconds();
         shared::request_drafts_of(&page.data_dir, now).len()
     });
@@ -35,7 +38,7 @@ pub(super) async fn node_header(cx: &Cx, current: Tab) -> TopcoatResult<impl Vie
         .unwrap_or_else(PoisonError::into_inner)
         .pending()
         .map_or(0, |pending| pending.len());
-    let relay_host = page.as_ref().filter(|page| page.host_ui).map(|page| {
+    let relay_host = page.as_ref().filter(|page| page.mode.hosts()).map(|page| {
         page.relay_url().map(|url| {
             reqwest::Url::parse(&url)
                 .ok()
@@ -48,19 +51,18 @@ pub(super) async fn node_header(cx: &Cx, current: Tab) -> TopcoatResult<impl Vie
             .ok()
             .flatten()
     });
-    let tabs = page.is_some();
-    let agents_href =
-        if page.as_ref().is_some_and(|page| page.host_ui) { "/agents" } else { "/" };
+    let tabs = mode.is_some();
+    let agents_href = if hosts { "/agents" } else { "/" };
     Ok(view! {
         <header class="border-b border-border">
             <div class="mx-auto flex min-h-14 max-w-6xl flex-wrap items-center gap-x-6 gap-y-2 px-4 sm:px-8">
                 <a href="/" class="text-base font-semibold tracking-tight text-foreground no-underline">"Aether"</a>
                 if tabs {
                     <nav aria-label="Pages" class="-mb-px flex self-stretch overflow-x-auto">
-                        if page.as_ref().is_some_and(|page| page.host_ui) {
+                        if hosts {
                             node_tab(href: "/", current: current == Tab::Sharing, "Who can use your agent")
                         }
-                        if page.as_ref().is_some_and(|page| page.caller) {
+                        if calls {
                             node_tab(
                                 href: agents_href,
                                 current: current == Tab::Agents,
