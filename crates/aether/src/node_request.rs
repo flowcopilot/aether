@@ -6,22 +6,61 @@ use crate::{
     transport::{self, Frame, TransportError},
 };
 
-#[derive(Debug, Clone)]
+// The flags of `aether node request`. A doc comment here would become the
+// command's help.
+#[derive(Debug, Clone, usage_rs::Args)]
 pub struct RequestInput {
-    pub data_dir: PathBuf,
-    pub scope: String,
-    pub text: String,
+    /// Defaults to `$AETHER_DATA_DIR`, else `~/.aether/host`.
+    #[usage(long)]
+    pub data_dir: Option<PathBuf>,
+    #[usage(long)]
     pub endpoint_id: Option<String>,
+    #[usage(long)]
     pub address: Option<String>,
+    #[usage(long)]
     pub directory: Option<String>,
+    #[usage(long)]
     pub directory_certificate: Option<PathBuf>,
+    #[usage(long)]
     pub agent_id: Option<String>,
+    #[usage(long)]
     pub agent_verifying_key: Option<PathBuf>,
+    #[usage(
+        long,
+        requires("--managed-control-certificate", "--agent-id"),
+        conflicts(
+            "--endpoint-id",
+            "--address",
+            "--directory",
+            "--directory-certificate",
+            "--agent-verifying-key"
+        )
+    )]
     pub managed_control: Option<String>,
+    #[usage(long, requires = "--managed-control")]
     pub managed_control_certificate: Option<PathBuf>,
+    /// An iroh relay to reach the peer through.
+    #[usage(long, env = "AETHER_RELAY_URL")]
     pub relay_url: Option<String>,
+    #[usage(long)]
+    pub scope: String,
+    #[usage(long)]
+    pub text: String,
+    /// Optional for a direct contact imported from an invite: its bundle
+    /// holds the authorization.
+    #[usage(long)]
     pub authorization: Option<PathBuf>,
+    /// Lets a caller retry a request idempotently by resubmitting the same
+    /// key. A fresh one is generated when this is left unset, matching the
+    /// previous, only behavior.
+    #[usage(long)]
     pub idempotency_key: Option<String>,
+    /// Lets a caller learn its own task id ahead of the response, so it can
+    /// target this request with an administration cancellation. A fresh one
+    /// is generated when this is left unset, matching the previous, only
+    /// behavior. Must be a UUID, the same requirement the wire protocol
+    /// already places on every task id.
+    #[usage(long)]
     pub task_id: Option<String>,
 }
 
@@ -51,7 +90,7 @@ fn direct_store_unavailable(error: DirectError) -> Option<RequestError> {
 }
 
 pub async fn send(input: RequestInput) -> Result<Vec<Frame>, RequestError> {
-    let data_dir = &input.data_dir;
+    let data_dir = &crate::data_dir::resolve_node_data_dir(input.data_dir.clone());
     if input
         .task_id
         .as_ref()

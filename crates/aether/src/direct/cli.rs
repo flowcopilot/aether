@@ -2,12 +2,24 @@
 
 use std::{path::Path, process::ExitCode};
 
+use usage_rs::Subcommands;
+
 use super::{DirectError, INVITE_PREFIX};
 
+#[derive(Subcommands)]
 pub enum Command {
-    Import { invitation: String },
-    Resolve { agent_id: String },
-    Remove { agent_id: String },
+    /// Imports an `aether-invite:` line, or a file with an invitation or an
+    /// invitation bundle.
+    Import {
+        invitation: String,
+    },
+    Resolve {
+        agent_id: String,
+    },
+    /// Forgets a contact: its invitation and its stored access.
+    Remove {
+        agent_id: String,
+    },
 }
 
 pub fn run(data_dir: &Path, command: Command) -> ExitCode {
