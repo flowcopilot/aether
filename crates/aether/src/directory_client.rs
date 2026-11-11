@@ -249,10 +249,9 @@ pub async fn sync_directory(
         if changes.is_empty() {
             return Ok((cursor, records));
         }
+        // `events_after` refuses a page whose cursors do not climb past
+        // `cursor`, so each change moves the cursor forward.
         for change in changes {
-            if change.cursor <= cursor {
-                return Err(());
-            }
             if matches!(
                 change.event,
                 aether_store::DirectoryEventType::Published

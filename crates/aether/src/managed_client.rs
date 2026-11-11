@@ -230,10 +230,9 @@ pub async fn sync_managed(
         if events.is_empty() {
             return Ok((cursor, changes));
         }
+        // `events_after` refuses a page whose cursors do not climb past
+        // `cursor`, so each event moves the cursor forward.
         for event in events {
-            if event.cursor <= cursor {
-                return Err(());
-            }
             crate::roster_sync::apply_managed_change(&mut store, &control, &event)?;
             cursor = event.cursor;
             changes = changes.checked_add(1).ok_or(())?;
