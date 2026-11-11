@@ -50,7 +50,9 @@ class AetherAdapter(BasePlatformAdapter):
 
     async def connect(self, **_kwargs) -> bool:
         self._loop = asyncio.get_running_loop()
-        self._stop.clear()
+        # Each link thread gets its own stop event: a thread that an earlier
+        # disconnect stopped must not run again because of this connect.
+        self._stop = threading.Event()
         threading.Thread(target=self._link.run, args=(self._stop,), name="aether-node", daemon=True).start()
         self._mark_connected()
         logger.info("Aether: answering tasks from %s", self._socket_path)

@@ -11,6 +11,8 @@ import importlib.util
 import json
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -113,6 +115,17 @@ class AetherAdapterTest(unittest.IsolatedAsyncioTestCase):
     async def test_a_failed_turn_fails_the_task_without_text(self) -> None:
         await self._send({"type": "task", "id": "task-2", "instructions": "Do the task.", "text": "fail"})
         self.assertEqual(await self._read(), {"type": "failed", "id": "task-2"})
+
+    async def test_a_quick_disconnect_and_connect_leaves_one_node_connection(self) -> None:
+        await self.adapter.disconnect()
+        await self.adapter.connect()
+        await asyncio.to_thread(self.node.accept)
+        self.assertEqual(await self._read(), {"type": "ready", "protocol": 1})
+        # The first link thread must stop, not reconnect after its retry delay.
+        deadline = time.monotonic() + 3
+        while sum(thread.name == "aether-node" for thread in threading.enumerate()) > 1:
+            self.assertLess(time.monotonic(), deadline, "the first link thread is still running")
+            await asyncio.sleep(0.05)
 
 
 if __name__ == "__main__":

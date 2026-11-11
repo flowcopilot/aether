@@ -1,9 +1,12 @@
 import { randomUUID, createHash } from 'node:crypto';
-import { existsSync, readFileSync, openSync, writeFileSync, fsyncSync, closeSync, unlinkSync } from 'node:fs';
+import { existsSync, readFileSync, openSync, writeFileSync, fsyncSync, closeSync, linkSync, unlinkSync } from 'node:fs';
 import { performance } from 'node:perf_hooks';
 import { frameTask, contract } from './node-link.mjs';
 
 // One executor, no automatic reassignment: expired work might still have effects.
+// Disconnecting clears `pending` and stops the active claim, and nothing is
+// queued or claimed while disconnected, so a waiting task or an active claim
+// that is not stopped implies `connected`.
 export class Mailbox {
   connected = false;
   pending = new Map();
@@ -13,8 +16,9 @@ export class Mailbox {
   constructor({ marker, send, wake = () => {}, leaseMs = 60_000, taskMs = 120_000, capacity = 32 }) {
     Object.assign(this, { marker, send, wake, leaseMs, taskMs, capacity });
     if (existsSync(marker)) {
-      const saved = JSON.parse(readFileSync(marker, 'utf8'));
-      if (typeof saved.id !== 'string' || typeof saved.lease !== 'string' || typeof saved.claim_id !== 'string') {
+      let saved;
+      try { saved = JSON.parse(readFileSync(marker, 'utf8')); } catch (error) { if (error.code) throw error; }
+      if (typeof saved?.id !== 'string' || typeof saved.lease !== 'string' || typeof saved.claim_id !== 'string') {
         throw new Error('Invalid active-claim marker; verify the old Bot is stopped before removing it');
       }
       this.active = { ...saved, stopped: true };
@@ -49,7 +53,7 @@ export class Mailbox {
   stopActive() {
     this.active.stopped = true;
     // Do not falsely claim that a hosted Bot has stopped running.
-    if (this.connected) this.send({ type: 'failed', id: this.active.id });
+    this.send({ type: 'failed', id: this.active.id });
   }
 
   tick() {
@@ -57,7 +61,7 @@ export class Mailbox {
     for (const [id, task] of this.pending) {
       if (task.deadline <= now) {
         this.pending.delete(id);
-        if (this.connected) this.send({ type: 'failed', id });
+        this.send({ type: 'failed', id });
       }
     }
     if (this.active && !this.active.stopped &&
@@ -74,13 +78,21 @@ export class Mailbox {
     const task = this.pending.values().next().value;
     if (!task) return { status: 'empty' };
     const active = { ...task, claim_id, lease: randomUUID(), leaseUntil: performance.now() + this.leaseMs, stopped: false };
-    // Exclusive creation fences concurrent bridge processes. Sync before exposing
-    // work so a crash/restart cannot silently assign overlapping work.
-    const fd = openSync(this.marker, 'wx', 0o600);
+    // The marker is written and synced under a private name, then linked into
+    // place: linking fails if the marker exists, which fences concurrent bridge
+    // processes, and a failed write never leaves a partial marker behind.
+    // Sync before exposing work so a crash/restart cannot assign overlapping work.
+    const temp = `${this.marker}.${process.pid}.${active.lease}.tmp`;
     try {
-      writeFileSync(fd, JSON.stringify({ id: active.id, claim_id, lease: active.lease }));
-      fsyncSync(fd);
-    } finally { closeSync(fd); }
+      const fd = openSync(temp, 'wx', 0o600);
+      try {
+        writeFileSync(fd, JSON.stringify({ id: active.id, claim_id, lease: active.lease }));
+        fsyncSync(fd);
+      } finally { closeSync(fd); }
+      linkSync(temp, this.marker);
+    } finally {
+      try { unlinkSync(temp); } catch {}
+    }
     this.active = active;
     this.pending.delete(task.id);
     return this.assignment();
@@ -97,7 +109,7 @@ export class Mailbox {
   progress(id, lease) {
     this.tick();
     const task = this.requireClaim(id, lease);
-    if (task.stopped || !this.connected) return { status: 'stop_required' };
+    if (task.stopped) return { status: 'stop_required' };
     task.leaseUntil = performance.now() + this.leaseMs;
     if (!this.send({ type: 'progress', id })) {
       task.stopped = true;
@@ -115,14 +127,14 @@ export class Mailbox {
       return { status: 'recorded' };
     }
     const task = this.requireClaim(id, lease);
-    if (outcome !== 'stopped' && (task.stopped || !this.connected)) {
+    if (outcome !== 'stopped' && task.stopped) {
       return { status: 'stop_required', reason: 'Stop all work, then finish with outcome stopped. Late answers are discarded.' };
     }
     if (outcome === 'result') {
       const line = JSON.stringify({ type: 'result', id, text }) + '\n';
       if (Buffer.byteLength(line) > contract.max_line_bytes) throw new Error('Answer exceeds the agent socket line limit');
     }
-    if (!task.stopped && this.connected) {
+    if (!task.stopped) {
       if (!this.send(outcome === 'result' ? { type: 'result', id, text } :
         { type: outcome === 'stopped' ? 'cancelled' : 'failed', id })) {
         task.stopped = true;

@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
-import { mkdtempSync, rmSync, existsSync } from 'node:fs';
+import { mock, test } from 'node:test';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+import { mkdtempSync, rmSync, existsSync, readdirSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
 import http from 'node:http';
 import os from 'node:os';
@@ -13,14 +15,7 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { Mailbox } from '../src/mailbox.mjs';
 import { NodeLink, contract, frameTask } from '../src/node-link.mjs';
 import { createBridgeServer } from '../src/server.mjs';
-
-async function until(check) {
-  const deadline = Date.now() + 3000;
-  while (!check()) {
-    assert.ok(Date.now() < deadline, 'timed out waiting for protocol outcome');
-    await sleep(2);
-  }
-}
+import { until } from './support.mjs';
 
 async function fixture(t, options = {}) {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'ae-grok-'));
@@ -184,4 +179,23 @@ test('HTTP rejects missing/wrong authority and browser origins; MCP exposes only
   const body = await response.json();
   assert.deepEqual(body.result.tools.map(tool => tool.name).sort(), ['bridge_status', 'claim_task', 'finish_task', 'report_progress']);
   assert.ok((await f.call('claim_task', { claim_id: 'invalid' })).error);
+});
+
+test('a failed marker write leaves no marker, and an unreadable marker is reported plainly', t => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'ae-grok-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const marker = path.join(directory, 'active-claim.json');
+  const mailbox = new Mailbox({ marker, send: () => true });
+  mailbox.setConnected(true);
+  mailbox.receive({ type: 'task', id: 'full', instructions: '', text: 'x' });
+  const full = mock.method(fs, 'fsyncSync', () => { throw Object.assign(new Error('no space'), { code: 'ENOSPC' }); });
+  syncBuiltinESMExports();
+  try {
+    assert.throws(() => mailbox.claim(randomUUID()), { code: 'ENOSPC' });
+  } finally { full.mock.restore(); syncBuiltinESMExports(); }
+  assert.deepEqual(readdirSync(directory), []);
+  assert.equal(mailbox.claim(randomUUID()).id, 'full');
+  assert.equal(existsSync(marker), true);
+  writeFileSync(marker, '');
+  assert.throws(() => new Mailbox({ marker, send: () => true }), { message: /^Invalid active-claim marker/ });
 });
