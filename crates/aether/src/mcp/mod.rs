@@ -13,6 +13,7 @@ use aether_store::{NodeStore, SentState, SentTask};
 
 use crate::access_groups::{self, Action};
 use crate::admin::{AuditEntry, ChangeRequest};
+use crate::admin_socket::{Request, Response};
 use crate::hub_client::HubClient;
 use crate::outbox::{self, Courier};
 
@@ -25,9 +26,9 @@ use support::{no_node, tool_error, tool_success};
 pub struct McpServer {
     /// The administration socket of the node.
     socket: PathBuf,
-    /// The caller's data directory, with its contacts: the friends' agents
-    /// that `aether.task.send` reaches.
-    caller: Option<PathBuf>,
+    /// The node's data directory, with its settings and its contacts: the
+    /// friends' agents that `aether.task.send` reaches.
+    data_dir: PathBuf,
     /// `AETHER_HUB_URL`, for the presence of the contacts.
     hub_flag: Option<String>,
     /// Whether only the tools in `CALLER_TOOLS` are listed and accepted.
@@ -89,50 +90,39 @@ pub(crate) const UNCONFIRMED_WARNING: &str =
     "A saved agent has this name, but the hub does not show that it is this agent.";
 
 impl McpServer {
-    fn data_dir(&self) -> Result<&Path, &'static str> {
-        self.caller.as_deref().ok_or("this MCP server has no node data directory")
-    }
-
-    /// The hub of this node: `AETHER_HUB_URL`, else the one set on the page.
-    fn node_hub(&self, data_dir: &Path) -> crate::hub_client::NodeHub {
-        crate::hub_client::NodeHub::new(data_dir.to_path_buf(), self.hub_flag.clone())
-    }
-
-    fn hub(&self) -> Result<HubClient, &'static str> {
-        let data_dir = self.data_dir()?;
-        self.caller_hub(data_dir)?.ok_or("the hub is off")
-    }
-
-    fn caller_hub(&self, data_dir: &Path) -> Result<Option<HubClient>, &'static str> {
-        self.node_hub(data_dir).client().map_err(|_| "the hub settings are unavailable")
-    }
-
+    /// A server for the node whose administration socket is `socket` and
+    /// whose data directory is `data_dir`. `hub_flag` is `AETHER_HUB_URL`,
+    /// which wins over the hub set on the page. With `caller_only`, it lists
+    /// and accepts only the tools in `CALLER_TOOLS`, for an agent that must
+    /// not manage this node.
     #[must_use]
-    pub fn socket(path: PathBuf) -> Self {
+    pub const fn new(
+        socket: PathBuf,
+        data_dir: PathBuf,
+        hub_flag: Option<String>,
+        caller_only: bool,
+    ) -> Self {
         Self {
-            socket: path,
-            caller: None,
-            hub_flag: None,
-            caller_only: false,
+            socket,
+            data_dir,
+            hub_flag,
+            caller_only,
             send_wait: SEND_WAIT,
             courier: None,
         }
     }
 
-    /// Reads the presence of the contacts from the hub `hub_flag`
-    /// (`AETHER_HUB_URL`), else the hub set on the page.
-    #[must_use]
-    pub fn with_hub_flag(mut self, hub_flag: Option<String>) -> Self {
-        self.hub_flag = hub_flag;
-        self
+    /// The hub of this node: `AETHER_HUB_URL`, else the one set on the page.
+    fn node_hub(&self) -> crate::hub_client::NodeHub {
+        crate::hub_client::NodeHub::new(self.data_dir.clone(), self.hub_flag.clone())
     }
 
-    /// Lists and accepts only the tools in `CALLER_TOOLS`, for an agent that
-    /// must not manage this node.
-    #[must_use]
-    pub const fn with_caller_only(mut self, caller_only: bool) -> Self {
-        self.caller_only = caller_only;
-        self
+    fn hub(&self) -> Result<HubClient, &'static str> {
+        self.caller_hub()?.ok_or("the hub is off")
+    }
+
+    fn caller_hub(&self) -> Result<Option<HubClient>, &'static str> {
+        self.node_hub().client().map_err(|_| "the hub settings are unavailable")
     }
 
     /// How long `aether.task.send` waits for an answer.
@@ -149,27 +139,24 @@ impl McpServer {
         self
     }
 
+    /// Sends `request` to the node through its administration socket.
+    fn ask(&self, request: &Request) -> io::Result<Response> {
+        crate::admin_socket::send(&self.socket, request)
+    }
+
     /// Asks the node's outbox to start a round now.
     async fn wake_node(&self) -> Wake {
         let path = self.socket.clone();
         let answer = tokio::task::spawn_blocking(move || {
-            crate::admin_socket::send(&path, &crate::admin_socket::Request::OutboxWake)
+            crate::admin_socket::send(&path, &Request::OutboxWake)
         })
         .await;
         match answer {
-            Ok(Ok(crate::admin_socket::Response::Applied)) => Wake::Applied,
+            Ok(Ok(Response::Applied)) => Wake::Applied,
             // `node admin` has a socket but no endpoint.
-            Ok(Ok(crate::admin_socket::Response::Error { code }))
-                if code == "unsupported" =>
-            {
-                Wake::NoNode
-            }
+            Ok(Ok(Response::Error { code })) if code == "unsupported" => Wake::NoNode,
             // A node from before the outbox cannot read the request.
-            Ok(Ok(crate::admin_socket::Response::Error { code }))
-                if code == "invalid" =>
-            {
-                Wake::OldNode
-            }
+            Ok(Ok(Response::Error { code })) if code == "invalid" => Wake::OldNode,
             Ok(Err(error)) if no_node(&error) => Wake::NoNode,
             _ => Wake::Unknown,
         }
@@ -242,37 +229,24 @@ impl McpServer {
         }
     }
 
-    /// Lets the agent use the friends' agents whose invites are kept in
-    /// `data_dir`.
-    #[must_use]
-    pub fn with_caller(mut self, data_dir: PathBuf) -> Self {
-        self.caller = Some(data_dir);
-        self
-    }
-
     /// Whether each contact on the hub is online, by endpoint ID. Empty
     /// without a hub or an answer.
     async fn presence(
         &self,
-        data_dir: &std::path::Path,
     ) -> Result<std::collections::BTreeMap<String, bool>, &'static str> {
-        match self.node_hub(data_dir).client() {
-            Ok(Some(hub)) => hub
+        match self.caller_hub()? {
+            Some(hub) => hub
                 .presence(PRESENCE_WAIT)
                 .await
                 .map_err(|_| "the hub cannot be reached now"),
-            Ok(None) => Ok(std::collections::BTreeMap::new()),
-            Err(_) => Err("the hub settings are unavailable"),
+            None => Ok(std::collections::BTreeMap::new()),
         }
     }
 
     fn audit_entries(&self) -> Result<Vec<AuditEntry>, &'static str> {
-        match crate::admin_socket::send(
-            &self.socket,
-            &crate::admin_socket::Request::Audit,
-        ) {
-            Ok(crate::admin_socket::Response::Audit { entries }) => Ok(entries),
-            Ok(crate::admin_socket::Response::Error { .. }) | Err(_) => {
+        match self.ask(&Request::Audit) {
+            Ok(Response::Audit { entries }) => Ok(entries),
+            Ok(Response::Error { .. }) | Err(_) => {
                 Err("administration service is unavailable")
             }
             Ok(_) => Err("administration service returned an invalid response"),
@@ -281,11 +255,8 @@ impl McpServer {
 
     /// The agent and endpoint ID of each live direct grant of the node.
     fn direct_peers(&self) -> Result<Vec<(String, String)>, &'static str> {
-        match crate::admin_socket::send(
-            &self.socket,
-            &crate::admin_socket::Request::DirectGrants,
-        ) {
-            Ok(crate::admin_socket::Response::DirectGrants { grants }) => Ok(grants
+        match self.ask(&Request::DirectGrants) {
+            Ok(Response::DirectGrants { grants }) => Ok(grants
                 .into_iter()
                 .map(|grant| (grant.agent, grant.endpoint_id))
                 .collect()),
@@ -300,9 +271,7 @@ impl McpServer {
         agent: Option<&str>,
         endpoint_id: Option<&str>,
     ) -> CallToolResult {
-        let Some(data_dir) = &self.caller else {
-            return tool_error("this MCP server has no node data directory");
-        };
+        let data_dir = self.data_dir.as_path();
         let peers = if matches!(action, Action::Add) {
             match self.direct_peers() {
                 Ok(peers) => peers,
@@ -326,21 +295,11 @@ impl McpServer {
         if request.clone().into_change().is_err() {
             return Err("aether.change has an invalid field");
         }
-        match crate::admin_socket::send(
-            &self.socket,
-            &crate::admin_socket::Request::Change {
-                change: Box::new(request),
-                dry_run,
-            },
-        ) {
-            Ok(crate::admin_socket::Response::Validated) => Ok("validated"),
-            Ok(crate::admin_socket::Response::Pending) => {
-                Ok("pending local confirmation")
-            }
-            Ok(crate::admin_socket::Response::Applied) => Ok("applied"),
-            Ok(crate::admin_socket::Response::Error { .. }) => {
-                Err("aether.change is invalid")
-            }
+        match self.ask(&Request::Change { change: Box::new(request), dry_run }) {
+            Ok(Response::Validated) => Ok("validated"),
+            Ok(Response::Pending) => Ok("pending local confirmation"),
+            Ok(Response::Applied) => Ok("applied"),
+            Ok(Response::Error { .. }) => Err("aether.change is invalid"),
             Ok(_) => Err("administration service returned an invalid response"),
             Err(_) => Err("administration service is unavailable"),
         }
@@ -350,14 +309,9 @@ impl McpServer {
         if Uuid::parse_str(task_id).is_err() {
             return Err("aether.task.cancel task_id must be a UUID");
         }
-        match crate::admin_socket::send(
-            &self.socket,
-            &crate::admin_socket::Request::Cancel { task_id: task_id.to_owned() },
-        ) {
-            Ok(crate::admin_socket::Response::Cancelled) => Ok("cancelled"),
-            Ok(crate::admin_socket::Response::Error { .. }) => {
-                Err("aether.task.cancel failed")
-            }
+        match self.ask(&Request::Cancel { task_id: task_id.to_owned() }) {
+            Ok(Response::Cancelled) => Ok("cancelled"),
+            Ok(Response::Error { .. }) => Err("aether.task.cancel failed"),
             Ok(_) => Err("administration service returned an invalid response"),
             Err(_) => Err("administration service is unavailable"),
         }
@@ -473,6 +427,16 @@ const fn find_error(error: crate::hub_client::HubError) -> &'static str {
         HubError::OldNode => "this node is older than the hub: update Aether",
         _ => "the hub cannot be reached",
     }
+}
+
+/// The answer of `search`, or `HubError::Unreachable` when the hub does not
+/// answer within `FIND_WAIT`.
+async fn within_find_wait<T>(
+    search: impl std::future::Future<Output = Result<T, crate::hub_client::HubError>>,
+) -> Result<T, crate::hub_client::HubError> {
+    tokio::time::timeout(FIND_WAIT, search)
+        .await
+        .unwrap_or(Err(crate::hub_client::HubError::Unreachable))
 }
 
 /// The hub rows for `query`: the exact full name, or the people whose name
@@ -667,13 +631,7 @@ pub async fn serve_stdio_for(
     hub_flag: Option<String>,
     caller_only: bool,
 ) -> io::Result<()> {
-    serve(
-        McpServer::socket(path)
-            .with_caller(data_dir)
-            .with_hub_flag(hub_flag)
-            .with_caller_only(caller_only),
-    )
-    .await
+    serve(McpServer::new(path, data_dir, hub_flag, caller_only)).await
 }
 
 async fn serve(server: McpServer) -> io::Result<()> {
