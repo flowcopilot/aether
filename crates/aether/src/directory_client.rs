@@ -197,59 +197,65 @@ impl DirectoryClient {
     }
 }
 
-#[allow(
-    clippy::result_unit_err,
-    clippy::ignored_unit_patterns,
-    clippy::match_same_arms
-)]
-pub fn read_authorization(path: &Path) -> Result<transport::A2aAuthorization, ()> {
-    let source = std::fs::read(path).map_err(|_| ())?;
-    serde_json::from_slice(&source).map_err(|_| ())
+/// A local read, a store write or a synchronization failed. Callers only
+/// report that it did, so the cause is dropped.
+///
+/// It is not a [`std::error::Error`] itself, so any error converts into
+/// it with `?`.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct Failed;
+
+impl<E: std::error::Error> From<E> for Failed {
+    fn from(_: E) -> Self {
+        Self
+    }
 }
 
-#[allow(clippy::result_unit_err)]
-pub fn read_verifying_key(path: &Path) -> Result<[u8; 32], ()> {
-    let source = std::fs::read_to_string(path).map_err(|_| ())?;
-    <[u8; 32]>::from_hex(source.trim()).map_err(|_| ())
+impl From<crate::discovery::DiscoveryError> for Failed {
+    fn from(_: crate::discovery::DiscoveryError) -> Self {
+        Self
+    }
 }
 
-#[allow(clippy::result_unit_err)]
-pub fn read_directory_record(path: &Path) -> Result<WireRecord, ()> {
-    serde_json::from_slice(&std::fs::read(path).map_err(|_| ())?).map_err(|_| ())
+pub fn read_authorization(path: &Path) -> Result<transport::A2aAuthorization, Failed> {
+    Ok(serde_json::from_slice(&std::fs::read(path)?)?)
 }
 
-#[allow(clippy::result_unit_err)]
+pub fn read_verifying_key(path: &Path) -> Result<[u8; 32], Failed> {
+    Ok(<[u8; 32]>::from_hex(std::fs::read_to_string(path)?.trim())?)
+}
+
+pub fn read_directory_record(path: &Path) -> Result<WireRecord, Failed> {
+    Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+}
+
 pub fn cache_directory_record(
     data_dir: &Path,
     record: &crate::discovery::Record,
-) -> Result<(), ()> {
-    let store = aether_store::NodeStore::in_dir(data_dir).map_err(|_| ())?;
+) -> Result<(), Failed> {
+    let store = aether_store::NodeStore::in_dir(data_dir)?;
     cache_wire_directory_record(&store, &WireRecord::from_record(record))
 }
 
-#[allow(clippy::result_unit_err)]
 pub fn cache_wire_directory_record(
     store: &aether_store::NodeStore,
     record: &WireRecord,
-) -> Result<(), ()> {
-    store
-        .cache_directory_record(&record.signed_store_record().map_err(|_| ())?)
-        .map_err(|_| ())
+) -> Result<(), Failed> {
+    Ok(store.cache_directory_record(&record.signed_store_record()?)?)
 }
 
-#[allow(clippy::result_unit_err)]
 pub async fn sync_directory(
     data_dir: &Path,
     directory: &str,
     trusted_key: [u8; 32],
     client: &DirectoryClient,
-) -> Result<(i64, usize), ()> {
-    std::fs::create_dir_all(data_dir).map_err(|_| ())?;
-    let store = aether_store::NodeStore::in_dir(data_dir).map_err(|_| ())?;
-    let mut cursor = store.directory_cursor(directory, &trusted_key).map_err(|_| ())?;
+) -> Result<(i64, usize), Failed> {
+    std::fs::create_dir_all(data_dir)?;
+    let store = aether_store::NodeStore::in_dir(data_dir)?;
+    let mut cursor = store.directory_cursor(directory, &trusted_key)?;
     let mut records = 0usize;
     loop {
-        let changes = client.events_after(cursor).await.map_err(|_| ())?;
+        let changes = client.events_after(cursor).await?;
         if changes.is_empty() {
             return Ok((cursor, records));
         }
@@ -259,49 +265,47 @@ pub async fn sync_directory(
         for change in changes {
             match change.event {
                 DirectoryEventType::Published | DirectoryEventType::Renewed => {
-                    let record = change.record.as_ref().ok_or(())?;
+                    let record = change.record.as_ref().ok_or(Failed)?;
                     cache_wire_directory_record(&store, record)?;
-                    records = records.checked_add(1).ok_or(())?;
+                    records = records.checked_add(1).ok_or(Failed)?;
                 }
                 DirectoryEventType::Revoked => {
-                    store
-                        .mark_directory_record_stale(&change.scope_id, &change.agent_id)
-                        .map_err(|_| ())?;
+                    store.mark_directory_record_stale(
+                        &change.scope_id,
+                        &change.agent_id,
+                    )?;
                 }
             }
             cursor = change.cursor;
-            store
-                .advance_directory_cursor(directory, &trusted_key, cursor)
-                .map_err(|_| ())?;
+            store.advance_directory_cursor(directory, &trusted_key, cursor)?;
         }
     }
 }
 
-#[allow(clippy::result_unit_err)]
 pub fn cached_directory_record(
     data_dir: &Path,
     scope_id: &str,
     agent_id: &str,
     trusted_key: [u8; 32],
-) -> Result<crate::discovery::Record, ()> {
-    let store = aether_store::NodeStore::in_dir(data_dir).map_err(|_| ())?;
-    let stored = store.directory_record(scope_id, agent_id).map_err(|_| ())?;
+) -> Result<crate::discovery::Record, Failed> {
+    let store = aether_store::NodeStore::in_dir(data_dir)?;
+    let stored = store.directory_record(scope_id, agent_id)?;
     if stored.scope_id != scope_id || stored.agent_id != agent_id {
-        return Err(());
+        return Err(Failed);
     }
     if stored.expires_at <= aether_core::time::now() {
-        return Err(());
+        return Err(Failed);
     }
-    let wire: WireRecord = serde_json::from_slice(&stored.record).map_err(|_| ())?;
-    let record = wire.to_record().map_err(|_| ())?;
+    let wire: WireRecord = serde_json::from_slice(&stored.record)?;
+    let record = wire.to_record()?;
     if record.signing_key != trusted_key {
-        return Err(());
+        return Err(Failed);
     }
-    validate_record(&record).map_err(|_| ())?;
+    validate_record(&record)?;
     Ok(record)
 }
 
-#[allow(clippy::ignored_unit_patterns, clippy::match_same_arms)]
+#[allow(clippy::match_same_arms)]
 pub async fn request_via_directory(
     data_dir: &Path,
     directory: &str,

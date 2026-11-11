@@ -8,6 +8,7 @@ use reqwest::StatusCode;
 use aether_store::ManagedEventType;
 
 use crate::{
+    directory_client::Failed,
     discovery::{
         validate_record,
         wire::{self, WireManagedEvent, WireManagedRedeem, WireRecord},
@@ -198,34 +199,31 @@ pub fn managed_member_active(
     member.agent_id == agent_id && member.is_active(aether_core::time::now())
 }
 
-#[allow(clippy::result_unit_err)]
 pub fn cached_managed_member(
     data_dir: &Path,
     scope_id: &str,
     agent_id: &str,
-) -> Result<aether_store::ManagedMember, ()> {
-    let store = aether_store::NodeStore::in_dir(data_dir).map_err(|_| ())?;
+) -> Result<aether_store::ManagedMember, Failed> {
+    let store = aether_store::NodeStore::in_dir(data_dir)?;
     store
-        .managed_members(scope_id)
-        .map_err(|_| ())?
+        .managed_members(scope_id)?
         .into_iter()
         .find(|member| managed_member_active(member, agent_id))
-        .ok_or(())
+        .ok_or(Failed)
 }
 
-#[allow(clippy::result_unit_err)]
 pub async fn sync_managed(
     data_dir: &Path,
     control: &str,
     scope_id: &str,
     client: &ManagedClient,
-) -> Result<(i64, usize), ()> {
-    std::fs::create_dir_all(data_dir).map_err(|_| ())?;
-    let mut store = aether_store::NodeStore::in_dir(data_dir).map_err(|_| ())?;
-    let mut cursor = store.managed_cursor(control, scope_id).map_err(|_| ())?;
+) -> Result<(i64, usize), Failed> {
+    std::fs::create_dir_all(data_dir)?;
+    let mut store = aether_store::NodeStore::in_dir(data_dir)?;
+    let mut cursor = store.managed_cursor(control, scope_id)?;
     let mut changes = 0usize;
     loop {
-        let events = client.events_after(scope_id, cursor).await.map_err(|_| ())?;
+        let events = client.events_after(scope_id, cursor).await?;
         if events.is_empty() {
             return Ok((cursor, changes));
         }
@@ -235,7 +233,7 @@ pub async fn sync_managed(
         for event in events {
             match event.event {
                 ManagedEventType::Joined => {
-                    let member = event.member.as_ref().ok_or(())?;
+                    let member = event.member.as_ref().ok_or(Failed)?;
                     store.apply_managed_member(control, event.cursor, member)
                 }
                 ManagedEventType::Revoked => store.revoke_managed_member(
@@ -244,10 +242,9 @@ pub async fn sync_managed(
                     &event.scope_id,
                     &event.agent_id,
                 ),
-            }
-            .map_err(|_| ())?;
+            }?;
             cursor = event.cursor;
-            changes = changes.checked_add(1).ok_or(())?;
+            changes = changes.checked_add(1).ok_or(Failed)?;
         }
     }
 }
@@ -281,7 +278,7 @@ pub async fn request_task(
         Ok(members) => members,
         Err(ManagedClientError::Request) => {
             vec![cached_managed_member(data_dir, &input.scope, agent_id).map_err(
-                |()| TransportError::Network("roster lookup failed".to_owned()),
+                |Failed| TransportError::Network("roster lookup failed".to_owned()),
             )?]
         }
         Err(_) => {
