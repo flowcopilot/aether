@@ -463,10 +463,15 @@ impl PactStore {
     }
 
     /// Spends an unused, unexpired refresh token and returns its grant.
-    /// A second use of the same token returns `None`.
+    /// A second use of the same token returns `None`. Only the personal
+    /// agent and user the grant belongs to, for its Brand, can spend it;
+    /// anyone else gets `None` and the token stays unused.
     pub fn use_refresh_token(
         &mut self,
         token_hash: &str,
+        brand_id: &str,
+        pa_issuer: &str,
+        pa_subject: &str,
         now: i64,
     ) -> Result<Option<PactGrant>, StoreError> {
         let transaction = rusqlite::Transaction::new_unchecked(
@@ -475,8 +480,8 @@ impl PactStore {
         )?;
         let grant_id: Option<String> = transaction
             .query_row(
-                "UPDATE pact_refresh_tokens SET used_at=?2 WHERE token_hash=?1 AND used_at IS NULL AND expires_at > ?2 RETURNING grant_id",
-                params![token_hash, now],
+                "UPDATE pact_refresh_tokens SET used_at=?2 WHERE token_hash=?1 AND used_at IS NULL AND expires_at > ?2 AND grant_id IN (SELECT grant_id FROM pact_grants WHERE brand_id=?3 AND pa_issuer=?4 AND pa_subject=?5) RETURNING grant_id",
+                params![token_hash, now, brand_id, pa_issuer, pa_subject],
                 |row| row.get(0),
             )
             .optional()?;
@@ -819,10 +824,46 @@ mod tests {
         store.approve_device("ABCD-EFGH", &grant("g"), 200).unwrap();
         store.put_refresh_token("once", "g", 5_000).unwrap();
         store.put_refresh_token("late", "g", 5_000).unwrap();
-        assert_eq!(store.use_refresh_token("once", 300).unwrap(), Some(grant("g")));
-        assert_eq!(store.use_refresh_token("once", 301).unwrap(), None);
-        assert_eq!(store.use_refresh_token("late", 5_000).unwrap(), None);
-        assert_eq!(store.use_refresh_token("unknown", 300).unwrap(), None);
+        let spend = |store: &mut PactStore, token: &str, now: i64| {
+            store
+                .use_refresh_token(token, "review", "https://pa.example", "user-1", now)
+                .unwrap()
+        };
+        assert_eq!(spend(&mut store, "once", 300), Some(grant("g")));
+        assert_eq!(spend(&mut store, "once", 301), None);
+        assert_eq!(spend(&mut store, "late", 5_000), None);
+        assert_eq!(spend(&mut store, "unknown", 300), None);
+    }
+
+    #[test]
+    fn only_the_grant_owner_can_spend_its_refresh_token() {
+        let (_directory, mut store) = store();
+        store.create_device_authorization(&device("ABCD-EFGH", "hash")).unwrap();
+        store.approve_device("ABCD-EFGH", &grant("g"), 200).unwrap();
+        store.put_refresh_token("token", "g", 5_000).unwrap();
+        for (brand, issuer, subject) in [
+            ("review", "https://other.example", "user-1"),
+            ("other", "https://pa.example", "user-1"),
+            ("review", "https://pa.example", "user-2"),
+        ] {
+            assert_eq!(
+                store.use_refresh_token("token", brand, issuer, subject, 300).unwrap(),
+                None,
+            );
+        }
+        // Nobody else's attempt spent it.
+        assert_eq!(
+            store
+                .use_refresh_token(
+                    "token",
+                    "review",
+                    "https://pa.example",
+                    "user-1",
+                    300
+                )
+                .unwrap(),
+            Some(grant("g")),
+        );
     }
 
     #[test]

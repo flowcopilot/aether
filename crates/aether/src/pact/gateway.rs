@@ -1362,7 +1362,13 @@ impl Gateway {
                 let refresh_token = field(form, "refresh_token").unwrap_or_default();
                 let used = self
                     .store()
-                    .use_refresh_token(&digest_hex(refresh_token), now)
+                    .use_refresh_token(
+                        &digest_hex(refresh_token),
+                        &brand.id,
+                        &caller.issuer,
+                        &caller.subject,
+                        now,
+                    )
                     .map_err(|_| oauth_store_error())?;
                 used.ok_or(Failure::OAuth(
                     OAuthError::InvalidGrant,

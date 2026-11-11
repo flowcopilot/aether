@@ -836,6 +836,31 @@ async fn a_revoked_or_foreign_delegation_is_an_invalid_token() {
 }
 
 #[tokio::test]
+async fn another_caller_cannot_spend_a_refresh_token() {
+    let fixture = fixture();
+    let tokens = fixture.delegate("u").await;
+    let refresh = tokens["refresh_token"].as_str().expect("refresh token");
+    let body =
+        format!("grant_type=refresh_token&refresh_token={refresh}&client_id={ISSUER}");
+    let fixture = &fixture;
+    let refresh_as = |sub: &str| {
+        let token = fixture.agent.token_for(sub);
+        let body = &body;
+        async move {
+            fixture
+                .call(Method::POST, "/a2a/review/oauth/token", Some(&token), None, body)
+                .await
+        }
+    };
+    let foreign = refresh_as("someone-else").await;
+    assert_eq!(foreign.status, StatusCode::BAD_REQUEST);
+    assert_eq!(foreign.body["error"], "invalid_grant");
+    // The owner's token is still unused.
+    let owner = refresh_as("u").await;
+    assert_eq!(owner.status, StatusCode::OK, "{}", owner.body);
+}
+
+#[tokio::test]
 async fn a_context_keeps_the_brand_user_it_first_ran_as() {
     let fixture = fixture();
     let started = fixture.send("u", None, user_message("m1", "hello")).await;
