@@ -158,8 +158,10 @@ pub(super) async fn hub_section(
     let sender = role == Role::Sender;
     let requests =
         invites.iter().filter(|invite| invite.status == Status::Requested).count();
+    // The screen the page script reloads.
+    let screen = if hosting && role == Role::Receiver { "/agents" } else { "/" };
     Ok(view! {
-        <div class="flex flex-col gap-5" data-hub-waiting=(waiting.then_some(""))>
+        <div class="flex flex-col gap-5" data-hub-waiting=(waiting.then_some(screen))>
             if sender && service {
                 <section id="invite" aria-label="Access requests" class="flex flex-col gap-4 rounded-xl border border-border bg-background p-6 shadow-sm">
                     <div class="flex flex-col gap-1.5">

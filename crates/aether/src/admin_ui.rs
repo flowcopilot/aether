@@ -62,8 +62,11 @@ const UI_HARDENING: crate::https::Hardening = crate::https::Hardening {
 
 /// Copies a `data-copy-text` value on click and says so in the button's
 /// `data-copy-label`. Only the Advanced page, which has `#activity-status`,
-/// opens the activity stream.
-const ADMIN_JAVASCRIPT: &str = "document.addEventListener('click',async event=>{const button=event.target.closest('[data-copy-text]');if(!button)return;const label=button.querySelector('[data-copy-label]')||button;const text=label.textContent;try{await navigator.clipboard.writeText(button.dataset.copyText);label.textContent='Copied'}catch{label.textContent='Select and copy'}setTimeout(()=>{label.textContent=text},1600)});const status=document.getElementById('activity-status');if(status){const events=new EventSource('/events');events.addEventListener('ready',()=>{status.textContent='Activity updates are connected.'});events.addEventListener('audit',event=>{status.textContent=JSON.parse(event.data).entry});events.addEventListener('task',event=>{const task=JSON.parse(event.data);status.textContent=`Task ${task.taskId}: ${task.event}`});events.addEventListener('unavailable',()=>{status.textContent='Activity updates cannot read the administration store.'});events.onerror=()=>{status.textContent='Activity updates will retry.'}}if(document.querySelector('[data-hub-waiting]')){const reload=()=>{const active=document.activeElement;if(active&&active.matches('input,select,textarea')&&active.value){setTimeout(reload,4000);return}location.assign('/')};setTimeout(reload,4000)}const dots=document.querySelectorAll('[data-presence]');if(dots.length){const update=async()=>{try{const answer=await fetch('/hub/presence');if(!answer.ok)return;const presence=await answer.json();for(const dot of dots){const online=presence[dot.dataset.presence];dot.dataset.state=online===undefined?'unknown':online?'online':'offline';dot.querySelector('[data-presence-label]').textContent=online===undefined?'':online?'Online':'Offline'}}catch{}};update();setInterval(update,15000)}";
+/// opens the activity stream. A hub section that waits for the other side
+/// names its screen in `data-hub-waiting`, and the script reloads that
+/// screen: the address bar may still hold the path of a form, which only
+/// answers a POST, and a node with both pages shows the caller at `/agents`.
+const ADMIN_JAVASCRIPT: &str = "document.addEventListener('click',async event=>{const button=event.target.closest('[data-copy-text]');if(!button)return;const label=button.querySelector('[data-copy-label]')||button;const text=label.textContent;try{await navigator.clipboard.writeText(button.dataset.copyText);label.textContent='Copied'}catch{label.textContent='Select and copy'}setTimeout(()=>{label.textContent=text},1600)});const status=document.getElementById('activity-status');if(status){const events=new EventSource('/events');events.addEventListener('ready',()=>{status.textContent='Activity updates are connected.'});events.addEventListener('audit',event=>{status.textContent=JSON.parse(event.data).entry});events.addEventListener('task',event=>{const task=JSON.parse(event.data);status.textContent=`Task ${task.taskId}: ${task.event}`});events.addEventListener('unavailable',()=>{status.textContent='Activity updates cannot read the administration store.'});events.onerror=()=>{status.textContent='Activity updates will retry.'}}const waiting=document.querySelector('[data-hub-waiting]');if(waiting){const reload=()=>{const active=document.activeElement;if(active&&active.matches('input,select,textarea')&&active.value){setTimeout(reload,4000);return}location.assign(waiting.dataset.hubWaiting||'/')};setTimeout(reload,4000)}const dots=document.querySelectorAll('[data-presence]');if(dots.length){const update=async()=>{try{const answer=await fetch('/hub/presence');if(!answer.ok)return;const presence=await answer.json();for(const dot of dots){const online=presence[dot.dataset.presence];dot.dataset.state=online===undefined?'unknown':online?'online':'offline';dot.querySelector('[data-presence-label]').textContent=online===undefined?'':online?'Online':'Offline'}}catch{}};update();setInterval(update,15000)}";
 
 //
 // topcoat has no TLS of its own; its docs point at fronting it with a
@@ -2981,6 +2984,38 @@ mod tests {
         );
         assert!(response.body.contains("EventSource"));
         assert!(response.body.contains("data-copy-text"));
+        // A waiting hub section reloads its own screen, not always `/`.
+        assert!(response.body.contains("location.assign(waiting.dataset.hubWaiting"));
+        assert!(!response.body.contains("location.assign('/')"));
+    }
+
+    #[tokio::test]
+    async fn a_waiting_invite_on_the_agents_page_reloads_the_agents_page() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let hub = crate::hub_client::test_hub::TestHub::start().await;
+        let (administration, _) = test_administration(directory.path());
+        let page =
+            test_host(directory.path(), Arc::new(std::sync::Mutex::new(Vec::new())))
+                .with_caller(true)
+                .with_hub(Some(hub.client(directory.path())));
+        let own =
+            crate::direct::endpoint_id(directory.path()).expect("endpoint must load");
+        let ana = peer_endpoint(5);
+        {
+            let mut state = hub.state();
+            state.add_account(&own, "tudor#0042");
+            state.add_account(&ana, "ana#0007");
+            state.add_invite(&ana, &own, "accepted");
+        }
+        let options = UiOptions { page: Some(Arc::new(page)), ..UiOptions::default() };
+        let application = app(build_admin_ui(administration, options, PORT));
+        let agents = get(application, "/agents").await;
+        assert_eq!(agents.status, StatusCode::OK);
+        assert!(
+            agents.body.contains("data-hub-waiting=\"/agents\""),
+            "{}",
+            agents.body
+        );
     }
 
     #[tokio::test]
