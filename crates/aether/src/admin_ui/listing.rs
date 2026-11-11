@@ -13,6 +13,24 @@ use topcoat::{
 use super::shared;
 use crate::components::button::{ButtonSize, ButtonVariant, button};
 
+/// The two buttons of the listing section, from their hidden `action` field.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum ListingAction {
+    List,
+    Stop,
+}
+
+impl ListingAction {
+    /// The field value; `Deserialize` reads the same names back.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::List => "list",
+            Self::Stop => "stop",
+        }
+    }
+}
+
 /// The listing section of a service agent's page.
 #[component]
 pub(super) async fn listing_section(
@@ -62,13 +80,13 @@ pub(super) async fn listing_section(
                 </p>
                 <div class="flex flex-wrap gap-2">
                     <form method="post" action="/listing/publish">
-                        <input type="hidden" name="action" value="list">
+                        <input type="hidden" name="action" value=(ListingAction::List.as_str())>
                         button(size: ButtonSize::Sm, attrs: attributes! { type="submit" disabled=(name.is_none().then_some("")) },
                             (if days_left.is_some() { "List again with the current card" } else { "List this agent" }))
                     </form>
                     if days_left.is_some() {
                         <form method="post" action="/listing/publish">
-                            <input type="hidden" name="action" value="stop">
+                            <input type="hidden" name="action" value=(ListingAction::Stop.as_str())>
                             button(variant: ButtonVariant::Outline, size: ButtonSize::Sm, attrs: attributes! { type="submit" }, "Stop listing")
                         </form>
                     }
@@ -101,4 +119,21 @@ pub(super) async fn listing_section(
             </div>
         </section>
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ListingAction;
+
+    #[test]
+    fn a_listing_action_value_reads_back_as_its_action() {
+        for action in [ListingAction::List, ListingAction::Stop] {
+            let value = serde_json::Value::from(action.as_str());
+            assert_eq!(
+                serde_json::from_value::<ListingAction>(value).ok(),
+                Some(action)
+            );
+        }
+        assert!(serde_json::from_value::<ListingAction>("pause".into()).is_err());
+    }
 }

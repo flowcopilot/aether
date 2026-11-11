@@ -22,7 +22,7 @@ use super::{
     Page, PageContext, admin_page, administration, ensure_admin_session,
     hub::{hub_section, hub_setting},
     layout::{Tab, Waiting, node_header},
-    listing::listing_section,
+    listing::{ListingAction, listing_section},
     shared::{self, Notice},
 };
 use crate::access_groups::{self, Action};
@@ -315,7 +315,7 @@ async fn groups_section(
                 <p role="alert" class="flex items-center gap-1.5 text-sm text-destructive">icon(data: ALERT) (error.clone())</p>
             }
             <form method="post" action="/groups" class="flex gap-2">
-                <input type="hidden" name="action" value="create" />
+                <input type="hidden" name="action" value=(GroupAction::Create.as_str()) />
                 input(attrs: attributes! { name="group" aria-label="New group name" placeholder="Group name" required="" maxlength="64" })
                 button(variant: ButtonVariant::Outline, attrs: attributes! { type="submit" }, "Create group")
             </form>
@@ -325,7 +325,7 @@ async fn groups_section(
                         <h3 class="text-[15px] font-semibold">(&group.name)</h3>
                         if group.name != crate::access_groups::FRIENDS_GROUP && group.name != crate::access_groups::REQUESTS_GROUP {
                             <form method="post" action="/groups">
-                                <input type="hidden" name="action" value="delete" />
+                                <input type="hidden" name="action" value=(GroupAction::Delete.as_str()) />
                                 <input type="hidden" name="group" value=(&group.name) />
                                 <button type="submit" class="text-sm font-medium text-destructive hover:underline">"Delete group"</button>
                             </form>
@@ -340,7 +340,7 @@ async fn groups_section(
                                 <li>
                                     <form method="post" action="/groups" class="flex items-center justify-between gap-2 py-2 text-sm">
                                         <span class="font-mono text-[13px]">(&member.agent_id)</span>
-                                        <input type="hidden" name="action" value="remove" />
+                                        <input type="hidden" name="action" value=(GroupAction::Remove.as_str()) />
                                         <input type="hidden" name="group" value=(&group.name) />
                                         <input type="hidden" name="agent" value=(&member.agent_id) />
                                         <input type="hidden" name="endpoint_id" value=(&member.endpoint_id) />
@@ -352,7 +352,7 @@ async fn groups_section(
                     }
                     if !friend_choices.is_empty() {
                         <form method="post" action="/groups" class="flex gap-2 pt-1">
-                            <input type="hidden" name="action" value="add" />
+                            <input type="hidden" name="action" value=(GroupAction::Add.as_str()) />
                             <input type="hidden" name="group" value=(&group.name) />
                             <select name="endpoint_id" aria-label=(format!("Add a person to {}", group.name)) class="h-8 min-w-0 flex-1 rounded-lg border border-border bg-background px-2 text-sm">
                                 for (name, endpoint) in &friend_choices {
@@ -368,10 +368,43 @@ async fn groups_section(
     })
 }
 
+/// The change a group form asks for, from its hidden `action` field.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum GroupAction {
+    Create,
+    Add,
+    Remove,
+    Delete,
+}
+
+impl GroupAction {
+    /// The field value; `Deserialize` reads the same names back.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Add => "add",
+            Self::Remove => "remove",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+impl From<GroupAction> for Action {
+    fn from(action: GroupAction) -> Self {
+        match action {
+            GroupAction::Create => Self::Create,
+            GroupAction::Add => Self::Add,
+            GroupAction::Remove => Self::Remove,
+            GroupAction::Delete => Self::Delete,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct GroupForm {
-    action: String,
+    action: GroupAction,
     group: String,
     agent: Option<String>,
     endpoint_id: Option<String>,
@@ -383,13 +416,6 @@ pub(super) async fn change_group(
     Form(form): Form<GroupForm>,
 ) -> TopcoatResult<impl View> {
     let page = admin_page(cx, "this node has no groups").await?;
-    let action = match form.action.as_str() {
-        "create" => Action::Create,
-        "add" => Action::Add,
-        "remove" => Action::Remove,
-        "delete" => Action::Delete,
-        _ => return Err(bad_request("this group action is invalid").into()),
-    };
     let peers = administration(cx)
         .grants()
         .map_err(|_| bad_request("grants are unavailable"))?
@@ -407,7 +433,7 @@ pub(super) async fn change_group(
         .collect::<Vec<_>>();
     let group_error = access_groups::change(
         &page.data_dir,
-        action,
+        form.action.into(),
         &form.group,
         form.agent.as_deref(),
         form.endpoint_id.as_deref(),
@@ -970,7 +996,7 @@ pub(super) async fn workspace(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ListingForm {
-    action: String,
+    action: ListingAction,
 }
 
 #[page(POST "/listing/publish")]
@@ -988,19 +1014,18 @@ pub(super) async fn publish_listing(
     {
         return Err(bad_request("only a service agent has a public listing").into());
     }
-    let result = match (form.action.as_str(), page.current_hub()) {
+    let result = match (form.action, page.current_hub()) {
         (_, None) => Err(crate::listing::HubPublishError::Hub(
             crate::hub_client::HubError::Unreachable,
         )),
-        ("list", Some(hub)) => {
+        (ListingAction::List, Some(hub)) => {
             crate::listing::publish_to_hub(&page.data_dir, &hub, now_seconds())
                 .await
                 .map(drop)
         }
-        ("stop", Some(hub)) => {
+        (ListingAction::Stop, Some(hub)) => {
             crate::listing::stop_hub_listing(&page.data_dir, &hub).await
         }
-        _ => return Err(bad_request("unknown listing action").into()),
     };
     let error = result
         .err()
@@ -1008,4 +1033,23 @@ pub(super) async fn publish_listing(
         .unwrap_or_default()
         .to_owned();
     Ok(view! { host_screen(notice: Notice::Listing(error)) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GroupAction;
+
+    #[test]
+    fn a_group_action_value_reads_back_as_its_action() {
+        for action in [
+            GroupAction::Create,
+            GroupAction::Add,
+            GroupAction::Remove,
+            GroupAction::Delete,
+        ] {
+            let value = serde_json::Value::from(action.as_str());
+            assert_eq!(serde_json::from_value::<GroupAction>(value).ok(), Some(action));
+        }
+        assert!(serde_json::from_value::<GroupAction>("rename".into()).is_err());
+    }
 }
