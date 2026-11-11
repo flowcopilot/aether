@@ -886,8 +886,12 @@ async fn approve(
             )
         })
         .map_err(|_| HubError::Unexpected)?;
+    // The approval goes only when the hub refused. After a lost answer the
+    // hub may have accepted the row, and the host signs it only with it.
     if let Err(error) = hub.approve(id, days).await {
-        let _ = store.remove_approval(id);
+        if !error.may_have_applied() {
+            let _ = store.remove_approval(id);
+        }
         return Err(error);
     }
     Ok(())

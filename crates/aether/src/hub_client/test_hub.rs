@@ -84,6 +84,9 @@ pub struct HubState {
     /// Acts as a hub from before protocol 2: no `GET /v1/hub`, and a claim
     /// body with `name` is invalid.
     pub old: bool,
+    /// Request paths whose answer is lost: the hub does the request, then
+    /// drops the connection before it answers.
+    pub lose_answers: BTreeSet<String>,
     next_id: u64,
 }
 
@@ -440,8 +443,14 @@ async fn handle(
     .unwrap_or_default();
     let mut state = shared.state.lock().expect("test hub state must lock");
     let response = route(&mut state, &endpoint, &method, &segments, &body, &query);
+    let lose_answer = state.lose_answers.contains(uri.path());
     drop(state);
     shared.changed.notify_waiters();
+    if lose_answer {
+        // Ends the connection task without an answer, as a timeout after
+        // the hub did the request would. No panic message is printed.
+        std::panic::resume_unwind(Box::new("the test hub lost the answer"));
+    }
     response
 }
 

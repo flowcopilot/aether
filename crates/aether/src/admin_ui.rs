@@ -1518,6 +1518,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_approval_whose_answer_is_lost_is_still_signed() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let hub = crate::hub_client::test_hub::TestHub::start().await;
+        let (page, cookie, data_dir) = service_page(directory.path(), &hub).await;
+        let service = crate::direct::endpoint_id(&data_dir).expect("endpoint");
+        let ana = peer_endpoint(5);
+        let id = {
+            let mut state = hub.state();
+            state.add_account(&ana, "ana#0001");
+            let id = state.add_request(&service, &ana, 7);
+            state.lose_answers.insert(format!("/v1/invites/{id}/approve"));
+            id
+        };
+        // The hub accepts the row, but the page gets no answer.
+        let approved = post(
+            page.clone(),
+            "/hub/approve",
+            Some(&cookie),
+            &format!("id={id}&days=7"),
+        )
+        .await;
+        assert_eq!(approved.status, StatusCode::OK, "{}", approved.body);
+        assert!(approved.body.contains("cannot be reached"), "{}", approved.body);
+        assert!(
+            hub.state()
+                .invites
+                .iter()
+                .any(|invite| invite.id == id && invite.status == "accepted")
+        );
+        // The owner approved the row, so the node keeps the approval and
+        // signs the accepted row instead of leaving it stuck.
+        let store = NodeStore::in_dir(&data_dir).expect("store");
+        assert!(store.hub_approval(&id).expect("approval must read").is_some());
+        wait_for_delivery(&hub, &id).await;
+        assert_eq!(group_members(&data_dir, "requests"), ["ana#0001"]);
+    }
+
+    #[tokio::test]
     async fn blocking_a_request_removes_it_and_keeps_the_block() {
         let directory = tempfile::tempdir().expect("directory must create");
         let hub = crate::hub_client::test_hub::TestHub::start().await;
