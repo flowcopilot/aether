@@ -202,10 +202,7 @@ defmodule AetherHub.Listings do
           :ok
       end
     end)
-    |> case do
-      {:ok, :ok} -> :ok
-      error -> error
-    end
+    |> ok()
   end
 
   def delete_expired do
@@ -218,11 +215,11 @@ defmodule AetherHub.Listings do
 
       :ok
     end)
-    |> case do
-      {:ok, :ok} -> :ok
-      error -> error
-    end
+    |> ok()
   end
+
+  defp ok({:ok, :ok}), do: :ok
+  defp ok({:error, _} = error), do: error
 
   defp live, do: from(l in Listing, where: l.expires_at > ^Clock.now())
 
@@ -292,8 +289,9 @@ defmodule AetherHub.Listings do
       Repo.one(
         from l in live(),
           join: a in Account,
+          as: :account,
           on: a.endpoint == l.endpoint,
-          where: a.name == ^name and a.number == ^number,
+          where: ^Names.named(name, number),
           select: {l, a}
       )
 

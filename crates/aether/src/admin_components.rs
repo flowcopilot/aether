@@ -10,6 +10,7 @@ use topcoat::{
 };
 
 use crate::components::{
+    badge::{BadgeVariant, badge},
     button::{ButtonSize, ButtonVariant, button},
     label::label,
 };
@@ -219,6 +220,183 @@ pub async fn step(
                 (child)
             </div>
         </li>
+    })
+}
+
+/// The color of a state badge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tone {
+    Success,
+    Warning,
+    Destructive,
+    Muted,
+}
+
+impl Tone {
+    /// The classes of a state badge in this tone.
+    #[must_use]
+    pub const fn class(self) -> &'static str {
+        match self {
+            Self::Success => "border-success/40 text-success",
+            Self::Warning => "border-warning/40 text-warning",
+            Self::Destructive => "border-destructive/40 text-destructive",
+            Self::Muted => "text-muted-foreground",
+        }
+    }
+}
+
+/// A state as a bordered badge: its word, in its tone.
+#[component]
+pub async fn state_badge(state: (&'static str, Tone)) -> Result<impl View> {
+    let (word, tone) = state;
+    Ok(view! {
+        badge(variant: BadgeVariant::Outline, attrs: attributes! { class=(tone.class()) }, (word))
+    })
+}
+
+/// A form that is one submit button: it posts the hidden `fields` to
+/// `action`. The child is the button's label. `title` explains the form;
+/// `aria_label` names the button where its label alone is unclear.
+#[component]
+pub async fn post_button(
+    action: &'static str,
+    fields: Vec<(&'static str, String)>,
+    #[default] variant: ButtonVariant,
+    #[default] size: ButtonSize,
+    #[default]
+    #[into]
+    title: String,
+    #[default]
+    #[into]
+    aria_label: String,
+    #[default] disabled: bool,
+    #[default] child: Child<'_>,
+) -> Result<impl View> {
+    Ok(view! {
+        <form method="post" action=(action) title=((!title.is_empty()).then_some(&title))>
+            for (name, value) in &fields {
+                <input type="hidden" name=(*name) value=(value)>
+            }
+            button(
+                variant: variant,
+                size: size,
+                attrs: attributes! {
+                    type="submit"
+                    aria-label=((!aria_label.is_empty()).then_some(&aria_label))
+                    disabled=(disabled.then_some(""))
+                },
+                (child)
+            )
+        </form>
+    })
+}
+
+/// Where an [`error_line`] sets its icon.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ErrorIcon {
+    /// At the top, nudged down to the first line of text.
+    #[default]
+    Nudged,
+    /// At the top, as it is.
+    Top,
+    /// In the middle of a one-line row.
+    Centered,
+}
+
+/// A refusal under a form, in the destructive color, with its icon.
+#[component]
+pub async fn error_line(
+    #[into] text: String,
+    #[default] placement: ErrorIcon,
+) -> Result<impl View> {
+    Ok(view! {
+        match placement {
+            ErrorIcon::Nudged => {
+                <p class="flex items-start gap-1.5 text-sm text-destructive" role="alert">
+                    <span class="mt-0.5 shrink-0">icon(data: ALERT)</span>
+                    (text)
+                </p>
+            }
+            ErrorIcon::Top => {
+                <p class="flex items-start gap-1.5 text-sm text-destructive" role="alert">icon(data: ALERT) (text)</p>
+            }
+            ErrorIcon::Centered => {
+                <p class="flex items-center gap-1.5 text-sm text-destructive" role="alert">icon(data: ALERT) (text)</p>
+            }
+        }
+    })
+}
+
+/// The heading of a page section. `id` is the target of its
+/// `aria-labelledby`, when it has one.
+#[component]
+pub async fn section_heading(
+    #[default]
+    #[into]
+    id: String,
+    #[default] child: Child<'_>,
+) -> Result<impl View> {
+    Ok(view! {
+        <h2 id=((!id.is_empty()).then_some(&id)) class="text-xl font-semibold tracking-tight">(child)</h2>
+    })
+}
+
+/// A count beside a tab or heading. `warning` marks changes that wait for
+/// the operator; `aria_label` reads the count out where the number alone is
+/// unclear.
+#[component]
+pub async fn count_badge(
+    count: usize,
+    #[default] warning: bool,
+    #[default]
+    #[into]
+    aria_label: String,
+) -> Result<impl View> {
+    Ok(view! {
+        <span
+            class=(if warning {
+                "flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-warning px-1.5 text-[11px] font-semibold text-primary-foreground"
+            } else {
+                "flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-primary px-1.5 text-[11px] font-semibold text-primary-foreground"
+            })
+            aria-label=((!aria_label.is_empty()).then_some(&aria_label))
+        >(count)</span>
+    })
+}
+
+/// A number of days in words: "1 day", "7 days".
+#[must_use]
+pub fn days_label(days: u64) -> String {
+    if days == 1 { "1 day".to_owned() } else { format!("{days} days") }
+}
+
+/// The `days` select of an access form: `choices`, with `selected` chosen.
+/// `id` names it for a label; `aria_label` names it where there is none.
+#[component]
+pub async fn days_select(
+    choices: Vec<u64>,
+    selected: u64,
+    #[into] class: String,
+    #[default]
+    #[into]
+    id: String,
+    #[default]
+    #[into]
+    aria_label: String,
+) -> Result<impl View> {
+    Ok(view! {
+        <select
+            id=((!id.is_empty()).then_some(&id))
+            name="days"
+            aria-label=((!aria_label.is_empty()).then_some(&aria_label))
+            class=(class)
+        >
+            for days in &choices {
+                <option value=(days) selected=((*days == selected).then_some(""))>
+                    (days_label(*days))
+                </option>
+            }
+        </select>
     })
 }
 

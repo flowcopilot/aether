@@ -15,17 +15,11 @@ use serde::{Serialize, de::DeserializeOwned};
 
 pub const KEY_FILE: &str = "pact-signing.key";
 
+/// The key cannot be read, written, parsed or created, or a token cannot be
+/// signed. No caller tells these apart.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
-pub enum KeyError {
-    #[error("the PACT signing key cannot be read or written")]
-    Io,
-    #[error("the PACT signing key is not a P-256 PKCS#8 key")]
-    Invalid,
-    #[error("the system cannot give random bytes for a key")]
-    Randomness,
-    #[error("a token cannot be signed")]
-    Sign,
-}
+#[error("the PACT signing key cannot be used")]
+pub struct KeyError;
 
 pub struct ProviderKey {
     encoding: EncodingKey,
@@ -42,31 +36,31 @@ impl ProviderKey {
         let path = data_dir.join(KEY_FILE);
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_file() => {
-                Self::from_pkcs8(&fs::read(&path).map_err(|_| KeyError::Io)?)
+                Self::from_pkcs8(&fs::read(&path).map_err(|_| KeyError)?)
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 let document = EcdsaKeyPair::generate_pkcs8(
                     &ECDSA_P256_SHA256_FIXED_SIGNING,
                     &SystemRandom::new(),
                 )
-                .map_err(|_| KeyError::Randomness)?;
-                fs::create_dir_all(data_dir).map_err(|_| KeyError::Io)?;
+                .map_err(|_| KeyError)?;
+                fs::create_dir_all(data_dir).map_err(|_| KeyError)?;
                 crate::key_file::write_owner_only(&path, document.as_ref())
-                    .map_err(|_| KeyError::Io)?;
+                    .map_err(|_| KeyError)?;
                 Self::from_pkcs8(document.as_ref())
             }
             // Not a plain file (a symbolic link, a directory), or unreadable.
-            Ok(_) | Err(_) => Err(KeyError::Io),
+            Ok(_) | Err(_) => Err(KeyError),
         }
     }
 
     pub fn from_pkcs8(der: &[u8]) -> Result<Self, KeyError> {
         let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, der)
-            .map_err(|_| KeyError::Invalid)?;
+            .map_err(|_| KeyError)?;
         // An uncompressed SEC1 point: 0x04, then 32 bytes of x, 32 of y.
         let point = pair.public_key().as_ref();
         let (Some(x), Some(y)) = (point.get(1..33), point.get(33..65)) else {
-            return Err(KeyError::Invalid);
+            return Err(KeyError);
         };
         let x = URL_SAFE_NO_PAD.encode(x);
         let y = URL_SAFE_NO_PAD.encode(y);
@@ -75,8 +69,7 @@ impl ProviderKey {
         let thumbprint = format!(r#"{{"crv":"P-256","kty":"EC","x":"{x}","y":"{y}"}}"#);
         let kid = URL_SAFE_NO_PAD
             .encode(digest::digest(&digest::SHA256, thumbprint.as_bytes()));
-        let decoding =
-            DecodingKey::from_ec_components(&x, &y).map_err(|_| KeyError::Invalid)?;
+        let decoding = DecodingKey::from_ec_components(&x, &y).map_err(|_| KeyError)?;
         Ok(Self { encoding: EncodingKey::from_ec_der(der), decoding, kid, x, y })
     }
 
@@ -106,8 +99,7 @@ impl ProviderKey {
         let mut header = Header::new(Algorithm::ES256);
         header.typ = Some(typ.to_owned());
         header.kid = Some(self.kid.clone());
-        jsonwebtoken::encode(&header, claims, &self.encoding)
-            .map_err(|_| KeyError::Sign)
+        jsonwebtoken::encode(&header, claims, &self.encoding).map_err(|_| KeyError)
     }
 
     /// Verifies a token this key signed, with header `typ`, and the claim

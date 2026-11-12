@@ -34,7 +34,6 @@ pub enum DiscoveryError {
     Forged,
     /// A wire form that names no valid time.
     Malformed,
-    NotFound,
 }
 
 pub fn validate_record(record: &Record) -> Result<(), DiscoveryError> {

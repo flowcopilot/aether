@@ -13,48 +13,23 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::{agent_card::CardSettings, untrusted};
-
-pub use crate::hub_client::protocol::{
-    MAX_LISTING_BYTES, MAX_LISTING_DAYS, MAX_LISTING_DESCRIPTION as MAX_DESCRIPTION,
-    MAX_LISTING_SKILL_DESCRIPTION as MAX_SKILL_DESCRIPTION,
-    MAX_LISTING_SKILL_ID as MAX_SKILL_ID, MAX_LISTING_SKILL_NAME as MAX_SKILL_NAME,
-    MAX_LISTING_SKILLS as MAX_SKILLS, MAX_LISTING_TAG as MAX_TAG,
-    MAX_LISTING_TAGS as MAX_TAGS, OWNER_LINK_MAX_DAYS,
+use crate::{
+    agent_card::CardSettings,
+    hub_client::protocol::{
+        self, MAX_LISTING_DAYS, MAX_LISTING_DESCRIPTION, MAX_LISTING_SKILL_DESCRIPTION,
+        MAX_LISTING_SKILL_ID, MAX_LISTING_SKILL_NAME, MAX_LISTING_TAG,
+        OWNER_LINK_MAX_DAYS,
+    },
+    untrusted,
 };
+
+pub use crate::hub_client::protocol::{Listing, ListingError};
 
 /// How long a new listing stays on the hub. The hub accepts 30 days at most.
 pub const LISTING_LIFETIME: Duration =
     Duration::from_hours(MAX_LISTING_DAYS.saturating_mul(24));
 /// A listing with less time left than this is signed again.
 pub const RENEW_BEFORE: Duration = Duration::from_hours(7 * 24);
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
-pub enum ListingError {
-    #[error("the listing is not valid")]
-    Invalid,
-    #[error("the listing signature does not verify")]
-    Signature,
-    #[error("the listing has expired")]
-    Expired,
-}
-
-/// A listing that passed the checks. Every text is from a stranger.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct Listing {
-    /// The full name, such as `law#0042`.
-    pub name: String,
-    pub description: String,
-    pub skills: Vec<ListingSkill>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct ListingSkill {
-    pub id: String,
-    pub name: String,
-    pub description: String,
-    pub tags: Vec<String>,
-}
 
 /// What this node last sent to the hub, kept under the setting
 /// [`settings::ListingState`].
@@ -86,23 +61,11 @@ pub fn listing_bytes(settings: &CardSettings, full_name: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-const fn wire_error(
-    error: crate::hub_client::protocol::ListingWireError,
-) -> ListingError {
-    match error {
-        crate::hub_client::protocol::ListingWireError::Invalid => ListingError::Invalid,
-        crate::hub_client::protocol::ListingWireError::Signature => {
-            ListingError::Signature
-        }
-        crate::hub_client::protocol::ListingWireError::Expired => ListingError::Expired,
-    }
-}
-
 /// The signature of `bytes` until `expires_at` by the endpoint `key`, as
 /// unpadded base64url.
 #[must_use]
 pub fn sign(key: &iroh::SecretKey, bytes: &[u8], expires_at: u64) -> String {
-    crate::hub_client::protocol::sign_listing(key, bytes, expires_at)
+    protocol::sign_listing(key, bytes, expires_at)
 }
 
 /// Checks that the endpoint `endpoint` signed the listing `text` until
@@ -114,10 +77,7 @@ pub fn verify(
     expires_at: u64,
     at: u64,
 ) -> Result<(), ListingError> {
-    crate::hub_client::protocol::verify_listing(
-        text, signature, endpoint, expires_at, at,
-    )
-    .map_err(wire_error)
+    protocol::verify_listing(text, signature, endpoint, expires_at, at)
 }
 
 /// How long an owner link lasts. The hub accepts 365 days at most.
@@ -132,7 +92,7 @@ pub fn sign_owner_claim(
     service_handle: &str,
     expires_at: u64,
 ) -> String {
-    let message = crate::hub_client::protocol::owner_claim_message(
+    let message = protocol::owner_claim_message(
         &key.public().to_string(),
         service_handle,
         expires_at,
@@ -148,7 +108,7 @@ pub fn sign_owner_confirm(
     personal: &str,
     expires_at: u64,
 ) -> String {
-    let message = crate::hub_client::protocol::owner_confirm_message(
+    let message = protocol::owner_confirm_message(
         &key.public().to_string(),
         personal,
         expires_at,
@@ -159,30 +119,23 @@ pub fn sign_owner_confirm(
 /// The listing in `text` (base64url) when it passes the hub's rules and
 /// names `handle`. Every text is cleaned for display.
 pub fn parse(text: &str, handle: &str) -> Result<Listing, ListingError> {
-    let bytes = URL_SAFE_NO_PAD.decode(text).map_err(|_| ListingError::Invalid)?;
-    let raw = crate::hub_client::protocol::parse_listing_bytes(&bytes, handle)
-        .map_err(wire_error)?;
-    Ok(Listing {
-        name: untrusted::single_line(&raw.name, raw.name.chars().count()),
-        description: untrusted::single_line(&raw.description, MAX_DESCRIPTION),
-        skills: raw
-            .skills
-            .into_iter()
-            .map(|skill| ListingSkill {
-                id: untrusted::single_line(&skill.id, MAX_SKILL_ID),
-                name: untrusted::single_line(&skill.name, MAX_SKILL_NAME),
-                description: untrusted::single_line(
-                    &skill.description,
-                    MAX_SKILL_DESCRIPTION,
-                ),
-                tags: skill
-                    .tags
-                    .iter()
-                    .map(|tag| untrusted::single_line(tag, MAX_TAG))
-                    .collect(),
-            })
-            .collect(),
-    })
+    let bytes = URL_SAFE_NO_PAD.decode(text).map_err(|_| ListingError)?;
+    let mut listing = protocol::parse_listing_bytes(&bytes, handle)?;
+    let clean = |text: &mut String, max: usize| {
+        *text = untrusted::single_line(text, max);
+    };
+    let name_chars = listing.name.chars().count();
+    clean(&mut listing.name, name_chars);
+    clean(&mut listing.description, MAX_LISTING_DESCRIPTION);
+    for skill in &mut listing.skills {
+        clean(&mut skill.id, MAX_LISTING_SKILL_ID);
+        clean(&mut skill.name, MAX_LISTING_SKILL_NAME);
+        clean(&mut skill.description, MAX_LISTING_SKILL_DESCRIPTION);
+        for tag in &mut skill.tags {
+            clean(tag, MAX_LISTING_TAG);
+        }
+    }
+    Ok(listing)
 }
 
 pub mod settings {
@@ -234,11 +187,8 @@ pub(crate) async fn publish_to_hub(
 ) -> Result<ListingState, HubPublishError> {
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 
-    let name =
-        crate::settings::setting::<crate::hub_client::settings::HubName>(data_dir)
-            .ok()
-            .flatten()
-            .ok_or(HubPublishError::NoName)?;
+    let name = crate::hub_client::settings::hub_name(data_dir)
+        .ok_or(HubPublishError::NoName)?;
     let settings = crate::agent_card::settings(data_dir);
     let bytes = listing_bytes(&settings, &name);
     let key = crate::data_dir::DataDir::new(data_dir)
@@ -251,11 +201,19 @@ pub(crate) async fn publish_to_hub(
         .await
         .map_err(HubPublishError::Hub)?;
     let state = ListingState { listed: true, expires_at, listing: text };
-    crate::settings::store_setting::<settings::ListingState>(
+    if crate::settings::store_setting::<settings::ListingState>(
         data_dir,
         &Some(state.clone()),
     )
-    .map_err(|_| HubPublishError::Store)?;
+    .is_err()
+    {
+        // Without its local state the node never renews the listing: take
+        // it off the hub again, so that the two sides agree.
+        let _ = hub.delete_listing().await.inspect_err(|error| {
+            tracing::warn!(?error, "hub listing left after local state failed");
+        });
+        return Err(HubPublishError::Store);
+    }
     Ok(state)
 }
 
@@ -271,8 +229,11 @@ pub(crate) async fn stop_hub_listing(
 pub(crate) const fn hub_publish_message(error: HubPublishError) -> &'static str {
     match error {
         HubPublishError::NoName => "Choose your name on Aether first.",
-        HubPublishError::Key | HubPublishError::Store => {
+        HubPublishError::Key => {
             "The listing was not saved on this computer. Try again."
+        }
+        HubPublishError::Store => {
+            "This computer could not keep the listing, so it is not on Aether. Try again."
         }
         HubPublishError::Hub(crate::hub_client::HubError::Invalid) => {
             "The hub refused the listing. Check the text of your agent's card."
@@ -302,11 +263,7 @@ async fn renew_listing(ctx: &crate::node_serve_context::NodeServeContext) {
             state.listed
                 && state.expires_at.saturating_sub(now) < RENEW_BEFORE.as_secs()
         });
-    let service = crate::settings::setting::<crate::hub_client::settings::AgentKind>(
-        &ctx.data_dir,
-    )
-    .ok()
-    .flatten()
+    let service = crate::hub_client::settings::agent_kind(&ctx.data_dir)
         == Some(AgentKind::Service);
     if !(due && service) {
         return;
@@ -359,10 +316,7 @@ mod tests {
         let endpoint = key.public().to_string();
         assert_eq!(verify(&text, &signature, &endpoint, NOW + 60, NOW), Ok(()));
         let other = iroh::SecretKey::generate().public().to_string();
-        assert_eq!(
-            verify(&text, &signature, &other, NOW + 60, NOW),
-            Err(ListingError::Signature)
-        );
+        assert_eq!(verify(&text, &signature, &other, NOW + 60, NOW), Err(ListingError));
 
         let listing = parse(&text, "law#0042").expect("the listing must parse");
         assert_eq!(listing.name, "law#0042");
@@ -384,19 +338,19 @@ mod tests {
         changed.push(b' ');
         assert_eq!(
             verify(&encode(&changed), &signature, &endpoint, NOW + 60, NOW),
-            Err(ListingError::Signature)
+            Err(ListingError)
         );
         assert_eq!(
             verify(&encode(&bytes), &signature, &endpoint, NOW + 61, NOW),
-            Err(ListingError::Signature)
+            Err(ListingError)
         );
         assert_eq!(
             verify(&encode(&bytes), &signature, &endpoint, NOW + 60, NOW + 60),
-            Err(ListingError::Expired)
+            Err(ListingError)
         );
         assert_eq!(
             verify(&encode(&bytes), "AAAA", &endpoint, NOW + 60, NOW),
-            Err(ListingError::Signature)
+            Err(ListingError)
         );
     }
 
@@ -433,7 +387,7 @@ mod tests {
         for (label, value) in changes {
             assert_eq!(
                 parse(&encode(value.to_string().as_bytes()), "law#0042"),
-                Err(ListingError::Invalid),
+                Err(ListingError),
                 "{label}"
             );
         }
@@ -441,10 +395,42 @@ mod tests {
             r#"{{"name":"law#0042","name":"law#0042","description":"x","skills":{}}}"#,
             good["skills"]
         );
-        assert_eq!(
-            parse(&encode(duplicate.as_bytes()), "law#0042"),
-            Err(ListingError::Invalid)
-        );
-        assert_eq!(parse("not base64!", "law#0042"), Err(ListingError::Invalid));
+        assert_eq!(parse(&encode(duplicate.as_bytes()), "law#0042"), Err(ListingError));
+        assert_eq!(parse("not base64!", "law#0042"), Err(ListingError));
+    }
+
+    #[tokio::test]
+    async fn a_listing_this_computer_cannot_keep_is_taken_off_the_hub() {
+        let hub = crate::hub_client::test_hub::TestHub::start().await;
+        let directory = tempfile::tempdir().expect("directory must create");
+        let data_dir = directory.path();
+        crate::settings::store_setting::<crate::hub_client::settings::HubName>(
+            data_dir,
+            &Some("law#0042".to_owned()),
+        )
+        .expect("name must store");
+        let client = hub.client(data_dir);
+        let endpoint = client.endpoint_id();
+        {
+            let mut state = hub.state();
+            state.add_account(&endpoint, "law#0042");
+            state.kinds.insert(endpoint.clone(), crate::hub_client::AgentKind::Service);
+            state.break_files.insert(
+                "/v1/listing".to_owned(),
+                data_dir.join(aether_store::NODE_DATABASE),
+            );
+        }
+        let published = super::publish_to_hub(data_dir, &client, NOW).await;
+        assert_eq!(published, Err(super::HubPublishError::Store));
+        // The hub took the listing, but this computer cannot renew it: the
+        // listing comes off the hub again.
+        assert!(!hub.state().listings.contains_key(&endpoint));
+        let methods: Vec<String> = hub
+            .requests()
+            .into_iter()
+            .filter(|request| request.target == "/v1/listing")
+            .map(|request| request.method)
+            .collect();
+        assert_eq!(methods, ["PUT", "DELETE"]);
     }
 }

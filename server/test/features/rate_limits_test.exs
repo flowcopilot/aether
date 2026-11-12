@@ -1,7 +1,7 @@
 defmodule AetherHub.Features.RateLimitsTest do
   use AetherHub.Feature, file: "rate-limits.feature", async: true
 
-  alias AetherHub.{Clock, Presence}
+  alias AetherHub.Presence
 
   defp account(node), do: request(node, "GET", "/v1/account")
 
@@ -11,16 +11,13 @@ defmodule AetherHub.Features.RateLimitsTest do
 
   defp claims(count, ip), do: for(_ <- 1..count, do: claim(new_node(), ip).status)
 
-  defp search(node), do: request(node, "GET", "/v1/people?q=ab")
-
   # Requests a minute
 
   defstep ~r/^(?<who>\w+) (?:sends|sent) (?<count>\d+) requests in one minute$/,
           %{who: who, count: count},
           state do
     node = actor(state, who)
-    {_limit, seconds} = AetherHub.RateLimit.limit(:request)
-    Clock.set(div(Clock.now(), seconds) * seconds)
+    start_of_window(:request)
 
     {:ok, %{statuses: for(_ <- 1..String.to_integer(count), do: account(node).status)}}
   end
@@ -102,11 +99,11 @@ defmodule AetherHub.Features.RateLimitsTest do
 
   defstep ~r/^(?<who>\w+) made 30 searches$/, %{who: who}, state do
     node = actor(state, who)
-    assert Enum.uniq(for _ <- 1..30, do: search(node).status) == [200]
+    assert Enum.uniq(for _ <- 1..30, do: search_people(node, "q=ab").status) == [200]
   end
 
   defstep ~r/^(?<who>\w+) searches once more$/, %{who: who}, state do
-    {:ok, %{conn: search(actor(state, who))}}
+    {:ok, %{conn: search_people(actor(state, who), "q=ab")}}
   end
 
   defstep ~r/^(?<who>\w+) reads her account$/, %{who: who}, state do

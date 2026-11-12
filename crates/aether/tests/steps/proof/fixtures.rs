@@ -24,14 +24,6 @@ use crate::common::{
 pub const CALLER: &str = "caller";
 pub const CALLER_ENDPOINT: &str = "caller-endpoint";
 
-pub async fn blocking<R, F>(work: F) -> R
-where
-    R: Send + 'static,
-    F: FnOnce() -> R + Send + 'static,
-{
-    tokio::task::spawn_blocking(work).await.expect("blocking step must finish")
-}
-
 /// The scope with the given kind name; its id is the same name.
 pub fn scope(name: &str) -> Scope {
     let kind = match name {

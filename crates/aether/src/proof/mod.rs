@@ -86,11 +86,8 @@ pub(crate) fn timestamp_after(duration: Duration) -> i64 {
 }
 
 mod admission;
-mod handle;
 mod scheduler;
 mod worker;
-
-pub use handle::ProofHandle;
 
 use scheduler::SchedulerContext;
 use worker::StoreWorker;
@@ -320,6 +317,7 @@ where
         self.workspace.path().map_err(|_| ProofError::Internal)
     }
 
+    #[cfg(test)]
     pub fn apply_grant(&self, grant: aether_core::Grant) -> Result<(), ProofError> {
         self.apply_grant_inner(grant, true)
     }
@@ -540,7 +538,10 @@ mod tests {
     };
 
     use super::*;
-    use crate::{execution::TurnContext, test_support::Trusted};
+    use crate::{
+        execution::{ExecutionEvent, TurnContext},
+        test_support::Trusted,
+    };
 
     #[derive(Clone)]
     struct Cancellable {
@@ -548,7 +549,12 @@ mod tests {
     }
 
     impl Agent for Cancellable {
-        fn start_turn(&mut self, _ctx: &TurnContext) -> Result<String, ExecutionError> {
+        fn start_turn_with_events(
+            &mut self,
+            _ctx: &TurnContext,
+            events: &mut dyn FnMut(ExecutionEvent),
+        ) -> Result<String, ExecutionError> {
+            events(ExecutionEvent::Completed);
             Ok("done".to_owned())
         }
 
@@ -565,7 +571,11 @@ mod tests {
     }
 
     impl Agent for Blocking {
-        fn start_turn(&mut self, ctx: &TurnContext) -> Result<String, ExecutionError> {
+        fn start_turn_with_events(
+            &mut self,
+            ctx: &TurnContext,
+            events: &mut dyn FnMut(ExecutionEvent),
+        ) -> Result<String, ExecutionError> {
             self.active.fetch_add(1, Ordering::AcqRel);
             if let Ok(mut order) = self.order.lock() {
                 order.push(ctx.task_id.clone());
@@ -574,6 +584,7 @@ mod tests {
                 thread::sleep(Duration::from_millis(5));
             }
             self.active.fetch_sub(1, Ordering::AcqRel);
+            events(ExecutionEvent::Completed);
             Ok(format!("done:{}", ctx.task_id))
         }
 
@@ -808,7 +819,11 @@ mod tests {
     }
 
     impl Agent for BlockingCancellable {
-        fn start_turn(&mut self, _ctx: &TurnContext) -> Result<String, ExecutionError> {
+        fn start_turn_with_events(
+            &mut self,
+            _ctx: &TurnContext,
+            events: &mut dyn FnMut(ExecutionEvent),
+        ) -> Result<String, ExecutionError> {
             self.active.fetch_add(1, Ordering::AcqRel);
             while !self.gate.load(Ordering::Acquire) {
                 if self.cancelled.load(Ordering::Acquire) {
@@ -818,6 +833,7 @@ mod tests {
                 thread::sleep(Duration::from_millis(5));
             }
             self.active.fetch_sub(1, Ordering::AcqRel);
+            events(ExecutionEvent::Completed);
             Ok("done".to_owned())
         }
 
@@ -926,64 +942,6 @@ mod tests {
         assert_eq!(
             node.queue_limits().expect("queue limits must load"),
             QueueLimits { global: 2, per_peer: 1 }
-        );
-        node.shutdown();
-    }
-
-    #[derive(Clone)]
-    struct RecordsWorkspace {
-        workspace: Arc<Mutex<Option<PathBuf>>>,
-    }
-
-    impl Agent for RecordsWorkspace {
-        fn start_turn(&mut self, _ctx: &TurnContext) -> Result<String, ExecutionError> {
-            Ok("done".to_owned())
-        }
-
-        fn cancel(&self, _task_id: &str) {}
-
-        fn set_workspace(&self, workspace: &Path) {
-            if let Ok(mut current) = self.workspace.lock() {
-                *current = Some(workspace.to_path_buf());
-            }
-        }
-    }
-
-    #[test]
-    fn apply_workspace_reaches_the_underlying_process() {
-        let directory = tempfile::tempdir().expect("directory must create");
-        let old_workspace = directory.path().join("old");
-        let new_workspace = directory.path().join("new");
-        std::fs::create_dir_all(&old_workspace).expect("old workspace must create");
-        std::fs::create_dir_all(&new_workspace).expect("new workspace must create");
-        let recorded = Arc::new(Mutex::new(None));
-        let node = ProofNode::new(
-            PolicyEngine::new(Trusted, Vec::<Grant>::new()),
-            NodeStore::in_dir(directory.path()).expect("store must open"),
-            Executor::new(
-                RecordsWorkspace { workspace: Arc::clone(&recorded) },
-                crate::execution::Limits {
-                    workspace: old_workspace,
-                    max_context_tokens: 32,
-                    max_seconds: 1,
-                },
-            ),
-            QueueLimits { global: 1, per_peer: 1 },
-            Scope { id: ScopeId::new("direct"), kind: ScopeKind::Direct },
-        )
-        .expect("node must create");
-        // Only Executor::set_workspace ran so far, at construction: nothing
-        // has told the process about a workspace change yet.
-        assert_eq!(recorded.lock().expect("recorded value must read").as_deref(), None);
-        node.apply_workspace(&new_workspace).expect("workspace must apply");
-        assert_eq!(
-            recorded.lock().expect("recorded workspace must read").as_deref(),
-            Some(
-                new_workspace
-                    .canonicalize()
-                    .expect("new workspace must canonicalize")
-                    .as_path()
-            )
         );
         node.shutdown();
     }
@@ -1459,7 +1417,11 @@ mod tests {
     struct FailsAfterStart;
 
     impl Agent for FailsAfterStart {
-        fn start_turn(&mut self, _ctx: &TurnContext) -> Result<String, ExecutionError> {
+        fn start_turn_with_events(
+            &mut self,
+            _ctx: &TurnContext,
+            _events: &mut dyn FnMut(ExecutionEvent),
+        ) -> Result<String, ExecutionError> {
             Err(ExecutionError::Protocol)
         }
 

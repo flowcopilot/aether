@@ -11,7 +11,9 @@ use std::{
 };
 
 use aether::{
-    execution::{Agent, ExecutionError, Executor, Limits, Task, TurnContext},
+    execution::{
+        Agent, ExecutionError, ExecutionEvent, Executor, Limits, Task, TurnContext,
+    },
     identity::SignedClaims,
     proof::{Identity, ProofError, ProofNode, SubmissionInput},
 };
@@ -26,10 +28,10 @@ use tempfile::TempDir;
 use tokio::{sync::broadcast, task::JoinHandle};
 
 use super::fixtures::{
-    CALLER_ENDPOINT, blocking, claim, expired_claim, grant, names, request, scope,
-    task, task_input,
+    CALLER_ENDPOINT, claim, expired_claim, grant, names, request, scope, task,
+    task_input,
 };
-use crate::steps::World;
+use crate::{common::blocking, steps::World};
 
 type Node = ProofNode<SignedClaims, TestAgent>;
 type Outcome = Result<(TaskState, Option<String>), ProofError>;
@@ -65,7 +67,23 @@ impl TestAgent {
 }
 
 impl Agent for TestAgent {
-    fn start_turn(&mut self, ctx: &TurnContext) -> Result<String, ExecutionError> {
+    fn start_turn_with_events(
+        &mut self,
+        ctx: &TurnContext,
+        events: &mut dyn FnMut(ExecutionEvent),
+    ) -> Result<String, ExecutionError> {
+        let answer = self.answer(ctx)?;
+        events(ExecutionEvent::Completed);
+        Ok(answer)
+    }
+
+    fn cancel(&self, _task_id: &str) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
+impl TestAgent {
+    fn answer(&self, ctx: &TurnContext) -> Result<String, ExecutionError> {
         self.turns.fetch_add(1, Ordering::Relaxed);
         self.started.store(true, Ordering::Release);
         let Behaviour::WaitsForCancel { late_result } = self.behaviour else {
@@ -82,10 +100,6 @@ impl Agent for TestAgent {
             return Ok("late result".to_owned());
         }
         Err(ExecutionError::Cancelled)
-    }
-
-    fn cancel(&self, _task_id: &str) {
-        self.cancelled.store(true, Ordering::Release);
     }
 }
 

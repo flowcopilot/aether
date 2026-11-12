@@ -6,7 +6,7 @@ import { spawn } from 'node:child_process';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { Mailbox } from './mailbox.mjs';
 import { NodeLink, contract } from './node-link.mjs';
-import { createBridgeServer, createMcpServer, localExecutor } from './server.mjs';
+import { createBridgeServer, createMcpServer, forwardOperations, localExecutor } from './server.mjs';
 import { UNAVAILABLE, acquireRuntime } from './runtime.mjs';
 
 function secret(file) {
@@ -33,37 +33,45 @@ function lastLine() {
   };
 }
 
-async function main() {
-  if (process.env.GROKBOT_EXPERIMENTAL !== '1') throw new Error('Set GROKBOT_EXPERIMENTAL=1 to acknowledge that hosted Bot stopping is cooperative, not guaranteed');
-  const transport = process.env.GROKBOT_TRANSPORT || 'http';
+function settings(env) {
+  if (env.GROKBOT_EXPERIMENTAL !== '1') throw new Error('Set GROKBOT_EXPERIMENTAL=1 to acknowledge that hosted Bot stopping is cooperative, not guaranteed');
+  const transport = env.GROKBOT_TRANSPORT || 'http';
   if (!['http', 'stdio'].includes(transport)) throw new Error('GROKBOT_TRANSPORT must be http or stdio');
-  const token = transport === 'http' ? secret(process.env.GROKBOT_TOKEN_FILE) : undefined;
-  const dataDir = process.env.AETHER_DATA_DIR?.trim() || path.join(os.homedir(), '.aether', 'host');
-  // Separate state from node authority. Do not delete the node data directory.
-  const stateDir = path.join(dataDir, 'grokbot-bridge');
-  mkdirSync(stateDir, { recursive: true, mode: 0o700 });
-  const port = Number(process.env.GROKBOT_PORT || 8788);
+  const token = transport === 'http' ? secret(env.GROKBOT_TOKEN_FILE) : undefined;
+  const dataDir = env.AETHER_DATA_DIR?.trim() || path.join(os.homedir(), '.aether', 'host');
+  const port = Number(env.GROKBOT_PORT || 8788);
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid GROKBOT_PORT');
-  const publicUrl = process.env.GROKBOT_PUBLIC_URL;
+  const publicUrl = env.GROKBOT_PUBLIC_URL;
   if (publicUrl && new URL(publicUrl).protocol !== 'https:') throw new Error('GROKBOT_PUBLIC_URL requires HTTPS');
-  const wakeUrl = process.env.GROKBOT_WAKE_URL;
+  const wakeUrl = env.GROKBOT_WAKE_URL;
   if (wakeUrl && new URL(wakeUrl).protocol !== 'https:') throw new Error('GROKBOT_WAKE_URL requires HTTPS');
-  const wakeToken = wakeUrl ? secret(process.env.GROKBOT_WAKE_TOKEN_FILE) : undefined;
-  let waking = false;
+  const wakeToken = wakeUrl ? secret(env.GROKBOT_WAKE_TOKEN_FILE) : undefined;
+  return { transport, token, dataDir, port, publicUrl, wakeUrl, wakeToken };
+}
+
+// Asks the Grok routine to come and claim work, at most every 30 seconds. The
+// request times out well inside that window, so wakes never overlap.
+function waker(url, token) {
   let lastWake = 0;
-  const wake = async () => {
-    if (!wakeUrl || waking || Date.now() - lastWake < 30_000) return;
-    waking = true;
+  return async () => {
+    if (!url || Date.now() - lastWake < 30_000) return;
     lastWake = Date.now();
     try {
-      const response = await fetch(wakeUrl, { method: 'POST', redirect: 'error',
-        headers: { Authorization: `Bearer ${wakeToken}`, 'Content-Type': 'application/json' },
+      const response = await fetch(url, { method: 'POST', redirect: 'error',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ type: 'aether.work_available' }), signal: AbortSignal.timeout(5000) });
       await response.body?.cancel();
       if (response.status !== 200) console.error('Grok routine wake was not accepted; tasks remain queued until their deadlines');
     } catch { console.error('Grok routine wake failed; tasks remain queued until their deadlines'); }
-    finally { waking = false; }
   };
+}
+
+async function main() {
+  const { transport, token, dataDir, port, publicUrl, wakeUrl, wakeToken } = settings(process.env);
+  // Separate state from node authority. Do not delete the node data directory.
+  const stateDir = path.join(dataDir, 'grokbot-bridge');
+  mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  const wake = waker(wakeUrl, wakeToken);
 
   const controller = new AbortController();
   const { signal } = controller;
@@ -74,12 +82,7 @@ async function main() {
     if (!executor) throw new Error(UNAVAILABLE);
     return executor;
   };
-  const tools = {
-    status: () => current().status(),
-    claim: claimId => current().claim(claimId),
-    progress: (id, lease) => current().progress(id, lease),
-    finish: (id, lease, outcome, text) => current().finish(id, lease, outcome, text),
-  };
+  const tools = forwardOperations((name, args) => current()[name](...args));
   let server;
   let child;
   let runtime;

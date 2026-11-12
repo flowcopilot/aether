@@ -11,7 +11,9 @@
 pub mod codex;
 pub mod connected;
 
-use std::path::Path;
+use std::{collections::VecDeque, io::Write, sync::Mutex};
+
+use serde::Serialize;
 
 use crate::{
     execution::{Agent, ExecutionError, ExecutionEvent, TurnContext},
@@ -36,13 +38,6 @@ impl NodeAgent {
 }
 
 impl Agent for NodeAgent {
-    fn start_turn(&mut self, ctx: &TurnContext) -> Result<String, ExecutionError> {
-        match self {
-            Self::Codex(agent) => agent.start_turn(ctx),
-            Self::Connected(agent) => agent.start_turn(ctx),
-        }
-    }
-
     fn start_turn_with_events(
         &mut self,
         ctx: &TurnContext,
@@ -60,18 +55,103 @@ impl Agent for NodeAgent {
             Self::Connected(agent) => agent.cancel(task_id),
         }
     }
+}
 
-    fn set_workspace(&self, workspace: &Path) {
-        match self {
-            Self::Codex(agent) => agent.set_workspace(workspace),
-            Self::Connected(agent) => agent.set_workspace(workspace),
+/// Writes `message` to `writer` as one line of JSON.
+fn write_json_line<W: Write>(
+    writer: &Mutex<W>,
+    message: &impl Serialize,
+) -> Result<(), ExecutionError> {
+    let mut line = serde_json::to_vec(message).map_err(|_| ExecutionError::Protocol)?;
+    line.push(b'\n');
+    let mut writer = writer.lock().map_err(|_| ExecutionError::Unavailable)?;
+    writer.write_all(&line).map_err(|_| ExecutionError::Unavailable)?;
+    writer.flush().map_err(|_| ExecutionError::Unavailable)
+}
+
+/// How many task IDs `EarlyCancels` keeps in each of its lists.
+const REMEMBERED_TASKS: usize = 256;
+
+/// The cancels that reach an adapter for a task it is not running.
+///
+/// The node cancels a task without knowing whether its turn has started,
+/// is running or has ended. A cancel that comes before the turn starts
+/// cancels it at the start; a cancel for a turn that already ended is
+/// dropped. Both lists keep only the latest `REMEMBERED_TASKS` IDs, so a
+/// cancel for a task that never starts cannot hold memory for ever.
+#[derive(Default)]
+struct EarlyCancels {
+    cancelled: VecDeque<String>,
+    ended: VecDeque<String>,
+}
+
+impl EarlyCancels {
+    /// Keeps a cancel for `task_id`, whose turn is not running, unless the
+    /// turn already ended.
+    fn cancel(&mut self, task_id: &str) {
+        if !self.ended.iter().any(|id| id == task_id)
+            && !self.cancelled.iter().any(|id| id == task_id)
+        {
+            remember(&mut self.cancelled, task_id);
         }
     }
 
-    fn supports_workspace_change(&self) -> bool {
-        match self {
-            Self::Codex(agent) => agent.supports_workspace_change(),
-            Self::Connected(agent) => agent.supports_workspace_change(),
+    /// Whether `task_id` was cancelled before its turn started. The cancel
+    /// is used up.
+    fn take(&mut self, task_id: &str) -> bool {
+        self.cancelled
+            .iter()
+            .position(|id| id == task_id)
+            .and_then(|index| self.cancelled.remove(index))
+            .is_some()
+    }
+
+    /// Notes that the turn of `task_id` ended, so that a later cancel for it
+    /// is dropped.
+    fn end(&mut self, task_id: &str) {
+        remember(&mut self.ended, task_id);
+    }
+}
+
+fn remember(ids: &mut VecDeque<String>, task_id: &str) {
+    if ids.len() >= REMEMBERED_TASKS {
+        ids.pop_front();
+    }
+    ids.push_back(task_id.to_owned());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EarlyCancels, REMEMBERED_TASKS};
+
+    #[test]
+    fn a_cancel_before_the_start_is_taken_once() {
+        let mut cancels = EarlyCancels::default();
+        cancels.cancel("task");
+        assert!(cancels.take("task"));
+        assert!(!cancels.take("task"));
+    }
+
+    #[test]
+    fn a_cancel_after_the_end_is_dropped() {
+        let mut cancels = EarlyCancels::default();
+        cancels.end("task");
+        cancels.cancel("task");
+        assert!(!cancels.take("task"));
+    }
+
+    #[test]
+    fn only_the_latest_cancels_are_kept() {
+        let mut cancels = EarlyCancels::default();
+        for index in 0..=REMEMBERED_TASKS {
+            cancels.cancel(&format!("task-{index}"));
         }
+        assert_eq!(cancels.cancelled.len(), REMEMBERED_TASKS);
+        assert!(!cancels.take("task-0"));
+        assert!(cancels.take(&format!("task-{REMEMBERED_TASKS}")));
+        for index in 0..=REMEMBERED_TASKS {
+            cancels.end(&format!("task-{index}"));
+        }
+        assert_eq!(cancels.ended.len(), REMEMBERED_TASKS);
     }
 }

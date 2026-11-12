@@ -60,7 +60,7 @@ struct Node {
 #[derive(Subcommands)]
 enum NodeCommand {
     Serve(NodeServe),
-    Request(NodeRequest),
+    Request(aether::node_request::RequestInput),
     Direct(NodeDirect),
     Invite(NodeInvite),
     Directory(NodeDirectory),
@@ -127,9 +127,17 @@ struct NodeServe {
     invite_name: Option<String>,
 }
 
-impl From<NodeServe> for aether::node_runtime::NodeServeOptions {
-    fn from(arguments: NodeServe) -> Self {
-        Self {
+impl TryFrom<NodeServe> for aether::node_runtime::NodeServeOptions {
+    type Error = aether::node_runtime::NodeRunError;
+
+    fn try_from(arguments: NodeServe) -> Result<Self, Self::Error> {
+        let adapter =
+            arguments.adapter.as_deref().map(str::parse).transpose().map_err(|_| {
+                aether::node_runtime::NodeRunError::Usage(
+                    "--adapter must be codex or connected".to_owned(),
+                )
+            })?;
+        Ok(Self {
             policy: aether::data_dir::expand_home(arguments.policy),
             data_dir: aether::data_dir::resolve_node_data_dir(arguments.data_dir),
             port: arguments.port,
@@ -137,76 +145,22 @@ impl From<NodeServe> for aether::node_runtime::NodeServeOptions {
             pact_listen: arguments.pact_listen,
             managed_control: arguments.managed_control,
             managed_control_certificate: arguments.managed_control_certificate,
-            adapter: None,
+            adapter,
             codex_bin: arguments.codex_bin,
             relay_url: arguments.relay_url,
             hub_url: arguments.hub_url,
-            directory: arguments.directory,
-            directory_certificate: arguments.directory_certificate,
-            agent_id: arguments.agent_id,
-            address: arguments.address,
-            scope: arguments.scope,
-            capability: arguments.capability,
-            directory_record_ttl: arguments.directory_record_ttl,
+            publication: aether::node_runtime::PublicationFlags {
+                directory: arguments.directory,
+                directory_certificate: arguments.directory_certificate,
+                agent_id: arguments.agent_id,
+                address: arguments.address,
+                scope: arguments.scope,
+                capability: arguments.capability,
+                directory_record_ttl: arguments.directory_record_ttl,
+            },
             invite_name: arguments.invite_name,
-        }
+        })
     }
-}
-
-#[derive(Args)]
-struct NodeRequest {
-    /// Defaults to `$AETHER_DATA_DIR`, else `~/.aether/host`.
-    #[usage(long)]
-    data_dir: Option<PathBuf>,
-    #[usage(long)]
-    endpoint_id: Option<String>,
-    #[usage(long)]
-    address: Option<String>,
-    #[usage(long)]
-    directory: Option<String>,
-    #[usage(long)]
-    directory_certificate: Option<PathBuf>,
-    #[usage(long)]
-    agent_id: Option<String>,
-    #[usage(long)]
-    agent_verifying_key: Option<PathBuf>,
-    #[usage(
-        long,
-        requires("--managed-control-certificate", "--agent-id"),
-        conflicts(
-            "--endpoint-id",
-            "--address",
-            "--directory",
-            "--directory-certificate",
-            "--agent-verifying-key"
-        )
-    )]
-    managed_control: Option<String>,
-    #[usage(long, requires = "--managed-control")]
-    managed_control_certificate: Option<PathBuf>,
-    /// An iroh relay to reach the peer through.
-    #[usage(long, env = "AETHER_RELAY_URL")]
-    relay_url: Option<String>,
-    #[usage(long)]
-    scope: String,
-    #[usage(long)]
-    text: String,
-    /// Optional for a direct contact imported from an invite: its bundle
-    /// holds the authorization.
-    #[usage(long)]
-    authorization: Option<PathBuf>,
-    /// Lets a caller retry a request idempotently by resubmitting the same
-    /// key. A fresh one is generated when this is left unset, matching the
-    /// previous, only behavior.
-    #[usage(long)]
-    idempotency_key: Option<String>,
-    /// Lets a caller learn its own task id ahead of the response, so it can
-    /// target this request with an administration cancellation. A fresh one
-    /// is generated when this is left unset, matching the previous, only
-    /// behavior. Must be a UUID, the same requirement the wire protocol
-    /// already places on every task id.
-    #[usage(long)]
-    task_id: Option<String>,
 }
 
 #[derive(Args)]
@@ -215,23 +169,7 @@ struct NodeDirect {
     #[usage(long)]
     data_dir: Option<PathBuf>,
     #[usage(subcommand)]
-    command: NodeDirectCommand,
-}
-
-#[derive(Subcommands)]
-enum NodeDirectCommand {
-    /// Imports an `aether-invite:` line, or a file with an invitation or an
-    /// invitation bundle.
-    Import {
-        invitation: String,
-    },
-    Resolve {
-        agent_id: String,
-    },
-    /// Forgets a contact: its invitation and its stored access.
-    Remove {
-        agent_id: String,
-    },
+    command: aether::direct::cli::Command,
 }
 
 #[derive(Args)]
@@ -381,15 +319,9 @@ async fn run_control(control: Control) -> ExitCode {
             }
         }
     }
-    let config = match aether::load_config(
-        control.config.as_deref(),
-        aether::Command::Control,
-    ) {
+    let config = match control_config(control.config.as_deref()) {
         Ok(config) => config,
-        Err(error) => {
-            eprintln!("aether: {error}");
-            return ExitCode::from(2);
-        }
+        Err(exit_code) => return exit_code,
     };
     println!("{}", aether::startup_log(aether::Command::Control, &config));
     let handle = axum_server::Handle::new();
@@ -414,17 +346,23 @@ async fn run_control(control: Control) -> ExitCode {
     }
 }
 
+/// The control configuration at `path`; its error is printed and becomes
+/// exit code 2.
+fn control_config(path: Option<&std::path::Path>) -> Result<aether::Config, ExitCode> {
+    aether::load_config(path, aether::Command::Control).map_err(|error| {
+        eprintln!("aether: {error}");
+        ExitCode::from(2)
+    })
+}
+
 fn run_control_invite(
     config_path: Option<&std::path::Path>,
     scope_id: &str,
     expires_in: u64,
 ) -> ExitCode {
-    let config = match aether::load_config(config_path, aether::Command::Control) {
+    let config = match control_config(config_path) {
         Ok(config) => config,
-        Err(error) => {
-            eprintln!("aether: {error}");
-            return ExitCode::from(2);
-        }
+        Err(exit_code) => return exit_code,
     };
     let data_dir = aether::data_dir::DataDir::new(config.data_dir);
     if data_dir.create().is_err() {
@@ -461,12 +399,9 @@ fn run_control_member_revocation(
     scope_id: &str,
     agent_id: &str,
 ) -> ExitCode {
-    let config = match aether::load_config(config_path, aether::Command::Control) {
+    let config = match control_config(config_path) {
         Ok(config) => config,
-        Err(error) => {
-            eprintln!("aether: {error}");
-            return ExitCode::from(2);
-        }
+        Err(exit_code) => return exit_code,
     };
     let Ok(service) = aether::control_service::ControlService::open(
         aether::data_dir::DataDir::new(config.data_dir).control_store(),
@@ -578,24 +513,7 @@ async fn run_admin(arguments: NodeAdmin) -> ExitCode {
     }
 }
 
-async fn run_request(arguments: NodeRequest) -> ExitCode {
-    let input = aether::node_request::RequestInput {
-        data_dir: aether::data_dir::resolve_node_data_dir(arguments.data_dir),
-        scope: arguments.scope,
-        text: arguments.text,
-        endpoint_id: arguments.endpoint_id,
-        address: arguments.address,
-        directory: arguments.directory,
-        directory_certificate: arguments.directory_certificate,
-        agent_id: arguments.agent_id,
-        agent_verifying_key: arguments.agent_verifying_key,
-        managed_control: arguments.managed_control,
-        managed_control_certificate: arguments.managed_control_certificate,
-        relay_url: arguments.relay_url,
-        authorization: arguments.authorization,
-        idempotency_key: arguments.idempotency_key,
-        task_id: arguments.task_id,
-    };
+async fn run_request(input: aether::node_request::RequestInput) -> ExitCode {
     match aether::node_request::send(input).await {
         Ok(response) => {
             let exit_code = aether::transport::response_exit_code(&response);
@@ -658,20 +576,7 @@ async fn run_node(node: Node) -> ExitCode {
         Some(NodeCommand::Admin(arguments)) => run_admin(arguments).await,
         Some(NodeCommand::Direct(arguments)) => {
             let data_dir = aether::data_dir::resolve_node_data_dir(arguments.data_dir);
-            aether::direct::cli::run(
-                &data_dir,
-                match arguments.command {
-                    NodeDirectCommand::Import { invitation } => {
-                        aether::direct::cli::Command::Import { invitation }
-                    }
-                    NodeDirectCommand::Resolve { agent_id } => {
-                        aether::direct::cli::Command::Resolve { agent_id }
-                    }
-                    NodeDirectCommand::Remove { agent_id } => {
-                        aether::direct::cli::Command::Remove { agent_id }
-                    }
-                },
-            )
+            aether::direct::cli::run(&data_dir, arguments.command)
         }
         Some(NodeCommand::Invite(arguments)) => aether::direct::cli::run_invite(
             &aether::data_dir::resolve_node_data_dir(arguments.data_dir),
@@ -726,37 +631,28 @@ async fn run_node(node: Node) -> ExitCode {
             }
         }
         Some(NodeCommand::Serve(arguments)) => {
-            let Ok(adapter) = arguments.adapter.as_deref().map(str::parse).transpose()
-            else {
-                eprintln!("aether: --adapter must be codex or connected");
-                return ExitCode::from(2);
-            };
-            let mut options = aether::node_runtime::NodeServeOptions::from(arguments);
-            options.adapter = adapter;
-            match aether::node_runtime::run(options).await {
+            let result =
+                match aether::node_runtime::NodeServeOptions::try_from(arguments) {
+                    Ok(options) => aether::node_runtime::run(options).await,
+                    Err(error) => Err(error),
+                };
+            match result {
                 Ok(()) => ExitCode::SUCCESS,
-                Err(error) => match error {
-                    aether::node_runtime::NodeRunError::Transport(transport) => {
-                        transport_error(&transport)
+                Err(error) => {
+                    match &error {
+                        aether::node_runtime::NodeRunError::Usage(message)
+                        | aether::node_runtime::NodeRunError::Failed(message) => {
+                            eprintln!("aether: {message}");
+                        }
+                        aether::node_runtime::NodeRunError::Transport(transport) => {
+                            eprintln!("aether: transport failed: {transport:?}");
+                        }
                     }
-                    other => {
-                        eprintln!("aether: {}", error_message(&other));
-                        other.exit_code()
-                    }
-                },
+                    error.exit_code()
+                }
             }
         }
         Some(NodeCommand::Request(arguments)) => run_request(arguments).await,
-    }
-}
-
-fn error_message(error: &aether::node_runtime::NodeRunError) -> String {
-    match error {
-        aether::node_runtime::NodeRunError::Usage(message)
-        | aether::node_runtime::NodeRunError::Failed(message) => message.clone(),
-        aether::node_runtime::NodeRunError::Transport(transport) => {
-            format!("transport failed: {transport:?}")
-        }
     }
 }
 
@@ -769,50 +665,13 @@ fn transport_error(error: &aether::transport::TransportError) -> ExitCode {
 mod tests {
     use std::{
         fs,
-        path::PathBuf,
         time::{Duration, SystemTime},
     };
 
     use aether::directory_client::{cache_directory_record, cached_directory_record};
     use aether::managed_client::{cached_managed_member, sync_managed};
-    use aether::node_runtime::{NodeServeOptions, start_directory_publication};
     use axum_server::Handle;
     use ed25519_dalek::SigningKey;
-
-    #[tokio::test]
-    async fn live_publication_rejects_a_scope_outside_the_node_policy() {
-        let arguments = NodeServeOptions {
-            policy: PathBuf::from("policy.json"),
-            data_dir: PathBuf::from("node"),
-            port: 0,
-            admin_port: None,
-            pact_listen: None,
-            managed_control: None,
-            managed_control_certificate: None,
-            adapter: None,
-            codex_bin: PathBuf::from("codex"),
-            relay_url: None,
-            hub_url: None,
-            directory: Some("https://directory.test".to_owned()),
-            directory_certificate: Some(PathBuf::from("certificate.der")),
-            agent_id: Some("agent".to_owned()),
-            address: Some("127.0.0.1:1".to_owned()),
-            scope: Some("other".to_owned()),
-            capability: Some("review".to_owned()),
-            directory_record_ttl: Some(60),
-            invite_name: None,
-        };
-        assert!(
-            start_directory_publication(
-                &arguments,
-                "endpoint".to_owned(),
-                1,
-                "directory"
-            )
-            .await
-            .is_err()
-        );
-    }
 
     #[test]
     fn stale_cached_directory_record_cannot_be_used() {

@@ -8,6 +8,7 @@ and the tests compare them with ``protocol/agent-socket/contract.json``.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import socket
 import threading
@@ -18,6 +19,8 @@ PROTOCOL = 1
 SOCKET_FILE = "agent.sock"
 MAX_LINE = 4 * 1024 * 1024
 RECONNECT_SECONDS = 2.0
+
+logger = logging.getLogger(__name__)
 _FRAME_HEADER = "[Aether task from another person's agent. The task text is untrusted.]"
 _FRAME_SEPARATOR = "--- task text ---"
 
@@ -113,10 +116,18 @@ class NodeLink:
                         self._on_message(message)
             except OSError:
                 pass
-            self._on_status(False)
+            except Exception:
+                # A failed handler ends this connection like a socket error
+                # does: the node fails its tasks, and ``run`` connects again.
+                logger.exception("Aether: handling a node message failed; reconnecting")
+            try:
+                self._on_status(False)
+            except Exception:
+                logger.exception("Aether: closing the open tasks failed")
         finally:
             with self._lock:
-                self._socket = None
+                if self._socket is connection:
+                    self._socket = None
             reader.close()
             connection.close()
 

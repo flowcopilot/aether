@@ -71,6 +71,26 @@ pub struct Frame {
     pub payload: serde_json::Value,
 }
 
+impl Frame {
+    /// The frame of `kind` that answers `request`: version 0, in the same
+    /// exchange, scope and task.
+    #[must_use]
+    pub fn reply_to(
+        request: &Self,
+        kind: FrameKind,
+        payload: serde_json::Value,
+    ) -> Self {
+        Self {
+            version: 0,
+            kind,
+            exchange_id: request.exchange_id.clone(),
+            scope_id: request.scope_id.clone(),
+            task_id: request.task_id.clone(),
+            payload,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct A2aRequest {
@@ -201,7 +221,19 @@ pub fn text_request_payload(
     request_nonce: &str,
     text: &str,
 ) -> serde_json::Value {
-    payload(A2aRequest {
+    payload(text_request(task_id, idempotency_key, request_nonce, text))
+}
+
+/// The request of one text task, without an authorization or an event
+/// cursor.
+#[must_use]
+pub fn text_request(
+    task_id: &str,
+    idempotency_key: &str,
+    request_nonce: &str,
+    text: &str,
+) -> A2aRequest {
+    A2aRequest {
         a2a_version: A2A_PROTOCOL_VERSION.to_owned(),
         idempotency_key: idempotency_key.to_owned(),
         request_nonce: request_nonce.to_owned(),
@@ -228,7 +260,7 @@ pub fn text_request_payload(
         },
         authorization: None,
         last_event_sequence: None,
-    })
+    }
 }
 
 impl A2aRequest {

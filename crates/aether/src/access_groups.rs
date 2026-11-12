@@ -71,7 +71,8 @@ pub fn change(
             if agent.is_none() && endpoint_id.is_none() {
                 return Err("select a person");
             }
-            let identities = if matches!(action, Action::Add) {
+            let add = matches!(action, Action::Add);
+            let identities = if add {
                 peers
                     .iter()
                     .filter(|(name, endpoint)| {
@@ -101,14 +102,10 @@ pub fn change(
             }
             let (agent, endpoint) =
                 identities.into_iter().next().ok_or("select one person")?;
-            let result = match action {
-                Action::Add => store.add_access_group_member(group, &agent, &endpoint),
-                Action::Remove => {
-                    store.remove_access_group_member(group, &agent, &endpoint)
-                }
-                Action::Create | Action::Delete => {
-                    return Err("this group action is invalid");
-                }
+            let result = if add {
+                store.add_access_group_member(group, &agent, &endpoint)
+            } else {
+                store.remove_access_group_member(group, &agent, &endpoint)
             };
             result.map_err(|error| match error {
                 StoreError::NotFound => "the group or person is not in this list",
@@ -116,6 +113,43 @@ pub fn change(
             })
         }
     }
+}
+
+/// Whether `agent` at `endpoint_id` is a member of `group`.
+pub fn is_member(
+    data_dir: &Path,
+    group: &str,
+    agent: &str,
+    endpoint_id: &str,
+) -> Result<bool, StoreError> {
+    member_of(&NodeStore::in_dir(data_dir)?, group, agent, endpoint_id)
+}
+
+/// Takes `agent` at `endpoint_id` out of `group`.
+pub fn leave(
+    data_dir: &Path,
+    group: &str,
+    agent: &str,
+    endpoint_id: &str,
+) -> Result<(), StoreError> {
+    NodeStore::in_dir(data_dir)?.remove_access_group_member(group, agent, endpoint_id)
+}
+
+fn member_of(
+    store: &NodeStore,
+    group: &str,
+    agent: &str,
+    endpoint_id: &str,
+) -> Result<bool, StoreError> {
+    Ok(store
+        .access_groups()?
+        .into_iter()
+        .find(|entry| entry.name == group)
+        .is_some_and(|entry| {
+            entry.members.iter().any(|member| {
+                member.agent_id == agent && member.endpoint_id == endpoint_id
+            })
+        }))
 }
 
 /// Why [`join_and_apply`] failed.
@@ -140,16 +174,8 @@ pub fn join_and_apply<T, E>(
     apply: impl FnOnce() -> Result<T, E>,
 ) -> Result<T, JoinError<E>> {
     let store = NodeStore::in_dir(data_dir).map_err(JoinError::Store)?;
-    let was_member = store
-        .access_groups()
-        .map_err(JoinError::Store)?
-        .into_iter()
-        .find(|entry| entry.name == group)
-        .is_some_and(|entry| {
-            entry.members.iter().any(|member| {
-                member.agent_id == agent && member.endpoint_id == endpoint_id
-            })
-        });
+    let was_member =
+        member_of(&store, group, agent, endpoint_id).map_err(JoinError::Store)?;
     store
         .add_access_group_member(group, agent, endpoint_id)
         .map_err(JoinError::Store)?;

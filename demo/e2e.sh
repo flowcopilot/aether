@@ -13,22 +13,13 @@ here="$(cd "$(dirname "$0")" && pwd)"
 . "$here/../scripts/lib.sh"
 compose="docker compose -f $here/compose.yml"
 call="python3 $here/mcp-call.py"
-live=""
-if [ -n "${OPENROUTER_API_KEY:-}" ] && [ -n "${DEMO_MODEL:-}" ]; then
-  live=1
-fi
+live="$(live_model "${DEMO_MODEL:-}")"
 
 logs() {
   $compose ps -a
   $compose logs --tail 40 alice bob model-alice model-bob 2>&1 || true
   $compose exec -T alice cat /opt/data/logs/demo/node.log 2>/dev/null || true
   $compose exec -T bob cat /root/.openclaw/logs/demo/node.log 2>/dev/null || true
-}
-
-fail() {
-  printf 'FAIL: %s\n' "$1" >&2
-  logs >&2
-  exit 1
 }
 
 down() {
@@ -62,7 +53,7 @@ answered() {
 # plugin connects a few seconds after its gateway starts; until then the node
 # fails the task as not available, so try again.
 send() {
-  retry "${live:+6}${live:-15}" "${live:+20}${live:-3}" answered "$1" "$2" "$3" \
+  retry_model 15 answered "$1" "$2" "$3" \
     || fail "$1 got no answer from $2: $result"
   printf '%s\n' "$result"
 }

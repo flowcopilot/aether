@@ -14,12 +14,6 @@ use super::{
 
 pub const GRANT_SECONDS: i64 = 30 * 24 * 60 * 60;
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
-pub enum GrantSignError {
-    #[error("the grant cannot be signed")]
-    Sign,
-}
-
 #[must_use]
 pub fn caller_agent_id(issuer: &str) -> String {
     format!("pact:{issuer}")
@@ -81,23 +75,23 @@ pub fn grant_binds(
     }
 }
 
+/// Signs the Aether grant for an approved delegation. `None` when the
+/// issuer key cannot be read or the system gives no randomness.
+#[must_use]
 pub fn sign_aether_grant(
     data_dir: &Path,
     brand: &Brand,
     caller: &PaIdentity,
     at: i64,
-) -> Result<Grant, GrantSignError> {
-    let issuer = crate::data_dir::DataDir::new(data_dir)
-        .issuer_key()
-        .map_err(|_| GrantSignError::Sign)?;
+) -> Option<Grant> {
+    let issuer = crate::data_dir::DataDir::new(data_dir).issuer_key().ok()?;
     let issued_secs = u64::try_from(at.saturating_sub(1)).unwrap_or(0);
     let issued_at = from_unix_seconds(issued_secs).unwrap_or(SystemTime::UNIX_EPOCH);
-    let expires_secs = u64::try_from(at.saturating_add(GRANT_SECONDS))
-        .map_err(|_| GrantSignError::Sign)?;
-    let expires_at = from_unix_seconds(expires_secs).ok_or(GrantSignError::Sign)?;
+    let expires_secs = u64::try_from(at.saturating_add(GRANT_SECONDS)).ok()?;
+    let expires_at = from_unix_seconds(expires_secs)?;
     let mut nonce = [0_u8; 32];
-    getrandom::fill(&mut nonce).map_err(|_| GrantSignError::Sign)?;
-    Ok(crate::identity::signed_grant(
+    getrandom::fill(&mut nonce).ok()?;
+    Some(crate::identity::signed_grant(
         &issuer,
         crate::identity::GrantInput {
             id: GrantId::new(format!("pact_{}", uuid::Uuid::new_v4().simple())),

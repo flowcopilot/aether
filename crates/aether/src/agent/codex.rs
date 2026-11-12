@@ -3,7 +3,7 @@
 
 use std::{
     collections::BTreeMap,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{ChildStdin, Stdio},
     sync::{
@@ -11,12 +11,13 @@ use std::{
         atomic::{AtomicU64, Ordering},
         mpsc::{self, Receiver},
     },
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use process_wrap::std::{ChildWrapper, CommandWrap};
 use serde_json::{Value, json};
 
+use super::{EarlyCancels, write_json_line};
 use crate::{
     execution::{
         Agent, ExecutionError, ExecutionEvent, TurnContext, agent_instructions,
@@ -26,21 +27,28 @@ use crate::{
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct CodexLimits {
-    pub sandbox: String,
-    pub approval: String,
+    pub sandbox: CodexSandbox,
     pub allow_network: bool,
     pub environment: BTreeMap<String, String>,
 }
 
+/// Where a task's Codex may write.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum CodexSandbox {
+    /// Each task runs in a new empty folder under the turn's workspace,
+    /// removed when the task ends. Codex can read and write only that folder
+    /// and the system files that a command needs.
+    TaskFolder,
+    /// Codex can write the turn's workspace.
+    WorkspaceWrite,
+}
+
+/// Codex's approval policy for a task: it never asks, because no person
+/// reads a remote task. An approval request that comes anyway is declined.
+const APPROVAL_POLICY: &str = "never";
+
 /// The most environment variables a spawned Codex process may receive.
 pub(crate) const MAX_ENVIRONMENT: usize = 16;
-
-/// The sandbox value of an ephemeral session.
-///
-/// Each task runs in a new empty folder under `CodexLimits::workspace`,
-/// removed when the task ends. Codex can read and write only that folder and
-/// the system files that a command needs.
-pub const TASK_FOLDER: &str = "task-folder";
 
 /// The name of the Codex permission profile of a task folder.
 const TASK_PROFILE: &str = "aether-task";
@@ -56,24 +64,26 @@ pub(crate) const RESERVED_ENVIRONMENT: &[&str] = &[
     "TMPDIR",
 ];
 
+/// The variables a task folder sets in the spawned environment.
+const TASK_FOLDER_ENVIRONMENT: [&str; 2] = ["TMPDIR", "HOME"];
+
 const fn reserved_slots(task_folder: bool) -> usize {
     if task_folder { 3 } else { 2 }
 }
 
-fn codex_limits_are_valid(limits: &CodexLimits) -> bool {
-    spawn_environment_valid(&limits.environment, limits.sandbox == TASK_FOLDER)
-        && matches!(
-            limits.sandbox.as_str(),
-            "read-only" | "workspace-write" | TASK_FOLDER
-        )
-        && matches!(limits.approval.as_str(), "untrusted" | "on-request" | "never")
-}
-
-fn spawn_environment_valid(
-    environment: &BTreeMap<String, String>,
-    _task_folder: bool,
-) -> bool {
-    environment.len() <= MAX_ENVIRONMENT
+/// Whether the environment that `spawn_environment` makes from `limits`
+/// fits `MAX_ENVIRONMENT` and holds only valid names and values.
+fn spawn_environment_valid(limits: &CodexLimits) -> bool {
+    let environment = &limits.environment;
+    let added = if limits.sandbox == CodexSandbox::TaskFolder {
+        TASK_FOLDER_ENVIRONMENT
+            .iter()
+            .filter(|name| !environment.contains_key(**name))
+            .count()
+    } else {
+        0
+    };
+    environment.len().saturating_add(added) <= MAX_ENVIRONMENT
         && environment.iter().all(|(key, value)| {
             valid_environment_key(key) && valid_environment_value(value)
         })
@@ -91,11 +101,7 @@ pub(crate) fn build_node_environment(
         let path = path.to_str().ok_or(PolicyError::Invalid)?;
         environment.insert(name.to_owned(), path.to_owned());
     }
-    if spawn_environment_valid(&environment, task_folder) {
-        Ok(environment)
-    } else {
-        Err(PolicyError::InvalidField("environmentAllowlist".to_owned()))
-    }
+    Ok(environment)
 }
 
 fn allowed_environment(
@@ -124,27 +130,23 @@ fn allowed_environment(
         .collect()
 }
 
+/// The environment of a spawned Codex: the node's, with the task folder's
+/// own temporary and home folders. `CodexAppServer::new` checked its size.
 fn spawn_environment(
     base: &BTreeMap<String, String>,
     task_folder: Option<&TaskFolder>,
-) -> Result<BTreeMap<String, String>, ExecutionError> {
+) -> BTreeMap<String, String> {
     let mut environment = base.clone();
     if let Some(folder) = task_folder {
+        let [tmpdir, home] = TASK_FOLDER_ENVIRONMENT;
         environment
-            .insert("TMPDIR".to_owned(), folder.0.join("tmp").display().to_string());
+            .insert(tmpdir.to_owned(), folder.0.join("tmp").display().to_string());
         environment.insert(
-            "HOME".to_owned(),
+            home.to_owned(),
             folder.0.join("tmp").join("home").display().to_string(),
         );
     }
-    if environment.len() > MAX_ENVIRONMENT
-        || !environment.iter().all(|(key, value)| {
-            valid_environment_key(key) && valid_environment_value(value)
-        })
-    {
-        return Err(ExecutionError::Limits);
-    }
-    Ok(environment)
+    environment
 }
 
 #[derive(Clone)]
@@ -155,7 +157,14 @@ pub struct CodexAppServer {
     source: Option<PathBuf>,
     arguments: Vec<String>,
     limits: CodexLimits,
-    active_turns: Arc<Mutex<BTreeMap<String, ActiveTurn>>>,
+    turns: Arc<Mutex<Turns>>,
+}
+
+/// The turns that run now, and the cancels for turns that do not.
+#[derive(Default)]
+struct Turns {
+    active: BTreeMap<String, ActiveTurn>,
+    cancels: EarlyCancels,
 }
 
 #[derive(Clone)]
@@ -202,15 +211,31 @@ fn app_server_arguments() -> Vec<String> {
 }
 
 impl CodexAppServer {
-    #[must_use]
-    pub fn new(binary: PathBuf, _workspace: PathBuf, limits: CodexLimits) -> Self {
-        Self {
+    /// A Codex adapter that runs `binary` within `limits`.
+    ///
+    /// # Errors
+    ///
+    /// `ExecutionError::Limits` when the environment that a task would get
+    /// is too large or holds an invalid name or value.
+    pub fn new(binary: PathBuf, limits: CodexLimits) -> Result<Self, ExecutionError> {
+        Self::with_arguments(binary, app_server_arguments(), limits)
+    }
+
+    fn with_arguments(
+        binary: PathBuf,
+        arguments: Vec<String>,
+        limits: CodexLimits,
+    ) -> Result<Self, ExecutionError> {
+        if !spawn_environment_valid(&limits) {
+            return Err(ExecutionError::Limits);
+        }
+        Ok(Self {
             source: resolve_binary(&binary).ok(),
             binary,
-            arguments: app_server_arguments(),
+            arguments,
             limits,
-            active_turns: Arc::new(Mutex::new(BTreeMap::new())),
-        }
+            turns: Arc::default(),
+        })
     }
 
     /// The Codex binary in `folder`. When the file found at start is gone
@@ -232,13 +257,12 @@ impl CodexAppServer {
         session: &AppServerSession,
         workspace: &Path,
         instruction: &str,
+        events: &mut dyn FnMut(ExecutionEvent),
     ) -> Result<String, ExecutionError> {
-        if !codex_limits_are_valid(&self.limits) {
-            return Err(ExecutionError::Limits);
-        }
         let response = session.request(
             "thread/start",
             &thread_start_params(&self.limits, workspace, instruction),
+            events,
         )?;
         response
             .pointer("/result/thread/id")
@@ -256,6 +280,7 @@ impl CodexAppServer {
         remote_text: &str,
         events: &mut dyn FnMut(ExecutionEvent),
     ) -> Result<String, ExecutionError> {
+        self.cancelled_early(task_id)?;
         // No `thread/goal/set` token budget: real Codex rejects goals on an
         // ephemeral thread, and the thread stays ephemeral so remote task
         // text never lands in the node owner's Codex history. The turn is
@@ -263,6 +288,7 @@ impl CodexAppServer {
         let response = session.request(
             "turn/start",
             &turn_start_params(&self.limits, workspace, thread_id, remote_text),
+            events,
         )?;
         let turn_id = response
             .pointer("/result/turn/id")
@@ -274,16 +300,72 @@ impl CodexAppServer {
             input: Arc::clone(&session.input),
             next_id: Arc::clone(&session.next_id),
         };
-        self.active_turns
+        {
+            let mut turns =
+                self.turns.lock().map_err(|_| ExecutionError::Unavailable)?;
+            // The turn has started; dropping the session stops it.
+            if turns.cancels.take(task_id) {
+                return Err(ExecutionError::Cancelled);
+            }
+            turns.active.insert(task_id.to_owned(), active);
+        }
+        session.wait_for_turn(thread_id, turn_id, events)
+    }
+
+    /// `Cancelled` when a cancel for `task_id` came before its turn started.
+    fn cancelled_early(&self, task_id: &str) -> Result<(), ExecutionError> {
+        if self
+            .turns
             .lock()
             .map_err(|_| ExecutionError::Unavailable)?
-            .insert(task_id.to_owned(), active);
-        let result = session.wait_for_turn(thread_id, turn_id, events);
-        self.active_turns
-            .lock()
-            .map_err(|_| ExecutionError::Unavailable)?
-            .remove(task_id);
-        result
+            .cancels
+            .take(task_id)
+        {
+            return Err(ExecutionError::Cancelled);
+        }
+        Ok(())
+    }
+
+    fn start(
+        &mut self,
+        ctx: &TurnContext,
+        events: &mut dyn FnMut(ExecutionEvent),
+    ) -> Result<String, ExecutionError> {
+        if Instant::now() >= ctx.deadline {
+            return Err(ExecutionError::Timeout);
+        }
+        self.cancelled_early(&ctx.task_id)?;
+        let task_folder = if self.limits.sandbox == CodexSandbox::TaskFolder {
+            Some(TaskFolder::create(&ctx.workspace, &ctx.task_id)?)
+        } else {
+            None
+        };
+        let workspace = if let Some(folder) = &task_folder {
+            folder.0.clone()
+        } else {
+            ctx.workspace.clone()
+        };
+        let (binary, arguments, environment) = match &task_folder {
+            Some(folder) => {
+                let mut arguments = self.arguments.clone();
+                arguments.extend(folder.arguments());
+                (
+                    self.task_binary(folder)?,
+                    arguments,
+                    spawn_environment(&self.limits.environment, Some(folder)),
+                )
+            }
+            None => (
+                self.binary.clone(),
+                self.arguments.clone(),
+                spawn_environment(&self.limits.environment, None),
+            ),
+        };
+        let session =
+            AppServerSession::spawn(&binary, &arguments, ctx.deadline, &environment)?;
+        session.request("initialize", &initialize_params(), events)?;
+        let thread_id = self.start_thread(&session, &workspace, &ctx.skill, events)?;
+        self.run_turn(&session, &workspace, &ctx.task_id, &thread_id, &ctx.text, events)
     }
 }
 
@@ -305,16 +387,16 @@ fn thread_start_params(
 ) -> Value {
     let mut params = json!({
         "cwd": workspace,
-        "approvalPolicy": limits.approval,
+        "approvalPolicy": APPROVAL_POLICY,
         "developerInstructions": agent_instructions(instruction),
         "ephemeral": true,
     });
     // A task folder's sandbox is the permission profile given at start; a
     // `sandbox` here would replace it.
-    if limits.sandbox != TASK_FOLDER
+    if limits.sandbox == CodexSandbox::WorkspaceWrite
         && let Some(params) = params.as_object_mut()
     {
-        params.insert("sandbox".to_owned(), json!(limits.sandbox));
+        params.insert("sandbox".to_owned(), json!("workspace-write"));
     }
     params
 }
@@ -328,14 +410,23 @@ fn turn_start_params(
     let mut params = json!({
         "threadId": thread_id,
         "input": [{"type": "text", "text": remote_text, "text_elements": []}],
-        "approvalPolicy": limits.approval,
+        "approvalPolicy": APPROVAL_POLICY,
         "cwd": workspace,
         "turnTrigger": "aether",
     });
-    if limits.sandbox != TASK_FOLDER
+    if limits.sandbox == CodexSandbox::WorkspaceWrite
         && let Some(params) = params.as_object_mut()
     {
-        params.insert("sandboxPolicy".to_owned(), sandbox_policy(limits, workspace));
+        params.insert(
+            "sandboxPolicy".to_owned(),
+            json!({
+                "type": "workspaceWrite",
+                "writableRoots": [workspace],
+                "networkAccess": limits.allow_network,
+                "excludeTmpdirEnvVar": true,
+                "excludeSlashTmp": true,
+            }),
+        );
     }
     params
 }
@@ -463,86 +554,34 @@ impl Drop for TaskFolder {
 }
 
 impl Agent for CodexAppServer {
-    fn start_turn(&mut self, ctx: &TurnContext) -> Result<String, ExecutionError> {
-        self.start_turn_with_events(ctx, &mut |_| {})
-    }
-
     fn start_turn_with_events(
         &mut self,
         ctx: &TurnContext,
         events: &mut dyn FnMut(ExecutionEvent),
     ) -> Result<String, ExecutionError> {
-        if !codex_limits_are_valid(&self.limits) {
-            return Err(ExecutionError::Limits);
+        let result = self.start(ctx, events);
+        if let Ok(mut turns) = self.turns.lock() {
+            turns.active.remove(&ctx.task_id);
+            turns.cancels.end(&ctx.task_id);
         }
-        let timeout = ctx
-            .deadline
-            .checked_duration_since(Instant::now())
-            .ok_or(ExecutionError::Timeout)?;
-        let task_folder = if self.limits.sandbox == TASK_FOLDER {
-            Some(TaskFolder::create(&ctx.workspace, &ctx.task_id)?)
-        } else {
-            None
-        };
-        let workspace = if let Some(folder) = &task_folder {
-            folder.0.clone()
-        } else {
-            ctx.workspace.clone()
-        };
-        let (binary, arguments, environment) = match &task_folder {
-            Some(folder) => {
-                let mut arguments = self.arguments.clone();
-                arguments.extend(folder.arguments());
-                (
-                    self.task_binary(folder)?,
-                    arguments,
-                    spawn_environment(&self.limits.environment, Some(folder))?,
-                )
-            }
-            None => (
-                self.binary.clone(),
-                self.arguments.clone(),
-                spawn_environment(&self.limits.environment, None)?,
-            ),
-        };
-        let session =
-            AppServerSession::spawn(&binary, &arguments, timeout, &environment)?;
-        session.request("initialize", &initialize_params())?;
-        let thread_id = self.start_thread(&session, &workspace, &ctx.skill)?;
-        self.run_turn(&session, &workspace, &ctx.task_id, &thread_id, &ctx.text, events)
+        result
     }
 
     fn cancel(&self, task_id: &str) {
-        let active =
-            self.active_turns.lock().ok().and_then(|turns| turns.get(task_id).cloned());
-        if let Some(active) = active {
-            let id = active.next_id.fetch_add(1, Ordering::Relaxed);
-            let request = json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "method": "turn/interrupt",
-                "params": {"threadId": active.thread_id, "turnId": active.turn_id},
-            });
-            let _ = write_json(&active.input, &request);
-        }
-    }
-}
-
-#[cfg(test)]
-impl CodexAppServer {
-    fn with_arguments(
-        binary: PathBuf,
-        _workspace: PathBuf,
-        arguments: Vec<String>,
-        limits: CodexLimits,
-    ) -> Self {
-        Self {
-            source: resolve_binary(&binary).ok(),
-            binary,
-            arguments,
-            limits,
-            active_turns: Arc::new(Mutex::new(BTreeMap::new())),
-        }
+        let Ok(mut turns) = self.turns.lock() else { return };
+        let Some(active) = turns.active.get(task_id).cloned() else {
+            turns.cancels.cancel(task_id);
+            return;
+        };
+        drop(turns);
+        let id = active.next_id.fetch_add(1, Ordering::Relaxed);
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "turn/interrupt",
+            "params": {"threadId": active.thread_id, "turnId": active.turn_id},
+        });
+        let _ = write_json_line(&active.input, &request);
     }
 }
 
@@ -557,31 +596,15 @@ pub(crate) fn valid_environment_key(key: &str) -> bool {
             .all(|byte| matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_'))
 }
 
-fn sandbox_policy(limits: &CodexLimits, workspace: &Path) -> Value {
-    match limits.sandbox.as_str() {
-        "read-only" => json!({
-            "type": "readOnly",
-            "networkAccess": limits.allow_network,
-        }),
-        "workspace-write" => json!({
-            "type": "workspaceWrite",
-            "writableRoots": [workspace],
-            "networkAccess": limits.allow_network,
-            "excludeTmpdirEnvVar": true,
-            "excludeSlashTmp": true,
-        }),
-        _ => Value::Null,
-    }
-}
-
 struct AppServerSession {
     /// The app-server leads its own process group (a job object on
     /// Windows), so a kill also stops the commands it started.
     child: Box<dyn ChildWrapper>,
     input: Arc<Mutex<ChildStdin>>,
     output: Receiver<Result<Value, ExecutionError>>,
-    timeout: Duration,
-    started_at: Instant,
+    /// The end of the turn, set before the task folder and the process: the
+    /// time they take counts toward the turn.
+    deadline: Instant,
     next_id: Arc<AtomicU64>,
 }
 
@@ -589,7 +612,7 @@ impl AppServerSession {
     fn spawn(
         binary: &Path,
         arguments: &[String],
-        timeout: Duration,
+        deadline: Instant,
         environment: &BTreeMap<String, String>,
     ) -> Result<Self, ExecutionError> {
         let mut command = CommandWrap::with_new(binary, |command| {
@@ -625,20 +648,30 @@ impl AppServerSession {
             child,
             input: Arc::new(Mutex::new(input)),
             output: receiver,
-            timeout,
-            started_at: Instant::now(),
+            deadline,
             next_id: Arc::new(AtomicU64::new(1)),
         })
     }
 
-    fn request(&self, method: &str, params: &Value) -> Result<Value, ExecutionError> {
+    /// Sends one request and waits for its response. An approval request
+    /// that comes first is declined and reported: Codex waits for its
+    /// answer before it answers this request.
+    fn request(
+        &self,
+        method: &str,
+        params: &Value,
+        events: &mut dyn FnMut(ExecutionEvent),
+    ) -> Result<Value, ExecutionError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let request =
             json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        write_json(&self.input, &request)?;
+        write_json_line(&self.input, &request)?;
         loop {
             let response = self.receive()?;
-            if response.get("id") != Some(&Value::from(id)) {
+            if self.decline_approval(&response, events)?
+                || response.get("method").is_some()
+                || response.get("id") != Some(&Value::from(id))
+            {
                 continue;
             }
             if response.get("error").is_some() {
@@ -663,9 +696,7 @@ impl AppServerSession {
         let mut final_answer: Option<String> = None;
         loop {
             let notification = self.receive()?;
-            if approval_request(&notification) {
-                events(ExecutionEvent::ApprovalRequested);
-                self.deny_approval(&notification)?;
+            if self.decline_approval(&notification, events)? {
                 continue;
             }
             let Some(method) = notification.get("method").and_then(Value::as_str)
@@ -692,7 +723,9 @@ impl AppServerSession {
                     if params.get("turnId").and_then(Value::as_str)
                         == Some(turn_id) =>
                 {
-                    if let Some(message) = final_answer_text(params.get("item")) {
+                    if let Some(message) =
+                        params.get("item").and_then(final_answer_text)
+                    {
                         final_answer.get_or_insert_with(String::new).push_str(message);
                     }
                 }
@@ -705,40 +738,19 @@ impl AppServerSession {
                         Some("interrupted") => return Err(ExecutionError::Cancelled),
                         _ => return Err(ExecutionError::Unavailable),
                     }
-                    if final_answer.is_none() {
-                        for item in params
-                            .pointer("/turn/items")
-                            .and_then(Value::as_array)
-                            .into_iter()
-                            .flatten()
-                        {
-                            if let Some(message) = final_answer_text(Some(item)) {
-                                final_answer
-                                    .get_or_insert_with(String::new)
-                                    .push_str(message);
-                            }
-                        }
-                    }
-                    if let Some(answer) = final_answer {
-                        text = answer;
-                    } else if text.is_empty() {
-                        for item in params
-                            .pointer("/turn/items")
-                            .and_then(Value::as_array)
-                            .into_iter()
-                            .flatten()
-                        {
-                            if item.get("type").and_then(Value::as_str)
-                                == Some("agentMessage")
-                                && let Some(message) =
-                                    item.get("text").and_then(Value::as_str)
-                            {
-                                text.push_str(message);
-                            }
-                        }
-                    }
+                    let items = params
+                        .pointer("/turn/items")
+                        .and_then(Value::as_array)
+                        .map_or(&[][..], Vec::as_slice);
+                    let answer = match final_answer
+                        .or_else(|| joined(items, final_answer_text))
+                    {
+                        Some(answer) => answer,
+                        None if !text.is_empty() => text,
+                        None => joined(items, agent_message_text).unwrap_or_default(),
+                    };
                     events(ExecutionEvent::Completed);
-                    return Ok(text);
+                    return Ok(answer);
                 }
                 _ => {}
             }
@@ -747,8 +759,8 @@ impl AppServerSession {
 
     fn receive(&self) -> Result<Value, ExecutionError> {
         let remaining = self
-            .timeout
-            .checked_sub(self.started_at.elapsed())
+            .deadline
+            .checked_duration_since(Instant::now())
             .ok_or(ExecutionError::Timeout)?;
         match self.output.recv_timeout(remaining) {
             Ok(message) => message,
@@ -757,6 +769,21 @@ impl AppServerSession {
                 Err(ExecutionError::Unavailable)
             }
         }
+    }
+
+    /// Declines `message` when it is an approval request, and reports it;
+    /// `false` for any other message.
+    fn decline_approval(
+        &self,
+        message: &Value,
+        events: &mut dyn FnMut(ExecutionEvent),
+    ) -> Result<bool, ExecutionError> {
+        if !approval_request(message) {
+            return Ok(false);
+        }
+        events(ExecutionEvent::ApprovalRequested);
+        self.deny_approval(message)?;
+        Ok(true)
     }
 
     fn deny_approval(&self, request: &Value) -> Result<(), ExecutionError> {
@@ -772,27 +799,34 @@ impl AppServerSession {
             "mcpServer/elicitation/request" => json!({"action": "decline"}),
             _ => json!({"decision": "decline"}),
         };
-        write_json(&self.input, &json!({"jsonrpc": "2.0", "id": id, "result": result}))
+        write_json_line(
+            &self.input,
+            &json!({"jsonrpc": "2.0", "id": id, "result": result}),
+        )
     }
 }
 
-fn write_json(
-    input: &Arc<Mutex<ChildStdin>>,
-    message: &Value,
-) -> Result<(), ExecutionError> {
-    let mut input = input.lock().map_err(|_| ExecutionError::Unavailable)?;
-    serde_json::to_writer(&mut *input, message)
-        .map_err(|_| ExecutionError::Protocol)?;
-    input.write_all(b"\n").map_err(|_| ExecutionError::Unavailable)?;
-    input.flush().map_err(|_| ExecutionError::Unavailable)
+fn agent_message_text(item: &Value) -> Option<&str> {
+    (item.get("type").and_then(Value::as_str) == Some("agentMessage"))
+        .then(|| item.get("text").and_then(Value::as_str))
+        .flatten()
 }
 
-fn final_answer_text(item: Option<&Value>) -> Option<&str> {
-    let item = item?;
-    (item.get("type").and_then(Value::as_str) == Some("agentMessage")
-        && item.get("phase").and_then(Value::as_str) == Some("final_answer"))
-    .then(|| item.get("text").and_then(Value::as_str))
-    .flatten()
+fn final_answer_text(item: &Value) -> Option<&str> {
+    (item.get("phase").and_then(Value::as_str) == Some("final_answer"))
+        .then(|| agent_message_text(item))
+        .flatten()
+}
+
+/// The texts that `text_of` finds in `items`, joined; `None` when it finds
+/// none.
+fn joined<'a>(
+    items: &'a [Value],
+    text_of: impl Fn(&'a Value) -> Option<&'a str>,
+) -> Option<String> {
+    let mut texts = items.iter().filter_map(text_of).peekable();
+    texts.peek()?;
+    Some(texts.collect())
 }
 
 fn approval_request(message: &Value) -> bool {
@@ -819,7 +853,7 @@ impl Drop for AppServerSession {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppServerSession, CodexAppServer, CodexLimits, TASK_FOLDER, TaskFolder,
+        AppServerSession, CodexAppServer, CodexLimits, CodexSandbox, TaskFolder,
         app_server_arguments, initialize_params, thread_start_params,
         turn_start_params,
     };
@@ -851,6 +885,14 @@ mod tests {
         sync::mpsc,
         time::{Duration, Instant},
     };
+
+    /// The test process's `PATH`, so that a fake app-server finds `sleep`
+    /// wherever this system keeps it.
+    fn test_path() -> BTreeMap<String, String> {
+        std::env::var("PATH")
+            .map(|path| BTreeMap::from([("PATH".to_owned(), path)]))
+            .unwrap_or_default()
+    }
     #[test]
     #[cfg(unix)]
     fn a_task_folder_copies_a_binary_that_the_task_could_change() {
@@ -900,8 +942,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("directory must create");
         let workspace = directory.path().to_path_buf();
         let limits = CodexLimits {
-            sandbox: "workspace-write".to_owned(),
-            approval: "never".to_owned(),
+            sandbox: CodexSandbox::WorkspaceWrite,
             allow_network: false,
             environment: BTreeMap::new(),
         };
@@ -929,8 +970,7 @@ mod tests {
     fn the_general_skill_asks_for_the_sent_task_and_keeps_the_setup_private() {
         let directory = tempfile::tempdir().expect("directory must create");
         let limits = CodexLimits {
-            sandbox: TASK_FOLDER.to_owned(),
-            approval: "never".to_owned(),
+            sandbox: CodexSandbox::TaskFolder,
             allow_network: false,
             environment: BTreeMap::new(),
         };
@@ -953,23 +993,18 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn app_server_uses_the_workspace_set_after_construction() {
-        let old_workspace = tempfile::tempdir().expect("old workspace must create");
-        let new_workspace = tempfile::tempdir().expect("new workspace must create");
-        let expected_cwd = new_workspace
-            .path()
-            .canonicalize()
-            .expect("new workspace must canonicalize");
+    fn app_server_runs_in_the_workspace_of_the_turn() {
+        let workspace = tempfile::tempdir().expect("workspace must create");
+        let expected_cwd =
+            workspace.path().canonicalize().expect("workspace must canonicalize");
         let limits = CodexLimits {
-            sandbox: "workspace-write".to_owned(),
-            approval: "never".to_owned(),
+            sandbox: CodexSandbox::WorkspaceWrite,
             allow_network: false,
             environment: BTreeMap::new(),
         };
-        // The script only answers "thread/start" (id 2) once the cwd it
-        // receives matches the workspace set below, not the one the
-        // process was constructed with — proving Executor::set_workspace
-        // reaches the process, not only its own bookkeeping copy.
+        // The script answers "thread/start" (id 2) only when its cwd is the
+        // turn's workspace: the executor's current workspace reaches Codex
+        // through `TurnContext::workspace`.
         let script = format!(
             r#"
 while IFS= read -r request; do
@@ -993,11 +1028,10 @@ done
         );
         let mut server = CodexAppServer::with_arguments(
             PathBuf::from("sh"),
-            old_workspace.path().to_path_buf(),
             vec!["-c".to_owned(), script],
             limits,
-        );
-        server.set_workspace(new_workspace.path());
+        )
+        .expect("limits must be valid");
         assert_eq!(
             server.start_turn(&turn_ctx(
                 &expected_cwd,
@@ -1015,8 +1049,7 @@ done
     fn app_server_runs_one_thread_and_turn() {
         let directory = tempfile::tempdir().expect("directory must create");
         let limits = CodexLimits {
-            sandbox: "workspace-write".to_owned(),
-            approval: "never".to_owned(),
+            sandbox: CodexSandbox::WorkspaceWrite,
             allow_network: false,
             environment: BTreeMap::from([(
                 "AETHER_ALLOWED".to_owned(),
@@ -1039,10 +1072,10 @@ done
 "#;
         let mut server = CodexAppServer::with_arguments(
             PathBuf::from("sh"),
-            directory.path().to_path_buf(),
             vec!["-c".to_owned(), script.to_owned()],
             limits,
-        );
+        )
+        .expect("limits must be valid");
         let mut events = Vec::new();
         assert_eq!(
             server.start_turn_with_events(
@@ -1059,8 +1092,7 @@ done
     fn app_server_returns_only_the_final_answer_not_the_commentary() {
         let directory = tempfile::tempdir().expect("directory must create");
         let limits = CodexLimits {
-            sandbox: "workspace-write".to_owned(),
-            approval: "never".to_owned(),
+            sandbox: CodexSandbox::WorkspaceWrite,
             allow_network: false,
             environment: BTreeMap::new(),
         };
@@ -1085,10 +1117,10 @@ done
 "#;
         let mut server = CodexAppServer::with_arguments(
             PathBuf::from("sh"),
-            directory.path().to_path_buf(),
             vec!["-c".to_owned(), script.to_owned()],
             limits,
-        );
+        )
+        .expect("limits must be valid");
         assert_eq!(
             server.start_turn(&turn_ctx(
                 directory.path(),
@@ -1098,6 +1130,71 @@ done
                 1
             )),
             Ok("periwinkle".to_owned())
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_session_ends_at_the_turn_deadline_set_before_it_started() {
+        // The time before the process starts (the task folder, the binary
+        // copy, the spawn) counts toward the turn: a deadline that passed
+        // by then leaves no time for a request, even one answered at once.
+        let deadline = Instant::now();
+        let session = AppServerSession::spawn(
+            Path::new("sh"),
+            &[
+                "-c".to_owned(),
+                r#"while IFS= read -r request; do printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'; done"#.to_owned(),
+            ],
+            deadline,
+            &BTreeMap::new(),
+        )
+        .expect("session must start");
+        assert_eq!(
+            session.request("initialize", &initialize_params(), &mut |_| {}),
+            Err(ExecutionError::Timeout)
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn app_server_takes_the_final_answer_from_the_completed_turn() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let limits = CodexLimits {
+            sandbox: CodexSandbox::WorkspaceWrite,
+            allow_network: false,
+            environment: BTreeMap::new(),
+        };
+        // No `item/completed`: only the completed turn's items say which
+        // message is the answer.
+        let script = r#"
+while IFS= read -r request; do
+  case "$request" in
+    *'"id":1'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}' ;;
+    *'"id":2'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread"}}}' ;;
+    *'"id":3'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn"}}}'
+      printf '%s\n' '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thread","turnId":"turn","delta":"I will look."}}'
+      printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread","turn":{"id":"turn","status":"completed","items":[{"type":"agentMessage","phase":"commentary","text":"I will look."},{"type":"agentMessage","phase":"final_answer","text":"teal"}]}}}'
+      ;;
+  esac
+done
+"#;
+        let mut server = CodexAppServer::with_arguments(
+            PathBuf::from("sh"),
+            vec!["-c".to_owned(), script.to_owned()],
+            limits,
+        )
+        .expect("limits must be valid");
+        assert_eq!(
+            server.start_turn(&turn_ctx(
+                directory.path(),
+                "task",
+                "review",
+                "untrusted",
+                30
+            )),
+            Ok("teal".to_owned())
         );
     }
 
@@ -1122,14 +1219,14 @@ done
         // Like a sandboxed command: a grandchild of the node that outlives
         // nothing but the app-server's own process group.
         let script = format!(
-            "/bin/sleep 60 & echo $! > '{}'; while IFS= read -r line; do :; done",
+            "sleep 60 & echo $! > '{}'; while IFS= read -r line; do :; done",
             pid_file.display()
         );
         let session = super::AppServerSession::spawn(
             std::path::Path::new("sh"),
             &["-c".to_owned(), script],
-            Duration::from_secs(5),
-            &BTreeMap::new(),
+            Instant::now() + Duration::from_secs(5),
+            &test_path(),
         )
         .expect("session must start");
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -1156,8 +1253,7 @@ done
     fn app_server_interrupts_an_active_turn() {
         let directory = tempfile::tempdir().expect("directory must create");
         let limits = CodexLimits {
-            sandbox: "workspace-write".to_owned(),
-            approval: "never".to_owned(),
+            sandbox: CodexSandbox::WorkspaceWrite,
             allow_network: false,
             environment: BTreeMap::new(),
         };
@@ -1185,10 +1281,10 @@ done
 "#;
         let server = CodexAppServer::with_arguments(
             PathBuf::from("sh"),
-            directory.path().to_path_buf(),
             vec!["-c".to_owned(), script.to_owned()],
             limits,
-        );
+        )
+        .expect("limits must be valid");
         let mut running = server.clone();
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let turn = std::thread::spawn(move || {
@@ -1213,16 +1309,70 @@ done
 
     #[test]
     #[cfg(unix)]
+    fn app_server_honours_a_cancel_that_comes_before_the_turn_starts() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let markers = tempfile::tempdir().expect("markers must create");
+        let starting = markers.path().join("thread-start");
+        let turned = markers.path().join("turn-start");
+        let limits = CodexLimits {
+            sandbox: CodexSandbox::WorkspaceWrite,
+            allow_network: false,
+            environment: test_path(),
+        };
+        // `thread/start` takes a while; the cancel comes then, before the
+        // adapter knows the turn's ID.
+        let script = format!(
+            r#"
+while IFS= read -r request; do
+  case "$request" in
+    *'"id":1'*) printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{}}}}' ;;
+    *'"id":2'*)
+      touch '{starting}'
+      sleep 0.5
+      printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"thread":{{"id":"thread"}}}}}}' ;;
+    *'"id":3'*)
+      touch '{turned}'
+      printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"turn":{{"id":"turn"}}}}}}'
+      printf '%s\n' '{{"jsonrpc":"2.0","method":"turn/completed","params":{{"threadId":"thread","turn":{{"id":"turn","status":"completed","items":[{{"type":"agentMessage","text":"ok"}}]}}}}}}'
+      ;;
+  esac
+done
+"#,
+            starting = starting.display(),
+            turned = turned.display(),
+        );
+        let server = CodexAppServer::with_arguments(
+            PathBuf::from("sh"),
+            vec!["-c".to_owned(), script],
+            limits,
+        )
+        .expect("limits must be valid");
+        let mut running = server.clone();
+        let workspace = directory.path().to_path_buf();
+        let turn = std::thread::spawn(move || {
+            running.start_turn(&turn_ctx(&workspace, "task", "review", "untrusted", 30))
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !starting.exists() {
+            assert!(Instant::now() < deadline, "the thread must start");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        server.cancel("task");
+        assert_eq!(
+            turn.join().expect("turn thread must join"),
+            Err(ExecutionError::Cancelled)
+        );
+        assert!(!turned.exists(), "a cancelled turn must not start");
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn app_server_time_limit_covers_the_full_turn() {
         let directory = tempfile::tempdir().expect("directory must create");
         let limits = CodexLimits {
-            sandbox: "workspace-write".to_owned(),
-            approval: "never".to_owned(),
+            sandbox: CodexSandbox::WorkspaceWrite,
             allow_network: false,
-            environment: BTreeMap::from([(
-                "PATH".to_owned(),
-                "/usr/bin:/bin".to_owned(),
-            )]),
+            environment: test_path(),
         };
         let script = r#"
 while IFS= read -r request; do
@@ -1241,10 +1391,10 @@ done
 "#;
         let mut server = CodexAppServer::with_arguments(
             PathBuf::from("sh"),
-            directory.path().to_path_buf(),
             vec!["-c".to_owned(), script.to_owned()],
             limits,
-        );
+        )
+        .expect("limits must be valid");
         assert_eq!(
             server.start_turn(&turn_ctx(
                 directory.path(),
@@ -1262,8 +1412,7 @@ done
     fn app_server_denies_and_reports_approval_requests() {
         let directory = tempfile::tempdir().expect("directory must create");
         let limits = CodexLimits {
-            sandbox: "workspace-write".to_owned(),
-            approval: "on-request".to_owned(),
+            sandbox: CodexSandbox::WorkspaceWrite,
             allow_network: false,
             environment: BTreeMap::new(),
         };
@@ -1287,10 +1436,10 @@ done
 "#;
         let mut server = CodexAppServer::with_arguments(
             PathBuf::from("sh"),
-            directory.path().to_path_buf(),
             vec!["-c".to_owned(), script.to_owned()],
             limits,
-        );
+        )
+        .expect("limits must be valid");
         let mut events = Vec::new();
         assert_eq!(
             server.start_turn_with_events(
@@ -1306,11 +1455,59 @@ done
     }
 
     #[test]
+    #[cfg(unix)]
+    fn app_server_denies_an_approval_request_sent_before_the_turn_starts() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let limits = CodexLimits {
+            sandbox: CodexSandbox::WorkspaceWrite,
+            allow_network: false,
+            environment: BTreeMap::new(),
+        };
+        // The approval request comes before the `turn/start` response, and
+        // Codex waits for its answer before it sends anything else.
+        let script = r#"
+while IFS= read -r request; do
+  case "$request" in
+    *'"id":1'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}' ;;
+    *'"id":2'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread"}}}' ;;
+    *'"id":3'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":10,"method":"item/fileChange/requestApproval","params":{"threadId":"thread","turnId":"turn"}}'
+      IFS= read -r approval
+      case "$approval" in
+        *'"id":10'*'"decision":"decline"'*) ;;
+        *) exit 1 ;;
+      esac
+      printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn"}}}'
+      printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread","turn":{"id":"turn","status":"completed","items":[{"type":"agentMessage","text":"ok"}]}}}'
+      ;;
+  esac
+done
+"#;
+        let mut server = CodexAppServer::with_arguments(
+            PathBuf::from("sh"),
+            vec!["-c".to_owned(), script.to_owned()],
+            limits,
+        )
+        .expect("limits must be valid");
+        let mut events = Vec::new();
+        assert_eq!(
+            server.start_turn_with_events(
+                &turn_ctx(directory.path(), "task", "review", "untrusted", 3),
+                &mut |event| events.push(event),
+            ),
+            Ok("ok".to_owned())
+        );
+        assert_eq!(
+            events,
+            [ExecutionEvent::ApprovalRequested, ExecutionEvent::Completed]
+        );
+    }
+
+    #[test]
     fn app_server_declines_an_mcp_elicitation_request() {
         let directory = tempfile::tempdir().expect("directory must create");
         let limits = CodexLimits {
-            sandbox: "workspace-write".to_owned(),
-            approval: "never".to_owned(),
+            sandbox: CodexSandbox::WorkspaceWrite,
             allow_network: false,
             environment: BTreeMap::new(),
         };
@@ -1334,10 +1531,10 @@ done
 "#;
         let mut server = CodexAppServer::with_arguments(
             PathBuf::from("sh"),
-            directory.path().to_path_buf(),
             vec!["-c".to_owned(), script.to_owned()],
             limits,
-        );
+        )
+        .expect("limits must be valid");
         let mut events = Vec::new();
         assert_eq!(
             server.start_turn_with_events(
@@ -1354,30 +1551,41 @@ done
 
     #[test]
     fn invalid_environment_rejects_the_app_server_before_start() {
-        let directory = tempfile::tempdir().expect("directory must create");
         let limits = CodexLimits {
-            sandbox: "read-only".to_owned(),
-            approval: "never".to_owned(),
+            sandbox: CodexSandbox::WorkspaceWrite,
             allow_network: false,
             environment: BTreeMap::from([(
                 "INVALID-NAME".to_owned(),
                 "value".to_owned(),
             )]),
         };
-        let mut server = CodexAppServer::new(
-            PathBuf::from("not-a-codex-binary"),
-            directory.path().to_path_buf(),
-            limits,
-        );
         assert_eq!(
-            server.start_turn(&turn_ctx(
-                directory.path(),
-                "task",
-                "review",
-                "untrusted",
-                30
-            )),
-            Err(ExecutionError::Limits)
+            CodexAppServer::new(PathBuf::from("not-a-codex-binary"), limits).err(),
+            Some(ExecutionError::Limits)
+        );
+    }
+
+    #[test]
+    fn the_task_folder_variables_count_toward_the_environment_limit() {
+        let full = |sandbox| CodexLimits {
+            sandbox,
+            allow_network: false,
+            environment: (0..super::MAX_ENVIRONMENT.saturating_sub(1))
+                .map(|index| (format!("NAME_{index}"), String::new()))
+                .collect(),
+        };
+        assert!(
+            CodexAppServer::new(
+                PathBuf::from("sh"),
+                full(CodexSandbox::WorkspaceWrite)
+            )
+            .is_ok()
+        );
+        // A task folder adds TMPDIR and HOME.
+        assert_eq!(
+            CodexAppServer::new(PathBuf::from("sh"), full(CodexSandbox::TaskFolder))
+                .err(),
+            Some(ExecutionError::Limits)
         );
     }
 
@@ -1435,15 +1643,17 @@ done
         let session = AppServerSession::spawn(
             &binary,
             &arguments,
-            Duration::from_secs(60),
+            Instant::now() + Duration::from_secs(60),
             &environment,
         )
         .expect("app server must start");
-        session.request("initialize", &initialize_params()).expect("initialize");
+        session
+            .request("initialize", &initialize_params(), &mut |_| {})
+            .expect("initialize");
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let status = session
-                .request("mcpServerStatus/list", &json!({}))
+                .request("mcpServerStatus/list", &json!({}), &mut |_| {})
                 .expect("status must list")
                 .to_string();
             if status.contains("probe")
@@ -1472,8 +1682,7 @@ done
         let quoted = forbidden.replace('\'', "'\\''");
         let directory = tempfile::tempdir().expect("workspace must create");
         let limits = CodexLimits {
-            sandbox: TASK_FOLDER.to_owned(),
-            approval: "never".to_owned(),
+            sandbox: CodexSandbox::TaskFolder,
             allow_network: false,
             environment: ["HOME", "PATH", "CODEX_HOME"]
                 .into_iter()
@@ -1482,11 +1691,8 @@ done
                 })
                 .collect(),
         };
-        let mut server = CodexAppServer::new(
-            PathBuf::from("codex"),
-            directory.path().to_path_buf(),
-            limits,
-        );
+        let mut server = CodexAppServer::new(PathBuf::from("codex"), limits)
+            .expect("limits must be valid");
         let answer = server
             .start_turn(&turn_ctx(
                 directory.path(),

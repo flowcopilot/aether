@@ -70,6 +70,20 @@ impl Setting for AgentKind {
     }
 }
 
+/// This node's name on its hub, or `None` when it has none or the store
+/// cannot be read.
+#[must_use]
+pub fn hub_name(data_dir: &Path) -> Option<String> {
+    setting::<HubName>(data_dir).ok().flatten()
+}
+
+/// The type of this node's agent, or `None` when it has none yet or the
+/// store cannot be read.
+#[must_use]
+pub fn agent_kind(data_dir: &Path) -> Option<super::AgentKind> {
+    setting::<AgentKind>(data_dir).ok().flatten()
+}
+
 /// Keeps the type of this node's agent. The type does not change: another
 /// type than the stored one is [`StoreError::InvalidState`].
 ///

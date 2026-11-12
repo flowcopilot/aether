@@ -30,6 +30,16 @@ pub enum HubError {
     Limit,
 }
 
+impl HubError {
+    /// Whether the hub may have done the request although it refused
+    /// nothing: the answer was lost, or it was a server error or could not
+    /// be read. Any other error is a refusal, or came before the request.
+    #[must_use]
+    pub const fn may_have_applied(self) -> bool {
+        matches!(self, Self::Unreachable | Self::Unexpected)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentKind {

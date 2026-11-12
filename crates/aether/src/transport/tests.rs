@@ -455,17 +455,19 @@ async fn a_link_returns_one_snapshot_for_each_exchange_on_one_connection() {
         .expect("the exchange must answer");
     assert_eq!(response.len(), 1);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-    let first = link.connection.as_ref().map(iroh::endpoint::Connection::stable_id);
+    let kept = |link: &super::Link| match &link.state {
+        super::LinkState::Kept(connection) => Some(connection.stable_id()),
+        _ => None,
+    };
+    let first = kept(&link);
+    assert!(first.is_some());
     for _ in 0..2 {
         link.exchange(&peer, receiver.addr(), probe_request())
             .await
             .expect("the exchange must answer");
     }
     assert_eq!(calls.load(Ordering::SeqCst), 3);
-    assert_eq!(
-        link.connection.as_ref().map(iroh::endpoint::Connection::stable_id),
-        first
-    );
+    assert_eq!(kept(&link), first);
     drop(link);
     router.shutdown().await.expect("router must stop");
     receiver.close().await;
@@ -510,8 +512,7 @@ async fn a_link_sends_each_request_once_to_a_host_with_one_stream_each() {
         assert_eq!(response[0].kind, FrameKind::Result);
     }
     assert_eq!(served.load(Ordering::SeqCst), 3);
-    assert!(link.one_stream_each);
-    assert!(link.connection.is_none());
+    assert!(matches!(link.state, super::LinkState::OneStreamEach));
     drop(link);
     receiver.close().await;
     host.await.expect("host must stop");

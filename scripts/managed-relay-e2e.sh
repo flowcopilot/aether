@@ -27,12 +27,8 @@ save_token() {
 }
 
 trap cleanup EXIT INT TERM
-new_network "$server_network"
-new_network "$client_network"
 new_volume "$state"
-run_detached "$relay" --network "$server_network" --network-alias relay -e RUST_LOG=info "$relay_image" --dev
-docker network connect --alias relay "$client_network" "$relay"
-wait_for_log "$relay" 'relay: serving on'
+start_relay "$relay" "$relay_image" "$server_network" "$client_network"
 
 run_detached "$control" --network "$server_network" --network-alias control --mount "source=$state,target=/state" --workdir /state "$node_image" control --port 8443
 docker network connect --alias control "$client_network" "$control"

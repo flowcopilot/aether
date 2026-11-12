@@ -7,14 +7,7 @@ defmodule AetherHub.Features.InvitesTest do
   @max_bundle Contract.get(["limits", "maxInviteBytes"])
   @bundle @prefix <> "signed-line"
 
-  defp list(node, query \\ "") do
-    path = if query == "", do: "/v1/invites", else: "/v1/invites" <> query
-    conn = http_get(node, path)
-    assert conn.status == 200
-    json(conn)
-  end
-
-  defp version(node), do: list(node)["version"]
+  defp version(node), do: invites(node)["version"]
 
   defp make_invite(state, from, to, days) do
     conn =
@@ -31,7 +24,7 @@ defmodule AetherHub.Features.InvitesTest do
 
   # The only invite on the list of `who`, which must be the scenario's invite.
   defp seen(state, who) do
-    assert [%{"id" => id} = invite] = list(actor(state, who))["invites"]
+    assert [%{"id" => id} = invite] = invites(actor(state, who))["invites"]
     assert id == id(state)
     invite
   end
@@ -199,7 +192,7 @@ defmodule AetherHub.Features.InvitesTest do
   end
 
   defstep ~r/^(?<who>\w+) sees no invites$/, %{who: who}, state do
-    assert list(actor(state, who))["invites"] == []
+    assert invites(actor(state, who))["invites"] == []
   end
 
   defstep ~r/^the new invite is not the old invite$/, _, state do
@@ -211,12 +204,12 @@ defmodule AetherHub.Features.InvitesTest do
           state do
     days = String.to_integer(days)
     id = id(state)
-    assert [%{"id" => ^id, "days" => ^days}] = list(actor(state, who))["invites"]
+    assert [%{"id" => ^id, "days" => ^days}] = invites(actor(state, who))["invites"]
   end
 
   defstep ~r/^(?<who>\w+) sees one invite, from (?<from>\w+)$/, %{who: who, from: from}, state do
     handle = actor(state, from).handle
-    assert [%{"from" => ^handle}] = list(actor(state, who))["invites"]
+    assert [%{"from" => ^handle}] = invites(actor(state, who))["invites"]
   end
 
   # Versions
@@ -248,9 +241,9 @@ defmodule AetherHub.Features.InvitesTest do
           %{who: who, seconds: seconds},
           state do
     node = actor(state, who)
-    query = "?after=#{state.versions[who]}&wait=#{seconds}"
+    query = "after=#{state.versions[who]}&wait=#{seconds}"
     started = System.monotonic_time(:millisecond)
-    task = Task.async(fn -> list(node, query) end)
+    task = Task.async(fn -> invites(node, query) end)
     Process.sleep(200)
     {:ok, %{waiter: who, wait: task, started: started}}
   end
@@ -260,7 +253,7 @@ defmodule AetherHub.Features.InvitesTest do
           state do
     v = if base == "that", do: state.versions[who], else: state.versions[who] - 1
     started = System.monotonic_time(:millisecond)
-    result = list(actor(state, who), "?after=#{v}&wait=#{seconds}")
+    result = invites(actor(state, who), "after=#{v}&wait=#{seconds}")
     elapsed = System.monotonic_time(:millisecond) - started
     {:ok, %{waiter: who, result: result, elapsed: elapsed}}
   end

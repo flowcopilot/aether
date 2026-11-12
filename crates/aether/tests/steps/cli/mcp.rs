@@ -7,8 +7,10 @@ use std::{
 
 use cucumber::{given, then, when};
 
-use super::{Process, utf8};
-use crate::{common::aether_command, steps::World};
+use crate::{
+    common::{ServerProcess, aether_command, blocking, utf8},
+    steps::World,
+};
 
 const INITIALIZE: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2026-07-28","capabilities":{},"clientInfo":{"name":"aether-test","version":"1.0.0"}}}
 {"jsonrpc":"2.0","method":"notifications/initialized","params":{}}
@@ -23,7 +25,7 @@ const ADD_WORKSPACE: &str = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","pa
 /// Starts `mcp serve`, writes `requests`, closes its input and waits for it
 /// to stop.
 async fn mcp_session(world: &mut World, mut command: Command, requests: String) {
-    let output = tokio::task::spawn_blocking(move || {
+    let output = blocking(move || {
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -34,15 +36,14 @@ async fn mcp_session(world: &mut World, mut command: Command, requests: String) 
         drop(stdin);
         child.wait_with_output().expect("mcp server must stop")
     })
-    .await
-    .expect("mcp task must finish");
+    .await;
     world.cli.output = Some(output);
 }
 
 #[given("a running owner page for a managed scope")]
 async fn running_owner_page(world: &mut World) {
     let data_dir = world.cli.root();
-    let mut process = Process::spawn(aether_command().args([
+    let mut process = ServerProcess::spawn(aether_command().args([
         "node",
         "admin",
         "--managed-scope",

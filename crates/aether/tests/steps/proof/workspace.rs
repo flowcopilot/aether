@@ -2,12 +2,14 @@
 
 use std::{fs, path::PathBuf};
 
-use aether::execution::{Agent, ExecutionError, Executor, Limits, Task, TurnContext};
+use aether::execution::{
+    Agent, ExecutionError, ExecutionEvent, Executor, Limits, Task, TurnContext,
+};
 use cucumber::{given, then, when};
 use tempfile::TempDir;
 
-use super::fixtures::{blocking, task};
-use crate::steps::World;
+use super::fixtures::task;
+use crate::{common::blocking, steps::World};
 
 #[derive(Debug, Default)]
 pub struct State {
@@ -30,7 +32,12 @@ impl State {
 struct EchoAgent;
 
 impl Agent for EchoAgent {
-    fn start_turn(&mut self, ctx: &TurnContext) -> Result<String, ExecutionError> {
+    fn start_turn_with_events(
+        &mut self,
+        ctx: &TurnContext,
+        events: &mut dyn FnMut(ExecutionEvent),
+    ) -> Result<String, ExecutionError> {
+        events(ExecutionEvent::Completed);
         Ok(format!("{}:{}", ctx.skill, ctx.text))
     }
 

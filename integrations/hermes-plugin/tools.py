@@ -12,7 +12,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Optional
 
-from .mcp_client import McpError, call_tool, caller_command, list_tools
+from .mcp_client import McpError, call_tool, list_tools
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +87,8 @@ class Settings:
         self._found: Optional[str] = None
 
     def command(self) -> list[str]:
-        return caller_command(self.aether_bin, self.data_dir)
+        """The MCP server that lists and accepts only the caller tools."""
+        return [self.aether_bin, "mcp", "serve", "--caller-only", "--data-dir", str(self.data_dir)]
 
     def tools_available(self) -> bool:
         if self._found is None or not os.access(self._found, os.X_OK):

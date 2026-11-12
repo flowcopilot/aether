@@ -2,7 +2,7 @@ use std::path::Path;
 
 use aether::{
     direct::{self, DirectError},
-    directory_client::{cache_wire_directory_record, cached_directory_record},
+    directory_client::{Failed, cache_wire_directory_record, cached_directory_record},
     discovery::{Invitation, Record, wire::WireInvitation},
 };
 use aether_store::{NodeStore, SignedRecord};
@@ -36,7 +36,10 @@ pub fn load_contact(
     direct::contact(store, agent_id)
 }
 
-pub fn store_directory_record(store: &NodeStore, record: &Record) -> Result<(), ()> {
+pub fn store_directory_record(
+    store: &NodeStore,
+    record: &Record,
+) -> Result<(), Failed> {
     cache_wire_directory_record(
         store,
         &aether::discovery::wire::WireRecord::from_record(record),
@@ -48,6 +51,6 @@ pub fn load_directory_record(
     scope_id: &str,
     agent_id: &str,
     trusted_key: [u8; 32],
-) -> Result<Record, ()> {
+) -> Result<Record, Failed> {
     cached_directory_record(data_dir, scope_id, agent_id, trusted_key)
 }

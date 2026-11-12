@@ -40,14 +40,6 @@ pub async fn apply_relay(
         .map_err(|_| TransportError::Io)
 }
 
-fn relay(stored: String) -> Option<String> {
-    (stored != RELAY_OFF).then_some(stored)
-}
-
-fn relay_text(relay: Option<&String>) -> String {
-    relay.map_or_else(|| RELAY_OFF.to_owned(), Clone::clone)
-}
-
 /// The owner's relay choice, kept for the next start. `None` keeps the
 /// node on the local network. A new node has the deployed relay.
 pub struct Relay;
@@ -61,11 +53,11 @@ impl Setting for Relay {
     }
 
     fn decode(stored: String) -> Result<Self::Value, StoreError> {
-        Ok(relay(stored))
+        Ok((stored != RELAY_OFF).then_some(stored))
     }
 
     fn encode(value: &Self::Value) -> Result<Option<String>, StoreError> {
-        Ok(Some(relay_text(value.as_ref())))
+        Ok(Some(value.clone().unwrap_or_else(|| RELAY_OFF.to_owned())))
     }
 }
 
@@ -79,11 +71,11 @@ impl Setting for ActiveRelay {
     type Value = Option<String>;
 
     fn decode(stored: String) -> Result<Self::Value, StoreError> {
-        Ok(relay(stored))
+        Relay::decode(stored)
     }
 
     fn encode(value: &Self::Value) -> Result<Option<String>, StoreError> {
-        Ok(Some(relay_text(value.as_ref())))
+        Relay::encode(value)
     }
 }
 

@@ -12,13 +12,9 @@ state="aether-e2e-state-$$"
 relay_url="http://relay:3340"
 
 trap cleanup EXIT INT TERM
-new_network "$server_network"
-new_network "$client_network"
 new_volume "$state"
 docker run --rm --mount "source=$state,target=/state" "$node_image" node fixture --data-dir /state >/dev/null
-run_detached "$relay" --network "$server_network" --network-alias relay -e RUST_LOG=info "$relay_image" --dev
-docker network connect --alias relay "$client_network" "$relay"
-wait_for_log "$relay" 'relay: serving on'
+start_relay "$relay" "$relay_image" "$server_network" "$client_network"
 
 run_detached "$server" --network "$server_network" --mount "source=$state,target=/state" -e AETHER_RELAY_URL="$relay_url" -e AETHER_CODEX_BIN=/state/fake-codex "$node_image" node serve --policy /state/policy.json --data-dir /state/server --port 4242
 wait_for_log "$server" '"endpoint_id"'

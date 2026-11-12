@@ -36,13 +36,29 @@ defmodule AetherHub.Names do
   def find(handle) do
     with {:ok, {name, number}} <- parse_handle(handle),
          %Account{} = account <-
-           Repo.one(from a in Account, where: a.name == ^name and a.number == ^number) do
+           Repo.one(from a in Account, as: :account, where: ^named(name, number)) do
       {:ok, account}
     else
       :error -> {:error, :invalid}
       nil -> {:error, :not_found}
     end
   end
+
+  @doc """
+  The account with the full name `handle` and the type `kind`. An account
+  of another type gets the answer of an unknown name, so the answer does
+  not show that it exists.
+  """
+  def find(handle, kind) do
+    case find(handle) do
+      {:ok, %Account{kind: ^kind}} = found -> found
+      {:ok, %Account{}} -> {:error, :not_found}
+      error -> error
+    end
+  end
+
+  @doc "The query condition for the account `name#number`, bound as `:account`."
+  def named(name, number), do: dynamic([account: a], a.name == ^name and a.number == ^number)
 
   @doc """
   A number for `name` that is free for `endpoint`: no other account holds

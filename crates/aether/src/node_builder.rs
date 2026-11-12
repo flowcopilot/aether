@@ -11,21 +11,20 @@ use std::{
 use aether_core::{
     AgentId, Grant, PolicyEngine, Scope, ScopeId, ScopeKind, TrustProvider,
 };
-use aether_store::QueueLimits;
 
 use crate::{
     agent::{
         NodeAgent,
-        codex::{CodexAppServer, CodexLimits, build_node_environment},
+        codex::{CodexAppServer, CodexLimits, CodexSandbox, build_node_environment},
         connected::ConnectedAgent,
     },
     data_dir::{DataDir, codex_login},
     execution::{Executor, Limits},
     identity::{NODE_ISSUER, RosterClaims, SignedClaims, decode_grant},
-    node_service::NodeService,
+    node_service::{NodeOptions, NodeService},
     policy::{
         AgentAdapter, PolicyError, PolicyFile, PolicySandbox, decode_key,
-        default_sandbox, keep, load_or_create, parse_scopes, stored_limit,
+        default_sandbox, keep, load_or_create, parse_scopes, stored_queue_limits,
     },
     proof::ProofNode,
 };
@@ -136,18 +135,7 @@ fn build(
             .ok_or(PolicyError::Invalid)?;
         signed_claims.verify_grant(grant, scope).map_err(|_| PolicyError::Invalid)?;
     }
-    let queue_limits = QueueLimits {
-        global: stored_limit(
-            &store,
-            aether_core::limits::QueueLimitId::Global,
-            queue.get(aether_core::limits::QueueLimitId::Global),
-        )?,
-        per_peer: stored_limit(
-            &store,
-            aether_core::limits::QueueLimitId::PerPeer,
-            queue.get(aether_core::limits::QueueLimitId::PerPeer),
-        )?,
-    };
+    let queue_limits = stored_queue_limits(&store, queue)?;
     let stored_workspace =
         store.current_workspace().map_err(|_| PolicyError::Invalid)?;
     let stored_grants = store
@@ -188,15 +176,12 @@ fn build(
         Some(sandbox) => NodeAgent::Codex(codex_agent(
             data_dir,
             codex_binary,
-            workspace.clone(),
-            CodexLimits {
-                sandbox: sandbox.as_str().to_owned(),
-                approval: "never".to_owned(),
-                allow_network: policy.allow_network,
-                environment: BTreeMap::new(),
+            match sandbox {
+                PolicySandbox::TaskFolder => CodexSandbox::TaskFolder,
+                PolicySandbox::WorkspaceWrite => CodexSandbox::WorkspaceWrite,
             },
+            policy.allow_network,
             &policy.environment_allowlist,
-            matches!(sandbox, PolicySandbox::TaskFolder),
         )?),
         None => NodeAgent::Connected(
             ConnectedAgent::listen(&layout.agent_socket())
@@ -220,10 +205,7 @@ fn build(
         scopes,
     )
     .map_err(|_| PolicyError::Invalid)?;
-    let mut service = NodeService::new(node);
-    service.set_task_folder_mode(matches!(sandbox, Some(PolicySandbox::TaskFolder)));
-    service.set_agent_adapter(adapter);
-    service.set_pact_config(pact);
+    let task_folder_mode = matches!(sandbox, Some(PolicySandbox::TaskFolder));
     // Fail closed the same way the policy file's own `workspace` field
     // already does: a named-but-missing approved directory is a
     // misconfiguration to catch at startup, not something to silently
@@ -237,7 +219,15 @@ fn build(
                 .map_err(|_| PolicyError::InvalidField("approvedWorkspaces".to_owned()))
         })
         .collect::<Result<BTreeMap<_, _>, _>>()?;
-    service.set_approved_workspaces(approved_workspaces);
+    let service = NodeService::new(
+        node,
+        NodeOptions {
+            approved_workspaces,
+            task_folder_mode,
+            agent_adapter: adapter,
+            pact,
+        },
+    );
     // A validated live workspace or grant change survives only in
     // `configuration`; the node built above always starts from the policy
     // file's baseline. Replay both here so a restart resumes the state the
@@ -247,7 +237,7 @@ fn build(
     // longer verifies (commonly: it expired since it was granted) is
     // skipped rather than blocking startup, since that is its expected
     // eventual lifecycle, not a sign of corruption.
-    if let Some(path) = stored_workspace.filter(|_| !service.task_folder_mode()) {
+    if let Some(path) = stored_workspace.filter(|_| !task_folder_mode) {
         service.apply_workspace(Path::new(&path)).map_err(|_| {
             PolicyError::InvalidField("admin.current.workspace".to_owned())
         })?;
@@ -307,10 +297,9 @@ fn is_default_tasks_root(workspace: &Path, layout: &DataDir) -> bool {
 fn codex_agent(
     data_dir: &Path,
     codex_binary: PathBuf,
-    workspace: PathBuf,
-    limits: CodexLimits,
+    sandbox: CodexSandbox,
+    allow_network: bool,
     environment_allowlist: &[String],
-    task_folder: bool,
 ) -> Result<CodexAppServer, PolicyError> {
     let owner_codex_home = std::env::var_os("CODEX_HOME")
         .filter(|value| !value.is_empty())
@@ -322,14 +311,14 @@ fn codex_agent(
     let environment = build_node_environment(
         &codex_home,
         environment_allowlist,
-        task_folder,
+        sandbox == CodexSandbox::TaskFolder,
         |name| std::env::var(name).ok(),
     )?;
-    Ok(CodexAppServer::new(
+    CodexAppServer::new(
         codex_binary,
-        workspace,
-        CodexLimits { environment, ..limits },
-    ))
+        CodexLimits { sandbox, allow_network, environment },
+    )
+    .map_err(|_| PolicyError::InvalidField("environmentAllowlist".to_owned()))
 }
 
 /// Creates the node's Codex home. It shares only the owner's login file, when

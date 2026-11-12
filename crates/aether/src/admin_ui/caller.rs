@@ -18,23 +18,24 @@ use topcoat::{
 };
 
 use super::{
-    Page, ensure_admin_session,
-    hub::{error_line, hub_section, hub_setting},
+    Page, admin_page, ensure_admin_session,
+    hub::{hub_failure, hub_section, hub_setting},
     layout::{Tab, node_header},
-    require_admin_session,
+    shared::{IdForm, Notice},
 };
 use crate::{
     admin_components::{
-        CHEVRON, CopyTone, copy_field, key_code, page_title, presence_dot, step,
+        CHEVRON, CopyTone, Tone, copy_field, days_label, days_select, error_line,
+        key_code, page_title, post_button, presence_dot, section_heading, state_badge,
+        step,
     },
     components::{
         avatar::{AvatarSize, avatar, avatar_fallback},
-        badge::{BadgeVariant, badge},
         button::{ButtonSize, ButtonVariant, button},
         input::input,
     },
     hub_client::{HubClient, Role},
-    hub_membership::{accept, hub_message},
+    hub_membership::accept,
 };
 
 /// An agent this computer can use, from its kept invite.
@@ -49,10 +50,7 @@ struct Contact {
 #[component]
 pub(super) async fn caller_screen(
     cx: &Cx,
-    #[default] error: String,
-    #[default] hub_error: String,
-    #[default] hub_setting_error: String,
-    #[default] request_error: String,
+    #[default] notice: Notice,
 ) -> TopcoatResult<impl View> {
     ensure_admin_session(cx).await?;
     let Page(Some(page)) = app_context::<Page>(cx) else {
@@ -61,7 +59,7 @@ pub(super) async fn caller_screen(
         ))
         .into());
     };
-    if !page.caller {
+    if !page.mode.calls() {
         return Err(internal_server_error(std::io::Error::other(
             "the caller screen needs a data directory",
         ))
@@ -98,9 +96,11 @@ pub(super) async fn caller_screen(
     // person's own agent uses the same contacts as this page.
     let mcp_command = mcp_command(&page.data_dir);
 
+    let error = notice.import_error();
+    let request_error = notice.request_error();
     let code_open = !error.is_empty();
     Ok(view! {
-        if !error.is_empty() || !request_error.is_empty() {
+        if notice.refused() {
             (StatusCode::BAD_REQUEST)
         }
         node_header(current: Tab::Agents)
@@ -125,7 +125,7 @@ pub(super) async fn caller_screen(
                     hub_section(
                         hub: hub.clone(),
                         role: Role::Receiver,
-                        error: hub_error.clone(),
+                        error: notice.hub_error(),
                         if !connected {
                             code_disclosure(endpoint_id: endpoint_id.clone(), error: error.clone(), open: code_open)
                         }
@@ -140,7 +140,7 @@ pub(super) async fn caller_screen(
             if connected {
                 <section aria-labelledby="agents" class="flex flex-col gap-4">
                     <div id="agents" class="flex flex-col gap-1.5">
-                        <h2 class="text-xl font-semibold tracking-tight">"Agents you can use"</h2>
+                        section_heading("Agents you can use")
                         <p class="text-sm text-muted-foreground">"Your own agent reaches them through Aether. From a terminal, the command next to each one sends a task."</p>
                     </div>
                     <ul class="flex flex-col divide-y divide-border rounded-xl border border-border bg-background" aria-label="Agents">
@@ -164,19 +164,17 @@ pub(super) async fn caller_screen(
                                         }
                                     </div>
                                     match contact.days_left {
-                                        Some(1) => <span class="text-[13px] text-muted-foreground">"Access ends in 1 day"</span>,
-                                        Some(days) => <span class="text-[13px] text-muted-foreground">"Access ends in " (days) " days"</span>,
+                                        Some(days) => <span class="text-[13px] text-muted-foreground">"Access ends in " (days_label(days))</span>,
                                         None => <span class="text-[13px] font-medium text-destructive">"Invite expired. Ask for a new one."</span>,
                                     }
-                                    <form method="post" action="/contacts/remove">
-                                        <input type="hidden" name="agent" value=(&contact.name)>
-                                        button(
-                                            variant: ButtonVariant::Outline,
-                                            size: ButtonSize::Sm,
-                                            attrs: attributes! { type="submit" aria-label=(format!("Remove {}", contact.name)) },
-                                            "Remove"
-                                        )
-                                    </form>
+                                    post_button(
+                                        action: "/contacts/remove",
+                                        fields: vec![("agent", contact.name.clone())],
+                                        variant: ButtonVariant::Outline,
+                                        size: ButtonSize::Sm,
+                                        aria_label: format!("Remove {}", contact.name),
+                                        "Remove"
+                                    )
                                 </div>
                                 if contact.days_left.is_some() {
                                     <div class="sm:pl-11">
@@ -223,7 +221,7 @@ pub(super) async fn caller_screen(
                 Ok(_) => {}
                 Err(_) => {
                     <section aria-labelledby="sent" class="flex flex-col gap-4">
-                        <h2 id="sent" class="text-xl font-semibold tracking-tight">"Sent tasks"</h2>
+                        section_heading(id: "sent", "Sent tasks")
                         <p role="alert" class="text-muted-foreground">"Sent tasks cannot be loaded."</p>
                     </section>
                 }
@@ -238,7 +236,7 @@ pub(super) async fn caller_screen(
                 </section>
             }
             <section aria-label="Hub" class="rounded-xl border border-border bg-background px-5">
-                hub_setting(url: hub.as_ref().map(HubClient::url), error: hub_setting_error.clone())
+                hub_setting(url: hub.as_ref().map(HubClient::url), error: notice.hub_setting_error())
             </section>
         </main>
     }
@@ -316,7 +314,7 @@ async fn request_drafts(
     Ok(view! {
         <section id="requests" aria-labelledby="requests-title" class="flex flex-col gap-4">
             <div class="flex flex-col gap-1.5">
-                <h2 id="requests-title" class="text-xl font-semibold tracking-tight">"Requests your agent wants to send"</h2>
+                section_heading(id: "requests-title", "Requests your agent wants to send")
                 <p class="text-sm text-muted-foreground">
                     "Your agent found these agents and asks for access to them. Nothing is sent until you select Confirm."
                 </p>
@@ -361,59 +359,40 @@ async fn request_draft(
             <div class="flex flex-wrap items-center gap-2">
                 <form method="post" action="/requests/confirm" class="flex items-center gap-2">
                     <input type="hidden" name="id" value=(&draft.id)>
-                    <select
-                        name="days"
-                        aria-label=(format!("Access to {} for", draft.target_name))
-                        class="h-8 rounded-lg border border-border bg-background px-2 text-sm"
-                    >
-                        for days in &choices {
-                            <option value=(days) selected=((*days == u64::from(draft.days)).then_some(""))>
-                                (if *days == 1 { "1 day".to_owned() } else { format!("{days} days") })
-                            </option>
-                        }
-                    </select>
+                    days_select(
+                        aria_label: format!("Access to {} for", draft.target_name),
+                        class: "h-8 rounded-lg border border-border bg-background px-2 text-sm",
+                        choices: choices.clone(),
+                        selected: u64::from(draft.days),
+                    )
                     button(size: ButtonSize::Sm, attrs: attributes! { type="submit" }, "Confirm")
                 </form>
-                <form method="post" action="/requests/discard">
-                    <input type="hidden" name="id" value=(&draft.id)>
-                    button(
-                        variant: ButtonVariant::Outline,
-                        size: ButtonSize::Sm,
-                        attrs: attributes! { type="submit" },
-                        "Discard"
-                    )
-                </form>
+                post_button(
+                    action: "/requests/discard",
+                    fields: vec![("id", draft.id.clone())],
+                    variant: ButtonVariant::Outline,
+                    size: ButtonSize::Sm,
+                    "Discard"
+                )
             </div>
         </li>
     })
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct InviteIdForm {
-    id: String,
-}
-
 #[page(POST "/hub/accept")]
 pub(super) async fn accept_invite(
     cx: &Cx,
-    Form(form): Form<InviteIdForm>,
+    Form(form): Form<IdForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let Page(Some(page)) = app_context::<Page>(cx) else {
-        return Err(bad_request("this node cannot accept invites").into());
-    };
-    if !page.caller {
+    let page = admin_page(cx, "this node cannot accept invites").await?;
+    if !page.mode.calls() {
         return Err(bad_request("this node cannot accept invites").into());
     }
     let Some(hub) = page.current_hub() else {
         return Err(bad_request("this node has no hub").into());
     };
-    let error = match accept(&hub, &page.data_dir, &form.id).await {
-        Ok(_) => "",
-        Err(error) => hub_message(error),
-    };
-    Ok(view! { caller_screen(hub_error: error.to_owned()) })
+    let error = hub_failure(accept(&hub, &page.data_dir, &form.id).await);
+    Ok(view! { caller_screen(notice: Notice::Hub(error.to_owned())) })
 }
 
 #[derive(Deserialize)]
@@ -429,10 +408,7 @@ pub(super) async fn confirm_request(
     cx: &Cx,
     Form(form): Form<ConfirmForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let Page(Some(page)) = app_context::<Page>(cx) else {
-        return Err(bad_request("this node sends no access requests").into());
-    };
+    let page = admin_page(cx, "this node sends no access requests").await?;
     let error = match page.hub_access() {
         super::HubAccess::Ready(hub) => {
             confirm(&hub, &page.data_dir, &form.id, form.days)
@@ -445,7 +421,7 @@ pub(super) async fn confirm_request(
             "This node cannot read its hub settings. Fix the data directory and try again."
         }
     };
-    Ok(view! { caller_screen(request_error: error.to_owned()) })
+    Ok(view! { caller_screen(notice: Notice::Request(error.to_owned())) })
 }
 
 /// Sends the draft `id` for `days` days: first to the hub, then the local
@@ -464,7 +440,7 @@ async fn confirm(
         return Err("Choose 1 to 30 days.");
     }
     let now = aether_core::time::now();
-    let store = crate::hub_store::HubStore::open(data_dir)
+    let store = aether_store::NodeStore::in_dir(data_dir)
         .map_err(|_| "The requests are unavailable.")?;
     let draft = store
         .access_request_draft(id)
@@ -484,19 +460,18 @@ async fn confirm(
         },
     )?;
     let approval = aether_store::HubApproval {
-        invite_id: invite.id.clone(),
-        side: aether_store::ApprovalSide::Receiver,
-        kind: aether_store::ApprovalKind::Request,
-        peer_name: draft.target_name.clone(),
-        peer_endpoint: None,
-        days: u32::try_from(days).unwrap_or(30),
-        access_group: crate::access_groups::REQUESTS_GROUP.to_owned(),
-        bundle: None,
-        created_at: now,
-        expires_at: now.saturating_add(crate::hub_membership::APPROVAL_SECONDS),
         listing: Some(draft.listing),
+        ..crate::hub_membership::new_approval(
+            &invite.id,
+            aether_store::ApprovalSide::Receiver,
+            aether_store::ApprovalKind::Request,
+            &draft.target_name,
+            u32::try_from(days).unwrap_or(30),
+            crate::access_groups::REQUESTS_GROUP,
+            now,
+        )
     };
-    if store.put_approval(&approval).is_err() {
+    if store.put_hub_approval(&approval).is_err() {
         let _ = hub.remove(&invite.id).await;
         return Err("This node cannot keep the request. Try again.");
     }
@@ -504,21 +479,12 @@ async fn confirm(
     Ok(())
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct DiscardForm {
-    id: String,
-}
-
 #[page(POST "/requests/discard")]
 pub(super) async fn discard_request(
     cx: &Cx,
-    Form(form): Form<DiscardForm>,
+    Form(form): Form<IdForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let Page(Some(page)) = app_context::<Page>(cx) else {
-        return Err(bad_request("this node sends no access requests").into());
-    };
+    let page = admin_page(cx, "this node sends no access requests").await?;
     aether_store::NodeStore::in_dir(&page.data_dir)
         .and_then(|store| store.remove_access_request_draft(&form.id))
         .map_err(internal_server_error)?;
@@ -557,27 +523,15 @@ fn age(then: i64, now: u64) -> String {
     )
 }
 
-const fn sent_state_word(state: aether_store::SentState) -> &'static str {
+/// The word and the badge tone of a sent task's state.
+const fn sent_state(state: aether_store::SentState) -> (&'static str, Tone) {
     match state {
         aether_store::SentState::Waiting | aether_store::SentState::Working => {
-            "Waiting"
+            ("Waiting", Tone::Warning)
         }
-        aether_store::SentState::Answered => "Answered",
-        aether_store::SentState::Failed => "Failed",
-        aether_store::SentState::NotDelivered => "Not delivered",
-    }
-}
-
-/// The badge color of a sent task's state.
-const fn sent_state_tone(state: aether_store::SentState) -> &'static str {
-    match state {
-        aether_store::SentState::Answered => "border-success/40 text-success",
-        aether_store::SentState::Waiting | aether_store::SentState::Working => {
-            "border-warning/40 text-warning"
-        }
-        aether_store::SentState::Failed | aether_store::SentState::NotDelivered => {
-            "border-destructive/40 text-destructive"
-        }
+        aether_store::SentState::Answered => ("Answered", Tone::Success),
+        aether_store::SentState::Failed => ("Failed", Tone::Destructive),
+        aether_store::SentState::NotDelivered => ("Not delivered", Tone::Destructive),
     }
 }
 
@@ -590,13 +544,13 @@ async fn sent_tasks(
 ) -> TopcoatResult<impl View> {
     Ok(view! {
         <section aria-labelledby="sent" class="flex flex-col gap-4">
-            <h2 id="sent" class="text-xl font-semibold tracking-tight">"Sent tasks"</h2>
+            section_heading(id: "sent", "Sent tasks")
             <ul class="flex flex-col divide-y divide-border border-y border-border" aria-label="Sent tasks">
                 for task in &tasks {
                     <li class="flex flex-col gap-2 py-3.5 text-sm">
                         <div class="flex flex-wrap items-center gap-3">
                             <span class="w-36 font-mono text-[13px] font-medium">(&task.agent_id)</span>
-                            badge(variant: BadgeVariant::Outline, attrs: attributes! { class=(sent_state_tone(task.state)) }, (sent_state_word(task.state)))
+                            state_badge(state: sent_state(task.state))
                             <span class="ml-auto text-[13px] text-muted-foreground">(age(task.created_at, now))</span>
                         </div>
                         if let Some(reason) = &task.reason {
@@ -631,10 +585,7 @@ pub(super) async fn import(
     cx: &Cx,
     Form(form): Form<ImportForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let Page(Some(page)) = app_context::<Page>(cx) else {
-        return Err(bad_request("this page cannot import invitations").into());
-    };
+    let page = admin_page(cx, "this page cannot import invitations").await?;
     let error = match crate::direct::InvitationBundle::decode(&form.bundle) {
         Err(_) => "This is not an Aether invite. Ask for it again and paste all of it.",
         Ok(bundle) => match crate::direct::import_bundle(&page.data_dir, &bundle) {
@@ -654,7 +605,7 @@ pub(super) async fn import(
             Err(_) => "This invite is not valid or has expired. Ask for a new one.",
         },
     };
-    Ok(view! { caller_screen(error: error.to_owned()) })
+    Ok(view! { caller_screen(notice: Notice::Import(error.to_owned())) })
 }
 
 #[derive(Deserialize)]
@@ -669,20 +620,30 @@ pub(super) async fn remove_contact(
     cx: &Cx,
     Form(form): Form<RemoveContactForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let Page(Some(page)) = app_context::<Page>(cx) else {
-        return Err(bad_request("this page has no contacts").into());
-    };
-    let error = match crate::direct::remove_contact(&page.data_dir, &form.agent) {
-        Ok(()) | Err(crate::direct::DirectError::UnknownContact) => "",
+    let page = admin_page(cx, "this page has no contacts").await?;
+    match crate::direct::remove_contact(&page.data_dir, &form.agent) {
+        Ok(()) | Err(crate::direct::DirectError::UnknownContact) => {}
         Err(error) => return Err(internal_server_error(error).into()),
-    };
-    Ok(view! { caller_screen(error: error.to_owned()) })
+    }
+    Ok(view! { caller_screen() })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use axum::http::StatusCode;
+
     use super::shell_quote;
+    use crate::admin::test_support::shared_in;
+    use crate::admin_ui::{
+        AdminUi, PageContext, UiOptions, build_admin_ui,
+        test_support::{
+            PORT, app, form_value, get, get_with, host_ui, hub_caller_ui, input_value,
+            post, session, session_cookie_pair,
+        },
+    };
+    use aether_store::NodeStore;
 
     #[test]
     fn a_path_with_a_space_or_a_quote_becomes_one_shell_word() {
@@ -692,5 +653,368 @@ mod tests {
         );
         assert_eq!(shell_quote("/Users/bob/My Files"), "'/Users/bob/My Files'");
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+
+    /// Lists the service agent in `host_dir` on `hub` as `handle`, and
+    /// returns its search row as a stranger gets it.
+    fn listed_service(
+        hub: &crate::hub_client::test_hub::TestHub,
+        host_dir: &std::path::Path,
+        handle: &str,
+    ) -> crate::hub_client::AgentRow {
+        let bytes = crate::listing::listing_bytes(
+            &crate::agent_card::CardSettings::default(),
+            handle,
+        );
+        hub.add_listing(host_dir, host_dir, handle, &bytes)
+    }
+
+    #[tokio::test]
+    async fn confirming_a_request_sends_it_and_records_the_approval() {
+        let caller_dir = tempfile::tempdir().expect("directory must create");
+        let service_dir = tempfile::tempdir().expect("directory must create");
+        let hub = crate::hub_client::test_hub::TestHub::start().await;
+        let page = hub_caller_ui(caller_dir.path(), &hub);
+        let me = crate::direct::endpoint_id(caller_dir.path()).expect("endpoint");
+        hub.state().add_account(&me, "ana#0001");
+        let row = listed_service(&hub, service_dir.path(), "law#0042");
+        let draft =
+            crate::access_requests::draft(caller_dir.path(), "law#0042", &row, 7)
+                .expect("the request must draft");
+        let cookie = session(&page).await;
+        let home = get_with(page.clone(), "/", &cookie).await;
+        for text in [
+            "Requests your agent wants to send",
+            "Requests to confirm",
+            "law#0042",
+            "The agent&#x27;s owner wrote this. Aether did not check it.",
+            "each computer can see the public IP address of the other",
+        ] {
+            assert!(
+                home.body.contains(text)
+                    || home.body.contains(&text.replace("&#x27;", "'")),
+                "{text}: {}",
+                home.body
+            );
+        }
+        assert!(!hub.requests().iter().any(|request| request.target == "/v1/requests"));
+
+        let confirmed = post(
+            page.clone(),
+            "/requests/confirm",
+            Some(&cookie),
+            &format!("id={}&days=30", draft.id),
+        )
+        .await;
+        assert_eq!(confirmed.status, StatusCode::OK, "{}", confirmed.body);
+        assert!(
+            confirmed.body.contains("Waiting for law#0042 to approve"),
+            "{}",
+            confirmed.body
+        );
+        let service = crate::direct::endpoint_id(service_dir.path()).expect("endpoint");
+        let invite = hub
+            .state()
+            .invites
+            .iter()
+            .find(|invite| invite.receiver == me)
+            .cloned()
+            .expect("the hub must have the request");
+        assert_eq!(
+            (
+                invite.sender.as_str(),
+                invite.status.as_str(),
+                invite.origin.as_str(),
+                invite.days
+            ),
+            (service.as_str(), "requested", "request", 30)
+        );
+        let store = NodeStore::in_dir(caller_dir.path()).expect("store");
+        let approval = store
+            .hub_approval(&invite.id)
+            .expect("approval must read")
+            .expect("approval");
+        assert_eq!(approval.side, aether_store::ApprovalSide::Receiver);
+        assert_eq!(approval.kind, aether_store::ApprovalKind::Request);
+        assert_eq!(approval.peer_name, "law#0042");
+        assert_eq!(approval.listing, Some(draft.listing));
+        assert!(store.access_request_drafts(0).expect("drafts").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_sixth_open_request_shows_the_limit_text() {
+        let caller_dir = tempfile::tempdir().expect("directory must create");
+        let hub = crate::hub_client::test_hub::TestHub::start().await;
+        let page = hub_caller_ui(caller_dir.path(), &hub);
+        let me = crate::direct::endpoint_id(caller_dir.path()).expect("endpoint");
+        hub.state().add_account(&me, "ana#0001");
+        let services: Vec<tempfile::TempDir> = (0..6)
+            .map(|_| tempfile::tempdir().expect("directory must create"))
+            .collect();
+        for (index, service) in services.iter().take(5).enumerate() {
+            listed_service(&hub, service.path(), &format!("law{index}#0001"));
+            let endpoint =
+                crate::direct::endpoint_id(service.path()).expect("endpoint");
+            hub.state().add_request(&endpoint, &me, 7);
+        }
+        let sixth = services.last().expect("six services");
+        let row = listed_service(&hub, sixth.path(), "law5#0001");
+        let draft =
+            crate::access_requests::draft(caller_dir.path(), "law5#0001", &row, 7)
+                .expect("the request must draft");
+        let cookie = session(&page).await;
+        let refused = post(
+            page.clone(),
+            "/requests/confirm",
+            Some(&cookie),
+            &format!("id={}&days=7", draft.id),
+        )
+        .await;
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+        assert!(
+            refused.body.contains("You reached a hub limit. Remove an old item first."),
+            "{}",
+            refused.body
+        );
+        assert!(!refused.body.contains("Nobody has this name"));
+    }
+
+    #[tokio::test]
+    async fn discarding_a_request_sends_nothing() {
+        let caller_dir = tempfile::tempdir().expect("directory must create");
+        let service_dir = tempfile::tempdir().expect("directory must create");
+        let hub = crate::hub_client::test_hub::TestHub::start().await;
+        let page = hub_caller_ui(caller_dir.path(), &hub);
+        let me = crate::direct::endpoint_id(caller_dir.path()).expect("endpoint");
+        hub.state().add_account(&me, "ana#0001");
+        let row = listed_service(&hub, service_dir.path(), "law#0042");
+        let draft =
+            crate::access_requests::draft(caller_dir.path(), "law#0042", &row, 7)
+                .expect("the request must draft");
+        let cookie = session(&page).await;
+        let discarded = post(
+            page.clone(),
+            "/requests/discard",
+            Some(&cookie),
+            &format!("id={}", draft.id),
+        )
+        .await;
+        assert_eq!(discarded.status, StatusCode::OK, "{}", discarded.body);
+        assert!(!discarded.body.contains("Requests your agent wants to send"));
+        let store = NodeStore::in_dir(caller_dir.path()).expect("store");
+        assert!(store.access_request_drafts(0).expect("drafts").is_empty());
+        assert!(!hub.requests().iter().any(|request| request.target == "/v1/requests"));
+        assert!(hub.state().invites.is_empty());
+    }
+
+    /// A caller UI over `data_dir`.
+    fn caller_ui(data_dir: &std::path::Path) -> AdminUi {
+        let options = UiOptions {
+            page: Some(Arc::new(PageContext::admin_caller(data_dir.to_path_buf()))),
+            ..UiOptions::default()
+        };
+        build_admin_ui(shared_in(data_dir), options, PORT)
+    }
+
+    /// Creates an invitation on a fresh host for the endpoint `caller_id`.
+    async fn bundle_for(caller_id: &str) -> String {
+        let host_directory = tempfile::tempdir().expect("directory must create");
+        let (host, _) = host_ui(host_directory.path());
+        let host = app(host);
+        let cookie = session(&host).await;
+        let response = post(
+            host,
+            "/invite",
+            Some(&cookie),
+            &format!("friend_name=ana&endpoint_id={caller_id}&days=7"),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK);
+        input_value(&response.body, "invite-line")
+    }
+
+    #[tokio::test]
+    async fn a_caller_imports_an_invitation_and_lists_the_agent() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let caller = caller_ui(directory.path());
+        let caller = app(caller);
+        // One request for both: a page load without the cookie would start a
+        // new session and end this one.
+        let home = get(caller.clone(), "/").await;
+        let cookie = session_cookie_pair(
+            home.set_cookie.as_deref().expect("home must set a cookie"),
+        )
+        .to_owned();
+        let caller_id = crate::data_dir::DataDir::new(directory.path())
+            .endpoint_key()
+            .expect("caller key must load")
+            .public()
+            .to_string();
+        assert!(home.body.contains("Connect to a friend's agent"));
+        // Shown in groups of four; the copy button holds it whole.
+        assert!(home.body.contains(&crate::admin_components::grouped(
+            caller_id.get(..32).expect("an endpoint id has 64 characters")
+        )));
+        assert!(home.body.contains(&format!("data-copy-text=\"{caller_id}\"")));
+        let bundle = bundle_for(&caller_id).await;
+        let response = post(
+            caller.clone(),
+            "/import",
+            Some(&cookie),
+            &form_value("bundle", &bundle),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::OK, "{}", response.body);
+        assert!(response.body.contains("Agents you can use"));
+        assert!(response.body.contains("Connect another agent"));
+        assert_eq!(
+            input_value(&response.body, "request-0"),
+            "aether node request --scope direct --agent-id tudor --text 'Give me three ideas for a project name'"
+        );
+        let kept = crate::direct::contact_bundle(
+            &crate::direct::open_store(directory.path()).expect("store must open"),
+            "tudor",
+        )
+        .expect("the bundle must be kept");
+        assert_eq!(kept.relay_url.as_deref(), Some("https://relay.test"));
+        // The line was v2: its card is kept apart from the contact.
+        let card = crate::direct::contact_card(
+            &crate::direct::open_store(directory.path()).expect("store must open"),
+            &kept,
+        )
+        .expect("the card must be kept");
+        assert_eq!(card.name, "tudor");
+        assert!(
+            response
+                .body
+                .contains("An agent that does tasks for people its owner invites.")
+        );
+        assert!(response.body.contains("Skill: General tasks"));
+    }
+
+    #[tokio::test]
+    async fn caller_page_shows_a_not_delivered_task_and_an_answer() {
+        let host = tempfile::tempdir().expect("directory must create");
+        let directory = tempfile::tempdir().expect("directory must create");
+        let endpoint = crate::direct::endpoint_id(directory.path()).expect("endpoint");
+        crate::direct::import_bundle(
+            directory.path(),
+            &crate::direct::test_bundle(host.path(), &endpoint, false),
+        )
+        .expect("the contact must import");
+        let now = aether_core::time::unix_timestamp(std::time::SystemTime::now())
+            .expect("time");
+        let store = NodeStore::in_dir(directory.path()).expect("store");
+        let answered = crate::outbox::enqueue(directory.path(), "tudor", "one", now)
+            .expect("task");
+        let lost = crate::outbox::enqueue(directory.path(), "tudor", "two", now)
+            .expect("task");
+        store
+            .record_sent_attempt(
+                &answered.task_id,
+                None,
+                &aether_store::SentAttempt {
+                    state: aether_store::SentState::Answered,
+                    reason: None,
+                    host_state: None,
+                    answer: Some("Three names".to_owned()),
+                    last_event_sequence: 1,
+                    next_attempt_at: now,
+                },
+                now,
+            )
+            .expect("record");
+        store
+            .end_sent_tasks_for_endpoint(
+                &lost.endpoint_id,
+                "the access to this agent ended",
+                now,
+            )
+            .expect("end");
+        let caller = app(caller_ui(directory.path()));
+        let page = get(caller, "/").await;
+        assert!(page.body.contains("Sent tasks"));
+        assert!(page.body.contains("Answered"));
+        assert!(page.body.contains("Three names"));
+        assert!(page.body.contains("Not delivered"));
+        assert!(page.body.contains("the access to this agent ended"));
+    }
+
+    #[tokio::test]
+    async fn a_caller_removes_a_contact_from_the_page() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let caller = app(caller_ui(directory.path()));
+        let cookie = session(&caller).await;
+        let caller_id =
+            crate::direct::endpoint_id(directory.path()).expect("caller key must load");
+        let bundle = bundle_for(&caller_id).await;
+        let imported = post(
+            caller.clone(),
+            "/import",
+            Some(&cookie),
+            &form_value("bundle", &bundle),
+        )
+        .await;
+        assert!(imported.body.contains("Remove tudor"));
+        let removed =
+            post(caller.clone(), "/contacts/remove", Some(&cookie), "agent=tudor")
+                .await;
+        assert_eq!(removed.status, StatusCode::OK, "{}", removed.body);
+        assert!(!removed.body.contains("Agents you can use"));
+        assert!(
+            crate::direct::contact_bundle(
+                &crate::direct::open_store(directory.path()).expect("store must open"),
+                "tudor"
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_caller_refuses_an_invitation_for_another_endpoint() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let caller = caller_ui(directory.path());
+        let caller = app(caller);
+        let cookie = session(&caller).await;
+        let other = iroh::SecretKey::generate().public().to_string();
+        let bundle = bundle_for(&other).await;
+        let response = post(
+            caller.clone(),
+            "/import",
+            Some(&cookie),
+            &form_value("bundle", &bundle),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        assert!(response.body.contains("This invite is for another computer."));
+        let response = post(
+            caller,
+            "/import",
+            Some(&cookie),
+            &form_value("bundle", "{\"format\":\"something-else\"}"),
+        )
+        .await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        assert!(response.body.contains("This is not an Aether invite."));
+        assert!(
+            crate::direct::contact_bundles(
+                &crate::direct::open_store(directory.path()).expect("store must open")
+            )
+            .expect("contacts must list")
+            .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_caller_page_says_when_sent_tasks_cannot_load() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let admin_ui = caller_ui(directory.path());
+        rusqlite::Connection::open(directory.path().join(aether_store::NODE_DATABASE))
+            .expect("database must open")
+            .execute("DROP TABLE sent_tasks", [])
+            .expect("sent tasks must drop");
+        let response = get(app(admin_ui), "/").await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert!(response.body.contains("Sent tasks cannot be loaded."));
     }
 }

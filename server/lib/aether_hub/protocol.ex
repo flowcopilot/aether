@@ -114,13 +114,10 @@ defmodule AetherHub.Protocol do
   """
   def regex(name), do: Regex.compile!(Map.fetch!(@patterns, name), [:dollar_endonly])
 
-  @doc """
-  Whether `endpoint` is a 64-character lowercase hex endpoint id.
-  """
-  def valid_endpoint?(endpoint),
-    do: is_binary(endpoint) and Regex.match?(regex(:endpoint), endpoint)
-
-  @doc "`:ok` when `endpoint` is valid, else `{:error, :invalid}`."
-  def validate_endpoint(endpoint),
-    do: if(valid_endpoint?(endpoint), do: :ok, else: {:error, :invalid})
+  @doc "`:ok` when `endpoint` is a 64-character lowercase hex endpoint id, else `{:error, :invalid}`."
+  def validate_endpoint(endpoint) do
+    if is_binary(endpoint) and Regex.match?(regex(:endpoint), endpoint),
+      do: :ok,
+      else: {:error, :invalid}
+  end
 end

@@ -45,6 +45,12 @@ defmodule AetherHub.Invites do
   @status_delivered Protocol.invite_status(:delivered)
   @role_sender Protocol.invite_role(:sender)
   @role_receiver Protocol.invite_role(:receiver)
+  # The legal moves: {the side that makes it, the status before, the status after}.
+  @transitions %{
+    approve: {@role_sender, @status_requested, @status_accepted},
+    accept: {@role_receiver, @status_pending, @status_accepted},
+    deliver: {@role_sender, @status_accepted, @status_delivered}
+  }
   @statuses_with_receiver_endpoint Enum.map(
                                      ~w(requested accepted delivered)a,
                                      &Protocol.invite_status/1
@@ -55,23 +61,17 @@ defmodule AetherHub.Invites do
   @doc "The personal agent `account` invites the personal agent `to` for `days` days."
   def invite(%Account{} = me, %{"to" => to, "days" => days})
       when is_binary(to) and is_integer(days) and days in @days do
-    Repo.atomic(fn ->
+    Versions.commit(fn ->
       # A service agent gets access only by request.
       if me.kind == @service, do: Repo.rollback(:forbidden)
 
-      receiver =
-        case Names.find(to) do
-          {:ok, %Account{kind: @personal} = receiver} -> receiver
-          # The same answer as for an unknown name: an invite does not
-          # show that an unlisted service agent exists.
-          {:ok, _service} -> Repo.rollback(:not_found)
-          {:error, reason} -> Repo.rollback(reason)
-        end
+      # A service agent gets the answer of an unknown name: an invite does
+      # not show that an unlisted service agent exists.
+      receiver = Repo.ok!(Names.find(to, @personal))
 
       if receiver.endpoint == me.endpoint, do: Repo.rollback(:invalid)
       insert(me, receiver, days, me.endpoint, @origin_invite)
     end)
-    |> Versions.notify()
   end
 
   def invite(_account, _body), do: {:error, :invalid}
@@ -79,18 +79,13 @@ defmodule AetherHub.Invites do
   @doc """
   `account` asks the listed service agent `to` for access for `days` days.
   The row has the service as its sender, because the service signs the
-  line. `{:ok, row, :created}`, or `{:ok, row, :open}` with an open row
+  line. `{:ok, row}` for a new row, or `{:ok, row, :open}` with an open row
   between the two, unchanged.
   """
   def request(%Account{} = me, %{"to" => to, "days" => days} = body)
       when map_size(body) == 2 and is_binary(to) and is_integer(days) and days in @days do
-    Repo.atomic(fn ->
-      service =
-        case Names.find(to) do
-          {:ok, %Account{kind: @service} = service} -> service
-          {:ok, _personal} -> Repo.rollback(:not_found)
-          {:error, reason} -> Repo.rollback(reason)
-        end
+    Versions.commit(fn ->
+      service = Repo.ok!(Names.find(to, @service))
 
       if service.endpoint == me.endpoint, do: Repo.rollback(:invalid)
       # An unlisted service agent gets the answer of an unknown name.
@@ -103,14 +98,12 @@ defmodule AetherHub.Invites do
 
         nil ->
           if open_requests(me.endpoint) >= @max_open_requests, do: Repo.rollback(:limit)
-          {row, touched} = insert(service, me, days, me.endpoint, @origin_request)
-          {{row, :created}, touched}
+          insert(service, me, days, me.endpoint, @origin_request)
       end
     end)
-    |> Versions.notify()
     |> case do
-      {:ok, {row, outcome}} -> {:ok, row, outcome}
-      error -> error
+      {:ok, {row, :open}} -> {:ok, row, :open}
+      result -> result
     end
   end
 
@@ -163,9 +156,7 @@ defmodule AetherHub.Invites do
         hidden_from: Blocks.hidden_from(target, maker)
       })
 
-    touched = sides(invite)
-    Versions.bump(touched)
-    {json(invite, Account.full_name(sender), Account.full_name(receiver), asker), touched}
+    {json(invite, Account.full_name(sender), Account.full_name(receiver), asker), sides(invite)}
   end
 
   ## Moving rows
@@ -177,12 +168,7 @@ defmodule AetherHub.Invites do
   def approve(%Account{} = account, id, body) do
     case approve_days(body) do
       {:ok, days} ->
-        transition(account, id, fn invite, role ->
-          if role != @role_sender or invite.status != @status_requested,
-            do: Repo.rollback(:forbidden)
-
-          Ecto.Changeset.change(invite, status: @status_accepted, days: days || invite.days)
-        end)
+        transition(account, id, :approve, if(days, do: [days: days], else: []))
 
       :error ->
         {:error, :invalid}
@@ -198,20 +184,12 @@ defmodule AetherHub.Invites do
   defp approve_days(_body), do: :error
 
   def accept(%Account{} = account, id) do
-    transition(account, id, fn invite, role ->
-      if role != @role_receiver or invite.status != @status_pending, do: Repo.rollback(:forbidden)
-      Ecto.Changeset.change(invite, status: @status_accepted)
-    end)
+    transition(account, id, :accept, [])
   end
 
   def deliver(%Account{} = account, id, %{"bundle" => bundle}) when is_binary(bundle) do
     if String.starts_with?(bundle, @bundle_prefix) and byte_size(bundle) <= @bundle_max do
-      transition(account, id, fn invite, role ->
-        if role != @role_sender or invite.status != @status_accepted,
-          do: Repo.rollback(:forbidden)
-
-        Ecto.Changeset.change(invite, status: @status_delivered, bundle: bundle)
-      end)
+      transition(account, id, :deliver, bundle: bundle)
     else
       {:error, :invalid}
     end
@@ -219,32 +197,37 @@ defmodule AetherHub.Invites do
 
   def deliver(_account, _id, _body), do: {:error, :invalid}
 
-  defp transition(%Account{endpoint: endpoint}, id, change) do
-    Repo.atomic(fn ->
+  # Makes the move `move` on the open row `id`, with the other `changes`.
+  # The update checks the status again, so a row that moved since it was
+  # read is forbidden too.
+  defp transition(%Account{endpoint: endpoint}, id, move, changes) do
+    {side, status, next} = Map.fetch!(@transitions, move)
+    changes = Keyword.put(changes, :status, next)
+
+    Versions.commit(fn ->
       invite = open!(endpoint, id)
-      invite = invite |> change.(role(invite, endpoint)) |> Repo.update!()
+      if role(invite, endpoint) != side or invite.status != status, do: Repo.rollback(:forbidden)
+
+      case Repo.update_all(from(i in Invite, where: i.id == ^id and i.status == ^status),
+             set: changes
+           ) do
+        {1, _} -> :ok
+        {0, _} -> Repo.rollback(:forbidden)
+      end
+
+      invite = struct!(invite, changes)
       if invite.status == @status_delivered, do: Contacts.add(invite)
-      touched = sides(invite)
-      Versions.bump(touched)
-      {json(invite, endpoint), touched}
+      {json(invite, endpoint), sides(invite)}
     end)
-    |> Versions.notify()
   end
 
   @doc "Either side removes the open row `id`."
   def delete(%Account{endpoint: endpoint}, id) do
-    Repo.atomic(fn ->
+    Versions.commit(fn ->
       invite = open!(endpoint, id)
       Repo.delete!(invite)
-      touched = sides(invite)
-      Versions.bump(touched)
-      {:ok, touched}
+      {:ok, sides(invite)}
     end)
-    |> Versions.notify()
-    |> case do
-      {:ok, :ok} -> :ok
-      error -> error
-    end
   end
 
   @doc """
@@ -375,18 +358,11 @@ defmodule AetherHub.Invites do
 
   @doc "Deletes every expired row and wakes both sides of each."
   def delete_expired do
-    Repo.atomic(fn ->
+    Versions.commit(fn ->
       expired = Repo.all(from i in Invite, where: i.created_at <= ^cutoff())
       Repo.delete_all(from i in Invite, where: i.id in ^Enum.map(expired, & &1.id))
-      touched = Enum.flat_map(expired, &[&1.sender_endpoint, &1.receiver_endpoint])
-      Versions.bump(touched)
-      {:ok, touched}
+      {:ok, Enum.flat_map(expired, &[&1.sender_endpoint, &1.receiver_endpoint])}
     end)
-    |> Versions.notify()
-    |> case do
-      {:ok, :ok} -> :ok
-      error -> error
-    end
   end
 
   ## Helpers

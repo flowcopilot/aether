@@ -630,13 +630,11 @@ impl NodeStore {
         if !lease_matches(&tx, task_id, execution_id)? {
             return Err(StoreError::NotFound);
         }
-        enter(&tx, task_id, TaskState::Succeeded)?;
+        end(&tx, task_id, TaskState::Succeeded)?;
         tx.execute(
             "UPDATE tasks SET final_result=?1,result_expires_at=?2 WHERE id=?3",
             params![result, result_expires_at, task_id],
         )?;
-        set_input_expiry(&tx, task_id)?;
-        tx.execute("DELETE FROM execution_leases WHERE task_id=?1", [task_id])?;
         tx.commit()?;
         Ok(())
     }
@@ -695,19 +693,7 @@ impl NodeStore {
         task_id: &str,
         execution_id: &str,
     ) -> Result<(), StoreError> {
-        let tx = self.connection.transaction()?;
-        if state(&tx, task_id)? == TaskState::Cancelled {
-            tx.commit()?;
-            return Ok(());
-        }
-        if !lease_matches(&tx, task_id, execution_id)? {
-            return Err(StoreError::NotFound);
-        }
-        enter(&tx, task_id, TaskState::Failed)?;
-        set_input_expiry(&tx, task_id)?;
-        tx.execute("DELETE FROM execution_leases WHERE task_id=?1", [task_id])?;
-        tx.commit()?;
-        Ok(())
+        self.end_execution(task_id, execution_id, TaskState::Failed)
     }
 
     /// Records that an execution's outcome could not be confirmed after the
@@ -719,19 +705,7 @@ impl NodeStore {
         task_id: &str,
         execution_id: &str,
     ) -> Result<(), StoreError> {
-        let tx = self.connection.transaction()?;
-        if state(&tx, task_id)? == TaskState::Cancelled {
-            tx.commit()?;
-            return Ok(());
-        }
-        if !lease_matches(&tx, task_id, execution_id)? {
-            return Err(StoreError::NotFound);
-        }
-        enter(&tx, task_id, TaskState::UnknownResult)?;
-        set_input_expiry(&tx, task_id)?;
-        tx.execute("DELETE FROM execution_leases WHERE task_id=?1", [task_id])?;
-        tx.commit()?;
-        Ok(())
+        self.end_execution(task_id, execution_id, TaskState::UnknownResult)
     }
 
     pub fn mark_rejected(
@@ -739,28 +713,32 @@ impl NodeStore {
         task_id: &str,
         execution_id: &str,
     ) -> Result<(), StoreError> {
+        self.end_execution(task_id, execution_id, TaskState::Rejected)
+    }
+
+    /// Ends the execution that holds `execution_id`'s lease in `next`. A
+    /// task cancelled in the meantime stays cancelled: the cancel already
+    /// ended it and deleted the lease.
+    fn end_execution(
+        &mut self,
+        task_id: &str,
+        execution_id: &str,
+        next: TaskState,
+    ) -> Result<(), StoreError> {
         let tx = self.connection.transaction()?;
+        if state(&tx, task_id)? == TaskState::Cancelled {
+            return Ok(());
+        }
         if !lease_matches(&tx, task_id, execution_id)? {
             return Err(StoreError::NotFound);
         }
-        enter(&tx, task_id, TaskState::Rejected)?;
-        set_input_expiry(&tx, task_id)?;
-        tx.execute("DELETE FROM execution_leases WHERE task_id=?1", [task_id])?;
+        end(&tx, task_id, next)?;
         tx.commit()?;
         Ok(())
     }
 
     pub fn cancel(&mut self, task_id: &str) -> Result<(), StoreError> {
-        let tx = self.connection.transaction()?;
-        if state(&tx, task_id)? == TaskState::Cancelled {
-            tx.commit()?;
-            return Ok(());
-        }
-        enter(&tx, task_id, TaskState::Cancelled)?;
-        set_input_expiry(&tx, task_id)?;
-        tx.execute("DELETE FROM execution_leases WHERE task_id=?1", [task_id])?;
-        tx.commit()?;
-        Ok(())
+        cancel(self.connection.transaction()?, task_id)
     }
 
     pub fn cancel_if_owned(
@@ -781,15 +759,7 @@ impl NodeStore {
         if owner != caller_endpoint_id || scope != scope_id {
             return Err(StoreError::Unauthorized);
         }
-        if state(&tx, task_id)? == TaskState::Cancelled {
-            tx.commit()?;
-            return Ok(());
-        }
-        enter(&tx, task_id, TaskState::Cancelled)?;
-        set_input_expiry(&tx, task_id)?;
-        tx.execute("DELETE FROM execution_leases WHERE task_id=?1", [task_id])?;
-        tx.commit()?;
-        Ok(())
+        cancel(tx, task_id)
     }
 
     pub fn task_execution_data(
@@ -818,7 +788,7 @@ impl NodeStore {
         let tx = self.connection.transaction()?;
         if state(&tx, task_id)? == TaskState::Leased {
             change(&tx, task_id, TaskState::Queued, EventType::Requeued)?;
-            tx.execute("DELETE FROM execution_leases WHERE task_id=?1", [task_id])?;
+            delete_lease(&tx, task_id)?;
         }
         tx.commit()?;
         Ok(())
@@ -846,20 +816,20 @@ impl NodeStore {
         let mut recovered_running = Vec::new();
         for id in ids {
             match state(&tx, &id)? {
-                TaskState::Leased => {
-                    change(&tx, &id, TaskState::Queued, EventType::LeaseExpired)?;
-                }
                 TaskState::Running => {
-                    enter(&tx, &id, TaskState::UnknownResult)?;
-                    // `UnknownResult` still gets a definite retention
-                    // deadline: it must not keep its input forever just
+                    // `end` gives `UnknownResult` a definite retention
+                    // deadline too: it must not keep its input forever just
                     // because it also requires operator review.
-                    set_input_expiry(&tx, &id)?;
-                    recovered_running.push(id.clone());
+                    end(&tx, &id, TaskState::UnknownResult)?;
+                    recovered_running.push(id);
                 }
-                _ => {}
+                current => {
+                    if current == TaskState::Leased {
+                        change(&tx, &id, TaskState::Queued, EventType::LeaseExpired)?;
+                    }
+                    delete_lease(&tx, &id)?;
+                }
             }
-            tx.execute("DELETE FROM execution_leases WHERE task_id=?1", [&id])?;
         }
         tx.commit()?;
         Ok(recovered_running)
@@ -942,6 +912,28 @@ fn state(tx: &Transaction<'_>, task_id: &str) -> Result<TaskState, StoreError> {
         .ok_or(StoreError::NotFound)
 }
 
+/// Moves the task to the terminal state `next`, starts its input's
+/// retention deadline and releases its lease.
+fn end(tx: &Transaction<'_>, task_id: &str, next: TaskState) -> Result<(), StoreError> {
+    enter(tx, task_id, next)?;
+    set_input_expiry(tx, task_id)?;
+    delete_lease(tx, task_id)
+}
+
+/// Cancels the task, or does nothing when it is already cancelled.
+fn cancel(tx: Transaction<'_>, task_id: &str) -> Result<(), StoreError> {
+    if state(&tx, task_id)? != TaskState::Cancelled {
+        end(&tx, task_id, TaskState::Cancelled)?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn delete_lease(tx: &Transaction<'_>, task_id: &str) -> Result<(), StoreError> {
+    tx.execute("DELETE FROM execution_leases WHERE task_id=?1", [task_id])?;
+    Ok(())
+}
+
 fn set_input_expiry(tx: &Transaction<'_>, task_id: &str) -> Result<(), StoreError> {
     tx.execute(
         "UPDATE tasks SET input_expires_at=?1 WHERE id=?2 AND input_expires_at IS NULL",
@@ -965,10 +957,19 @@ fn change(
     next: TaskState,
     event_type: EventType,
 ) -> Result<(), StoreError> {
-    if !state(tx, task_id)?.allows(next) {
+    let current = state(tx, task_id)?;
+    if !current.allows(next) {
         return Err(StoreError::InvalidState);
     }
-    tx.execute("UPDATE tasks SET state=?1 WHERE id=?2", params![next, task_id])?;
+    // Write only over the state just checked, so the guard holds even if
+    // another writer changed the row in between.
+    if tx.execute(
+        "UPDATE tasks SET state=?1 WHERE id=?2 AND state=?3",
+        params![next, task_id, current],
+    )? == 0
+    {
+        return Err(StoreError::InvalidState);
+    }
     event(tx, task_id, event_type)
 }
 
@@ -1569,6 +1570,21 @@ mod tests {
             .mark_rejected("task", "execution")
             .expect("a leased task must be rejectable");
         assert_eq!(store.state("task"), Ok(TaskState::Rejected));
+        fs::remove_file(database).expect("database must remove");
+    }
+
+    #[test]
+    fn rejecting_a_task_cancelled_while_leased_is_a_no_op() {
+        let (mut store, database) = store();
+        store
+            .admit(&input("task", "caller"), QueueLimits { global: 1, per_peer: 1 })
+            .expect("task must admit");
+        store.lease_next("worker", "execution", 10).expect("task must lease");
+        store.cancel("task").expect("task must cancel");
+        store
+            .mark_rejected("task", "execution")
+            .expect("a dispatch denial after cancellation must be a no-op");
+        assert_eq!(store.state("task"), Ok(TaskState::Cancelled));
         fs::remove_file(database).expect("database must remove");
     }
 

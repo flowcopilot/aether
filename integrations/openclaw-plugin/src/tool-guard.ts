@@ -3,14 +3,14 @@
 // agent and its tool profile (research/openclaw-integration.md, Security).
 import { CHANNEL_ID } from "./inbound.ts";
 
-export interface ToolCallInput {
+interface ToolCallInput {
   sessionKey?: string;
   channel?: string;
   toolName: string;
   allowedTools: readonly string[];
 }
 
-export type ToolDecision = { block: false } | { block: true; reason: string };
+type ToolDecision = { block: false } | { block: true; reason: string };
 
 export function decideToolCall(input: ToolCallInput): ToolDecision {
   // The session key holds the channel name between colons, so either test

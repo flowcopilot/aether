@@ -1,12 +1,12 @@
 use std::{
     future::Future,
     path::Path,
-    sync::{Arc, Mutex, PoisonError},
+    sync::{Arc, PoisonError},
     time::Duration,
 };
 
 use aether_core::time::now;
-use aether_store::AuditActor;
+use aether_store::{AuditActor, HubApproval};
 
 use crate::{
     admin::SharedAdministration,
@@ -19,52 +19,40 @@ use crate::{
 const RETRY_WAIT: Duration = Duration::from_secs(5);
 const POLL_WAIT: Duration = Duration::from_secs(25);
 
-enum HubPoll {
-    Ready(Box<HubClient>),
-    Off,
-    Unavailable,
-}
-
-fn hub_poll(ctx: &NodeServeContext) -> HubPoll {
-    match ctx.hub.access() {
-        HubAccess::Ready(client) => HubPoll::Ready(client),
-        HubAccess::Off => HubPoll::Off,
-        HubAccess::Unavailable => HubPoll::Unavailable,
-    }
-}
-
-async fn follow<C, F, Fut>(current: C, mut act: F)
+/// Follows the invites of the hub that `ctx` uses and runs `act` on each
+/// list. A new hub URL starts again from the full list.
+async fn follow<F, Fut>(ctx: &NodeServeContext, mut act: F)
 where
-    C: Fn() -> HubPoll,
     F: FnMut(HubClient, Vec<Invite>) -> Fut,
     Fut: Future<Output = ()>,
 {
-    let mut version = None;
-    let mut followed = String::new();
+    // The hub URL that is followed, and the version of its last list.
+    let mut followed: Option<(String, u64)> = None;
     loop {
-        match current() {
-            HubPoll::Unavailable => {
+        match ctx.hub.access() {
+            HubAccess::Unavailable => {
                 println!(
                     "{}",
                     serde_json::json!({ "event": "hub_access_unavailable" })
                 );
-                version = None;
+                followed = None;
                 tokio::time::sleep(RETRY_WAIT).await;
             }
-            HubPoll::Off => {
-                version = None;
+            HubAccess::Off => {
+                followed = None;
                 tokio::time::sleep(RETRY_WAIT).await;
             }
-            HubPoll::Ready(hub) => {
-                if hub.url() != followed {
-                    followed = hub.url();
-                    version = None;
-                }
+            HubAccess::Ready(hub) => {
+                let url = hub.url();
+                let version = followed
+                    .as_ref()
+                    .filter(|(followed, _)| *followed == url)
+                    .map(|&(_, version)| version);
                 if let Ok(list) = hub.invites(version, POLL_WAIT).await {
-                    version = Some(list.version);
+                    followed = Some((url, list.version));
                     act(*hub, list.invites).await;
                 } else {
-                    version = None;
+                    followed = None;
                     tokio::time::sleep(RETRY_WAIT).await;
                 }
             }
@@ -72,62 +60,119 @@ where
     }
 }
 
-enum HostAction {
-    Skip,
-    Refuse,
-    Failed,
-    Deliver(String),
+/// The local approval of `invite` and whether the owner blocked the
+/// endpoint that it names.
+fn host_inputs(
+    store: &aether_store::NodeStore,
+    invite: &Invite,
+) -> Result<(Option<HubApproval>, bool), aether_store::StoreError> {
+    let approval = store.hub_approval(&invite.id)?;
+    let blocked = match invite.receiver_endpoint.as_deref() {
+        Some(endpoint) => store.hub_blocked(endpoint)?,
+        None => false,
+    };
+    Ok((approval, blocked))
 }
 
-fn host_action(
+/// Signs the grant of `step` and pins `approval` to the line. `None` when
+/// either fails. When the line cannot be pinned, the grant is revoked again,
+/// and the person leaves `access_group` if the signing put them in it.
+#[allow(clippy::too_many_arguments)]
+fn sign_and_pin(
     administration: &SharedAdministration,
     data_dir: &Path,
-    hub_sign: &Mutex<()>,
-    store: &crate::hub_store::HubStore,
+    store: &aether_store::NodeStore,
+    own_name: &str,
+    approval: &HubApproval,
+    friend_name: &str,
+    endpoint: &str,
+    days: u64,
+    access_group: &str,
+) -> Option<String> {
+    let was_member =
+        crate::access_groups::is_member(data_dir, access_group, friend_name, endpoint)
+            .ok()?;
+    let signing = DirectInviteSigning::for_data_dir(data_dir);
+    let (line, grant_id) = sign_direct_invite(
+        administration,
+        &signing,
+        own_name,
+        friend_name,
+        endpoint,
+        days,
+        access_group,
+        AuditActor::Ui,
+    )
+    .ok()?;
+    if store.pin_hub_approval(approval, endpoint, &line).is_err() {
+        let _ = administration
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .revoke(&grant_id, AuditActor::Ui);
+        if !was_member {
+            let _ = crate::access_groups::leave(
+                data_dir,
+                access_group,
+                friend_name,
+                endpoint,
+            );
+        }
+        return None;
+    }
+    Some(line)
+}
+
+/// What the host sends to the hub for one row.
+enum HostSend {
+    /// Remove the row.
+    Refuse,
+    /// Send this line.
+    Line(String),
+}
+
+/// What the host sends for `invite`, signing a grant first when the row
+/// needs one. `None` when there is nothing to send now, or when this node
+/// failed (logged here).
+fn host_send(
+    administration: &SharedAdministration,
+    ctx: &NodeServeContext,
+    store: &aether_store::NodeStore,
     invite: &Invite,
     own_name: Option<&str>,
-) -> HostAction {
-    let _sign = hub_sign.lock().unwrap_or_else(PoisonError::into_inner);
-    let Ok(approval) = store.approval(&invite.id) else {
-        return HostAction::Failed;
-    };
-    let blocked = if let Some(endpoint) = invite.receiver_endpoint.as_deref() {
-        let Ok(blocked) = store.is_blocked(endpoint) else {
-            return HostAction::Failed;
-        };
-        blocked
-    } else {
-        false
+) -> Option<HostSend> {
+    // The page signs under the same lock, so a row is signed only once.
+    let _sign = ctx.hub_sign.lock().unwrap_or_else(PoisonError::into_inner);
+    let Ok((approval, blocked)) = host_inputs(store, invite) else {
+        log("hub_invite_failed", invite);
+        return None;
     };
     match host_step(invite, approval.as_ref(), own_name, blocked) {
-        HostStep::Skip => HostAction::Skip,
-        HostStep::Refuse => HostAction::Refuse,
-        HostStep::Deliver(line) => HostAction::Deliver(line),
-        HostStep::Sign { friend_name, endpoint, days, access_group } => {
-            let (Some(own_name), Some(approval)) = (own_name, approval.as_ref()) else {
-                return HostAction::Skip;
-            };
-            let signing = DirectInviteSigning::for_data_dir(data_dir);
-            let Ok((line, grant_id)) = sign_direct_invite(
+        HostStep::Skip => None,
+        HostStep::Refuse => Some(HostSend::Refuse),
+        HostStep::Deliver(line) => Some(HostSend::Line(line)),
+        HostStep::Sign {
+            own_name,
+            approval,
+            friend_name,
+            endpoint,
+            days,
+            access_group,
+        } => {
+            let line = sign_and_pin(
                 administration,
-                &signing,
+                &ctx.data_dir,
+                store,
                 own_name,
+                approval,
                 &friend_name,
                 &endpoint,
                 days,
                 &access_group,
-                AuditActor::Ui,
-            ) else {
-                return HostAction::Failed;
-            };
-            if store.pin_approval(approval, &endpoint, &line).is_err() {
-                let _ = administration
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .revoke(&grant_id, AuditActor::Ui);
-                return HostAction::Failed;
+            );
+            if line.is_none() {
+                log("hub_invite_failed", invite);
             }
-            HostAction::Deliver(line)
+            line.map(HostSend::Line)
         }
     }
 }
@@ -136,58 +181,33 @@ pub async fn host_worker(
     administration: SharedAdministration,
     ctx: Arc<NodeServeContext>,
 ) {
-    follow(
-        {
-            let ctx = Arc::clone(&ctx);
-            move || hub_poll(&ctx)
-        },
-        {
-            let ctx = Arc::clone(&ctx);
-            move |hub, invites| {
-                let administration = administration.clone();
-                let ctx = Arc::clone(&ctx);
-                async move {
-                    let Ok(store) = crate::hub_store::HubStore::open(&ctx.data_dir)
-                    else {
-                        println!(
-                            "{}",
-                            serde_json::json!({ "event": "hub_store_unavailable" })
-                        );
-                        return;
-                    };
-                    if store.clear_expired_approvals(now()).is_err() {
-                        println!(
-                            "{}",
-                            serde_json::json!({ "event": "hub_store_unavailable" })
-                        );
-                        return;
+    follow(&Arc::clone(&ctx), move |hub, invites| {
+        let administration = administration.clone();
+        let ctx = Arc::clone(&ctx);
+        async move {
+            let Ok(store) = aether_store::NodeStore::in_dir(&ctx.data_dir) else {
+                println!("{}", serde_json::json!({ "event": "hub_store_unavailable" }));
+                return;
+            };
+            if store.clear_expired_hub_approvals(now()).is_err() {
+                println!("{}", serde_json::json!({ "event": "hub_store_unavailable" }));
+                return;
+            }
+            let own_name = crate::hub_client::settings::hub_name(&ctx.data_dir);
+            for invite in invites {
+                match host_send(
+                    &administration,
+                    &ctx,
+                    &store,
+                    &invite,
+                    own_name.as_deref(),
+                ) {
+                    None => {}
+                    Some(HostSend::Refuse) => {
+                        log("hub_invite_refused", &invite);
+                        let _ = hub.remove(&invite.id).await;
                     }
-                    let own_name = crate::settings::setting::<
-                        crate::hub_client::settings::HubName,
-                    >(&ctx.data_dir)
-                    .ok()
-                    .flatten();
-                    for invite in invites {
-                        let line = match host_action(
-                            &administration,
-                            &ctx.data_dir,
-                            &ctx.hub_sign,
-                            &store,
-                            &invite,
-                            own_name.as_deref(),
-                        ) {
-                            HostAction::Skip => continue,
-                            HostAction::Refuse => {
-                                log("hub_invite_refused", &invite);
-                                let _ = hub.remove(&invite.id).await;
-                                continue;
-                            }
-                            HostAction::Failed => {
-                                log("hub_invite_failed", &invite);
-                                continue;
-                            }
-                            HostAction::Deliver(line) => line,
-                        };
+                    Some(HostSend::Line(line)) => {
                         match hub.deliver(&invite.id, &line).await {
                             Ok(_) => log("hub_invite_delivered", &invite),
                             Err(_) => log("hub_invite_failed", &invite),
@@ -195,64 +215,48 @@ pub async fn host_worker(
                     }
                 }
             }
-        },
-    )
+        }
+    })
     .await;
 }
 
 pub async fn caller_worker(ctx: Arc<NodeServeContext>) {
-    follow(
-        {
-            let ctx = Arc::clone(&ctx);
-            move || hub_poll(&ctx)
-        },
-        {
-            let ctx = Arc::clone(&ctx);
-            move |hub, invites| {
-                let ctx = Arc::clone(&ctx);
-                async move {
-                    let Ok(store) = crate::hub_store::HubStore::open(&ctx.data_dir)
-                    else {
-                        println!(
-                            "{}",
-                            serde_json::json!({ "event": "hub_store_unavailable" })
-                        );
-                        return;
-                    };
-                    for invite in invites {
-                        let Ok(approval) = store.approval(&invite.id) else {
-                            continue;
-                        };
-                        match caller_step(&invite, approval.as_ref()) {
-                            crate::hub_sync::CallerStep::Skip => continue,
-                            crate::hub_sync::CallerStep::Import(bundle) => {
-                                match crate::direct::import_bundle(
-                                    &ctx.data_dir,
-                                    &bundle,
-                                ) {
-                                    Ok(_) => log("hub_invite_kept", &invite),
-                                    Err(error) => {
-                                        log_reason(
-                                            "hub_invite_refused",
-                                            &invite,
-                                            &error.to_string(),
-                                        );
-                                    }
-                                }
+    follow(&Arc::clone(&ctx), move |hub, invites| {
+        let ctx = Arc::clone(&ctx);
+        async move {
+            let Ok(store) = aether_store::NodeStore::in_dir(&ctx.data_dir) else {
+                println!("{}", serde_json::json!({ "event": "hub_store_unavailable" }));
+                return;
+            };
+            for invite in invites {
+                let Ok(approval) = store.hub_approval(&invite.id) else {
+                    continue;
+                };
+                match caller_step(&invite, approval.as_ref()) {
+                    crate::hub_sync::CallerStep::Skip => continue,
+                    crate::hub_sync::CallerStep::Import(bundle) => {
+                        match crate::direct::import_bundle(&ctx.data_dir, &bundle) {
+                            Ok(_) => log("hub_invite_kept", &invite),
+                            Err(error) => {
+                                log_reason(
+                                    "hub_invite_refused",
+                                    &invite,
+                                    &error.to_string(),
+                                );
                             }
-                            crate::hub_sync::CallerStep::Refuse(reason) => {
-                                log_reason("hub_invite_refused", &invite, reason);
-                            }
-                        }
-                        let _ = store.remove_approval(&invite.id);
-                        if hub.remove(&invite.id).await.is_err() {
-                            log("hub_invite_failed", &invite);
                         }
                     }
+                    crate::hub_sync::CallerStep::Refuse(reason) => {
+                        log_reason("hub_invite_refused", &invite, reason);
+                    }
+                }
+                let _ = store.remove_hub_approval(&invite.id);
+                if hub.remove(&invite.id).await.is_err() {
+                    log("hub_invite_failed", &invite);
                 }
             }
-        },
-    )
+        }
+    })
     .await;
 }
 
@@ -277,27 +281,78 @@ fn log_reason(event: &str, invite: &Invite, reason: &str) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
-    use super::hub_poll;
-    use crate::{
-        hub_client::{HubAccess, node_hub::NodeHub},
-        node_serve_context::NodeServeContext,
-    };
+    use aether_store::{ApprovalKind, ApprovalSide, NodeStore};
+
+    use super::sign_and_pin;
+    use crate::admin::test_support::{FakeNode, shared_in};
+
+    fn members(data_dir: &std::path::Path, group: &str) -> Vec<String> {
+        NodeStore::in_dir(data_dir)
+            .expect("store must open")
+            .access_groups()
+            .expect("groups must read")
+            .into_iter()
+            .find(|entry| entry.name == group)
+            .map(|entry| {
+                entry.members.into_iter().map(|member| member.agent_id).collect()
+            })
+            .unwrap_or_default()
+    }
 
     #[test]
-    fn hub_poll_reports_unavailable_when_the_store_cannot_be_read() {
-        let directory = tempfile::tempdir().expect("directory");
-        aether_store::NodeStore::in_dir(directory.path()).expect("store");
-        std::fs::write(directory.path().join("node.sqlite"), b"not sqlite")
-            .expect("break store");
-        let ctx = NodeServeContext {
-            data_dir: directory.path().to_path_buf(),
-            hub: Arc::new(NodeHub::new(directory.path().to_path_buf(), None)),
-            hub_sign: Arc::new(Mutex::new(())),
-            caller: false,
+    fn a_line_that_cannot_be_pinned_leaves_no_grant_and_no_new_member() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let data_dir = directory.path();
+        let administration = shared_in(data_dir);
+        let node = Arc::new(FakeNode::default().with_workspace("/start"));
+        administration.lock().expect("administration must lock").set_live(node);
+        let store = aether_store::NodeStore::in_dir(data_dir).expect("store must open");
+        let group = crate::access_groups::REQUESTS_GROUP;
+        // This approval was never kept, so no line can be pinned to it.
+        let approval = crate::hub_membership::new_approval(
+            "0123456789abcdef0123456789abcdef",
+            ApprovalSide::Sender,
+            ApprovalKind::Request,
+            "ana#0001",
+            7,
+            group,
+            aether_core::time::now(),
+        );
+        let sign = |endpoint: &str| {
+            sign_and_pin(
+                &administration,
+                data_dir,
+                &store,
+                "law#0042",
+                &approval,
+                "ana#0001",
+                endpoint,
+                7,
+                group,
+            )
         };
-        assert!(matches!(hub_poll(&ctx), super::HubPoll::Unavailable));
-        assert!(matches!(ctx.hub.access(), HubAccess::Unavailable));
+        let grants = || {
+            administration
+                .lock()
+                .expect("administration must lock")
+                .grants()
+                .expect("grants must read")
+        };
+
+        let endpoint = iroh::SecretKey::generate().public().to_string();
+        assert_eq!(sign(&endpoint), None);
+        assert_eq!(grants(), Vec::new());
+        assert!(members(data_dir, group).is_empty());
+
+        // A person who was in the group before stays in it.
+        NodeStore::in_dir(data_dir)
+            .expect("store must open")
+            .add_access_group_member(group, "ana#0001", &endpoint)
+            .expect("member must add");
+        assert_eq!(sign(&endpoint), None);
+        assert_eq!(grants(), Vec::new());
+        assert_eq!(members(data_dir, group), ["ana#0001"]);
     }
 }

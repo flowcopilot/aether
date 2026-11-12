@@ -39,3 +39,18 @@ pub fn tool_success(message: impl Into<String>) -> CallToolResult {
 pub fn tool_error(message: impl Into<String>) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(message)])
 }
+
+/// The answer when the node refuses `what` with the error `code`.
+pub fn refused(what: &str, code: &str) -> CallToolResult {
+    tool_error(format!("the node refused {what}: {code}"))
+}
+
+/// A success with the text of `Ok`, else an error with the text of `Err`.
+pub fn tool_result(
+    result: Result<impl Into<String>, impl Into<String>>,
+) -> CallToolResult {
+    match result {
+        Ok(message) => tool_success(message),
+        Err(message) => tool_error(message),
+    }
+}

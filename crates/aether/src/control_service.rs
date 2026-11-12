@@ -425,9 +425,6 @@ impl From<DiscoveryError> for ControlError {
             DiscoveryError::Expired => Self::Expired,
             DiscoveryError::Forged => Self::Forged,
             DiscoveryError::Malformed => Self::InvalidRecord,
-            DiscoveryError::NotFound => {
-                Self::Server("unexpected discovery state".to_owned())
-            }
         }
     }
 }

@@ -47,10 +47,22 @@ pub fn relay_endpoint_addr(
     ))
 }
 
+/// What a [`Link`] holds between exchanges.
+#[derive(Debug, Default)]
+pub(crate) enum LinkState {
+    /// No connection yet, or the last one failed.
+    #[default]
+    Fresh,
+    /// The connection of the last exchange, for the next one.
+    Kept(iroh::endpoint::Connection),
+    /// The host serves one stream for each connection, so each exchange
+    /// connects again.
+    OneStreamEach,
+}
+
 #[derive(Debug, Default)]
 pub struct Link {
-    pub(crate) connection: Option<iroh::endpoint::Connection>,
-    pub(crate) one_stream_each: bool,
+    pub(crate) state: LinkState,
 }
 
 impl Link {
@@ -62,19 +74,25 @@ impl Link {
         remote: iroh::EndpointAddr,
         request: Frame,
     ) -> Result<Vec<Frame>, TransportError> {
-        let response = if let Some(connection) = self.connection.take() {
-            if let Ok(response) = exchange_stream(&connection, request.clone()).await {
-                self.connection = Some(connection);
-                response
-            } else {
-                // The host closed the kept connection: an older host serves
-                // one stream for each connection.
-                connection.close(0u32.into(), b"done");
-                self.one_stream_each = true;
+        let response = match std::mem::take(&mut self.state) {
+            LinkState::Kept(connection) => {
+                if let Ok(response) =
+                    exchange_stream(&connection, request.clone()).await
+                {
+                    self.state = LinkState::Kept(connection);
+                    response
+                } else {
+                    // The host closed the kept connection: an older host
+                    // serves one stream for each connection.
+                    connection.close(0u32.into(), b"done");
+                    self.state = LinkState::OneStreamEach;
+                    self.connect_and_exchange(endpoint, remote, request.clone()).await?
+                }
+            }
+            state => {
+                self.state = state;
                 self.connect_and_exchange(endpoint, remote, request.clone()).await?
             }
-        } else {
-            self.connect_and_exchange(endpoint, remote, request.clone()).await?
         };
         validate_response(&[request], &response)?;
         Ok(response)
@@ -92,8 +110,8 @@ impl Link {
                 .map_err(|_| TransportError::Timeout)?
                 .map_err(|error| TransportError::Network(error.to_string()))?;
         let response = exchange_stream(&connection, request).await;
-        if response.is_ok() && !self.one_stream_each {
-            self.connection = Some(connection);
+        if response.is_ok() && !matches!(self.state, LinkState::OneStreamEach) {
+            self.state = LinkState::Kept(connection);
         } else {
             connection.close(0u32.into(), b"done");
         }
@@ -103,7 +121,7 @@ impl Link {
 
 impl Drop for Link {
     fn drop(&mut self) {
-        if let Some(connection) = self.connection.take() {
+        if let LinkState::Kept(connection) = std::mem::take(&mut self.state) {
             connection.close(0u32.into(), b"done");
         }
     }

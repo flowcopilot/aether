@@ -1,7 +1,7 @@
 defmodule AetherHub.Features.ContactsTest do
   use AetherHub.Feature, file: "contacts.feature", async: false
 
-  alias AetherHub.{Clock, Contract, Presence, Sweeper}
+  alias AetherHub.{Clock, Contract, Presence}
 
   @step Contract.get(["limits", "presence", "lastSeenStepSeconds"])
   @keep Contract.get(["limits", "presence", "keepSeconds"])

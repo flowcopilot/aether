@@ -481,7 +481,12 @@ pub fn contacts_by_endpoint(
     Ok(contacts)
 }
 
-/// The kept bundle of the contact named `agent_id`.
+/// The kept bundle of the contact named `agent_id`, expired or not.
+///
+/// It does not check the expiry so that removal, the outbox, which tells an
+/// expired contact from an unknown one, and the contact lists, which show
+/// the days left, see expired contacts too. [`contact_by_name`] is the
+/// checked lookup.
 pub fn contact_bundle(
     store: &NodeStore,
     agent_id: &str,
@@ -535,7 +540,8 @@ pub fn contact_card(
     .ok()
 }
 
-/// Every kept bundle, in name order.
+/// Every kept bundle, in name order, expired or not, as in
+/// [`contact_bundle`].
 pub fn contact_bundles(
     store: &NodeStore,
 ) -> Result<Vec<InvitationBundle>, DirectError> {
@@ -566,29 +572,12 @@ impl RequestIds {
 /// The request frame for one text task in `scope_id`, carrying
 /// `authorization`.
 pub fn request_frame(
-    mut authorization: A2aAuthorization,
+    authorization: A2aAuthorization,
     scope_id: &str,
     text: &str,
     ids: RequestIds,
 ) -> Result<Frame, DirectError> {
-    authorization.request_id.clone_from(&ids.task_id);
-    let mut payload: A2aRequest =
-        serde_json::from_value(crate::transport::text_request_payload(
-            &ids.task_id,
-            &ids.idempotency_key,
-            &uuid::Uuid::new_v4().to_string(),
-            text,
-        ))
-        .map_err(|_| DirectError::Invalid)?;
-    payload.authorization = Some(authorization);
-    Ok(Frame {
-        version: 0,
-        kind: FrameKind::Request,
-        exchange_id: uuid::Uuid::new_v4().to_string(),
-        scope_id: scope_id.to_owned(),
-        task_id: Some(ids.task_id),
-        payload: serde_json::to_value(payload).map_err(|_| DirectError::Invalid)?,
-    })
+    request_frame_after(authorization, scope_id, text, ids, None)
 }
 
 /// The request frame that sends the task `ids` again.
@@ -602,12 +591,35 @@ pub fn resend_frame(
     ids: RequestIds,
     after: u64,
 ) -> Result<Frame, DirectError> {
-    let mut frame = request_frame(authorization, SCOPE, text, ids)?;
-    let mut payload: A2aRequest =
-        serde_json::from_value(frame.payload).map_err(|_| DirectError::Invalid)?;
-    payload.last_event_sequence = Some(after);
-    frame.payload = serde_json::to_value(payload).map_err(|_| DirectError::Invalid)?;
-    Ok(frame)
+    request_frame_after(authorization, SCOPE, text, ids, Some(after))
+}
+
+fn request_frame_after(
+    mut authorization: A2aAuthorization,
+    scope_id: &str,
+    text: &str,
+    ids: RequestIds,
+    after: Option<u64>,
+) -> Result<Frame, DirectError> {
+    authorization.request_id.clone_from(&ids.task_id);
+    let payload = A2aRequest {
+        authorization: Some(authorization),
+        last_event_sequence: after,
+        ..crate::transport::text_request(
+            &ids.task_id,
+            &ids.idempotency_key,
+            &uuid::Uuid::new_v4().to_string(),
+            text,
+        )
+    };
+    Ok(Frame {
+        version: 0,
+        kind: FrameKind::Request,
+        exchange_id: uuid::Uuid::new_v4().to_string(),
+        scope_id: scope_id.to_owned(),
+        task_id: Some(ids.task_id),
+        payload: serde_json::to_value(payload).map_err(|_| DirectError::Invalid)?,
+    })
 }
 
 /// The kept bundle of the contact named `agent_id`, when its invitation is
@@ -627,11 +639,11 @@ pub fn access_ends_at(bundle: &InvitationBundle) -> u64 {
     bundle.invitation.expires_at.min(bundle.authorization.claim.expires_at)
 }
 
-/// Sends `request` to the endpoint in `invitation`: through `relay_url` when
-/// one is set, otherwise directly to `address`.
+/// Sends `request` to `endpoint_id`: through `relay_url` when one is set,
+/// otherwise directly to `address`.
 pub async fn send(
     data_dir: &Path,
-    invitation: &WireInvitation,
+    endpoint_id: &str,
     address: Option<&str>,
     relay_url: Option<&str>,
     request: Frame,
@@ -640,20 +652,15 @@ pub async fn send(
         (Some(relay_url), _) => {
             crate::transport::request_once_via_relay(
                 data_dir,
-                &invitation.endpoint_id,
+                endpoint_id,
                 relay_url,
                 request,
             )
             .await
         }
         (None, Some(address)) => {
-            crate::transport::request_once(
-                data_dir,
-                &invitation.endpoint_id,
-                address,
-                request,
-            )
-            .await
+            crate::transport::request_once(data_dir, endpoint_id, address, request)
+                .await
         }
         (None, None) => Err(TransportError::Address),
     }

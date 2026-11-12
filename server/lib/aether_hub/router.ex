@@ -160,25 +160,12 @@ defmodule AetherHub.Router do
   end
 
   get "/v1/people/:name/:number" do
-    result =
-      with {:ok, {name, number}} <- parse_name(name, number),
-           :ok <- count_search(conn) do
-        as_account(conn, &People.lookup(&1, name, number))
-      end
-
-    reply(conn, result)
+    reply(conn, search(conn, parse_name(name, number), &People.lookup/3))
   end
 
   get "/v1/people" do
     conn = fetch_query_params(conn)
-
-    result =
-      with {:ok, q, limit} <- People.parse_search(conn.query_params),
-           :ok <- count_search(conn) do
-        as_account(conn, &People.search(&1, q, limit))
-      end
-
-    reply(conn, result)
+    reply(conn, search(conn, People.parse_search(conn.query_params), &People.search/3))
   end
 
   put "/v1/listing" do
@@ -194,25 +181,12 @@ defmodule AetherHub.Router do
   end
 
   get "/v1/agents/:name/:number" do
-    result =
-      with {:ok, {name, number}} <- parse_name(name, number),
-           :ok <- count_search(conn) do
-        as_account(conn, &Listings.lookup(&1, name, number))
-      end
-
-    reply(conn, result)
+    reply(conn, search(conn, parse_name(name, number), &Listings.lookup/3))
   end
 
   get "/v1/agents" do
     conn = fetch_query_params(conn)
-
-    result =
-      with {:ok, words, limit} <- Listings.parse_search(conn.query_params),
-           :ok <- count_search(conn) do
-        as_account(conn, &Listings.search(&1, words, limit))
-      end
-
-    reply(conn, result)
+    reply(conn, search(conn, Listings.parse_search(conn.query_params), &Listings.search/3))
   end
 
   post "/v1/owner-links" do
@@ -260,20 +234,26 @@ defmodule AetherHub.Router do
   defp counted({bucket, key}, fun) do
     with :ok <- limited(RateLimit.check(bucket, key)) do
       case fun.() do
+        # An answer that changed nothing counts nothing.
         {:ok, value, :open} ->
           {:ok, value}
 
-        {:ok, value, :created} ->
+        {:ok, _value} = ok ->
           RateLimit.hit(bucket, key)
-          {:ok, value}
-
-        {:ok, value} ->
-          RateLimit.hit(bucket, key)
-          {:ok, value}
+          ok
 
         error ->
           error
       end
+    end
+  end
+
+  # A lookup or a search: the parsed request, then the search limits, then
+  # the account.
+  defp search(conn, parsed, fun) do
+    with {:ok, first, second} <- parsed,
+         :ok <- count_search(conn) do
+      as_account(conn, &fun.(&1, first, second))
     end
   end
 
@@ -288,7 +268,7 @@ defmodule AetherHub.Router do
 
   defp parse_name(name, number) do
     case Names.parse_handle(name <> "#" <> number) do
-      {:ok, parsed} -> {:ok, parsed}
+      {:ok, {name, number}} -> {:ok, name, number}
       :error -> {:error, :invalid}
     end
   end

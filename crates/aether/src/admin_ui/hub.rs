@@ -10,7 +10,6 @@ use serde::Deserialize;
 use topcoat::{
     Result as TopcoatResult,
     context::{Cx, app_context},
-    icon::icon,
     router::{
         HeaderValue,
         content::Form,
@@ -23,14 +22,21 @@ use topcoat::{
 };
 
 use super::{
-    Page, PageContext, hub_form_screen, layout::page_data_dir, require_admin_session,
-    shared,
+    Page, PageContext, UiMode, admin_page,
+    caller::caller_screen,
+    host::host_screen,
+    layout::page_data_dir,
+    require_admin_session,
+    shared::{self, IdForm, Notice},
 };
 use crate::hub_client::protocol::{DEFAULT_ACCESS_DAYS, OFFER_DAYS};
 use aether_store::{ApprovalKind, ApprovalSide, HubApproval};
 
 use crate::{
-    admin_components::{ALERT, copy_button, field},
+    admin_components::{
+        copy_button, count_badge, days_label, days_select, error_line, field,
+        post_button, section_heading,
+    },
     components::{
         button::{ButtonSize, ButtonVariant, button},
         input::input,
@@ -39,12 +45,11 @@ use crate::{
         Account, AgentKind, Block, DEFAULT_HUB_URL, HubClient, HubError, Invite,
         Origin, OwnerLink, Role, Status, valid_full_name, valid_name_part,
     },
-    hub_membership::{APPROVAL_SECONDS, hub_message, keep_hub_name, offer},
+    hub_membership::{hub_message, keep_hub_name, new_approval, offer},
 };
 
 /// How long a page waits for the hub before it shows the page without it.
 const PAGE_WAIT: Duration = Duration::from_secs(4);
-/// How long a worker waits after the hub fails before it asks again.
 /// The hub's answer for one page, or why there is none.
 enum HubState {
     Ready {
@@ -96,18 +101,13 @@ pub(super) async fn hub_section(
     #[default]
     child: topcoat::view::Child<'_>,
 ) -> TopcoatResult<impl View> {
-    let Page(page) = app_context::<Page>(cx);
-    let hosting = page.as_ref().is_some_and(|page| page.host_ui);
+    let hosting = app_context::<Page>(cx).mode().is_some_and(UiMode::hosts);
     let state = load(&hub).await;
     if let (HubState::Ready { account: Some(account), .. }, Some(data_dir)) =
         (&state, page_data_dir(cx))
     {
         keep_hub_name(&data_dir, &account.handle);
-        if crate::settings::setting::<crate::hub_client::settings::AgentKind>(&data_dir)
-            .ok()
-            .flatten()
-            .is_none()
-        {
+        if crate::hub_client::settings::agent_kind(&data_dir).is_none() {
             let _ =
                 crate::hub_client::settings::store_agent_kind(&data_dir, account.kind);
         }
@@ -131,15 +131,15 @@ pub(super) async fn hub_section(
     // no other.
     let approved: std::collections::BTreeSet<String> = page_data_dir(cx)
         .and_then(|data_dir| {
-            crate::hub_store::HubStore::open(&data_dir).ok().and_then(|store| {
-                store
-                    .sender_approved_invite_ids(
-                        invites
-                            .iter()
-                            .filter(|invite| invite.role == Role::Sender)
-                            .map(|invite| invite.id.clone()),
-                    )
-                    .ok()
+            aether_store::NodeStore::in_dir(&data_dir).ok().and_then(|store| {
+                sender_approved_invite_ids(
+                    &store,
+                    invites
+                        .iter()
+                        .filter(|invite| invite.role == Role::Sender)
+                        .map(|invite| invite.id.clone()),
+                )
+                .ok()
             })
         })
         .unwrap_or_default();
@@ -158,15 +158,17 @@ pub(super) async fn hub_section(
     let sender = role == Role::Sender;
     let requests =
         invites.iter().filter(|invite| invite.status == Status::Requested).count();
+    // The screen the page script reloads.
+    let screen = if hosting && role == Role::Receiver { "/agents" } else { "/" };
     Ok(view! {
-        <div class="flex flex-col gap-5" data-hub-waiting=(waiting.then_some(""))>
+        <div class="flex flex-col gap-5" data-hub-waiting=(waiting.then_some(screen))>
             if sender && service {
                 <section id="invite" aria-label="Access requests" class="flex flex-col gap-4 rounded-xl border border-border bg-background p-6 shadow-sm">
                     <div class="flex flex-col gap-1.5">
                         <h2 class="flex items-center gap-2 text-lg leading-tight font-semibold">
                             "Access requests"
                             if requests > 0 {
-                                <span class="flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-primary px-1.5 text-[11px] font-semibold text-primary-foreground">(requests)</span>
+                                count_badge(count: requests)
                             }
                         </h2>
                         <p class="text-[13px] text-muted-foreground">"This is a service agent."</p>
@@ -264,7 +266,7 @@ pub(super) async fn hub_section(
                             }
                             if !invites.is_empty() {
                                 <section aria-labelledby="invites-title" class="flex flex-col gap-3">
-                                    <h2 id="invites-title" class="text-xl font-semibold tracking-tight">"Invites"</h2>
+                                    section_heading(id: "invites-title", "Invites")
                                     <ul class="flex flex-col divide-y divide-border rounded-xl border border-border bg-background px-5" aria-label="Invites">
                                         for invite in &invites {
                                             invite_row(
@@ -301,15 +303,21 @@ pub(super) async fn hub_section(
     .boxed())
 }
 
-/// A refusal under a form, in the destructive color, with its icon.
-#[component]
-pub(super) async fn error_line(text: String) -> TopcoatResult<impl View> {
-    Ok(view! {
-        <p class="flex items-start gap-1.5 text-sm text-destructive" role="alert">
-            <span class="mt-0.5 shrink-0">icon(data: ALERT)</span>
-            (text)
-        </p>
-    })
+/// The ids in `invite_ids` whose local approval is on the sender's side.
+fn sender_approved_invite_ids(
+    store: &aether_store::NodeStore,
+    invite_ids: impl IntoIterator<Item = String>,
+) -> Result<std::collections::BTreeSet<String>, aether_store::StoreError> {
+    let mut approved = std::collections::BTreeSet::new();
+    for invite_id in invite_ids {
+        if store
+            .hub_approval(&invite_id)?
+            .is_some_and(|approval| approval.side == ApprovalSide::Sender)
+        {
+            approved.insert(invite_id);
+        }
+    }
+    Ok(approved)
 }
 
 /// The service agents that this personal agent claims as its own, with a
@@ -332,15 +340,13 @@ async fn service_agents(links: Vec<OwnerLink>) -> TopcoatResult<impl View> {
                                 (&link.service)
                                 (if link.confirmed { " (linked)" } else { " (waits for the service agent to confirm)" })
                             </span>
-                            <form method="post" action="/hub/owner/remove">
-                                <input type="hidden" name="id" value=(&link.id)>
-                                button(
-                                    variant: ButtonVariant::Outline,
-                                    size: ButtonSize::Sm,
-                                    attrs: attributes! { type="submit" },
-                                    "Remove"
-                                )
-                            </form>
+                            post_button(
+                                action: "/hub/owner/remove",
+                                fields: vec![("id", link.id.clone())],
+                                variant: ButtonVariant::Outline,
+                                size: ButtonSize::Sm,
+                                "Remove"
+                            )
                         </li>
                     }
                 </ul>
@@ -389,20 +395,20 @@ async fn owner_claims(links: Vec<OwnerLink>) -> TopcoatResult<impl View> {
                             </p>
                             <div class="flex flex-wrap gap-2">
                                 if !link.confirmed {
-                                    <form method="post" action="/hub/owner/confirm">
-                                        <input type="hidden" name="id" value=(&link.id)>
-                                        button(size: ButtonSize::Sm, attrs: attributes! { type="submit" }, "Confirm")
-                                    </form>
-                                }
-                                <form method="post" action="/hub/owner/remove">
-                                    <input type="hidden" name="id" value=(&link.id)>
-                                    button(
-                                        variant: ButtonVariant::Outline,
+                                    post_button(
+                                        action: "/hub/owner/confirm",
+                                        fields: vec![("id", link.id.clone())],
                                         size: ButtonSize::Sm,
-                                        attrs: attributes! { type="submit" },
-                                        "Remove"
+                                        "Confirm"
                                     )
-                                </form>
+                                }
+                                post_button(
+                                    action: "/hub/owner/remove",
+                                    fields: vec![("id", link.id.clone())],
+                                    variant: ButtonVariant::Outline,
+                                    size: ButtonSize::Sm,
+                                    "Remove"
+                                )
                             </div>
                         </li>
                     }
@@ -424,15 +430,13 @@ async fn blocked_list(blocks: Vec<Block>) -> TopcoatResult<impl View> {
                         <span class="mr-auto text-sm">
                             (block.handle.clone().unwrap_or_else(|| "deleted account".to_owned()))
                         </span>
-                        <form method="post" action="/hub/unblock">
-                            <input type="hidden" name="endpoint" value=(&block.endpoint)>
-                            button(
-                                variant: ButtonVariant::Outline,
-                                size: ButtonSize::Sm,
-                                attrs: attributes! { type="submit" },
-                                "Unblock"
-                            )
-                        </form>
+                        post_button(
+                            action: "/hub/unblock",
+                            fields: vec![("endpoint", block.endpoint.clone())],
+                            variant: ButtonVariant::Outline,
+                            size: ButtonSize::Sm,
+                            "Unblock"
+                        )
                     </li>
                 }
             </ul>
@@ -518,17 +522,12 @@ async fn invite_form(error: String) -> TopcoatResult<impl View> {
                 field(
                     name: "Access for",
                     control_id: "hub-days",
-                    <select
-                        id="hub-days"
-                        name="days"
-                        class="h-9 rounded-lg border border-border bg-background px-3 text-sm shadow-xs"
-                    >
-                        for days in OFFER_DAYS {
-                            <option value=(days) selected=((days == DEFAULT_ACCESS_DAYS).then_some(""))>
-                                (if days == 1 { "1 day".to_owned() } else { format!("{days} days") })
-                            </option>
-                        }
-                    </select>
+                    days_select(
+                        id: "hub-days",
+                        class: "h-9 rounded-lg border border-border bg-background px-3 text-sm shadow-xs",
+                        choices: OFFER_DAYS.to_vec(),
+                        selected: DEFAULT_ACCESS_DAYS,
+                    )
                 )
             </div>
             if !error.is_empty() {
@@ -554,58 +553,59 @@ async fn request_row(invite: Invite) -> TopcoatResult<impl View> {
             <p class="text-sm">
                 <strong>(&invite.to)</strong>
                 " asks for access for "
-                (if invite.days == 1 { "1 day".to_owned() } else { format!("{} days", invite.days) })
+                (days_label(invite.days))
                 "."
             </p>
             <p class="font-mono text-xs break-all text-muted-foreground">"Key " (crate::admin_components::grouped(&endpoint))</p>
             <div class="flex flex-wrap items-center gap-2">
                 <form method="post" action="/hub/approve" class="flex items-center gap-2">
                     <input type="hidden" name="id" value=(&invite.id)>
-                    <select
-                        name="days"
-                        aria-label=(format!("Access for {}", invite.to))
-                        class="h-8 rounded-lg border border-border bg-background px-2 text-sm"
-                    >
-                        for days in OFFER_DAYS {
-                            <option value=(days) selected=((days == selected).then_some(""))>
-                                (if days == 1 { "1 day".to_owned() } else { format!("{days} days") })
-                            </option>
-                        }
-                    </select>
+                    days_select(
+                        aria_label: format!("Access for {}", invite.to),
+                        class: "h-8 rounded-lg border border-border bg-background px-2 text-sm",
+                        choices: OFFER_DAYS.to_vec(),
+                        selected: selected,
+                    )
                     button(size: ButtonSize::Sm, attrs: attributes! { type="submit" }, "Approve")
                 </form>
-                <form method="post" action="/hub/remove">
-                    <input type="hidden" name="id" value=(&invite.id)>
-                    button(
-                        variant: ButtonVariant::Outline,
-                        size: ButtonSize::Sm,
-                        attrs: attributes! { type="submit" },
-                        "Decline"
-                    )
-                </form>
-                <form method="post" action="/hub/block-request" title="Block hides this key's requests from you. It sees the same as before.">
-                    <input type="hidden" name="id" value=(&invite.id)>
-                    button(
-                        variant: ButtonVariant::Ghost,
-                        size: ButtonSize::Sm,
-                        attrs: attributes! { type="submit" },
-                        "Block"
-                    )
-                </form>
+                post_button(
+                    action: "/hub/remove",
+                    fields: vec![("id", invite.id.clone())],
+                    variant: ButtonVariant::Outline,
+                    size: ButtonSize::Sm,
+                    "Decline"
+                )
+                post_button(
+                    action: "/hub/block-request",
+                    fields: vec![("id", invite.id.clone())],
+                    variant: ButtonVariant::Ghost,
+                    size: ButtonSize::Sm,
+                    title: "Block hides this key's requests from you. It sees the same as before.",
+                    "Block"
+                )
             </div>
         </li>
     })
 }
 
-#[component]
-async fn invite_row(invite: Invite, approved: bool) -> TopcoatResult<impl View> {
-    let days = if invite.days == 1 {
-        "1 day".to_owned()
-    } else {
-        format!("{} days", invite.days)
-    };
+/// What one invite row says and offers.
+#[derive(Debug, PartialEq, Eq)]
+struct InviteOffer {
+    text: String,
+    /// The two nodes are connecting.
+    spinner: bool,
+    /// **Accept** and **Block**: a received invite that waits.
+    answer: bool,
+    /// The label of the button that removes the invite, if it has one.
+    remove: Option<&'static str>,
+}
+
+/// What a row offers for `invite`, from its side, its status, and whether
+/// this page approved it (`approved` counts only for a sent invite).
+fn invite_offer(invite: &Invite, approved: bool) -> InviteOffer {
+    let unapproved = invite.role == Role::Sender && !approved;
     let text = match (invite.role, invite.status) {
-        (Role::Sender, _) if !approved => {
+        (Role::Sender, _) if unapproved => {
             "This invite was made before an update. Cancel it and invite again."
                 .to_owned()
         }
@@ -613,62 +613,91 @@ async fn invite_row(invite: Invite, approved: bool) -> TopcoatResult<impl View> 
             format!("Waiting for {} to accept", invite.to)
         }
         (Role::Sender, _) => format!("Connecting {}…", invite.to),
-        (Role::Receiver, Status::Pending) => {
-            format!("{} wants to share their agent with you for {days}", invite.from)
-        }
+        (Role::Receiver, Status::Pending) => format!(
+            "{} wants to share their agent with you for {}",
+            invite.from,
+            days_label(invite.days)
+        ),
         (Role::Receiver, Status::Requested) => {
             format!("Waiting for {} to approve", invite.from)
         }
         (Role::Receiver, _) => format!("Connecting to {}…", invite.from),
     };
-    let can_accept = invite.role == Role::Receiver && invite.status == Status::Pending;
+    let removable =
+        matches!(invite.status, Status::Pending | Status::Requested) || unapproved;
     let remove_label = match (invite.role, invite.status) {
         (Role::Sender, _) | (Role::Receiver, Status::Requested) => "Cancel",
         (Role::Receiver, _) => "Decline",
     };
+    InviteOffer {
+        text,
+        spinner: matches!(invite.status, Status::Accepted | Status::Delivered),
+        answer: invite.role == Role::Receiver && invite.status == Status::Pending,
+        remove: removable.then_some(remove_label),
+    }
+}
+
+#[component]
+async fn invite_row(invite: Invite, approved: bool) -> TopcoatResult<impl View> {
+    let offer = invite_offer(&invite, approved);
     Ok(view! {
         <li class="flex flex-wrap items-center gap-3 py-3">
-            if matches!(invite.status, Status::Accepted | Status::Delivered) {
+            if offer.spinner {
                 <span class="size-3.5 shrink-0 animate-spin rounded-full border-2 border-border border-t-primary" aria-hidden="true"></span>
             }
-            <span class="mr-auto text-sm">(text)</span>
-            if can_accept {
-                <form method="post" action="/hub/accept">
-                    <input type="hidden" name="id" value=(&invite.id)>
-                    button(size: ButtonSize::Sm, attrs: attributes! { type="submit" }, "Accept")
-                </form>
+            <span class="mr-auto text-sm">(&offer.text)</span>
+            if offer.answer {
+                post_button(
+                    action: "/hub/accept",
+                    fields: vec![("id", invite.id.clone())],
+                    size: ButtonSize::Sm,
+                    "Accept"
+                )
+                post_button(
+                    action: "/hub/block",
+                    fields: vec![("id", invite.id.clone())],
+                    variant: ButtonVariant::Ghost,
+                    size: ButtonSize::Sm,
+                    title: "Block hides this person's invites from you. They see the same as after a decline.",
+                    "Block"
+                )
             }
-            if invite.role == Role::Receiver && invite.status == Status::Pending {
-                <form method="post" action="/hub/block" title="Block hides this person's invites from you. They see the same as after a decline.">
-                    <input type="hidden" name="id" value=(&invite.id)>
-                    button(
-                        variant: ButtonVariant::Ghost,
-                        size: ButtonSize::Sm,
-                        attrs: attributes! { type="submit" },
-                        "Block"
-                    )
-                </form>
-            }
-            if matches!(invite.status, Status::Pending | Status::Requested)
-                || (invite.role == Role::Sender && !approved)
-            {
-                <form method="post" action="/hub/remove">
-                    <input type="hidden" name="id" value=(&invite.id)>
-                    button(
-                        variant: ButtonVariant::Outline,
-                        size: ButtonSize::Sm,
-                        attrs: attributes! { type="submit" },
-                        (remove_label)
-                    )
-                </form>
+            if let Some(label) = offer.remove {
+                post_button(
+                    action: "/hub/remove",
+                    fields: vec![("id", invite.id.clone())],
+                    variant: ButtonVariant::Outline,
+                    size: ButtonSize::Sm,
+                    (label)
+                )
             }
         </li>
     })
 }
 
-/// The hub of this page's side, and the page to show after a hub form.
-fn page_hub(cx: &Cx) -> TopcoatResult<HubClient> {
+/// The screen to show after a hub form: the host screen when the page has
+/// one, else the caller screen.
+#[component]
+async fn hub_form_screen(cx: &Cx, notice: Notice) -> TopcoatResult<impl View> {
+    let hosting = app_context::<Page>(cx).mode().is_some_and(UiMode::hosts);
+    Ok(view! {
+        if hosting {
+            host_screen(notice: notice.clone())
+        } else {
+            caller_screen(notice: notice.clone())
+        }
+    })
+}
+
+/// Requires the admin session, then the hub of this page.s side.
+async fn admin_hub(cx: &Cx) -> TopcoatResult<HubClient> {
+    require_admin_session(cx).await?;
     current_hub(cx).ok_or_else(|| bad_request("this page has no hub").into())
+}
+
+/// The text a hub form shows for `result`: empty when it worked.
+pub(super) fn hub_failure<T>(result: Result<T, HubError>) -> &'static str {
+    result.err().map(hub_message).unwrap_or_default()
 }
 
 /// The hub of this page's side now, if there is one.
@@ -696,22 +725,16 @@ pub(super) async fn claim_name(
     cx: &Cx,
     Form(form): Form<NameForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let hub = page_hub(cx)?;
-    let Page(page) = app_context::<Page>(cx);
+    let hub = admin_hub(cx).await?;
     let data_dir = page_data_dir(cx);
     let name = form.name.trim();
     // A page without a host has only a personal agent.
-    let host_ui = page.as_ref().is_some_and(|page| page.host_ui);
+    let host_ui = app_context::<Page>(cx).mode().is_some_and(UiMode::hosts);
     let chosen = match (host_ui, form.kind.as_deref()) {
         (false, _) | (true, None) => Some(AgentKind::Personal),
         (true, Some(kind)) => AgentKind::parse(kind),
     };
-    let stored = data_dir.as_deref().and_then(|dir| {
-        crate::settings::setting::<crate::hub_client::settings::AgentKind>(dir)
-            .ok()
-            .flatten()
-    });
+    let stored = data_dir.as_deref().and_then(crate::hub_client::settings::agent_kind);
     let error = match chosen {
         _ if !valid_name_part(name) => {
             "Use lowercase letters, digits, dots, dashes or underscores, up to 32."
@@ -738,7 +761,7 @@ pub(super) async fn claim_name(
             }
         }
     };
-    Ok(view! { hub_form_screen(error: error.to_owned()) })
+    Ok(view! { hub_form_screen(notice: Notice::Hub(error.to_owned())) })
 }
 
 #[derive(Deserialize)]
@@ -754,15 +777,14 @@ pub(super) async fn set_search(
     cx: &Cx,
     Form(form): Form<SearchForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let hub = page_hub(cx)?;
+    let hub = admin_hub(cx).await?;
     let searchable = form.searchable.as_deref() == Some("on");
     let error = match hub.set_searchable(searchable).await {
         Ok(_) => "",
         Err(HubError::Invalid) => "Only a personal agent can be found by name search.",
         Err(error) => hub_message(error),
     };
-    Ok(view! { hub_form_screen(error: error.to_owned()) })
+    Ok(view! { hub_form_screen(notice: Notice::Hub(error.to_owned())) })
 }
 
 #[derive(Deserialize)]
@@ -778,10 +800,7 @@ pub(super) async fn invite_by_name(
     cx: &Cx,
     Form(form): Form<InviteForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let Page(Some(page)) = app_context::<Page>(cx) else {
-        return Err(bad_request("this node cannot invite").into());
-    };
+    let page = admin_page(cx, "this node cannot invite").await?;
     let hub = page.current_hub().ok_or_else(|| bad_request("this node has no hub"))?;
     let to = form.to.trim();
     let error = if !valid_full_name(to) {
@@ -791,13 +810,7 @@ pub(super) async fn invite_by_name(
     } else {
         offer(&hub, &page.data_dir, to, form.days).await.err().unwrap_or_default()
     };
-    Ok(view! { hub_form_screen(error: error.to_owned()) })
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct InviteIdForm {
-    id: String,
+    Ok(view! { hub_form_screen(notice: Notice::Hub(error.to_owned())) })
 }
 
 #[derive(Deserialize)]
@@ -814,21 +827,14 @@ pub(super) async fn approve_request(
     cx: &Cx,
     Form(form): Form<ApproveForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let Page(Some(page)) = app_context::<Page>(cx) else {
-        return Err(bad_request("this node has no access requests").into());
-    };
+    let page = admin_page(cx, "this node has no access requests").await?;
     let hub = page.current_hub().ok_or_else(|| bad_request("this node has no hub"))?;
     let error = if OFFER_DAYS.contains(&form.days) {
-        approve(&hub, &page.data_dir, &form.id, form.days)
-            .await
-            .err()
-            .map(hub_message)
-            .unwrap_or_default()
+        hub_failure(approve(&hub, &page.data_dir, &form.id, form.days).await)
     } else {
         "Choose how long they can use your agent."
     };
-    Ok(view! { hub_form_screen(error: error.to_owned()) })
+    Ok(view! { hub_form_screen(notice: Notice::Hub(error.to_owned())) })
 }
 
 /// The open request `id` to this service agent, with the endpoint that
@@ -867,28 +873,31 @@ async fn approve(
         return Err(HubError::Forbidden);
     }
     let store =
-        crate::hub_store::HubStore::open(data_dir).map_err(|_| HubError::Unexpected)?;
-    if store.is_blocked(&endpoint).map_err(|_| HubError::Unexpected)? {
+        aether_store::NodeStore::in_dir(data_dir).map_err(|_| HubError::Unexpected)?;
+    if store.hub_blocked(&endpoint).map_err(|_| HubError::Unexpected)? {
         return Err(HubError::Forbidden);
     }
-    let now = now();
+    let approved_days = u32::try_from(days).map_err(|_| HubError::Invalid)?;
     store
-        .put_approval(&HubApproval {
-            invite_id: invite.id.clone(),
-            side: ApprovalSide::Sender,
-            kind: ApprovalKind::Request,
-            peer_name: invite.to.clone(),
+        .put_hub_approval(&HubApproval {
             peer_endpoint: Some(endpoint),
-            days: u32::try_from(days).map_err(|_| HubError::Invalid)?,
-            access_group: crate::access_groups::REQUESTS_GROUP.to_owned(),
-            bundle: None,
-            created_at: now,
-            expires_at: now.saturating_add(APPROVAL_SECONDS),
-            listing: None,
+            ..new_approval(
+                &invite.id,
+                ApprovalSide::Sender,
+                ApprovalKind::Request,
+                &invite.to,
+                approved_days,
+                crate::access_groups::REQUESTS_GROUP,
+                now(),
+            )
         })
         .map_err(|_| HubError::Unexpected)?;
+    // The approval goes only when the hub refused. After a lost answer the
+    // hub may have accepted the row, and the host signs it only with it.
     if let Err(error) = hub.approve(id, days).await {
-        let _ = store.remove_approval(id);
+        if !error.may_have_applied() {
+            let _ = store.remove_hub_approval(id);
+        }
         return Err(error);
     }
     Ok(())
@@ -899,19 +908,12 @@ async fn approve(
 #[page(POST "/hub/block-request")]
 pub(super) async fn block_request(
     cx: &Cx,
-    Form(form): Form<InviteIdForm>,
+    Form(form): Form<IdForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let Page(Some(page)) = app_context::<Page>(cx) else {
-        return Err(bad_request("this node has no access requests").into());
-    };
+    let page = admin_page(cx, "this node has no access requests").await?;
     let hub = page.current_hub().ok_or_else(|| bad_request("this node has no hub"))?;
-    let error = block_requester(&hub, page, &form.id)
-        .await
-        .err()
-        .map(hub_message)
-        .unwrap_or_default();
-    Ok(view! { hub_form_screen(error: error.to_owned()) })
+    let error = hub_failure(block_requester(&hub, page, &form.id).await);
+    Ok(view! { hub_form_screen(notice: Notice::Hub(error.to_owned())) })
 }
 
 async fn block_requester(
@@ -922,12 +924,12 @@ async fn block_requester(
     let (invite, endpoint) = open_request(hub, id).await?;
     {
         let _sign = page.hub_sign().lock().unwrap_or_else(PoisonError::into_inner);
-        let store = crate::hub_store::HubStore::open(&page.data_dir)
+        let store = aether_store::NodeStore::in_dir(&page.data_dir)
             .map_err(|_| HubError::Unexpected)?;
         store
-            .put_block(&endpoint, &invite.to, now())
+            .put_hub_block(&endpoint, &invite.to, now())
             .map_err(|_| HubError::Unexpected)?;
-        let _ = store.remove_approval(id);
+        let _ = store.remove_hub_approval(id);
     }
     hub.block(&endpoint).await
 }
@@ -962,8 +964,7 @@ pub(super) async fn claim_owner(
     cx: &Cx,
     Form(form): Form<OwnerClaimForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let hub = page_hub(cx)?;
+    let hub = admin_hub(cx).await?;
     let (kind, key) = page_agent(cx, &hub).await?;
     if kind != AgentKind::Personal {
         return Err(bad_request("only a personal agent claims a service agent").into());
@@ -982,23 +983,22 @@ pub(super) async fn claim_owner(
     } else {
         "Use the full name of the service agent, with the four digits, such as law#0042."
     };
-    Ok(view! { hub_form_screen(error: error.to_owned()) })
+    Ok(view! { hub_form_screen(notice: Notice::Hub(error.to_owned())) })
 }
 
 /// The service agent confirms the claim of its owner's personal agent.
 #[page(POST "/hub/owner/confirm")]
 pub(super) async fn confirm_owner(
     cx: &Cx,
-    Form(form): Form<InviteIdForm>,
+    Form(form): Form<IdForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let hub = page_hub(cx)?;
+    let hub = admin_hub(cx).await?;
     let (kind, key) = page_agent(cx, &hub).await?;
     if kind != AgentKind::Service {
         return Err(bad_request("only a service agent confirms an owner").into());
     }
     let error = confirm_claim(&hub, &key, &form.id).await.err().unwrap_or_default();
-    Ok(view! { hub_form_screen(error: error.to_owned()) })
+    Ok(view! { hub_form_screen(notice: Notice::Hub(error.to_owned())) })
 }
 
 /// Signs the confirm of the open claim `id` with the endpoint `key`.
@@ -1032,30 +1032,22 @@ async fn confirm_claim(
 #[page(POST "/hub/owner/remove")]
 pub(super) async fn remove_owner(
     cx: &Cx,
-    Form(form): Form<InviteIdForm>,
+    Form(form): Form<IdForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let hub = page_hub(cx)?;
-    let error = hub
-        .delete_owner_link(&form.id)
-        .await
-        .err()
-        .map(hub_message)
-        .unwrap_or_default();
-    Ok(view! { hub_form_screen(error: error.to_owned()) })
+    let hub = admin_hub(cx).await?;
+    let error = hub_failure(hub.delete_owner_link(&form.id).await);
+    Ok(view! { hub_form_screen(notice: Notice::Hub(error.to_owned())) })
 }
 
 /// Blocks the sender of a received invite.
 #[page(POST "/hub/block")]
 pub(super) async fn block_invite(
     cx: &Cx,
-    Form(form): Form<InviteIdForm>,
+    Form(form): Form<IdForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let hub = page_hub(cx)?;
-    let error =
-        hub.block_invite(&form.id).await.err().map(hub_message).unwrap_or_default();
-    Ok(view! { hub_form_screen(error: error.to_owned()) })
+    let hub = admin_hub(cx).await?;
+    let error = hub_failure(hub.block_invite(&form.id).await);
+    Ok(view! { hub_form_screen(notice: Notice::Hub(error.to_owned())) })
 }
 
 #[derive(Deserialize)]
@@ -1069,29 +1061,31 @@ pub(super) async fn unblock(
     cx: &Cx,
     Form(form): Form<UnblockForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let hub = page_hub(cx)?;
-    let error =
-        hub.unblock(&form.endpoint).await.err().map(hub_message).unwrap_or_default();
-    if error.is_empty()
-        && let Some(store) = page_data_dir(cx)
-            .and_then(|data_dir| crate::hub_store::HubStore::open(&data_dir).ok())
-    {
-        let _ = store.remove_block(&form.endpoint);
-    }
-    Ok(view! { hub_form_screen(error: error.to_owned()) })
+    let hub = admin_hub(cx).await?;
+    // The node's own block goes first: while the hub block stays, the page
+    // lists it, so a failed unblock can be tried again.
+    let kept = page_data_dir(cx).is_some_and(|data_dir| {
+        aether_store::NodeStore::in_dir(&data_dir)
+            .and_then(|store| store.remove_hub_block(&form.endpoint))
+            .is_err()
+    });
+    let error = if kept {
+        "This computer could not remove the block. Try again."
+    } else {
+        hub_failure(hub.unblock(&form.endpoint).await)
+    };
+    Ok(view! { hub_form_screen(notice: Notice::Hub(error.to_owned())) })
 }
 
 /// Declines or cancels an invite.
 #[page(POST "/hub/remove")]
 pub(super) async fn remove_invite(
     cx: &Cx,
-    Form(form): Form<InviteIdForm>,
+    Form(form): Form<IdForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let hub = page_hub(cx)?;
-    let error = hub.remove(&form.id).await.err().map(hub_message).unwrap_or_default();
-    Ok(view! { hub_form_screen(error: error.to_owned()) })
+    let hub = admin_hub(cx).await?;
+    let error = hub_failure(hub.remove(&form.id).await);
+    Ok(view! { hub_form_screen(notice: Notice::Hub(error.to_owned())) })
 }
 
 /// Which hub names go through, as a row of the Connection card, and a form
@@ -1102,44 +1096,27 @@ pub(super) async fn hub_setting(
     url: Option<String>,
     #[default] error: String,
 ) -> TopcoatResult<impl View> {
-    let open = url.is_none() || !error.is_empty();
-    let value = url.clone().unwrap_or_default();
     Ok(view! {
-        <div id="hub" class="py-3">
-            <details class="group" open=(open.then_some(""))>
-                <summary class="flex cursor-pointer list-none items-center justify-between gap-3">
-                    <span class="flex min-w-0 flex-col gap-0.5">
-                        match &url {
-                            Some(url) => {
-                                <span class="text-[13px] text-muted-foreground">"Names go through"</span>
-                                <code class="font-mono text-[13px] break-all text-foreground">(url)</code>
-                            }
-                            None => <span class="text-[13px] text-muted-foreground">"No hub: connect with a code."</span>,
-                        }
-                    </span>
-                    <span class="shrink-0 text-[13px] font-medium text-primary underline underline-offset-4">
-                        (if url.is_some() { "Change hub" } else { "Set a hub" })
-                    </span>
-                </summary>
-                <form method="post" action="/hub/url" class="mt-3 flex flex-col gap-2">
-                    field(
-                        name: "Hub URL",
-                        control_id: "hub_url",
-                        hint: format!("The public hub is {DEFAULT_HUB_URL}. Leave it empty to turn names off."),
-                        input(attrs: attributes! {
-                            id="hub_url" name="hub_url" type="url" value=(&value)
-                            placeholder=(DEFAULT_HUB_URL) class="font-mono"
-                            spellcheck="false" autocomplete="off"
-                            aria-invalid=((!error.is_empty()).then_some("true"))
-                        })
-                    )
-                    if !error.is_empty() {
-                        <p class="flex items-center gap-1.5 text-sm text-destructive" role="alert">icon(data: ALERT) (&error)</p>
-                    }
-                    button(variant: ButtonVariant::Outline, size: ButtonSize::Sm, attrs: attributes! { type="submit" class="w-fit" }, "Use this hub")
-                </form>
-            </details>
-        </div>
+        shared::url_setting(
+            id: "hub",
+            action: "/hub/url",
+            name: "Hub URL",
+            control: "hub_url",
+            hint: format!("The public hub is {DEFAULT_HUB_URL}. Leave it empty to turn names off."),
+            placeholder: DEFAULT_HUB_URL,
+            value: url.clone().unwrap_or_default(),
+            error: error,
+            missing: url.is_none(),
+            link: if url.is_some() { "Change hub" } else { "Set a hub" },
+            submit: "Use this hub",
+            match &url {
+                Some(url) => {
+                    <span class="text-[13px] text-muted-foreground">"Names go through"</span>
+                    <code class="font-mono text-[13px] break-all text-foreground">(url)</code>
+                }
+                None => <span class="text-[13px] text-muted-foreground">"No hub: connect with a code."</span>,
+            }
+        )
     })
 }
 
@@ -1157,11 +1134,7 @@ pub(super) async fn hub_url(
     cx: &Cx,
     Form(form): Form<HubUrlForm>,
 ) -> TopcoatResult<impl View> {
-    require_admin_session(cx).await?;
-    let Page(page) = app_context::<Page>(cx);
-    let Some(page) = page.as_ref() else {
-        return Err(bad_request("this page has no hub").into());
-    };
+    let page = admin_page(cx, "this page has no hub").await?;
     let data_dir = page.data_dir.clone();
     let url = form.hub_url.trim().trim_end_matches('/');
     let chosen = crate::hub_client::hub_setting(url).ok().and_then(|stored| {
@@ -1180,7 +1153,7 @@ pub(super) async fn hub_url(
         }
         None => "Use an https:// address, such as the public hub.".to_owned(),
     };
-    Ok(view! { hub_form_screen(setting_error: setting_error) })
+    Ok(view! { hub_form_screen(notice: Notice::HubSetting(setting_error)) })
 }
 
 /// presence dots. Empty without a hub or an answer.
@@ -1207,3 +1180,6 @@ pub(super) async fn presence(cx: &Cx) -> TopcoatResult<impl IntoResponse> {
     let body = serde_json::to_string(&presence).map_err(internal_server_error)?;
     Ok(([(header::CONTENT_TYPE, HeaderValue::from_static("application/json"))], body))
 }
+
+#[cfg(test)]
+mod tests;

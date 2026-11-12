@@ -5,8 +5,6 @@ defmodule AetherHub.Features.PeopleTest do
 
   alias AetherHub.Names
 
-  defp search(asker, params), do: http_get(asker, "/v1/people", params)
-
   defp fill(text, %{word: word}), do: String.replace(text, "{word}", word)
   defp fill(text, _state), do: text
 
@@ -82,7 +80,7 @@ defmodule AetherHub.Features.PeopleTest do
     word = fill(word, state)
     params = if word == "", do: [], else: [q: word]
     params = if limit in ["", "none"], do: params, else: params ++ [limit: limit]
-    {:ok, %{conn: search(actor(state, who), params)}}
+    {:ok, %{conn: search_people(actor(state, who), params)}}
   end
 
   defstep ~r/^(?<who>\w+) finds, in this order:$/, %{table: rows}, %{conn: conn} = state do
@@ -105,7 +103,7 @@ defmodule AetherHub.Features.PeopleTest do
 
     statuses =
       statuses ++
-        for _ <- 1..String.to_integer(searches), do: search(asker, q: other.name).status
+        for _ <- 1..String.to_integer(searches), do: search_people(asker, q: other.name).status
 
     {:ok, %{statuses: statuses}}
   end
@@ -118,7 +116,7 @@ defmodule AetherHub.Features.PeopleTest do
   defstep ~r/^a search of (?<who>\w+) for the name of (?<other>\w+) gets 429$/,
           %{who: who, other: other},
           state do
-    assert search(actor(state, who), q: actor(state, other).name).status == 429
+    assert search_people(actor(state, who), q: actor(state, other).name).status == 429
   end
 
   defstep ~r/^another node can still look up the tag of (?<other>\w+)$/, %{other: other}, state do

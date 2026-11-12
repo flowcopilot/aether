@@ -3,9 +3,10 @@
 
 pub mod cli;
 
-use std::{path::Path, sync::Mutex};
+use std::path::Path;
 
 use ed25519_dalek::SigningKey;
+use tokio::sync::Mutex;
 
 use crate::{
     data_dir::DataDir, directory_client::DirectoryClient, discovery::wire::WireRecord,
@@ -21,13 +22,12 @@ pub struct DirectoryPublication {
     directory: String,
     client: DirectoryClient,
     signing_key: SigningKey,
-    agent_id: String,
-    address: String,
-    scope: String,
     // An admin-triggered capability change (see `publish_with_capability`)
-    // updates this on success, so a later periodic renewal keeps the newly
-    // approved capability.
-    capability: Mutex<String>,
+    // updates the capability on success, so a later periodic renewal keeps
+    // the newly approved capability.
+    record: Mutex<PublicationRecord>,
+    // A copy of the record's ttl, which never changes, so reading it does
+    // not wait for the lock.
     ttl: u64,
 }
 
@@ -85,11 +85,8 @@ impl DirectoryPublication {
             directory,
             client,
             signing_key,
-            agent_id: record.agent_id,
-            address: record.address,
-            scope: record.scope,
-            capability: Mutex::new(record.capability),
             ttl: record.ttl,
+            record: Mutex::new(record),
         })
     }
 
@@ -115,8 +112,8 @@ impl DirectoryPublication {
         &self,
         endpoint_id: &str,
     ) -> Result<WireRecord, PublicationError> {
-        let capability = self.capability.lock().map_err(|_| PublicationError)?.clone();
-        self.publish(endpoint_id, capability).await
+        let record = self.record.lock().await;
+        self.publish(&record, &record.capability, endpoint_id).await
     }
 
     /// Publishes the record with `capability` in place of the current one,
@@ -132,28 +129,24 @@ impl DirectoryPublication {
         endpoint_id: &str,
         capability: String,
     ) -> Result<(), PublicationError> {
-        self.publish(endpoint_id, capability.clone()).await?;
-        *self.capability.lock().map_err(|_| PublicationError)? = capability;
+        let mut record = self.record.lock().await;
+        self.publish(&record, &capability, endpoint_id).await?;
+        record.capability = capability;
+        drop(record);
         Ok(())
     }
 
+    /// Signs and publishes `record` with `capability`. Callers hold the
+    /// record's lock until the directory answers, so a renewal that signed
+    /// the old capability cannot land after a capability change.
     async fn publish(
         &self,
+        record: &PublicationRecord,
+        capability: &str,
         endpoint_id: &str,
-        capability: String,
     ) -> Result<WireRecord, PublicationError> {
-        let record = signed_record(
-            &self.signing_key,
-            &PublicationRecord {
-                agent_id: self.agent_id.clone(),
-                address: self.address.clone(),
-                scope: self.scope.clone(),
-                capability,
-                ttl: self.ttl,
-            },
-            endpoint_id,
-        )?;
-        self.client.publish(&record).await.map_err(|_| PublicationError)
+        let signed = signed_record(&self.signing_key, record, capability, endpoint_id)?;
+        self.client.publish(&signed).await.map_err(|_| PublicationError)
     }
 }
 
@@ -171,12 +164,14 @@ pub fn signed_node_record(
 ) -> Result<WireRecord, PublicationError> {
     let signing_key =
         DataDir::new(data_dir).discovery_key().map_err(|_| PublicationError)?;
-    signed_record(&signing_key, record, endpoint_id)
+    signed_record(&signing_key, record, &record.capability, endpoint_id)
 }
 
+/// `record` signed with `capability` in place of its own.
 fn signed_record(
     signing_key: &SigningKey,
     record: &PublicationRecord,
+    capability: &str,
     endpoint_id: &str,
 ) -> Result<WireRecord, PublicationError> {
     let expires_at = std::time::SystemTime::now()
@@ -188,8 +183,75 @@ fn signed_record(
         endpoint_id.to_owned(),
         vec![record.address.clone()],
         record.scope.clone(),
-        vec![record.capability.clone()],
+        vec![capability.to_owned()],
         expires_at,
     );
     Ok(WireRecord::from_record(&record))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::Arc, time::Duration};
+
+    use tokio::{net::TcpListener, time::timeout};
+
+    use super::{DirectoryPublication, PublicationRecord};
+
+    #[tokio::test]
+    async fn capability_change_waits_for_an_in_flight_renewal() {
+        let data_dir = tempfile::tempdir().expect("directory must create");
+        // A directory that accepts connections and never answers, so a
+        // request stays in flight until its connection is dropped.
+        let directory =
+            TcpListener::bind("127.0.0.1:0").await.expect("listener must bind");
+        let port =
+            directory.local_addr().expect("listener must have an address").port();
+        let certificate =
+            rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()])
+                .expect("certificate must generate")
+                .cert;
+        let publication = Arc::new(
+            DirectoryPublication::new(
+                format!("https://127.0.0.1:{port}"),
+                certificate.der(),
+                data_dir.path(),
+                PublicationRecord {
+                    agent_id: "agent".to_owned(),
+                    address: "127.0.0.1:9443".to_owned(),
+                    scope: "scope".to_owned(),
+                    capability: "old".to_owned(),
+                    ttl: 60,
+                },
+            )
+            .expect("publication must build"),
+        );
+
+        let renewal = tokio::spawn({
+            let publication = Arc::clone(&publication);
+            async move { publication.renew("endpoint").await }
+        });
+        let (renewal_connection, _) =
+            timeout(Duration::from_secs(5), directory.accept())
+                .await
+                .expect("renewal must connect")
+                .expect("renewal connection must open");
+        let change = tokio::spawn({
+            let publication = Arc::clone(&publication);
+            async move {
+                publication.publish_with_capability("endpoint", "new".to_owned()).await
+            }
+        });
+        assert!(
+            timeout(Duration::from_millis(300), directory.accept()).await.is_err(),
+            "a capability change must not publish while a renewal is in flight"
+        );
+
+        drop(renewal_connection);
+        assert!(renewal.await.expect("renewal task must finish").is_err());
+        timeout(Duration::from_secs(5), directory.accept())
+            .await
+            .expect("capability change must publish once the renewal ends")
+            .expect("capability change connection must open");
+        change.abort();
+    }
 }

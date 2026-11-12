@@ -11,6 +11,8 @@ the local node, and it has no secret.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from .node import default_data_dir, socket_path
 from .tools import Settings, register_tools
 
@@ -35,16 +37,21 @@ def register(ctx) -> None:
     settings = _settings(ctx)
     register_tools(ctx, settings)
 
+    def extra(config) -> dict:
+        return getattr(config, "extra", {}) or {}
+
+    def data_dir(config) -> Path:
+        """The platform's ``data_dir``, else the plugin's."""
+        value = extra(config).get("data_dir")
+        return Path(value).expanduser() if value else settings.data_dir
+
     def is_connected(config) -> bool:
-        extra = getattr(config, "extra", {}) or {}
-        return bool(extra.get("enabled")) or socket_path(settings.data_dir).exists()
+        return bool(extra(config).get("enabled")) or socket_path(data_dir(config)).exists()
 
     def adapter_factory(config):
         from .adapter import AetherAdapter
 
-        extra = getattr(config, "extra", {}) or {}
-        data_dir = extra.get("data_dir") or settings.data_dir
-        return AetherAdapter(config, data_dir=data_dir)
+        return AetherAdapter(config, data_dir=data_dir(config))
 
     ctx.register_platform(
         name="aether",

@@ -13,12 +13,19 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub enum HostStep {
+pub enum HostStep<'a> {
     /// Nothing now: the row is not ready, or this page never sent it.
     Skip,
-    /// Sign access for `friend_name` at `endpoint` for `days` days, in
-    /// `access_group`, then send the line.
-    Sign { friend_name: String, endpoint: String, days: u64, access_group: String },
+    /// Sign access as `own_name` for `friend_name` at `endpoint` for `days`
+    /// days, in `access_group`, then pin `approval` to the line and send it.
+    Sign {
+        own_name: &'a str,
+        approval: &'a HubApproval,
+        friend_name: String,
+        endpoint: String,
+        days: u64,
+        access_group: String,
+    },
     /// The line was signed before: send the same line again.
     Deliver(String),
     /// The row does not match what the owner approved: remove it.
@@ -30,12 +37,12 @@ pub enum HostStep {
 /// flag: without it the host makes no step. `blocked` is whether the owner
 /// blocked the endpoint that the row names: the host never signs for it.
 #[must_use]
-pub fn host_step(
+pub fn host_step<'a>(
     invite: &Invite,
-    approval: Option<&HubApproval>,
-    own_name: Option<&str>,
+    approval: Option<&'a HubApproval>,
+    own_name: Option<&'a str>,
     blocked: bool,
-) -> HostStep {
+) -> HostStep<'a> {
     let (Role::Sender, Status::Accepted, Some(endpoint)) =
         (invite.role, invite.status, invite.receiver_endpoint.as_deref())
     else {
@@ -74,6 +81,8 @@ pub fn host_step(
         return HostStep::Deliver(bundle.clone());
     }
     HostStep::Sign {
+        own_name,
+        approval,
         friend_name: invite.to.clone(),
         endpoint: endpoint.to_owned(),
         days: invite.days,
@@ -205,9 +214,12 @@ mod tests {
             host_step(&accepted(), Some(&approval()), None, false),
             HostStep::Skip
         );
+        let signed = approval();
         assert_eq!(
-            host_step(&accepted(), Some(&approval()), Some("tudor#0042"), false),
+            host_step(&accepted(), Some(&signed), Some("tudor#0042"), false),
             HostStep::Sign {
+                own_name: "tudor#0042",
+                approval: &signed,
                 friend_name: "ana#0007".to_owned(),
                 endpoint: endpoint(),
                 days: 7,
@@ -266,6 +278,8 @@ mod tests {
         assert_eq!(
             refuse(Invite { days: 1, ..accepted() }),
             HostStep::Sign {
+                own_name: "tudor#0042",
+                approval: &approval,
                 friend_name: "ana#0007".to_owned(),
                 endpoint: endpoint(),
                 days: 1,
@@ -395,13 +409,15 @@ mod tests {
 
     #[test]
     fn a_request_is_signed_only_for_the_endpoint_the_owner_approved() {
-        let (invite, approval) = approved_request();
-        let step = |invite: &Invite, approval: &HubApproval| {
+        fn step<'a>(invite: &Invite, approval: &'a HubApproval) -> HostStep<'a> {
             host_step(invite, Some(approval), Some("law#0042"), false)
-        };
+        }
+        let (invite, approval) = approved_request();
         assert_eq!(
             step(&invite, &approval),
             HostStep::Sign {
+                own_name: "law#0042",
+                approval: &approval,
                 friend_name: "ana#0001".to_owned(),
                 endpoint: endpoint(),
                 days: 7,

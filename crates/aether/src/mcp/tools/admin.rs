@@ -7,11 +7,12 @@ use serde_json::json;
 
 use crate::access_groups::{self, Action};
 use crate::admin::ChangeRequest;
+use crate::admin_socket::{Request, Response};
 use crate::hub_client::{AgentKind, HUB_OFF, valid_name_part};
 
 use super::super::McpServer;
 use super::super::support::{
-    AuditField, audit_item, no_node, tool_error, tool_success,
+    AuditField, audit_item, no_node, refused, tool_error, tool_result, tool_success,
 };
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -104,9 +105,7 @@ impl McpServer {
         description = "Read the node's saved task policy, relay and hub settings. Task policy changes need a node restart."
     )]
     async fn settings_get(&self) -> CallToolResult {
-        let Ok(data_dir) = self.data_dir() else {
-            return tool_error("this MCP server has no node data directory");
-        };
+        let data_dir = self.data_dir.as_path();
         let policy = match crate::policy::policy_settings(data_dir) {
             Ok(policy) => policy.map(|settings| {
                 json!({
@@ -124,7 +123,7 @@ impl McpServer {
         else {
             return tool_error("the node relay setting is unavailable");
         };
-        let Ok(hub_url) = self.node_hub(data_dir).resolve_url() else {
+        let Ok(hub_url) = self.node_hub().resolve_url() else {
             return tool_error("the node hub setting is unavailable");
         };
         tool_success(
@@ -146,9 +145,7 @@ impl McpServer {
         &self,
         Parameters(arguments): Parameters<PolicyUpdateArguments>,
     ) -> CallToolResult {
-        let Ok(data_dir) = self.data_dir() else {
-            return tool_error("this MCP server has no node data directory");
-        };
+        let data_dir = self.data_dir.as_path();
         if arguments.workspace.is_none()
             && arguments.max_context_tokens.is_none()
             && arguments.max_seconds.is_none()
@@ -162,34 +159,29 @@ impl McpServer {
             Ok(None) => return tool_error("start the node once to create its policy"),
             Err(_) => return tool_error("the node policy is unavailable"),
         }
-        match crate::admin_socket::send(
-            &self.socket,
-            &crate::admin_socket::Request::UpdatePolicy {
-                workspace: arguments.workspace,
-                max_context_tokens: arguments.max_context_tokens,
-                max_seconds: arguments.max_seconds,
-                queue_global: arguments.queue_global,
-                queue_per_peer: arguments.queue_per_peer,
-                dry_run: arguments.dry_run,
-            },
-        ) {
-            Ok(crate::admin_socket::Response::Validated) => tool_success(
+        match self.ask(&Request::UpdatePolicy {
+            workspace: arguments.workspace,
+            max_context_tokens: arguments.max_context_tokens,
+            max_seconds: arguments.max_seconds,
+            queue_global: arguments.queue_global,
+            queue_per_peer: arguments.queue_per_peer,
+            dry_run: arguments.dry_run,
+        }) {
+            Ok(Response::Validated) => tool_success(
                 json!({
                     "status": "validated",
                     "restartRequired": false,
                 })
                 .to_string(),
             ),
-            Ok(crate::admin_socket::Response::Applied) => tool_success(
+            Ok(Response::Applied) => tool_success(
                 json!({
                     "status": "saved",
                     "restartRequired": true,
                 })
                 .to_string(),
             ),
-            Ok(crate::admin_socket::Response::Error { code }) => {
-                tool_error(format!("the node refused the policy change: {code}"))
-            }
+            Ok(Response::Error { code }) => refused("the policy change", &code),
             _ => tool_error("administration service is unavailable"),
         }
     }
@@ -202,9 +194,7 @@ impl McpServer {
         &self,
         Parameters(arguments): Parameters<UrlSettingArguments>,
     ) -> CallToolResult {
-        let Ok(data_dir) = self.data_dir() else {
-            return tool_error("this MCP server has no node data directory");
-        };
+        let data_dir = self.data_dir.as_path();
         let url = arguments.url.trim();
         let relay = if url.is_empty() || url == crate::transport::relay::RELAY_OFF {
             None
@@ -217,16 +207,11 @@ impl McpServer {
         if arguments.dry_run {
             return tool_success(json!({"status": "validated"}).to_string());
         }
-        match crate::admin_socket::send(
-            &self.socket,
-            &crate::admin_socket::Request::SetRelay { url: relay.map(str::to_owned) },
-        ) {
-            Ok(crate::admin_socket::Response::Applied) => tool_success(
+        match self.ask(&Request::SetRelay { url: relay.map(str::to_owned) }) {
+            Ok(Response::Applied) => tool_success(
                 json!({"status": "applied", "restartRequired": false}).to_string(),
             ),
-            Ok(crate::admin_socket::Response::Error { code }) => {
-                tool_error(format!("the node refused the relay: {code}"))
-            }
+            Ok(Response::Error { code }) => refused("the relay", &code),
             // No node runs: it uses the saved choice on its next start.
             Err(error) if no_node(&error) => {
                 match crate::settings::store_setting::<crate::transport::relay::Relay>(
@@ -278,21 +263,15 @@ impl McpServer {
             Ok(hub) => hub,
             Err(error) => return tool_error(error),
         };
-        let Ok(data_dir) = self.data_dir() else {
-            return tool_error("this MCP server has no node data directory");
-        };
+        let data_dir = self.data_dir.as_path();
         if arguments.dry_run {
             return tool_success("validated");
         }
         // The hub sets the type once: only the first claim names it.
         let kind = match hub.account().await {
             Ok(None) => Some(
-                crate::settings::setting::<crate::hub_client::settings::AgentKind>(
-                    data_dir,
-                )
-                .ok()
-                .flatten()
-                .unwrap_or(AgentKind::Personal),
+                crate::hub_client::settings::agent_kind(data_dir)
+                    .unwrap_or(AgentKind::Personal),
             ),
             Ok(Some(_)) => None,
             Err(error) => return tool_error(error.to_string()),
@@ -334,20 +313,15 @@ impl McpServer {
         if arguments.dry_run {
             return tool_success("validated");
         }
-        match crate::admin_socket::send(
-            &self.socket,
-            &crate::admin_socket::Request::CreateInvite {
-                friend_name: arguments.friend_name,
-                endpoint_id: arguments.endpoint_id.split_whitespace().collect(),
-                days: arguments.days,
-            },
-        ) {
-            Ok(crate::admin_socket::Response::Invitation { line }) => {
+        match self.ask(&Request::CreateInvite {
+            friend_name: arguments.friend_name,
+            endpoint_id: arguments.endpoint_id.split_whitespace().collect(),
+            days: arguments.days,
+        }) {
+            Ok(Response::Invitation { line }) => {
                 tool_success(json!({"code": line}).to_string())
             }
-            Ok(crate::admin_socket::Response::Error { code }) => {
-                tool_error(format!("the node refused the invite: {code}"))
-            }
+            Ok(Response::Error { code }) => refused("the invite", &code),
             _ => tool_error("the running node is unavailable"),
         }
     }
@@ -360,9 +334,7 @@ impl McpServer {
         &self,
         Parameters(arguments): Parameters<CodeImportArguments>,
     ) -> CallToolResult {
-        let Ok(data_dir) = self.data_dir() else {
-            return tool_error("this MCP server has no node data directory");
-        };
+        let data_dir = self.data_dir.as_path();
         let bundle = match crate::direct::InvitationBundle::decode(&arguments.code) {
             Ok(bundle) => bundle,
             Err(error) => return tool_error(error.to_string()),
@@ -380,11 +352,8 @@ impl McpServer {
         description = "List people who can send tasks to this running node and their grant IDs."
     )]
     async fn access_list(&self) -> CallToolResult {
-        match crate::admin_socket::send(
-            &self.socket,
-            &crate::admin_socket::Request::DirectGrants,
-        ) {
-            Ok(crate::admin_socket::Response::DirectGrants { grants }) => {
+        match self.ask(&Request::DirectGrants) {
+            Ok(Response::DirectGrants { grants }) => {
                 tool_success(json!({"grants": grants}).to_string())
             }
             _ => tool_error("the running node is unavailable"),
@@ -405,14 +374,9 @@ impl McpServer {
         if arguments.dry_run {
             return tool_success("validated");
         }
-        match crate::admin_socket::send(
-            &self.socket,
-            &crate::admin_socket::Request::RevokeGrant { id: arguments.grant_id },
-        ) {
-            Ok(crate::admin_socket::Response::Applied) => tool_success("revoked"),
-            Ok(crate::admin_socket::Response::Error { code }) => {
-                tool_error(format!("the node refused the revocation: {code}"))
-            }
+        match self.ask(&Request::RevokeGrant { id: arguments.grant_id }) {
+            Ok(Response::Applied) => tool_success("revoked"),
+            Ok(Response::Error { code }) => refused("the revocation", &code),
             _ => tool_error("the running node is unavailable"),
         }
     }
@@ -421,9 +385,7 @@ impl McpServer {
         description = "List incoming access groups and their members."
     )]
     async fn groups_list(&self) -> CallToolResult {
-        let Some(data_dir) = &self.caller else {
-            return tool_error("this MCP server has no node data directory");
-        };
+        let data_dir = self.data_dir.as_path();
         match access_groups::list(data_dir) {
             Ok(groups) => tool_success(json!({ "groups": groups.iter().map(|group| json!({
                 "name": group.name,
@@ -534,10 +496,7 @@ impl McpServer {
         &self,
         Parameters(arguments): Parameters<ChangeArguments>,
     ) -> CallToolResult {
-        match self.change_request(arguments.change, arguments.dry_run) {
-            Ok(message) => tool_success(message),
-            Err(message) => tool_error(message),
-        }
+        tool_result(self.change_request(arguments.change, arguments.dry_run))
     }
     #[tool(
         name = "aether.settings.set_hub",
@@ -547,9 +506,7 @@ impl McpServer {
         &self,
         Parameters(arguments): Parameters<UrlSettingArguments>,
     ) -> CallToolResult {
-        let Ok(data_dir) = self.data_dir() else {
-            return tool_error("this MCP server has no node data directory");
-        };
+        let data_dir = self.data_dir.as_path();
         // `off` turns the hub off here, as an empty URL does.
         let url = arguments.url.trim().trim_end_matches('/');
         let stored = if url == HUB_OFF {
@@ -600,8 +557,7 @@ mod tests {
         let store =
             aether_store::NodeStore::in_dir(directory.path()).expect("store must open");
         drop(store);
-        let server = served(directory.path(), shared_in(directory.path()))
-            .with_caller(directory.path().to_path_buf());
+        let server = served(directory.path(), shared_in(directory.path()));
         let created = server
             .groups_create(Parameters(GroupArguments { name: "work".to_owned() }))
             .await;
@@ -631,8 +587,7 @@ mod tests {
             None,
         )
         .expect("first policy must create");
-        let server =
-            served(&data_dir, shared_in(&data_dir)).with_caller(data_dir.clone());
+        let server = served(&data_dir, shared_in(&data_dir));
         let request = PolicyUpdateArguments {
             workspace: None,
             max_context_tokens: None,
@@ -703,7 +658,7 @@ mod tests {
         ));
         let socket = crate::data_dir::DataDir::new(&data_dir).admin_socket();
         start(&socket, administration.clone()).expect("socket must start");
-        let server = McpServer::socket(socket).with_caller(data_dir.clone());
+        let server = McpServer::new(socket, data_dir.clone(), None, false);
         let endpoint = crate::direct::endpoint_id(caller.path())
             .expect("caller endpoint must create");
         let result = server
@@ -749,8 +704,7 @@ mod tests {
             .expect("grant ID must be listed")
             .to_owned();
         assert_eq!(access["grants"][0]["agent"], "alice");
-        let caller_server = served(caller.path(), shared_in(caller.path()))
-            .with_caller(caller.path().to_path_buf());
+        let caller_server = served(caller.path(), shared_in(caller.path()));
         let imported = caller_server
             .invites_code_import(Parameters(CodeImportArguments { code }))
             .await;
@@ -776,8 +730,7 @@ mod tests {
             &Some(hub.url.clone()),
         )
         .expect("the hub must store");
-        let server = served(directory.path(), shared_in(directory.path()))
-            .with_caller(directory.path().to_path_buf());
+        let server = served(directory.path(), shared_in(directory.path()));
         let claimed = server
             .name_set(Parameters(NameArguments {
                 handle: "ana".to_owned(),
@@ -788,20 +741,9 @@ mod tests {
         let name =
             decode(&claimed)["name"].as_str().expect("name must return").to_owned();
         assert!(name.starts_with("ana#"));
+        assert_eq!(crate::hub_client::settings::hub_name(directory.path()), Some(name));
         assert_eq!(
-            crate::settings::setting::<crate::hub_client::settings::HubName>(
-                directory.path()
-            )
-            .ok()
-            .flatten(),
-            Some(name)
-        );
-        assert_eq!(
-            crate::settings::setting::<crate::hub_client::settings::AgentKind>(
-                directory.path()
-            )
-            .ok()
-            .flatten(),
+            crate::hub_client::settings::agent_kind(directory.path()),
             Some(crate::hub_client::AgentKind::Personal)
         );
         let changed = server
@@ -811,14 +753,7 @@ mod tests {
             }))
             .await;
         assert_eq!(changed.is_error, Some(false));
-        assert_eq!(
-            crate::settings::setting::<crate::hub_client::settings::HubName>(
-                directory.path()
-            )
-            .ok()
-            .flatten(),
-            None
-        );
+        assert_eq!(crate::hub_client::settings::hub_name(directory.path()), None);
     }
 
     #[tokio::test]
@@ -831,7 +766,7 @@ mod tests {
         administration.lock().expect("administration must lock").set_live(node.clone());
         let socket = crate::data_dir::DataDir::new(&data_dir).admin_socket();
         start(&socket, administration).expect("socket must start");
-        let server = McpServer::socket(socket).with_caller(data_dir.clone());
+        let server = McpServer::new(socket, data_dir.clone(), None, false);
         let result = server
             .settings_set_relay(Parameters(UrlSettingArguments {
                 url: "off".to_owned(),
@@ -849,15 +784,16 @@ mod tests {
         let socket = crate::data_dir::DataDir::new(directory.path()).admin_socket();
         let administration = shared_in(directory.path());
         start(&socket, administration.clone()).expect("socket must start");
-        let response = McpServer::socket(socket.clone())
-            .change(Parameters(ChangeArguments {
-                change: ChangeRequest::Workspace {
-                    id: "workspace".to_owned(),
-                    path: "project".to_owned(),
-                },
-                dry_run: false,
-            }))
-            .await;
+        let response =
+            McpServer::new(socket.clone(), directory.path().to_path_buf(), None, false)
+                .change(Parameters(ChangeArguments {
+                    change: ChangeRequest::Workspace {
+                        id: "workspace".to_owned(),
+                        path: "project".to_owned(),
+                    },
+                    dry_run: false,
+                }))
+                .await;
         assert_eq!(response.is_error, Some(false));
         administration
             .lock()
@@ -885,15 +821,16 @@ mod tests {
         // socket, exactly as a caller connecting over MCP would. It is
         // high-risk, so it lands pending, not applied — an MCP caller
         // cannot lower a change's risk class by confirming its own request.
-        let workspace_response = McpServer::socket(socket.clone())
-            .change(Parameters(ChangeArguments {
-                change: ChangeRequest::Workspace {
-                    id: "workspace".to_owned(),
-                    path: "project".to_owned(),
-                },
-                dry_run: false,
-            }))
-            .await;
+        let workspace_response =
+            McpServer::new(socket.clone(), directory.path().to_path_buf(), None, false)
+                .change(Parameters(ChangeArguments {
+                    change: ChangeRequest::Workspace {
+                        id: "workspace".to_owned(),
+                        path: "project".to_owned(),
+                    },
+                    dry_run: false,
+                }))
+                .await;
         assert_eq!(workspace_response.is_error, Some(false));
         assert!(node.calls().is_empty());
 
@@ -909,15 +846,16 @@ mod tests {
 
         // Queuing and confirming the grant change only after the workspace
         // change fully applied (rather than queuing both up front) matters:
-        let grant_response = McpServer::socket(socket.clone())
-            .change(Parameters(ChangeArguments {
-                change: {
-                    let grant = crate::admin::peer_grant();
-                    ChangeRequest::Grant { id: grant.id.as_str().to_owned(), grant }
-                },
-                dry_run: false,
-            }))
-            .await;
+        let grant_response =
+            McpServer::new(socket.clone(), directory.path().to_path_buf(), None, false)
+                .change(Parameters(ChangeArguments {
+                    change: {
+                        let grant = crate::admin::peer_grant();
+                        ChangeRequest::Grant { id: grant.id.as_str().to_owned(), grant }
+                    },
+                    dry_run: false,
+                }))
+                .await;
         assert_eq!(grant_response.is_error, Some(false));
         assert_eq!(node.calls(), ["workspace workspace project"]);
         administration

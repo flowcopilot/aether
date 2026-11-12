@@ -27,20 +27,11 @@ logs() {
   done
 }
 
-fail() {
-  printf 'FAIL: %s\n' "$1" >&2
-  logs >&2
-  exit 1
-}
-
 trap cleanup EXIT INT TERM
 new_network "$network"
 new_volume "$state"
 docker run --rm --mount "source=$state,target=/state" "$aether_image" node fixture --data-dir /state >/dev/null
-live=""
-if [ -n "${OPENROUTER_API_KEY:-}" ] && [ -n "${E2E_MODEL:-}" ]; then
-  live=1
-fi
+live="$(live_model "${E2E_MODEL:-}")"
 # `-e NAME` without a value copies the variable from this shell, so the key is
 # not on the docker command line.
 export OPENROUTER_API_KEY="${OPENROUTER_API_KEY:-}" E2E_MODEL="${E2E_MODEL:-}"
@@ -74,11 +65,9 @@ answered() {
 }
 
 # The plugin connects to agent.sock a few seconds after the gateway starts.
-# Until then the node fails the task as not available, so try again. A real
-# model has a rate limit (free OpenRouter models allow a few requests a
-# minute), so wait longer between attempts.
+# Until then the node fails the task as not available, so try again.
 result=""
-retry "${live:+6}${live:-20}" "${live:+20}${live:-3}" answered || fail "no OpenClaw answer; last result: $result"
+retry_model 20 answered || fail "no OpenClaw answer; last result: $result"
 printf '%s\n' "$result"
 
 if [ -z "$live" ]; then
