@@ -90,6 +90,11 @@ impl NodeStore {
     }
 
     /// Applies the roster event `cursor` of `control`: `member` joined.
+    ///
+    /// A member that this node knows as revoked stays revoked. The control
+    /// service never lets a revoked agent join its scope again, so such an
+    /// event is an old one that a second cursor of the scope reads again
+    /// (the cursor has the control URL in its key, the roster does not).
     pub fn apply_managed_member(
         &mut self,
         control: &str,
@@ -103,7 +108,8 @@ impl NodeStore {
         transaction.execute(
             &format!(
                 "INSERT INTO managed_members({MEMBER_COLUMNS}) VALUES(?1,?2,?3,?4,?5,NULL)
-                 ON CONFLICT(scope_id,agent_id) DO UPDATE SET endpoint_id=excluded.endpoint_id,role=excluded.role,expires_at=excluded.expires_at,revoked_at=NULL"
+                 ON CONFLICT(scope_id,agent_id) DO UPDATE SET endpoint_id=excluded.endpoint_id,role=excluded.role,expires_at=excluded.expires_at
+                 WHERE managed_members.revoked_at IS NULL"
             ),
             params![member.scope_id, member.agent_id, member.endpoint_id, member.role, member.expires_at],
         )?;
@@ -112,7 +118,9 @@ impl NodeStore {
     }
 
     /// Applies the roster event `cursor` of `control`: `agent_id` left
-    /// `scope_id`.
+    /// `scope_id`. For a member that is revoked already only the cursor
+    /// moves, so a second cursor of the scope gets past the event. An agent
+    /// that the roster does not have is [`StoreError::NotFound`].
     pub fn revoke_managed_member(
         &mut self,
         control: &str,
@@ -126,7 +134,7 @@ impl NodeStore {
         let transaction = self.connection.transaction()?;
         advance_cursor(&transaction, &cursor_key(control, scope_id), cursor)?;
         if transaction.execute(
-            "UPDATE managed_members SET revoked_at=?1 WHERE scope_id=?2 AND agent_id=?3 AND revoked_at IS NULL",
+            "UPDATE managed_members SET revoked_at=COALESCE(revoked_at,?1) WHERE scope_id=?2 AND agent_id=?3",
             params![now(), scope_id, agent_id],
         )? != 1 {
             return Err(StoreError::NotFound);
@@ -240,6 +248,41 @@ mod tests {
         assert!(members[0].revoked_at.is_some());
         assert_eq!(store.managed_cursor("control", "managed"), Ok(2));
         fs::remove_file(database).expect("database must remove");
+    }
+
+    /// The roster cursor has the control URL in its key. A second spelling
+    /// of the URL reads the events of the scope again from the start.
+    #[test]
+    fn a_second_control_url_does_not_bring_a_revoked_member_back() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let mut store = NodeStore::in_dir(directory.path()).expect("store must open");
+        let member = ManagedMember {
+            scope_id: "managed".to_owned(),
+            agent_id: "member-agent".to_owned(),
+            endpoint_id: "member-endpoint".to_owned(),
+            role: "member".to_owned(),
+            expires_at: i64::MAX,
+            revoked_at: None,
+        };
+        store.apply_managed_member("https://control", 1, &member).expect("join");
+        store
+            .revoke_managed_member("https://control", 2, "managed", "member-agent")
+            .expect("revoke");
+        let revoked = store.managed_members("managed").expect("members must load");
+        assert!(revoked[0].revoked_at.is_some());
+
+        store.apply_managed_member("https://control/", 1, &member).expect("old join");
+        assert_eq!(store.managed_members("managed").expect("members"), revoked);
+        store
+            .revoke_managed_member("https://control/", 2, "managed", "member-agent")
+            .expect("the old revoke must move the second cursor");
+        assert_eq!(store.managed_members("managed").expect("members"), revoked);
+        assert_eq!(store.managed_cursor("https://control/", "managed"), Ok(2));
+        assert_eq!(
+            store.revoke_managed_member("https://control/", 3, "managed", "stranger"),
+            Err(StoreError::NotFound)
+        );
+        assert_eq!(store.managed_cursor("https://control/", "managed"), Ok(2));
     }
 
     #[test]

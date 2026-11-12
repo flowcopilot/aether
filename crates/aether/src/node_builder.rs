@@ -412,6 +412,8 @@ mod tests {
                 aether_store::ChangeKind::Limit,
                 aether_core::limits::QueueLimitId::Global.as_str(),
                 "2",
+                aether_store::AuditActor::Ui,
+                1,
             )
             .expect("queue limit must store");
         drop(store);
@@ -885,6 +887,8 @@ mod tests {
                 aether_store::ChangeKind::Grant,
                 "restored",
                 &encode_grant(&restored_grant).expect("grant must encode"),
+                aether_store::AuditActor::Ui,
+                1,
             )
             .expect("grant must store");
         drop(store);

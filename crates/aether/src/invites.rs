@@ -78,6 +78,13 @@ pub fn sign_direct_invite(
     )
 }
 
+/// One call of [`sign_direct_invite`] at a time in this process. A call
+/// reads the group, adds the person, and takes the person out again when
+/// it fails. Two calls for one person that interleave would undo each
+/// other: the one that fails would take out the person that the other
+/// one's invite needs.
+static SIGNING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// [`crate::direct::encode_invite_after_grant`], which tests replace.
 type EncodeInvite = fn(
     &Path,
@@ -103,6 +110,7 @@ fn sign_direct_invite_with(
     let internal = |error: &dyn std::fmt::Display| {
         InviteError::Internal(std::io::Error::other(error.to_string()))
     };
+    let _signing = SIGNING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let agent_card = crate::direct::create_card(&signing.data_dir, agent_name)
         .map_err(|error| internal(&error))?;
     let (authorization, grant) = crate::direct::sign_invite_access(
@@ -239,6 +247,86 @@ mod tests {
             .expect("member must add");
         assert!(sign(&endpoint).is_err());
         assert_eq!(grants(), Vec::new());
+        assert_eq!(members(data_dir, group), ["ana"]);
+    }
+
+    #[test]
+    fn a_failing_invite_does_not_take_out_the_person_of_a_second_invite() {
+        use std::sync::mpsc::{Receiver, Sender, channel};
+        use std::sync::{Mutex, PoisonError};
+        use std::time::Duration;
+
+        // The failing call says that it reached the encode step, then
+        // waits a moment for the second call before it fails.
+        static REACHED: Mutex<Option<Sender<()>>> = Mutex::new(None);
+        static SECOND_DONE: Mutex<Option<Receiver<()>>> = Mutex::new(None);
+
+        let directory = tempfile::tempdir().expect("directory must create");
+        let data_dir = directory.path();
+        let administration = shared_in(data_dir);
+        let node = Arc::new(FakeNode::default().with_workspace("/start"));
+        administration.lock().expect("administration must lock").set_live(node);
+        let signing = DirectInviteSigning::for_data_dir(data_dir);
+        let group = crate::access_groups::REQUESTS_GROUP;
+        let endpoint = iroh::SecretKey::generate().public().to_string();
+        let (reached, reached_rx) = channel();
+        let (second_done, second_done_rx) = channel();
+        *REACHED.lock().unwrap_or_else(PoisonError::into_inner) = Some(reached);
+        *SECOND_DONE.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some(second_done_rx);
+
+        std::thread::scope(|scope| {
+            let failing = scope.spawn(|| {
+                sign_direct_invite_with(
+                    &administration,
+                    &signing,
+                    "law",
+                    "ana",
+                    &endpoint,
+                    7,
+                    group,
+                    AuditActor::Ui,
+                    |_, _, _, _, _, _| {
+                        let reached = REACHED
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .take();
+                        if let Some(reached) = reached {
+                            let _ = reached.send(());
+                        }
+                        let done = SECOND_DONE
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .take();
+                        if let Some(done) = done {
+                            let _ = done.recv_timeout(Duration::from_millis(500));
+                        }
+                        Err(crate::direct::DirectError::Unavailable)
+                    },
+                )
+            });
+            reached_rx.recv().expect("the first call must reach the encode step");
+            let second = sign_direct_invite_with(
+                &administration,
+                &signing,
+                "law",
+                "ana",
+                &endpoint,
+                7,
+                group,
+                AuditActor::Ui,
+                |_, _, _, _, _, _| Ok("line".to_owned()),
+            );
+            let _ = second_done.send(());
+            assert!(failing.join().expect("the first call must not panic").is_err());
+            let (_, grant_id) = second.expect("the second call must sign");
+            let grants = administration
+                .lock()
+                .expect("administration must lock")
+                .grants()
+                .expect("grants must read");
+            assert!(grants.iter().any(|grant| grant.id.as_str() == grant_id));
+        });
         assert_eq!(members(data_dir, group), ["ana"]);
     }
 

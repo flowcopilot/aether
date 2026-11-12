@@ -21,6 +21,7 @@ pub const CONTROL_MIGRATIONS: &[&str] = &[
     include_str!("../migrations/control/003_managed_members.sql"),
     include_str!("../migrations/control/004_managed_events.sql"),
     include_str!("../migrations/control/005_drop_unused_tables.sql"),
+    include_str!("../migrations/control/006_directory_record_marks.sql"),
 ];
 
 /// What happened to a directory record. The names are the
@@ -80,18 +81,36 @@ impl ControlStore {
         Ok(Self { connection: open_connection(path.as_ref(), CONTROL_MIGRATIONS)? })
     }
 
-    /// Keeps `record` and its `event`, which publishes or renews it.
+    /// Keeps `record`, which `signing_key` signed, and its `event`, which
+    /// publishes or renews it.
+    ///
+    /// A record that does not expire after the last revocation of this
+    /// agent ID and key is [`StoreError::InvalidState`]: it was public
+    /// before the revocation, so its sender need not be its owner.
     pub fn publish_signed_record(
         &mut self,
         record: &SignedRecord,
+        signing_key: &[u8; 32],
         event: DirectoryEventType,
     ) -> Result<(), StoreError> {
         if event == DirectoryEventType::Revoked {
             return Err(StoreError::InvalidState);
         }
         let transaction = self.connection.transaction()?;
+        let revoked_through: Option<i64> = transaction
+            .query_row(
+                "SELECT revoked_through FROM directory_record_marks WHERE agent_id=?1 AND signing_key=?2",
+                params![record.agent_id, signing_key],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        if revoked_through.is_some_and(|through| record.expires_at <= through) {
+            return Err(StoreError::InvalidState);
+        }
         put_scope(&transaction, &record.scope_id, ScopeKind::Directory)?;
         upsert_record(&transaction, &record.agent_id, record)?;
+        mark_latest(&transaction, &record.agent_id, signing_key, record.expires_at)?;
         transaction.execute(
             "INSERT INTO directory_events(event_type,scope_id,agent_id,record,created_at) VALUES(?1,?2,?3,?4,?5)",
             params![event, record.scope_id, record.agent_id, record.record, now()],
@@ -113,18 +132,31 @@ impl ControlStore {
             .ok_or(StoreError::NotFound)
     }
 
-    pub fn revoke_signed_record(&mut self, agent_id: &str) -> Result<(), StoreError> {
+    /// Removes the record of `agent_id`, which `signing_key` signed. No
+    /// record of that key that the directory had before this call can be
+    /// published again.
+    pub fn revoke_signed_record(
+        &mut self,
+        agent_id: &str,
+        signing_key: &[u8; 32],
+    ) -> Result<(), StoreError> {
         let transaction = self.connection.transaction()?;
-        let scope_id: String = transaction
+        let (scope_id, expires_at): (String, i64) = transaction
             .query_row(
-                "SELECT scope_id FROM signed_records WHERE agent_id=?1 ORDER BY expires_at DESC LIMIT 1",
+                "SELECT scope_id,expires_at FROM signed_records WHERE agent_id=?1 ORDER BY expires_at DESC LIMIT 1",
                 [agent_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?
             .ok_or(StoreError::NotFound)?;
         transaction
             .execute("DELETE FROM signed_records WHERE agent_id=?1", [agent_id])?;
+        // A record from before the marks table has no mark yet.
+        mark_latest(&transaction, agent_id, signing_key, expires_at)?;
+        transaction.execute(
+            "UPDATE directory_record_marks SET revoked_through=latest_expires_at WHERE agent_id=?1 AND signing_key=?2",
+            params![agent_id, signing_key],
+        )?;
         transaction.execute(
             "INSERT INTO directory_events(event_type,scope_id,agent_id,record,created_at) VALUES(?1,?2,?3,NULL,?4)",
             params![DirectoryEventType::Revoked, scope_id, agent_id, now()],
@@ -285,6 +317,22 @@ impl ControlStore {
     }
 }
 
+/// Raises the latest expiry of the records of `agent_id` that `signing_key`
+/// signed to `expires_at`.
+fn mark_latest(
+    connection: &Connection,
+    agent_id: &str,
+    signing_key: &[u8; 32],
+    expires_at: i64,
+) -> Result<(), StoreError> {
+    connection.execute(
+        "INSERT INTO directory_record_marks(agent_id,signing_key,latest_expires_at) VALUES(?1,?2,?3)
+         ON CONFLICT(agent_id,signing_key) DO UPDATE SET latest_expires_at=MAX(latest_expires_at,excluded.latest_expires_at)",
+        params![agent_id, signing_key, expires_at],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -301,6 +349,38 @@ mod tests {
         }
     }
 
+    const KEY: [u8; 32] = [7; 32];
+
+    #[test]
+    fn a_record_from_before_a_revocation_cannot_be_published_again() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let mut store =
+            ControlStore::open(directory.path().join("control")).expect("open");
+        let publish = |store: &mut ControlStore, expires_at, key: &[u8; 32]| {
+            store.publish_signed_record(
+                &record("agent", expires_at),
+                key,
+                DirectoryEventType::Published,
+            )
+        };
+        publish(&mut store, 20, &KEY).expect("the newer record must publish");
+        // An older record of the owner replaces the newer one, as before.
+        publish(&mut store, 10, &KEY).expect("the older record must publish");
+        store.revoke_signed_record("agent", &KEY).expect("record must revoke");
+        // Both were public, so neither comes back.
+        assert_eq!(publish(&mut store, 10, &KEY), Err(StoreError::InvalidState));
+        assert_eq!(publish(&mut store, 20, &KEY), Err(StoreError::InvalidState));
+        assert_eq!(store.signed_record("agent"), Err(StoreError::NotFound));
+        assert_eq!(store.directory_events_after(0, 10).expect("events").len(), 3);
+        // Another key has its own mark.
+        publish(&mut store, 5, &[8; 32]).expect("another key must publish");
+        store.revoke_signed_record("agent", &[8; 32]).expect("record must revoke");
+        // Only the owner can sign a record that expires later.
+        publish(&mut store, 21, &KEY).expect("a later record must publish");
+        store.revoke_signed_record("agent", &KEY).expect("record must revoke");
+        assert_eq!(publish(&mut store, 21, &KEY), Err(StoreError::InvalidState));
+    }
+
     #[test]
     fn published_records_are_durable_and_a_revocation_is_an_event() {
         let database = path("control-record");
@@ -308,22 +388,31 @@ mod tests {
         assert_eq!(
             store.publish_signed_record(
                 &record("agent", 1),
+                &KEY,
                 DirectoryEventType::Revoked
             ),
             Err(StoreError::InvalidState)
         );
         store
-            .publish_signed_record(&record("agent", 1), DirectoryEventType::Published)
+            .publish_signed_record(
+                &record("agent", 1),
+                &KEY,
+                DirectoryEventType::Published,
+            )
             .expect("record must publish");
         store
-            .publish_signed_record(&record("agent", 2), DirectoryEventType::Renewed)
+            .publish_signed_record(
+                &record("agent", 2),
+                &KEY,
+                DirectoryEventType::Renewed,
+            )
             .expect("record must renew");
         drop(store);
         let mut store = ControlStore::open(&database).expect("control must reopen");
         assert_eq!(store.signed_record("agent"), Ok(record("agent", 2)));
         assert_eq!(store.active_signed_records(1).expect("records must load").len(), 1);
         assert!(store.active_signed_records(2).expect("records must load").is_empty());
-        store.revoke_signed_record("agent").expect("record must revoke");
+        store.revoke_signed_record("agent", &KEY).expect("record must revoke");
         assert_eq!(store.signed_record("agent"), Err(StoreError::NotFound));
         assert_eq!(
             store

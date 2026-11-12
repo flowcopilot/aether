@@ -495,6 +495,10 @@ where
         let _ = renewal.0.send(());
         let _ = renewal.1.join();
         slot.deactivate();
+        // A renewal that failed before the turn started left a cancel that
+        // no turn took. The task may be queued again; its next run must not
+        // be stopped by it.
+        self.canceller.forget(&task_id);
         let run = RunReport {
             result,
             renewal_failed: renewal_failed.load(Ordering::Acquire),

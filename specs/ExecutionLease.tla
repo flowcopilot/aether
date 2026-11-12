@@ -7,13 +7,17 @@
 (*   `mark_succeeded`, `mark_failed`, `mark_unknown_result`,               *)
 (*   `mark_rejected`, `cancel`, `requeue_leased`,                          *)
 (*   `recover_expired_leases`).                                            *)
-(* Node side: `SchedulerContext` in crates/aether/src/proof.rs             *)
+(* Node side: `SchedulerContext` in crates/aether/src/proof/scheduler.rs   *)
 (*   (`prepare_execution`, `prepare_leased`, `run_execution` with its      *)
-(*   lease-renewal thread and `on_confirmed_start`, `maintain`), and       *)
-(*   `ProofNode::cancel` / `ProofNode::shutdown`.                          *)
-(* Agent side: `Agent::start_turn` and `Agent::cancel` in                  *)
-(*   crates/aether/src/agent/{codex,connected}.rs. Both adapters drop a    *)
-(*   cancel for a turn that they did not register yet.                     *)
+(*   lease-renewal thread and `on_confirmed_start`, `settlement`,          *)
+(*   `maintain`), and `ProofNode::cancel` / `ProofNode::shutdown` in       *)
+(*   crates/aether/src/proof/mod.rs.                                       *)
+(* Agent side: `Agent::start_turn_with_events` and `Agent::cancel` in      *)
+(*   crates/aether/src/agent/{codex,connected}.rs, and `EarlyCancels` in   *)
+(*   crates/aether/src/agent.rs. An adapter keeps a cancel for a turn that *)
+(*   it did not register yet, and cancels that turn when it registers it.  *)
+(*   It drops a cancel for a turn that ended, and `Agent::forget` drops a  *)
+(*   kept cancel when the execution ends.                                  *)
 (*                                                                         *)
 (* One node process runs one scheduler, so at most one execution is       *)
 (* active. The process can stop (crash or exit) and start again. Each     *)
@@ -22,7 +26,8 @@
 (*                                                                         *)
 (* Abstracted away: task input and output, events, retention, the order   *)
 (* in which `lease_next` picks a queued task, queue limits, and the       *)
-(* `event_error` path of `run_execution`.                                  *)
+(* `event_error` path of `run_execution`, and the bound of 256 task IDs    *)
+(* in each `EarlyCancels` list.                                            *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
 
@@ -62,7 +67,8 @@ VARIABLES
     nextExec,   \* the next fresh execution ID
     grant,      \* whether policy and access groups still allow the task
     w,          \* the one execution thread (`run_execution`)
-    turn,       \* the agent turn that the execution started
+    turn,       \* the agent turn that the execution started, and the
+                \* adapter's `EarlyCancels`
     signals,    \* tasks with an `Agent::cancel` call that is not made yet
     shutdown,   \* the `shutdown` flag
     restarts,   \* how often the process stopped
@@ -73,8 +79,16 @@ vars == <<state, lease, now, nextExec, grant, w, turn, signals, shutdown,
 
 IdleWorker == [phase |-> "idle", task |-> CHOOSE t \in Tasks : TRUE, exec |-> 0,
                confirmed |-> FALSE, renewFailed |-> FALSE, outcome |-> "none"]
+\* `early` and `ended` are the two lists of `EarlyCancels`. `spurious` is a
+\* ghost: the adapter cancelled a turn at its start with a cancel that an
+\* earlier execution of the task left behind (see NoSpuriousCancel).
 NoTurn == [live |-> FALSE, registered |-> FALSE, interrupted |-> FALSE,
-           task |-> CHOOSE t \in Tasks : TRUE]
+           task |-> CHOOSE t \in Tasks : TRUE, early |-> {}, ended |-> {},
+           spurious |-> FALSE]
+
+\* The turn is over: `NoTurn`, with the adapter's lists kept.
+TurnOver(early, ended, spurious) ==
+    [NoTurn EXCEPT !.early = early, !.ended = ended, !.spurious = spurious]
 
 TypeOK ==
     /\ state \in [Tasks -> States]
@@ -85,7 +99,8 @@ TypeOK ==
     /\ w \in [phase : Phases, task : Tasks, exec : 0..MaxExec,
               confirmed : BOOLEAN, renewFailed : BOOLEAN, outcome : Outcomes]
     /\ turn \in [live : BOOLEAN, registered : BOOLEAN, interrupted : BOOLEAN,
-                 task : Tasks]
+                 task : Tasks, early : SUBSET Tasks, ended : SUBSET Tasks,
+                 spurious : BOOLEAN]
     /\ signals \subseteq Tasks
     /\ shutdown \in BOOLEAN
     /\ restarts \in 0..MaxRestarts
@@ -131,10 +146,14 @@ Requeue(t) ==
 
 Apply(r) == state' = r.st /\ lease' = r.ls
 
-\* `Agent::cancel`: it reaches only a turn that the adapter registered.
+\* `Agent::cancel`: it interrupts a turn that the adapter registered.
+\* Otherwise `EarlyCancels::cancel` keeps it, unless the turn of the task
+\* already ended.
 Interrupt(t) ==
     turn' = IF turn.live /\ turn.registered /\ turn.task = t
-            THEN [turn EXCEPT !.interrupted = TRUE] ELSE turn
+            THEN [turn EXCEPT !.interrupted = TRUE]
+            ELSE IF t \in turn.ended THEN turn
+            ELSE [turn EXCEPT !.early = @ \cup {t}]
 
 -----------------------------------------------------------------------------
 (* The environment. *)
@@ -265,7 +284,8 @@ ConfirmRunning ==
     /\ w.phase = "confirm"
     /\ LET t == w.task IN
        CASE shutdown ->
-              UNCHANGED <<state, lease>>
+              \* `requeue_leased`, and `settled_at_start`.
+              Apply(Requeue(t))
               /\ w' = [w EXCEPT !.phase = "finish", !.outcome = "cancelled"]
          [] ~grant[t] ->
               Apply(MarkRejected(t, w.exec))
@@ -288,20 +308,28 @@ ConfirmCheck ==
               /\ UNCHANGED <<turn, starts>>
          [] state[t] \in {"leased", "running"} ->
               /\ w' = [w EXCEPT !.phase = "starting", !.confirmed = TRUE]
-              /\ turn' = [live |-> TRUE, registered |-> FALSE,
-                          interrupted |-> FALSE, task |-> t]
+              /\ turn' = [turn EXCEPT !.live = TRUE, !.registered = FALSE,
+                                       !.interrupted = FALSE, !.task = t]
               /\ starts' = [starts EXCEPT ![t] = @ + 1]
          [] OTHER ->
               w' = [w EXCEPT !.phase = "finish", !.outcome = "err"]
               /\ UNCHANGED <<turn, starts>>
     /\ UNCHANGED <<state, lease, now, nextExec, grant, signals, shutdown, restarts>>
 
-\* The adapter registers the turn (Codex `active_turns` after `turn/start`;
-\* the connected agent's `pending` map). From now on `Agent::cancel` works.
+\* The adapter registers the turn (Codex `turns.active` after `turn/start`;
+\* the connected agent's `pending` map). `EarlyCancels::take`: a cancel
+\* that came first ends the turn here as cancelled. Otherwise
+\* `Agent::cancel` interrupts the turn from now on.
 Register ==
     /\ w.phase = "starting"
-    /\ w' = [w EXCEPT !.phase = "turn"]
-    /\ turn' = [turn EXCEPT !.registered = TRUE]
+    /\ LET t == w.task IN
+       IF t \in turn.early
+       THEN /\ w' = [w EXCEPT !.phase = "finish", !.outcome = "cancelled"]
+            /\ turn' = TurnOver(turn.early \ {t}, turn.ended \cup {t},
+                                turn.spurious \/ (state[t] = "running"
+                                                  /\ ~w.renewFailed /\ ~shutdown))
+       ELSE /\ w' = [w EXCEPT !.phase = "turn"]
+            /\ turn' = [turn EXCEPT !.registered = TRUE]
     /\ UNCHANGED <<state, lease, now, nextExec, grant, signals, shutdown,
                    restarts, starts>>
 
@@ -309,7 +337,7 @@ Register ==
 StartFails ==
     /\ w.phase = "starting"
     /\ w' = [w EXCEPT !.phase = "finish", !.outcome = "err"]
-    /\ turn' = NoTurn
+    /\ turn' = TurnOver(turn.early, turn.ended \cup {w.task}, turn.spurious)
     /\ UNCHANGED <<state, lease, now, nextExec, grant, signals, shutdown,
                    restarts, starts>>
 
@@ -318,20 +346,20 @@ TurnEnds ==
     /\ w.phase = "turn"
     /\ \E o \in IF turn.interrupted THEN {"cancelled"} ELSE {"ok", "err"} :
          w' = [w EXCEPT !.phase = "finish", !.outcome = o]
-    /\ turn' = NoTurn
+    /\ turn' = TurnOver(turn.early \ {w.task}, turn.ended \cup {w.task},
+                         turn.spurious)
     /\ UNCHANGED <<state, lease, now, nextExec, grant, signals, shutdown,
                    restarts, starts>>
 
 \* The renewal thread of `run_execution` -> `renew_lease`. On failure it
-\* calls `canceller.cancel`, and then calls it again at each interval until
-\* the execution stops the thread: an adapter drops a cancel for a turn
-\* that it has not registered yet. A cancel deletes the lease, so it also
-\* makes the renewal fail.
+\* calls `canceller.cancel` once and stops. A cancel deletes the lease, so
+\* it also makes the renewal fail: this is the cancel's second signal.
 Renew ==
     /\ w.phase \in {"confirm", "confirm_check", "starting", "turn"}
     /\ ~shutdown
+    /\ ~w.renewFailed
     /\ LET t == w.task IN
-       IF ~w.renewFailed /\ LeaseIs(t, w.exec) /\ lease[t].exp > now
+       IF LeaseIs(t, w.exec) /\ lease[t].exp > now
        THEN /\ lease' = [lease EXCEPT ![t].exp = now + TTL]
             /\ UNCHANGED <<w, turn>>
        ELSE /\ w' = [w EXCEPT !.renewFailed = TRUE]
@@ -348,6 +376,10 @@ ShutdownSignal ==
     /\ UNCHANGED <<state, lease, now, nextExec, grant, w, signals, shutdown,
                    restarts, starts>>
 
+\* `Agent::forget`, which `run_execution` calls after the executor returns
+\* and the renewal thread stops: the adapter drops a kept cancel.
+Forget(t) == turn' = [turn EXCEPT !.early = @ \ {t}]
+
 \* `run_execution` after the executor returns and the renewal thread stops.
 Finish ==
     /\ w.phase = "finish"
@@ -356,12 +388,14 @@ Finish ==
        IN IF w.renewFailed
           THEN /\ Apply(IF w.outcome = "ok" THEN MarkEnd(t, e, "succeeded") ELSE Same)
                /\ w' = [w EXCEPT !.phase = "finish_renewal"]
+               /\ Forget(t)
           ELSE /\ Apply(CASE w.outcome = "ok" -> MarkEnd(t, e, "succeeded")
                           [] w.outcome = "cancelled" -> Same
                           [] OTHER -> IF w.confirmed THEN MarkEnd(t, e, "unknown_result")
                                       ELSE MarkEnd(t, e, "failed"))
                /\ w' = IdleWorker
-    /\ UNCHANGED <<now, nextExec, grant, turn, signals, shutdown, restarts, starts>>
+               /\ Forget(t)
+    /\ UNCHANGED <<now, nextExec, grant, signals, shutdown, restarts, starts>>
 
 \* `run_execution`, the renewal-failed branch after the late result.
 FinishRenewal ==
@@ -383,9 +417,11 @@ Next ==
 
 Spec == Init /\ [][Next]_vars
 
-\* The renewal thread and the shutdown loop run while the execution runs.
-\* The turn itself gets no fairness: an agent may run until `max_seconds`.
+\* The renewal thread and the shutdown loop run while the execution runs,
+\* and each `canceller.cancel` that follows a store call is made. The turn
+\* itself gets no fairness: an agent may run until `max_seconds`.
 FairSpec == Spec /\ WF_vars(Renew) /\ WF_vars(ShutdownSignal)
+                 /\ \A t \in Tasks : WF_vars(Signal(t))
 
 -----------------------------------------------------------------------------
 (* Properties. *)
@@ -407,14 +443,23 @@ TurnMatchesState ==
 \* Every cancel reaches the turn: a registered turn whose task is cancelled
 \* or unknown_result is interrupted, or it ends.
 \*
-\* The first `Agent::cancel` can come before the adapter registers the turn
-\* (Codex inserts it into `active_turns` only after `turn/start` answers;
-\* the connected agent inserts into `pending` in `start_turn_with_events`),
-\* and then it does nothing. The cancel deleted the lease, so the renewal
-\* fails and says the cancel again at each interval until the turn stops.
+\* An `Agent::cancel` can come before the adapter registers the turn
+\* (Codex inserts it into `turns.active` only after `turn/start` answers;
+\* the connected agent inserts into `pending` in `run_turn`). The adapter
+\* keeps it, and the turn ends as cancelled when it registers. No signal
+\* is repeated: the cancel itself and one renewal failure are all.
 CancelReachesTurn ==
     [](turn.live /\ turn.registered
          /\ state[turn.task] \in {"cancelled", "unknown_result"}
        => <>(turn.interrupted \/ ~turn.live))
+
+\* The adapter cancels a turn at its start only for a cancel, a lost lease
+\* or a shutdown of this execution. Before `run_execution` called
+\* `Agent::forget`, this failed: a renewal that failed before
+\* `on_confirmed_start` left a kept cancel, recovery gave the task back to
+\* the queue, and the kept cancel ended the turn of the next execution.
+\* `settlement` writes nothing for `ExecutionError::Cancelled`, so the task
+\* stayed `running` with no turn and ended as `unknown_result`.
+NoSpuriousCancel == ~turn.spurious
 
 =============================================================================

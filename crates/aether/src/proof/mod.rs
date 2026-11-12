@@ -61,8 +61,12 @@ pub struct SubmissionInput<'a> {
     pub task: &'a Task,
 }
 
-pub(crate) const REPLAY_LIMIT: usize = 256;
 pub(crate) const REPLAY_TTL: Duration = Duration::from_secs(300);
+/// The replay entries that the node keeps for one endpoint and scope. An
+/// entry stays for `REPLAY_TTL`, and a full table refuses the next frame, so
+/// the table has room for every frame that the peer rate limit lets through
+/// in that time: its burst and then `PEER_REQUESTS_PER_SECOND` each second.
+pub(crate) const REPLAY_LIMIT: usize = 2408;
 pub(crate) const RESULT_TTL: Duration = Duration::from_hours(24);
 pub(crate) const LEASE_TTL: Duration = Duration::from_secs(30);
 pub(crate) const LEASE_RENEWAL_INTERVAL: Duration = Duration::from_secs(10);
@@ -467,27 +471,28 @@ where
         Ok(())
     }
 
+    /// Cancels the task that `caller_endpoint` sent as `task_id`, and returns
+    /// the ID that the node keeps it under.
     pub fn cancel_from(
         &self,
         task_id: &str,
         caller_endpoint: &EndpointId,
         scope_id: &str,
-    ) -> Result<(), ProofError> {
-        let task_id = task_id.to_owned();
-        {
+    ) -> Result<String, ProofError> {
+        let task_id = {
             let _guard =
                 self.dispatch_serial.lock().map_err(|_| ProofError::Internal)?;
             let caller_endpoint = caller_endpoint.as_str().to_owned();
             let scope_id = scope_id.to_owned();
-            let stored_task_id = task_id.clone();
+            let sent_task_id = task_id.to_owned();
             self.store.call(move |store| {
-                store.cancel_if_owned(&stored_task_id, &caller_endpoint, &scope_id)
-            })?;
-        }
+                store.cancel_if_owned(&sent_task_id, &caller_endpoint, &scope_id)
+            })?
+        };
         self.canceller.cancel(&task_id);
         let _ = self.scheduler_wake.try_send(());
-        let _ = self.event_sender.send(task_id);
-        Ok(())
+        let _ = self.event_sender.send(task_id.clone());
+        Ok(task_id)
     }
 }
 
@@ -542,6 +547,13 @@ mod tests {
         execution::{ExecutionEvent, TurnContext},
         test_support::Trusted,
     };
+
+    #[test]
+    fn the_replay_table_holds_every_frame_that_the_rate_limit_lets_through() {
+        let frames = u64::from(crate::transport::PEER_REQUESTS_PER_SECOND)
+            * (REPLAY_TTL.as_secs() + 1);
+        assert!(u64::try_from(REPLAY_LIMIT).expect("limit fits") >= frames);
+    }
 
     #[derive(Clone)]
     struct Cancellable {

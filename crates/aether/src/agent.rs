@@ -107,9 +107,16 @@ impl EarlyCancels {
     }
 
     /// Notes that the turn of `task_id` ended, so that a later cancel for it
-    /// is dropped.
+    /// is dropped. A cancel that was kept while the turn ran is dropped too.
     fn end(&mut self, task_id: &str) {
+        self.forget(task_id);
         remember(&mut self.ended, task_id);
+    }
+
+    /// Drops a kept cancel for `task_id`: the run that it was for is over,
+    /// and its turn did not take it.
+    fn forget(&mut self, task_id: &str) {
+        self.cancelled.retain(|id| id != task_id);
     }
 }
 
@@ -138,6 +145,25 @@ mod tests {
         cancels.end("task");
         cancels.cancel("task");
         assert!(!cancels.take("task"));
+    }
+
+    #[test]
+    fn a_cancel_kept_while_the_turn_ran_is_dropped_at_its_end() {
+        let mut cancels = EarlyCancels::default();
+        cancels.cancel("task");
+        cancels.end("task");
+        assert!(!cancels.take("task"));
+    }
+
+    #[test]
+    fn a_forgotten_cancel_does_not_stop_a_later_start() {
+        let mut cancels = EarlyCancels::default();
+        cancels.cancel("task");
+        cancels.forget("task");
+        assert!(!cancels.take("task"));
+        // A cancel after it is kept again.
+        cancels.cancel("task");
+        assert!(cancels.take("task"));
     }
 
     #[test]

@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 use aether_store::AuditActor;
 
 use crate::admin::{
-    AdminError, AuditEntry, ChangeOutcome, ChangeRequest, SharedAdministration,
+    AdminError, ApplyOutcome, AuditEntry, ChangeOutcome, ChangeRequest,
+    SharedAdministration,
 };
 
 const MAX_SOCKET_BYTES: u64 = 65_536;
@@ -318,7 +319,10 @@ fn handle(
                 }
             } else {
                 match administration.save_policy_settings(&settings, AuditActor::Mcp) {
-                    Ok(()) => Response::Applied,
+                    Ok(ApplyOutcome::Applied) => Response::Applied,
+                    // A new task folder root or a higher limit waits for the
+                    // owner's confirmation in the UI.
+                    Ok(ApplyOutcome::Pending) => Response::Pending,
                     Err(error) => error_response(&error),
                 }
             }

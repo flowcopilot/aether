@@ -378,9 +378,7 @@ mod tests {
             session_cookie_pair,
         },
     };
-    use aether_store::{
-        AuditActor, AuditResult, ManagedMember, NodeStore, QueueLimits, TaskInput,
-    };
+    use aether_store::{AuditActor, ManagedMember, NodeStore, QueueLimits, TaskInput};
 
     #[test]
     fn a_failed_confirm_keeps_its_token_and_a_confirmed_one_uses_it_up() {
@@ -518,11 +516,10 @@ mod tests {
                 aether_store::ChangeKind::Capability,
                 "review",
                 "private-credential",
+                AuditActor::Mcp,
+                1,
             )
             .expect("change must apply");
-        store
-            .record_change(AuditActor::Mcp, AuditResult::Applied)
-            .expect("change must record");
         store
             .put_scope("scope", aether_core::ScopeKind::Direct)
             .expect("scope must store");

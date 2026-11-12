@@ -120,6 +120,10 @@ pub trait Agent {
         self.start_turn_with_events(ctx, &mut |_| {})
     }
     fn cancel(&self, task_id: &str);
+    /// The node's run of `task_id` is over. An adapter that keeps a cancel
+    /// for a turn that has not started drops it here, so that the cancel
+    /// does not stop a later turn of the same task.
+    fn forget(&self, _task_id: &str) {}
 }
 pub struct Executor<P> {
     process: P,

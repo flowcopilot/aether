@@ -320,7 +320,7 @@ pub(crate) fn load_or_create(
 
 /// Settings the owner can change on the Advanced page. They take effect at
 /// the next node start, when the executor and queue are built.
-#[derive(Clone)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PolicySettings {
     pub workspace: PathBuf,
     pub max_context_tokens: u32,
@@ -336,6 +336,14 @@ pub struct PolicySettings {
 pub fn policy_settings(data_dir: &Path) -> Result<Option<PolicySettings>, PolicyError> {
     let store = NodeStore::in_dir(data_dir).map_err(|_| PolicyError::Read)?;
     Ok(stored(&store)?.as_ref().map(PolicyFile::settings))
+}
+
+/// The settings of the policy that `store` holds; `None` before the first
+/// start.
+pub(crate) fn policy_settings_in_store(
+    store: &NodeStore,
+) -> Result<Option<PolicySettings>, PolicyError> {
+    Ok(stored(store)?.as_ref().map(PolicyFile::settings))
 }
 
 /// Saves the common policy settings and keeps every other field of the
