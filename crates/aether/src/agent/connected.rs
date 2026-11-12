@@ -319,6 +319,12 @@ impl Agent for ConnectedAgent {
         }
         cancels.cancel(task_id);
     }
+
+    fn forget(&self, task_id: &str) {
+        if let Ok(mut cancels) = self.shared.cancels.lock() {
+            cancels.forget(task_id);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -643,6 +649,31 @@ mod tests {
             agent.start_turn(&turn_ctx("task-early", "hello", deadline)),
             Err(ExecutionError::Cancelled)
         );
+    }
+
+    #[test]
+    fn a_cancel_for_a_run_that_started_no_turn_does_not_stop_the_next_run() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let path = crate::data_dir::DataDir::new(directory.path()).agent_socket();
+        let agent = ConnectedAgent::listen(&path).expect("listen");
+        let mut peer =
+            Peer::attach(&agent, &path, &json!({"type": "ready", "protocol": 1}));
+        peer.stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout must set");
+        // The lease renewal of a run failed before its turn started, and
+        // the run ended.
+        agent.cancel("task-1");
+        agent.forget("task-1");
+        let deadline =
+            Instant::now().checked_add(Duration::from_secs(5)).expect("deadline");
+        let mut runner = agent;
+        let turn = std::thread::spawn(move || {
+            runner.start_turn(&turn_ctx("task-1", "hello", deadline))
+        });
+        assert_eq!(peer.read()["type"], "task");
+        peer.write(&json!({"type": "result", "id": "task-1", "text": "answer"}));
+        assert_eq!(turn.join().expect("turn joins"), Ok("answer".to_owned()));
     }
 
     #[test]

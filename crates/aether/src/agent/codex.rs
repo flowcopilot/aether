@@ -583,6 +583,12 @@ impl Agent for CodexAppServer {
         });
         let _ = write_json_line(&active.input, &request);
     }
+
+    fn forget(&self, task_id: &str) {
+        if let Ok(mut turns) = self.turns.lock() {
+            turns.cancels.forget(task_id);
+        }
+    }
 }
 
 pub(crate) fn valid_environment_value(value: &str) -> bool {
