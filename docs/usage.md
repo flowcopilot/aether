@@ -81,9 +81,10 @@ The same node data directory serves MCP tools for these groups, task policy,
 relay and hub URLs, your hub name, invites, and direct access. Use
 `aether.settings.get` to read the saved policy and URLs. Use
 `aether.settings.update_policy` to edit task limits or the task folder root.
-Policy changes need a node restart. `aether.settings.set_relay` changes a
-running node at once, and `aether.settings.set_hub` takes effect on the next
-hub request. The `aether.name.*`, `aether.invites.*`, `aether.access.list`
+A new task folder root or a higher limit waits until you confirm it under
+Pending changes on the Advanced page. Policy changes need a node restart.
+`aether.settings.set_relay` changes a running node at once, and
+`aether.settings.set_hub` takes effect on the next hub request. The `aether.name.*`, `aether.invites.*`, `aether.access.list`
 and `aether.access.revoke` tools cover the matching actions on the Sharing
 page. On a node without an agent type, a first `aether.name.set` makes a
 personal agent: claim a service agent on the page. `aether.access.request`

@@ -7,14 +7,15 @@
 (*                                                                         *)
 (* Code that this spec models:                                             *)
 (*   crates/aether/src/admin.rs          Administration::submit, apply,    *)
-(*       queue_pending, apply_now, finish_live, apply_live,                *)
-(*       apply_live_inner, change_requires_confirmation, confirm_ui,       *)
-(*       confirm_pending, check_not_stale, revoke, revoke_inner,           *)
-(*       save_policy_settings, with_store; Change::is_high_risk            *)
-(*   crates/aether-store/src/admin.rs    apply_change, queue_change,       *)
-(*       pending_revision, record_applied_change, admin_revision,          *)
+(*       settle, queue_pending, apply_now, check_live, finish_live,        *)
+(*       apply_live, change_requires_confirmation, policy_is_wider,        *)
+(*       confirm_ui, confirm_pending, check_not_stale, revoke,             *)
+(*       revoke_inner, save_policy_settings, with_store;                   *)
+(*       Change::is_high_risk                                              *)
+(*   crates/aether-store/src/admin.rs    apply_change, keep_change,        *)
+(*       queue_change, delete_expired, pending_revision, admin_revision,   *)
 (*       revert_change, confirm_pending_change, revoke_applied_grant,      *)
-(*       set_current_workspace, grant_revoked                              *)
+(*       record_change, fail_change, grant_revoked                         *)
 (*   crates/aether/src/admin_socket.rs   handle: Change, RevokeGrant and   *)
 (*       UpdatePolicy always get AuditActor::Mcp; the socket has no        *)
 (*       confirm request                                                   *)
@@ -33,6 +34,12 @@
 (* `aether node admin` (mode "admin", no live node). It can stop at any    *)
 (* step and start again. A store call can fail (StoreFaults).              *)
 (*                                                                         *)
+(* A change is one store transaction (the value, the current workspace of  *)
+(* a workspace change, the new revision and the audit record) and then     *)
+(* the node call. When the node refuses, a second transaction puts the     *)
+(* old value back. When that fails, the Administration keeps the undo and  *)
+(* runs no request before it worked (pc "undo").                           *)
+(*                                                                         *)
 (* The MCP client is hostile inside its interface: it sends any socket     *)
 (* request in any order. It cannot sign a grant, but it can send again a   *)
 (* signed grant that it saw before.                                        *)
@@ -41,12 +48,12 @@
 (* clock (a pending change expires at any moment), the audit records       *)
 (* other than `applied` (an audit record has no value column, so it holds  *)
 (* no secret by its type), grant expiry and a stored grant that no longer  *)
-(* verifies at start, the approved-workspace set (a refusal is one         *)
-(* nondeterministic step), the two limit ids (one limit here), the         *)
-(* `admin.<kind>.<id>` values of workspace, capability and directory       *)
-(* changes (nothing reads them at start), set_relay, cancel_task, access   *)
-(* groups, and the two store writes of save_policy_settings_in_store,      *)
-(* which are one step here. A live revoke does not fail.                   *)
+(* verifies at start, the two limit ids and the two task limits of the     *)
+(* policy (one limit here), the `admin.<kind>.<id>` values of workspace,   *)
+(* capability, directory and policy changes (nothing reads them at         *)
+(* start), set_relay, cancel_task, access groups, and the store writes of  *)
+(* save_policy_settings_in_store, which are one step here. A live revoke   *)
+(* does not fail.                                                          *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
 
@@ -59,7 +66,9 @@ CONSTANTS
 
 None == "none"
 Actors == {"mcp", "ui"}
-Kinds == {"grant", "workspace", "limit", "capability", "directory"}
+\* "policy": the settings of UpdatePolicy, which wait as a pending change
+\* when they come from MCP and are wider than the stored policy.
+Kinds == {"grant", "workspace", "limit", "capability", "directory", "policy"}
 \* "lo": a direct invite grant (direct::grant_is_low_risk_invite). "hi":
 \* every other grant.
 GVals == {"lo", "hi"}
@@ -69,11 +78,13 @@ InitLimit == 2
 InitWs == "w1"
 
 \* The value of a change: `val` for a grant or a workspace, `num` for a
-\* limit. Capability and directory changes have one value.
+\* limit, both for the policy settings. Capability and directory changes
+\* have one value.
 ValsOf(kind) ==
     CASE kind = "grant" -> [val : GVals, num : {0}]
       [] kind = "workspace" -> [val : WVals, num : {0}]
       [] kind = "limit" -> [val : {None}, num : Limits]
+      [] kind = "policy" -> [val : WVals, num : Limits]
       [] OTHER -> [val : {None}, num : {0}]
 
 \* Change::is_high_risk.
@@ -81,7 +92,7 @@ HighRisk(kind, v) ==
     \/ kind = "grant" /\ v.val = "hi"
     \/ kind \in {"workspace", "capability"}
 
-Pcs == {"idle", "live", "ws_cur", "record", "revert", "rv_live", "rv_record"}
+Pcs == {"idle", "live", "revert", "undo", "rv_live"}
 
 VARIABLES
     mode,        \* "serve": a node runs in the process; "admin": none
@@ -105,21 +116,17 @@ VARIABLES
     wsOk,        \* workspaces that a UI action asked for or confirmed
     limOk,       \* the highest limit that a UI action asked for
     capOk,       \* a UI action confirmed a capability
-    wsPol,       \* workspaces that MCP saved with UpdatePolicy
-    limPol,      \* the highest limit that MCP saved with UpdatePolicy
     dead,        \* grants revoked, with no new apply of the id since
-    applies,     \* changes and revokes that reached the node
-    lost,        \* a live apply whose revision was not recorded
-    auditLost,   \* an apply or revoke whose audit record was not written
-    faulted,     \* a store write failed since the process started
+    applies,     \* changes, revokes and policy saves that took effect
     mcpRevived,  \* MCP applied a grant id that the owner had revoked
     staleConfirmed, \* a confirm passed although a change landed after the queue
-    otherConfirmed  \* the same, for a revoke or a policy save
+    otherConfirmed, \* the same, for a revoke or a policy save
+    expiredApplied  \* a confirm applied an expired change
 
 store == <<durGrant, durLimit, curWs, pol, revoked, pending, drev, audits>>
 node == <<liveGrant, liveLimit, liveWs, liveCap>>
-approvals == <<grOk, wsOk, limOk, capOk, wsPol, limPol>>
-flags == <<lost, auditLost, faulted, mcpRevived, staleConfirmed, otherConfirmed>>
+approvals == <<grOk, wsOk, limOk, capOk>>
+flags == <<mcpRevived, staleConfirmed, otherConfirmed, expiredApplied>>
 vars == <<mode, op, store, mrev, node, nOps, restarts, approvals, dead,
           applies, flags>>
 
@@ -127,7 +134,7 @@ NoPending == [kind |-> None, val |-> None, num |-> 0, base |-> 0,
               expired |-> FALSE, landed |-> "no"]
 Idle == [pc |-> "idle", actor |-> "ui", kind |-> "grant",
          id |-> CHOOSE i \in Ids : TRUE, val |-> None, num |-> 0,
-         prevVal |-> None, prevNum |-> 0]
+         prevVal |-> None, prevNum |-> 0, prevCur |-> None]
 
 Max(a, b) == IF a >= b THEN a ELSE b
 
@@ -135,7 +142,8 @@ TypeOK ==
     /\ mode \in {"serve", "admin"}
     /\ op \in [pc : Pcs, actor : Actors, kind : Kinds, id : Ids,
                val : GVals \cup WVals \cup {None}, num : 0..3,
-               prevVal : GVals \cup {None}, prevNum : 0..3]
+               prevVal : GVals \cup {None}, prevNum : 0..3,
+               prevCur : WVals \cup {None}]
     /\ durGrant \in [Ids -> GVals \cup {None}]
     /\ durLimit \in 0..3
     /\ curWs \in WVals \cup {None}
@@ -153,13 +161,12 @@ TypeOK ==
     /\ audits \in 0..MaxOps /\ applies \in 0..MaxOps
     /\ nOps \in 0..MaxOps /\ restarts \in 0..MaxRestarts
     /\ grOk \subseteq Ids \X GVals
-    /\ wsOk \subseteq WVals /\ wsPol \subseteq WVals
-    /\ limOk \in Limits /\ limPol \in 0..3
+    /\ wsOk \subseteq WVals
+    /\ limOk \in Limits
     /\ capOk \in BOOLEAN
     /\ dead \subseteq Ids
-    /\ lost \in BOOLEAN /\ auditLost \in BOOLEAN /\ faulted \in BOOLEAN
     /\ mcpRevived \in BOOLEAN /\ staleConfirmed \in BOOLEAN
-    /\ otherConfirmed \in BOOLEAN
+    /\ otherConfirmed \in BOOLEAN /\ expiredApplied \in BOOLEAN
 
 \* node_builder: the grants that a node start makes live. The policy file
 \* grants without the revoked ones, then each stored grant, which replaces
@@ -185,12 +192,12 @@ Init ==
     /\ liveCap = FALSE
     /\ audits = 0 /\ applies = 0 /\ nOps = 0 /\ restarts = 0
     /\ grOk = FileIds \X {"hi"}
-    /\ wsOk = {InitWs} /\ wsPol = {}
-    /\ limOk = InitLimit /\ limPol = 0
+    /\ wsOk = {InitWs}
+    /\ limOk = InitLimit
     /\ capOk = FALSE
     /\ dead = {}
-    /\ lost = FALSE /\ auditLost = FALSE /\ faulted = FALSE
-    /\ mcpRevived = FALSE /\ staleConfirmed = FALSE /\ otherConfirmed = FALSE
+    /\ mcpRevived = FALSE /\ staleConfirmed = FALSE
+    /\ otherConfirmed = FALSE /\ expiredApplied = FALSE
 
 Fault == StoreFaults
 
@@ -203,30 +210,35 @@ Landed(p, what) ==
 \* What a UI action approves (ghost).
 Approve(kind, id, v) ==
     /\ grOk' = IF kind = "grant" THEN grOk \cup {<<id, v.val>>} ELSE grOk
-    /\ wsOk' = IF kind = "workspace" THEN wsOk \cup {v.val} ELSE wsOk
-    /\ limOk' = IF kind = "limit" THEN Max(limOk, v.num) ELSE limOk
+    /\ wsOk' = IF kind \in {"workspace", "policy"} THEN wsOk \cup {v.val}
+               ELSE wsOk
+    /\ limOk' = IF kind \in {"limit", "policy"} THEN Max(limOk, v.num)
+                ELSE limOk
     /\ capOk' = (capOk \/ kind = "capability")
-    /\ UNCHANGED <<wsPol, limPol>>
 
 -----------------------------------------------------------------------------
-(* A change request: the socket's `Change` (MCP), or a UI action that      *)
-(* applies a change (the invite page, the consent page, the hub workers).  *)
+(* A change request: the socket's `Change` and `UpdatePolicy` (MCP), or a  *)
+(* UI action that applies a change (the invite page, the consent page,     *)
+(* the hub workers, the policy form).                                      *)
 
 \* change_requires_confirmation. A limit from MCP is free only when the
-\* live node reads a limit that is not lower.
+\* live node reads a limit that is not lower. Policy settings from MCP are
+\* free only when they keep the workspace and raise no limit
+\* (policy_is_wider).
 NeedsConfirmation(actor, kind, v) ==
     /\ actor = "mcp"
-    /\ IF kind = "limit"
-       THEN ~(mode = "serve" /\ v.num <= liveLimit)
-       ELSE HighRisk(kind, v)
+    /\ CASE kind = "limit" -> ~(mode = "serve" /\ v.num <= liveLimit)
+         [] kind = "policy" -> v.val # pol.ws \/ v.num > pol.limit
+         [] OTHER -> HighRisk(kind, v)
 
-\* Administration::apply -> queue_pending -> queue_change. The row's key is
-\* the id alone, so a second row for the id is a store error.
+\* Administration::apply or save_policy_settings -> queue_pending ->
+\* queue_change. The row's key is the id alone, so a second row for the id
+\* is a store error; delete_expired first removes a row that expired.
 Queue(actor, kind, id, v) ==
     /\ op.pc = "idle" /\ nOps < MaxOps
     /\ NeedsConfirmation(actor, kind, v)
     /\ nOps' = nOps + 1
-    /\ IF pending[id].kind = None
+    /\ IF pending[id].kind = None \/ pending[id].expired
        THEN \/ pending' = [pending EXCEPT ![id] =
                              [kind |-> kind, val |-> v.val, num |-> v.num,
                               base |-> mrev, expired |-> FALSE, landed |-> "no"]]
@@ -235,161 +247,169 @@ Queue(actor, kind, id, v) ==
     /\ UNCHANGED <<mode, op, durGrant, durLimit, curWs, pol, revoked, drev,
                    audits, mrev, node, restarts, approvals, dead, applies, flags>>
 
-\* Administration::apply -> apply_now, first half: apply_change keeps the
-\* value in the store and returns the value that it replaced.
+\* apply_change and confirm_pending_change -> keep_change: one transaction
+\* keeps the value, the current workspace of a workspace change, the new
+\* revision and the audit record. The revision in memory follows at once.
+\* `p` is the pending table without the row that a confirm removes.
+Keep(actor, kind, id, v, p) ==
+    /\ op' = [pc |-> "live", actor |-> actor, kind |-> kind, id |-> id,
+              val |-> v.val, num |-> v.num,
+              prevVal |-> IF kind = "grant" THEN durGrant[id] ELSE None,
+              prevNum |-> IF kind = "limit" THEN durLimit ELSE 0,
+              prevCur |-> curWs]
+    /\ durGrant' = IF kind = "grant" THEN [durGrant EXCEPT ![id] = v.val]
+                   ELSE durGrant
+    /\ durLimit' = IF kind = "limit" THEN v.num ELSE durLimit
+    /\ curWs' = IF kind = "workspace" THEN v.val ELSE curWs
+    /\ drev' = mrev + 1 /\ mrev' = mrev + 1
+    /\ audits' = audits + 1
+    /\ pending' = Landed(p, "change")
+    /\ dead' = IF kind = "grant" THEN dead \ {id} ELSE dead
+
+\* check_live: the running node refuses a workspace (not approved, or not
+\* a folder) before the store has it.
+WorkspaceRefused(kind) == kind = "workspace" /\ mode = "serve"
+
+\* Administration::apply -> apply_now, up to the store transaction. Policy
+\* settings that need no confirmation go to SavePolicy.
 ApplyNow(actor, kind, id, v) ==
     /\ op.pc = "idle" /\ nOps < MaxOps
+    /\ kind # "policy"
     /\ ~NeedsConfirmation(actor, kind, v)
     /\ nOps' = nOps + 1
-    /\ \/ /\ op' = [pc |-> "live", actor |-> actor, kind |-> kind, id |-> id,
-                    val |-> v.val, num |-> v.num,
-                    prevVal |-> IF kind = "grant" THEN durGrant[id] ELSE None,
-                    prevNum |-> IF kind = "limit" THEN durLimit ELSE 0]
-          /\ durGrant' = IF kind = "grant" THEN [durGrant EXCEPT ![id] = v.val]
-                         ELSE durGrant
-          /\ durLimit' = IF kind = "limit" THEN v.num ELSE durLimit
-          /\ dead' = IF kind = "grant" THEN dead \ {id} ELSE dead
+    /\ \/ /\ Keep(actor, kind, id, v, pending)
           /\ mcpRevived' = (mcpRevived \/ (actor = "mcp" /\ kind = "grant"
                                            /\ id \in revoked))
           /\ IF actor = "ui" THEN Approve(kind, id, v) ELSE UNCHANGED approvals
-       \/ /\ Fault
-          /\ UNCHANGED <<op, durGrant, durLimit, dead, mcpRevived, approvals>>
-    /\ UNCHANGED <<mode, curWs, pol, revoked, pending, drev, audits, mrev, node,
-                   restarts, applies, lost, auditLost, faulted, staleConfirmed,
-                   otherConfirmed>>
+       \/ /\ Fault \/ WorkspaceRefused(kind)
+          /\ UNCHANGED <<op, durGrant, durLimit, curWs, drev, mrev, audits,
+                         pending, dead, mcpRevived, approvals>>
+    /\ UNCHANGED <<mode, pol, revoked, node, restarts, applies,
+                   staleConfirmed, otherConfirmed, expiredApplied>>
 
 \* Administration::confirm_ui -> confirm_pending: only the UI calls it.
 \* check_not_stale compares the revision of the queue with the revision in
-\* memory. confirm_pending_change refuses an expired row; else it keeps
-\* the value and deletes the row in one transaction.
+\* memory. confirm_pending_change refuses an expired row and removes it;
+\* else it keeps the value and deletes the row in one transaction.
 Confirm(id) ==
     /\ op.pc = "idle" /\ nOps < MaxOps
     /\ pending[id].kind # None
     /\ nOps' = nOps + 1
     /\ LET p == pending[id]
            v == [val |-> p.val, num |-> p.num]
-       IN IF p.base # mrev \/ p.expired
-          THEN UNCHANGED <<op, durGrant, durLimit, pending, dead, approvals,
-                           staleConfirmed, otherConfirmed>>
-          ELSE \/ /\ op' = [pc |-> "live", actor |-> "ui", kind |-> p.kind,
-                            id |-> id, val |-> p.val, num |-> p.num,
-                            prevVal |-> IF p.kind = "grant" THEN durGrant[id]
-                                        ELSE None,
-                            prevNum |-> IF p.kind = "limit" THEN durLimit ELSE 0]
-                  /\ durGrant' = IF p.kind = "grant"
-                                 THEN [durGrant EXCEPT ![id] = p.val] ELSE durGrant
-                  /\ durLimit' = IF p.kind = "limit" THEN p.num ELSE durLimit
+           nothing == UNCHANGED <<op, durGrant, durLimit, curWs, drev, mrev,
+                                  audits, pending, dead, approvals,
+                                  staleConfirmed, otherConfirmed,
+                                  expiredApplied>>
+       IN IF p.base # mrev
+          THEN nothing
+          ELSE IF p.expired
+          THEN \/ nothing
+               \/ /\ ~WorkspaceRefused(p.kind)
                   /\ pending' = [pending EXCEPT ![id] = NoPending]
-                  /\ dead' = IF p.kind = "grant" THEN dead \ {id} ELSE dead
+                  /\ UNCHANGED <<op, durGrant, durLimit, curWs, drev, mrev,
+                                 audits, dead, approvals, staleConfirmed,
+                                 otherConfirmed, expiredApplied>>
+          ELSE \/ /\ Keep("ui", p.kind, id, v,
+                          [pending EXCEPT ![id] = NoPending])
                   /\ Approve(p.kind, id, v)
                   /\ staleConfirmed' = (staleConfirmed \/ p.landed = "change")
                   /\ otherConfirmed' = (otherConfirmed \/ p.landed = "other")
-               \/ /\ Fault
-                  /\ UNCHANGED <<op, durGrant, durLimit, pending, dead,
-                                 approvals, staleConfirmed, otherConfirmed>>
-    /\ UNCHANGED <<mode, curWs, pol, revoked, drev, audits, mrev, node,
-                   restarts, applies, lost, auditLost, faulted, mcpRevived>>
+                  /\ expiredApplied' = (expiredApplied \/ p.expired)
+               \/ (Fault \/ WorkspaceRefused(p.kind)) /\ nothing
+    /\ UNCHANGED <<mode, pol, revoked, node, restarts, applies, mcpRevived>>
 
-\* The live value is in the node: apply_live adds one to the revision in
-\* memory.
+\* The node, or the stored policy, has the change.
 LiveDone ==
-    /\ mrev' = mrev + 1
     /\ applies' = applies + 1
-    /\ pending' = Landed(pending, "change")
-    /\ op' = [op EXCEPT !.pc = "record"]
+    /\ op' = Idle
 
-\* finish_live -> apply_live -> apply_live_inner. Without a live node, a
-\* grant, a limit and a workspace count as applied; a directory and a
-\* capability change are unsupported. The node can refuse a grant (it does
-\* not verify), a workspace (not approved), a directory and a capability.
+\* finish_live -> apply_live. Without a live node, a grant, a limit and a
+\* workspace count as applied; a directory and a capability change are
+\* unsupported. The node can refuse a grant (it does not verify), a
+\* workspace (the folder went away after check_live), a directory and a
+\* capability. Policy settings go to the stored policy
+\* (save_policy_settings_in_store), which also removes the stored limit;
+\* the running node keeps its settings until it starts again.
 ApplyLive ==
     /\ op.pc = "live"
     /\ LET refuse == /\ op' = [op EXCEPT !.pc = "revert"]
-                     /\ UNCHANGED <<mrev, applies, pending, node>>
+                     /\ UNCHANGED <<applies, node, pol, durLimit>>
        IN CASE op.kind = "grant" ->
                  \/ /\ LiveDone
                     /\ liveGrant' = IF mode = "serve"
                                     THEN [liveGrant EXCEPT ![op.id] = op.val]
                                     ELSE liveGrant
-                    /\ UNCHANGED <<liveLimit, liveWs, liveCap>>
+                    /\ UNCHANGED <<liveLimit, liveWs, liveCap, pol, durLimit>>
                  \/ mode = "serve" /\ refuse
             [] op.kind = "limit" ->
                  /\ LiveDone
                  /\ liveLimit' = IF mode = "serve" THEN op.num ELSE liveLimit
-                 /\ UNCHANGED <<liveGrant, liveWs, liveCap>>
+                 /\ UNCHANGED <<liveGrant, liveWs, liveCap, pol, durLimit>>
             [] op.kind = "workspace" ->
-                 \/ /\ liveWs' = IF mode = "serve" THEN op.val ELSE liveWs
-                    /\ op' = [op EXCEPT !.pc = "ws_cur"]
-                    /\ UNCHANGED <<mrev, applies, pending, liveGrant, liveLimit,
-                                   liveCap>>
+                 \/ /\ LiveDone
+                    /\ liveWs' = IF mode = "serve" THEN op.val ELSE liveWs
+                    /\ UNCHANGED <<liveGrant, liveLimit, liveCap, pol, durLimit>>
                  \/ mode = "serve" /\ refuse
             [] op.kind = "capability" ->
                  \/ /\ mode = "serve"
                     /\ LiveDone
                     /\ liveCap' = TRUE
-                    /\ UNCHANGED <<liveGrant, liveLimit, liveWs>>
+                    /\ UNCHANGED <<liveGrant, liveLimit, liveWs, pol, durLimit>>
                  \/ refuse
+            [] op.kind = "policy" ->
+                 \/ /\ LiveDone
+                    /\ pol' = [ws |-> op.val, limit |-> op.num]
+                    /\ durLimit' = 0
+                    /\ UNCHANGED node
+                 \/ Fault /\ refuse
             [] OTHER ->
-                 \/ mode = "serve" /\ LiveDone /\ UNCHANGED node
+                 \/ mode = "serve" /\ LiveDone /\ UNCHANGED <<node, pol, durLimit>>
                  \/ refuse
-    /\ UNCHANGED <<mode, durGrant, durLimit, curWs, pol, revoked, drev, audits,
+    /\ UNCHANGED <<mode, durGrant, curWs, revoked, pending, drev, audits, mrev,
                    nOps, restarts, approvals, dead, flags>>
 
-\* apply_live_inner, the workspace branch after the node moved:
-\* set_current_workspace. When it fails, finish_live reverts the store
-\* value, but the node keeps the new workspace.
-SetCurrentWorkspace ==
-    /\ op.pc = "ws_cur"
-    /\ \/ /\ curWs' = op.val
-          /\ LiveDone
-          /\ UNCHANGED faulted
-       \/ /\ Fault
-          /\ faulted' = TRUE
-          /\ op' = [op EXCEPT !.pc = "revert"]
-          /\ UNCHANGED <<curWs, mrev, applies, pending>>
-    /\ UNCHANGED <<mode, durGrant, durLimit, pol, revoked, drev, audits, node,
-                   nOps, restarts, approvals, dead, lost, auditLost, mcpRevived,
-                   staleConfirmed, otherConfirmed>>
-
-\* finish_live, the success branch: record_applied_change writes the new
-\* revision and the audit record in one transaction.
-Record ==
-    /\ op.pc = "record"
+\* revert_change: one transaction puts back the value and the current
+\* workspace that the change replaced and marks the audit record as
+\* failed. The revision stays.
+PutBack ==
+    /\ durGrant' = IF op.kind = "grant"
+                   THEN [durGrant EXCEPT ![op.id] = op.prevVal]
+                   ELSE durGrant
+    /\ durLimit' = IF op.kind = "limit" THEN op.prevNum ELSE durLimit
+    /\ curWs' = IF op.kind = "workspace" THEN op.prevCur ELSE curWs
+    /\ audits' = audits - 1
     /\ op' = Idle
-    /\ \/ /\ drev' = mrev
-          /\ audits' = audits + 1
-          /\ UNCHANGED <<lost, auditLost, faulted>>
-       \/ /\ Fault
-          /\ lost' = TRUE /\ auditLost' = TRUE /\ faulted' = TRUE
-          /\ UNCHANGED <<drev, audits>>
-    /\ UNCHANGED <<mode, durGrant, durLimit, curWs, pol, revoked, pending, mrev,
-                   node, nOps, restarts, approvals, dead, applies, mcpRevived,
-                   staleConfirmed, otherConfirmed>>
 
-\* finish_live, the failure branch: revert_change puts back the value that
-\* the change replaced.
+\* finish_live, the failure branch. When the store fails, the
+\* Administration keeps the undo.
 Revert ==
     /\ op.pc = "revert"
-    /\ op' = Idle
-    /\ \/ /\ durGrant' = IF op.kind = "grant"
-                         THEN [durGrant EXCEPT ![op.id] = op.prevVal]
-                         ELSE durGrant
-          /\ durLimit' = IF op.kind = "limit" THEN op.prevNum ELSE durLimit
-          /\ UNCHANGED faulted
+    /\ \/ PutBack
        \/ /\ Fault
-          /\ faulted' = TRUE
-          /\ UNCHANGED <<durGrant, durLimit>>
-    /\ UNCHANGED <<mode, curWs, pol, revoked, pending, drev, audits, mrev, node,
-                   nOps, restarts, approvals, dead, applies, lost, auditLost,
-                   mcpRevived, staleConfirmed, otherConfirmed>>
+          /\ op' = [op EXCEPT !.pc = "undo"]
+          /\ UNCHANGED <<durGrant, durLimit, curWs, audits>>
+    /\ UNCHANGED <<mode, pol, revoked, pending, drev, mrev, node, nOps,
+                   restarts, approvals, dead, applies, flags>>
+
+\* Administration::settle: the next request, of any kind, first tries the
+\* undo again, and is refused when the store fails again.
+Settle ==
+    /\ op.pc = "undo" /\ nOps < MaxOps
+    /\ nOps' = nOps + 1
+    /\ \/ PutBack
+       \/ Fault /\ UNCHANGED <<op, durGrant, durLimit, curWs, audits>>
+    /\ UNCHANGED <<mode, pol, revoked, pending, drev, mrev, node, restarts,
+                   approvals, dead, applies, flags>>
 
 -----------------------------------------------------------------------------
 (* Revoke and the policy settings.                                         *)
 
 \* Administration::revoke -> revoke_inner, first half:
-\* revoke_applied_grant removes the stored grant and keeps the mark. A
-\* process without a node refuses. The socket's RevokeGrant (MCP) asks
-\* first that the live policy has the grant.
+\* revoke_applied_grant removes the stored grant, keeps the mark and writes
+\* the audit record in one transaction. A process without a node refuses.
+\* The socket's RevokeGrant (MCP) asks first that the live policy has the
+\* grant.
 Revoke(actor, id) ==
     /\ op.pc = "idle" /\ nOps < MaxOps
     /\ mode = "serve"
@@ -397,9 +417,10 @@ Revoke(actor, id) ==
     /\ nOps' = nOps + 1
     /\ \/ /\ revoked' = revoked \cup {id}
           /\ durGrant' = [durGrant EXCEPT ![id] = None]
+          /\ audits' = audits + 1
           /\ op' = [Idle EXCEPT !.pc = "rv_live", !.actor = actor, !.id = id]
-       \/ Fault /\ UNCHANGED <<revoked, durGrant, op>>
-    /\ UNCHANGED <<mode, durLimit, curWs, pol, pending, drev, audits, mrev, node,
+       \/ Fault /\ UNCHANGED <<revoked, durGrant, audits, op>>
+    /\ UNCHANGED <<mode, durLimit, curWs, pol, pending, drev, mrev, node,
                    restarts, approvals, dead, applies, flags>>
 
 \* revoke_inner: LiveNode::revoke_grant. It does not change the revision.
@@ -409,52 +430,40 @@ RevokeLive ==
     /\ dead' = dead \cup {op.id}
     /\ applies' = applies + 1
     /\ pending' = Landed(pending, "other")
-    /\ op' = [op EXCEPT !.pc = "rv_record"]
+    /\ op' = Idle
     /\ UNCHANGED <<mode, durGrant, durLimit, curWs, pol, revoked, drev, audits,
                    mrev, liveLimit, liveWs, liveCap, nOps, restarts, approvals,
                    flags>>
 
-\* revoke_inner: record_change.
-RevokeRecord ==
-    /\ op.pc = "rv_record"
-    /\ op' = Idle
-    /\ \/ audits' = audits + 1 /\ UNCHANGED <<auditLost, faulted>>
-       \/ Fault /\ auditLost' = TRUE /\ faulted' = TRUE /\ UNCHANGED audits
-    /\ UNCHANGED <<mode, durGrant, durLimit, curWs, pol, revoked, pending, drev,
-                   mrev, node, nOps, restarts, approvals, dead, applies, lost,
-                   mcpRevived, staleConfirmed, otherConfirmed>>
-
-\* The socket's UpdatePolicy (MCP, the tool aether.settings.update_policy)
-\* and the UI's policy form -> Administration::save_policy_settings ->
-\* save_policy_settings_in_store. It keeps the workspace and the limit in
-\* the stored policy and removes the stored limit of `aether.change`. No
-\* actor needs a confirmation. The running node keeps its settings until
-\* it starts again.
-UpdatePolicy(actor, w, l) ==
+\* The UI's policy form, or the socket's UpdatePolicy (MCP, the tool
+\* aether.settings.update_policy) with settings that are not wider ->
+\* Administration::save_policy_settings -> save_policy_settings_in_store.
+\* The audit record is written first (record_change); when the save fails,
+\* fail_change marks it, and when that fails too the record stays. The
+\* save keeps the workspace and the limit in the stored policy and removes
+\* the stored limit of `aether.change`. The running node keeps its
+\* settings until it starts again.
+SavePolicy(actor, v) ==
     /\ op.pc = "idle" /\ nOps < MaxOps
+    /\ ~NeedsConfirmation(actor, "policy", v)
     /\ nOps' = nOps + 1
-    /\ \/ /\ pol' = [ws |-> w, limit |-> l]
+    /\ \/ /\ pol' = [ws |-> v.val, limit |-> v.num]
           /\ durLimit' = 0
+          /\ audits' = audits + 1
           /\ applies' = applies + 1
           /\ pending' = Landed(pending, "other")
-          /\ IF actor = "ui"
-             THEN /\ wsOk' = wsOk \cup {w} /\ limOk' = Max(limOk, l)
-                  /\ UNCHANGED <<wsPol, limPol>>
-             ELSE /\ wsPol' = wsPol \cup {w} /\ limPol' = Max(limPol, l)
-                  /\ UNCHANGED <<wsOk, limOk>>
-          /\ \/ audits' = audits + 1 /\ UNCHANGED <<auditLost, faulted>>
-             \/ Fault /\ auditLost' = TRUE /\ faulted' = TRUE /\ UNCHANGED audits
+          /\ IF actor = "ui" THEN Approve("policy", op.id, v)
+             ELSE UNCHANGED approvals
        \/ /\ Fault
-          /\ UNCHANGED <<pol, durLimit, applies, pending, wsOk, limOk, wsPol,
-                         limPol, audits, auditLost, faulted>>
+          /\ audits' \in {audits, audits + 1}
+          /\ UNCHANGED <<pol, durLimit, applies, pending, approvals>>
     /\ UNCHANGED <<mode, op, durGrant, curWs, revoked, drev, mrev, node,
-                   restarts, grOk, capOk, dead, lost, mcpRevived,
-                   staleConfirmed, otherConfirmed>>
+                   restarts, dead, flags>>
 
 -----------------------------------------------------------------------------
 (* The environment.                                                        *)
 
-\* 300 s pass after the queue. No function deletes an expired row.
+\* 300 s pass after the queue.
 Expire(id) ==
     /\ pending[id].kind # None /\ ~pending[id].expired
     /\ pending' = [pending EXCEPT ![id].expired = TRUE]
@@ -464,39 +473,32 @@ Expire(id) ==
 
 \* The process stops at any step and starts again, with or without a
 \* node. Administration::with_store reads the stored revision. A node
-\* start replays the store (node_builder). A stop between the live apply
-\* and record_applied_change loses the new revision and the audit record.
+\* start replays the store (node_builder), so it has a change that was
+\* stored and not yet live, and an undo that was not done.
 Restart(m) ==
     /\ restarts < MaxRestarts
     /\ restarts' = restarts + 1
     /\ mode' = m
     /\ op' = Idle
     /\ mrev' = drev
-    /\ lost' = (lost \/ op.pc = "record")
-    /\ auditLost' = (auditLost \/ op.pc \in {"record", "rv_record"})
-    /\ faulted' = FALSE
     /\ liveGrant' = [id \in Ids |-> IF m = "serve" THEN StartGrant(id) ELSE None]
     /\ liveLimit' = IF durLimit # 0 THEN durLimit ELSE pol.limit
     /\ liveWs' = IF curWs # None THEN curWs ELSE pol.ws
     /\ liveCap' = FALSE
-    /\ UNCHANGED <<store, nOps, approvals, dead, applies, mcpRevived,
-                   staleConfirmed, otherConfirmed>>
+    /\ UNCHANGED <<store, nOps, approvals, dead, applies, flags>>
 
 Next ==
     \/ \E actor \in Actors, kind \in Kinds, id \in Ids :
          \E v \in ValsOf(kind) :
             Queue(actor, kind, id, v) \/ ApplyNow(actor, kind, id, v)
+    \/ \E actor \in Actors : \E v \in ValsOf("policy") : SavePolicy(actor, v)
     \/ \E id \in Ids : Confirm(id) \/ Expire(id)
     \/ \E actor \in Actors, id \in Ids : Revoke(actor, id)
-    \/ \E actor \in Actors, w \in WVals, l \in Limits : UpdatePolicy(actor, w, l)
-    \/ ApplyLive \/ SetCurrentWorkspace \/ Record \/ Revert
-    \/ RevokeLive \/ RevokeRecord
+    \/ ApplyLive \/ Revert \/ Settle \/ RevokeLive
     \/ \E m \in {"serve", "admin"} : Restart(m)
 
 \* A request that started goes on to its end.
-Fairness ==
-    /\ WF_vars(ApplyLive) /\ WF_vars(SetCurrentWorkspace) /\ WF_vars(Record)
-    /\ WF_vars(Revert) /\ WF_vars(RevokeLive) /\ WF_vars(RevokeRecord)
+Fairness == WF_vars(ApplyLive) /\ WF_vars(Revert) /\ WF_vars(RevokeLive)
 
 Spec == Init /\ [][Next]_vars /\ Fairness
 
@@ -515,75 +517,51 @@ HighRiskGrantNeedsUi ==
 CapabilityNeedsUi == liveCap => capOk
 
 \* A pending change is not in force: its value reaches the store and the
-\* node only through Confirm. The workspace that a change made live, and
-\* the stored limit, come from a UI action, or the limit is not higher
-\* than a limit that the node already had.
-ChangeNeedsUi ==
+\* node only through Confirm. The stored workspace, the stored limit and
+\* the stored policy come from a UI action, or the limit is not higher
+\* than a limit that a UI action asked for.
+StoredFromUi ==
     /\ curWs # None => curWs \in wsOk
-    /\ durLimit <= Max(limOk, limPol)
+    /\ durLimit <= limOk
+    /\ pol.ws \in wsOk /\ pol.limit <= limOk
 
-\* The live workspace and limit come from a UI action or from a saved
-\* policy (UpdatePolicy), from the UI or from MCP.
-LiveFromUiOrPolicy ==
-    /\ liveWs \in wsOk \cup wsPol
-    /\ liveLimit <= Max(limOk, limPol)
+\* The live workspace and limit come from a UI action only. An MCP client
+\* moves the workspace or raises the limit neither with a change nor with
+\* UpdatePolicy and a node start.
+LiveFromUi ==
+    /\ liveWs \in wsOk
+    /\ liveLimit <= limOk
 
-\* After each complete request, the node and the store agree, unless a
-\* store write failed since the process started.
+\* When no request runs and no undo waits, the node and the store agree,
+\* also after a store write failed.
 Agree ==
     /\ \A id \in Ids : liveGrant[id] = StartGrant(id)
     /\ curWs # None => liveWs = curWs
     /\ durLimit # 0 => liveLimit = durLimit
-LiveMatchesStore ==
-    (mode = "serve" /\ op.pc = "idle" /\ ~faulted) => Agree
+LiveMatchesStore == (mode = "serve" /\ op.pc = "idle") => Agree
 
 \* A revoked grant is not live and not in the store, and a node start does
 \* not bring it back, until someone applies a grant with that id again.
 RevokedStaysOut ==
     \A id \in dead : liveGrant[id] = None /\ durGrant[id] = None
 
-\* A confirmation is refused when another change was applied after the
-\* queue, as long as each applied change recorded its revision.
-StaleRefusedWhileRecorded == staleConfirmed => lost
+\* A confirmation is refused when another change was stored after the
+\* queue, also when the process stopped before the node had that change.
+StaleRefused == ~staleConfirmed
 
-\* Each change that reached the node has one `applied` audit record, as
-\* long as each record was written.
-AuditedWhileRecorded ==
-    /\ audits <= applies
-    /\ (op.pc = "idle" /\ ~auditLost) => audits = applies
+\* Each change, revoke and policy save that took effect has an `applied`
+\* audit record, which the store had no later than the change.
+Audited == applies <= audits
 
-\* A pending row that expired never changes (but for the ghost `landed`)
-\* and never leaves the table:
-\* only confirm_pending_change deletes a row, and it refuses this one. The
-\* row's key is the id, so no change with this id can be queued again (see
-\* Queue).
-ExpiredRowStays ==
-    [][\A id \in Ids :
-         (pending[id].kind # None /\ pending[id].expired)
-            => [pending'[id] EXCEPT !.landed = "no"]
-                 = [pending[id] EXCEPT !.landed = "no"]]_vars
+\* A confirmation never applies an expired change. An expired row leaves
+\* at the next confirm of its id or at the next queue (see Queue and
+\* Confirm), so its id is free again.
+ExpiredNeverApplies == ~expiredApplied
 
 (***************************************************************************)
 (* Properties that TLC finds false. They are not in PendingChange.cfg;     *)
 (* each comment gives the counterexample.                                  *)
 (***************************************************************************)
-
-\* FALSE: the live workspace and limit come from a UI action only.
-\* UpdatePolicy("mcp", w2, 3), Restart("serve"): the node starts in w2
-\* with the limit 3. admin_socket.rs gives UpdatePolicy to
-\* save_policy_settings with no confirmation, and node_builder reads the
-\* stored policy at start. An `aether.change` for the same workspace or
-\* limit waits for the UI.
-LiveFromUi ==
-    /\ liveWs \in wsOk
-    /\ liveLimit <= limOk
-
-\* FALSE: a stale confirmation is always refused. MCP queues a change at
-\* revision 0; the UI applies another change; the process stops after
-\* apply_live and before record_applied_change; it starts again with the
-\* stored revision 0, and Confirm passes. The store value of the other
-\* change was written first, so a node start makes it live.
-StaleRefused == ~staleConfirmed
 
 \* FALSE (by design): a revoke or a policy save after the queue makes the
 \* confirmation stale. Neither changes the revision.
@@ -595,23 +573,13 @@ StaleSeesRevoke == ~otherConfirmed
 \* The revoked mark only stops a grant of the policy file.
 NoMcpRevival == ~mcpRevived
 
-\* FALSE with a store fault: the node and the store agree after each
-\* complete request. (1) A workspace change moves the node, then
-\* set_current_workspace fails, and revert_change restores the store only.
-\* (2) The node refuses a grant and revert_change fails: the store keeps
-\* the grant, the caller reads an error, and the next start makes it live.
-LiveMatchesStoreAlways == (mode = "serve" /\ op.pc = "idle") => Agree
-
-\* FALSE with a store fault or a stop: each applied change has an audit
-\* record. record_applied_change runs after the node has the change.
-Audited == op.pc = "idle" => audits = applies
-
 (***************************************************************************)
 (* Liveness.                                                               *)
 (***************************************************************************)
 
-\* A request that holds the mutex ends: it is recorded or reverted, or the
-\* process stops.
-RequestEnds == (op.pc # "idle") ~> (op.pc = "idle")
+\* A request that holds the mutex ends: its change is in the node, or its
+\* value is put back or waits as an undo, or the process stops.
+RequestEnds ==
+    (op.pc \notin {"idle", "undo"}) ~> (op.pc \in {"idle", "undo"})
 
 =============================================================================

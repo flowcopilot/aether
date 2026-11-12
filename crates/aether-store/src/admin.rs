@@ -18,6 +18,8 @@ pub enum ChangeKind {
     Directory,
     Capability,
     Limit,
+    /// The policy settings that an MCP client asked to save.
+    Policy,
 }
 
 aether_core::named!(ChangeKind {
@@ -26,11 +28,18 @@ aether_core::named!(ChangeKind {
     Directory => "directory",
     Capability => "capability",
     Limit => "limit",
+    Policy => "policy",
 });
 
 impl ChangeKind {
-    const ALL: [Self; 5] =
-        [Self::Workspace, Self::Grant, Self::Directory, Self::Capability, Self::Limit];
+    const ALL: [Self; 6] = [
+        Self::Workspace,
+        Self::Grant,
+        Self::Directory,
+        Self::Capability,
+        Self::Limit,
+        Self::Policy,
+    ];
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -87,6 +96,18 @@ pub struct AuditRecord {
     pub result: AuditResult,
 }
 
+/// What an applied change replaced, so that [`NodeStore::revert_change`]
+/// can put it back.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct Replaced {
+    /// The value of the change's id; `None` when the change created it.
+    pub value: Option<String>,
+    /// The current workspace; read only for a workspace change.
+    workspace: Option<String>,
+    /// The audit record of the change.
+    audit: i64,
+}
+
 fn change_key(kind: ChangeKind, id: &str) -> String {
     format!("admin.{}.{id}", kind.as_str())
 }
@@ -113,15 +134,58 @@ const CURRENT_WORKSPACE_KEY: &str = "admin.current.workspace";
 /// revision is stale.
 const REVISION_KEY: &str = "admin.revision";
 
+/// Writes an audit record and returns its row id.
 fn audit(
     connection: &Connection,
     actor: AuditActor,
     result: AuditResult,
-) -> Result<(), StoreError> {
+) -> Result<i64, StoreError> {
     connection.execute(
         "INSERT INTO audit_records(actor_type,action,result,created_at) VALUES(?1,?2,?3,?4)",
         params![actor, AuditAction::Change, result, now()],
     )?;
+    Ok(connection.last_insert_rowid())
+}
+
+/// Keeps `value` as the applied change `id` of `kind`, with the admin
+/// `revision` that it moves the node to and its `applied` audit record. A
+/// workspace change also becomes the current workspace. The caller commits.
+fn keep_change(
+    transaction: &Connection,
+    kind: ChangeKind,
+    id: &str,
+    value: &str,
+    actor: AuditActor,
+    revision: u64,
+) -> Result<Replaced, StoreError> {
+    let key = change_key(kind, id);
+    let previous = config::get(transaction, &key)?;
+    config::put(transaction, &key, value)?;
+    let workspace = if kind == ChangeKind::Workspace {
+        let workspace = config::get(transaction, CURRENT_WORKSPACE_KEY)?;
+        config::put(transaction, CURRENT_WORKSPACE_KEY, value)?;
+        workspace
+    } else {
+        None
+    };
+    config::put(transaction, REVISION_KEY, &revision.to_string())?;
+    let audit = audit(transaction, actor, AuditResult::Applied)?;
+    Ok(Replaced { value: previous, workspace, audit })
+}
+
+/// Removes each expired pending change with its revision.
+fn delete_expired(transaction: &Connection) -> Result<(), StoreError> {
+    let expired = {
+        let mut statement = transaction
+            .prepare("SELECT id FROM pending_changes WHERE expires_at<=?1")?;
+        statement
+            .query_map([now()], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for id in expired {
+        transaction.execute("DELETE FROM pending_changes WHERE id=?1", [&id])?;
+        config::delete(transaction, &pending_revision_key(&id))?;
+    }
     Ok(())
 }
 
@@ -160,24 +224,29 @@ impl NodeStore {
         config::delete(&self.connection, &change_key(kind, id))
     }
 
-    /// Keeps `value` as the applied change `id` of `kind`, and returns the
-    /// value it replaced.
+    /// Keeps `value` as the applied change `id` of `kind` in one
+    /// transaction with the admin `revision` it moves the node to and its
+    /// audit record, and returns what it replaced. The caller applies the
+    /// change to the running node after this, so a process that stops in
+    /// between has the revision and the record, and its next start makes
+    /// the value live.
     pub fn apply_change(
         &mut self,
         kind: ChangeKind,
         id: &str,
         value: &str,
-    ) -> Result<Option<String>, StoreError> {
+        actor: AuditActor,
+        revision: u64,
+    ) -> Result<Replaced, StoreError> {
         let transaction = self.connection.transaction()?;
-        let key = change_key(kind, id);
-        let previous = config::get(&transaction, &key)?;
-        config::put(&transaction, &key, value)?;
+        let replaced = keep_change(&transaction, kind, id, value, actor, revision)?;
         transaction.commit()?;
-        Ok(previous)
+        Ok(replaced)
     }
 
     /// Queues the change `id` until the owner confirms it, with the admin
-    /// `revision` it was queued at.
+    /// `revision` it was queued at. An expired change leaves first, so that
+    /// its id is free again.
     pub fn queue_change(
         &mut self,
         kind: ChangeKind,
@@ -187,6 +256,7 @@ impl NodeStore {
         revision: u64,
     ) -> Result<(), StoreError> {
         let transaction = self.connection.transaction()?;
+        delete_expired(&transaction)?;
         transaction.execute(
             "INSERT INTO pending_changes(id,change_type,value,expires_at) VALUES(?1,?2,?3,?4)",
             params![id, kind, value, expires_at],
@@ -205,25 +275,21 @@ impl NodeStore {
             .transpose()
     }
 
+    /// Writes an audit record and returns its id for [`Self::fail_change`].
     pub fn record_change(
         &self,
         actor: AuditActor,
         result: AuditResult,
-    ) -> Result<(), StoreError> {
+    ) -> Result<i64, StoreError> {
         audit(&self.connection, actor, result)
     }
 
-    /// Records that `actor` applied a change live, which moved the admin
-    /// revision to `revision`.
-    pub fn record_applied_change(
-        &mut self,
-        actor: AuditActor,
-        revision: u64,
-    ) -> Result<(), StoreError> {
-        let transaction = self.connection.transaction()?;
-        config::put(&transaction, REVISION_KEY, &revision.to_string())?;
-        audit(&transaction, actor, AuditResult::Applied)?;
-        transaction.commit()?;
+    /// Marks the audit record `audit` as failed.
+    pub fn fail_change(&self, audit: i64) -> Result<(), StoreError> {
+        self.connection.execute(
+            "UPDATE audit_records SET result=?1 WHERE id=?2",
+            params![AuditResult::Failed, audit],
+        )?;
         Ok(())
     }
 
@@ -233,32 +299,44 @@ impl NodeStore {
             .map_or(Ok(0), |value| value.parse().map_err(|_| StoreError::InvalidState))
     }
 
-    /// Restores the value that an applied change replaced and records the
-    /// failure. `previous` is `None` when the change created the value.
+    /// Restores what the applied change `id` of `kind` replaced and marks
+    /// its audit record as failed. The admin revision stays: a pending
+    /// change that was queued before the attempt is stale.
     pub fn revert_change(
         &mut self,
         kind: ChangeKind,
         id: &str,
-        previous: Option<&str>,
-        actor: AuditActor,
+        replaced: &Replaced,
     ) -> Result<(), StoreError> {
         let key = change_key(kind, id);
         let transaction = self.connection.transaction()?;
-        match previous {
+        match &replaced.value {
             Some(value) => config::put(&transaction, &key, value)?,
             None => config::delete(&transaction, &key)?,
         }
-        audit(&transaction, actor, AuditResult::Failed)?;
+        if kind == ChangeKind::Workspace {
+            match &replaced.workspace {
+                Some(path) => config::put(&transaction, CURRENT_WORKSPACE_KEY, path)?,
+                None => config::delete(&transaction, CURRENT_WORKSPACE_KEY)?,
+            }
+        }
+        transaction.execute(
+            "UPDATE audit_records SET result=?1 WHERE id=?2",
+            params![AuditResult::Failed, replaced.audit],
+        )?;
         transaction.commit()?;
         Ok(())
     }
 
-    /// Applies the pending change `id` and returns the value it replaced.
-    /// An expired change is [`StoreError::InvalidState`].
+    /// Applies the pending change `id` as [`Self::apply_change`] does, in
+    /// one transaction with the removal of its row, and returns what it
+    /// replaced. An expired change is [`StoreError::InvalidState`], and it
+    /// leaves the table.
     pub fn confirm_pending_change(
         &mut self,
         id: &str,
-    ) -> Result<Option<String>, StoreError> {
+        revision: u64,
+    ) -> Result<Replaced, StoreError> {
         let transaction = self.connection.transaction()?;
         let (kind, value, expires_at): (ChangeKind, String, i64) = transaction
             .query_row(
@@ -269,16 +347,17 @@ impl NodeStore {
             .optional()?
             .ok_or(StoreError::NotFound)?;
         if expires_at <= now() {
+            delete_expired(&transaction)?;
+            transaction.commit()?;
             return Err(StoreError::InvalidState);
         }
-        let key = change_key(kind, id);
-        let previous = config::get(&transaction, &key)?;
-        config::put(&transaction, &key, &value)?;
         transaction.execute("DELETE FROM pending_changes WHERE id=?1", [id])?;
         config::delete(&transaction, &pending_revision_key(id))?;
         audit(&transaction, AuditActor::Ui, AuditResult::Confirmed)?;
+        let replaced =
+            keep_change(&transaction, kind, id, &value, AuditActor::Ui, revision)?;
         transaction.commit()?;
-        Ok(previous)
+        Ok(replaced)
     }
 
     pub fn pending_changes(&self) -> Result<Vec<PendingChange>, StoreError> {
@@ -305,11 +384,17 @@ impl NodeStore {
             .ok_or(StoreError::NotFound)
     }
 
-    /// Removes the applied grant `id` and marks it revoked.
-    pub fn revoke_applied_grant(&mut self, id: &str) -> Result<(), StoreError> {
+    /// Removes the applied grant `id`, marks it revoked, and writes the
+    /// audit record of `actor`, in one transaction.
+    pub fn revoke_applied_grant(
+        &mut self,
+        id: &str,
+        actor: AuditActor,
+    ) -> Result<(), StoreError> {
         let transaction = self.connection.transaction()?;
         config::put(&transaction, &revoked_key(id), "revoked")?;
         config::delete(&transaction, &change_key(ChangeKind::Grant, id))?;
+        audit(&transaction, actor, AuditResult::Applied)?;
         transaction.commit()?;
         Ok(())
     }
@@ -373,7 +458,7 @@ mod tests {
         store
             .queue_change(ChangeKind::Grant, "grant", "private-credential", i64::MAX, 0)
             .expect("change must queue");
-        store.confirm_pending_change("grant").expect("change must confirm");
+        store.confirm_pending_change("grant", 1).expect("change must confirm");
         drop(store);
         let store = NodeStore::in_dir(directory.path()).expect("store must reopen");
         assert_eq!(
@@ -385,7 +470,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 (AuditActor::Mcp, AuditResult::Pending),
-                (AuditActor::Ui, AuditResult::Confirmed)
+                (AuditActor::Ui, AuditResult::Confirmed),
+                (AuditActor::Ui, AuditResult::Applied)
             ]
         );
         store
@@ -397,41 +483,99 @@ mod tests {
     #[test]
     fn a_confirmed_change_returns_the_value_it_replaced_and_its_revision_goes() {
         let (_directory, mut store) = test_support::temp_node_store();
-        assert_eq!(
-            store.apply_change(ChangeKind::Limit, "queue_global", "2"),
-            Ok(None)
-        );
+        let first = store
+            .apply_change(ChangeKind::Limit, "queue_global", "2", AuditActor::Ui, 1)
+            .expect("change must apply");
+        assert_eq!(first.value, None);
         store
             .queue_change(ChangeKind::Limit, "queue_global", "9", i64::MAX, 4)
             .expect("change must queue");
         assert_eq!(store.pending_revision("queue_global"), Ok(Some(4)));
-        assert_eq!(
-            store.confirm_pending_change("queue_global"),
-            Ok(Some("2".to_owned()))
-        );
+        let replaced =
+            store.confirm_pending_change("queue_global", 5).expect("must confirm");
+        assert_eq!(replaced.value.as_deref(), Some("2"));
         assert_eq!(store.pending_revision("queue_global"), Ok(None));
         assert_eq!(
             store.applied_change(ChangeKind::Limit, "queue_global"),
             Ok(Some("9".to_owned()))
         );
+        assert_eq!(store.admin_revision(), Ok(5));
         store
-            .revert_change(ChangeKind::Limit, "queue_global", Some("2"), AuditActor::Ui)
+            .revert_change(ChangeKind::Limit, "queue_global", &replaced)
             .expect("change must revert");
         assert_eq!(
             store.applied_change(ChangeKind::Limit, "queue_global"),
             Ok(Some("2".to_owned()))
         );
+        assert_eq!(store.admin_revision(), Ok(5));
+    }
+
+    #[test]
+    fn a_change_keeps_its_revision_and_audit_record_with_its_value() {
+        let (_directory, mut store) = test_support::temp_node_store();
+        let replaced = store
+            .apply_change(ChangeKind::Workspace, "w", "/work", AuditActor::Mcp, 7)
+            .expect("change must apply");
+        assert_eq!(store.admin_revision(), Ok(7));
+        assert_eq!(store.current_workspace(), Ok(Some("/work".to_owned())));
+        assert_eq!(results(&store), [AuditResult::Applied]);
+        let second = store
+            .apply_change(ChangeKind::Workspace, "v", "/other", AuditActor::Mcp, 8)
+            .expect("change must apply");
+        store.revert_change(ChangeKind::Workspace, "v", &second).expect("revert");
+        assert_eq!(store.current_workspace(), Ok(Some("/work".to_owned())));
+        assert_eq!(store.applied_change(ChangeKind::Workspace, "v"), Ok(None));
+        assert_eq!(results(&store), [AuditResult::Applied, AuditResult::Failed]);
+        store.revert_change(ChangeKind::Workspace, "w", &replaced).expect("revert");
+        assert_eq!(store.current_workspace(), Ok(None));
+    }
+
+    #[test]
+    fn an_expired_pending_change_frees_its_id() {
+        let (_directory, mut store) = test_support::temp_node_store();
+        store
+            .queue_change(ChangeKind::Workspace, "w", "/old", 1, 3)
+            .expect("change must queue");
+        assert_eq!(store.confirm_pending_change("w", 1), Err(StoreError::InvalidState));
+        store
+            .queue_change(ChangeKind::Workspace, "w", "/new", i64::MAX, 5)
+            .expect("the id of an expired change must queue again");
+        assert_eq!(store.pending_revision("w"), Ok(Some(5)));
+        assert_eq!(
+            store.pending_change_ignoring_expiry("w").map(|change| change.value),
+            Ok("/new".to_owned())
+        );
+        store.queue_change(ChangeKind::Workspace, "x", "/x", 1, 5).expect("queue");
+        assert_eq!(store.confirm_pending_change("x", 1), Err(StoreError::InvalidState));
+        assert_eq!(
+            store.pending_change_ignoring_expiry("x"),
+            Err(StoreError::NotFound)
+        );
+        assert_eq!(store.pending_revision("x"), Ok(None));
+    }
+
+    fn results(store: &NodeStore) -> Vec<AuditResult> {
+        store
+            .audit_records()
+            .expect("audit must load")
+            .into_iter()
+            .map(|record| record.result)
+            .collect()
     }
 
     #[test]
     fn counts_and_lists_hold_only_applied_changes_of_their_kind() {
         let (_directory, mut store) = test_support::temp_node_store();
-        store.apply_change(ChangeKind::Grant, "b", "grant-b").expect("grant");
-        store.apply_change(ChangeKind::Grant, "a", "grant-a").expect("grant");
-        store.apply_change(ChangeKind::Workspace, "w", "/work").expect("workspace");
-        store.set_current_workspace("/work").expect("workspace");
-        store.revoke_applied_grant("b").expect("revocation");
-        store.record_applied_change(AuditActor::Ui, 3).expect("revision");
+        for (kind, id, value, revision) in [
+            (ChangeKind::Grant, "b", "grant-b", 1),
+            (ChangeKind::Grant, "a", "grant-a", 2),
+            (ChangeKind::Workspace, "w", "/work", 3),
+        ] {
+            store
+                .apply_change(kind, id, value, AuditActor::Ui, revision)
+                .expect("change must apply");
+        }
+        store.revoke_applied_grant("b", AuditActor::Ui).expect("revocation");
         assert_eq!(
             store.applied_changes(ChangeKind::Grant),
             Ok(vec!["grant-a".to_owned()])
@@ -454,6 +598,7 @@ mod tests {
             (ChangeKind::Directory, "directory"),
             (ChangeKind::Capability, "capability"),
             (ChangeKind::Limit, "limit"),
+            (ChangeKind::Policy, "policy"),
         ] {
             assert_eq!(kind.as_str(), name);
         }

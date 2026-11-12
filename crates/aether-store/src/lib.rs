@@ -25,6 +25,7 @@ pub use access_groups::{
 };
 pub use admin::{
     AuditAction, AuditActor, AuditRecord, AuditResult, ChangeKind, PendingChange,
+    Replaced,
 };
 pub use control::{
     CONTROL_MIGRATIONS, ControlStore, DirectoryEvent, DirectoryEventType, ManagedEvent,
@@ -66,6 +67,7 @@ pub const NODE_MIGRATIONS: &[&str] = &[
     include_str!("../migrations/node/015_access_request_drafts.sql"),
     include_str!("../migrations/node/016_signed_record_kinds.sql"),
     include_str!("../migrations/node/017_drop_unused_grants.sql"),
+    include_str!("../migrations/node/018_task_caller_ids.sql"),
 ];
 
 pub const NODE_DATABASE: &str = "node.sqlite";

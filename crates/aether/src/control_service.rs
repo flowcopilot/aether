@@ -44,6 +44,8 @@ pub enum ControlError {
     Expired,
     #[error("record was not found")]
     NotFound,
+    #[error("record is not later than a revoked record")]
+    Revoked,
     #[error("control store error")]
     Store(#[from] aether_store::StoreError),
     #[error("control server error: {0}")]
@@ -83,14 +85,23 @@ impl ControlService {
             Err(aether_store::StoreError::NotFound) => false,
             Err(error) => return Err(ControlError::Store(error)),
         };
-        store.publish_signed_record(
-            &wire.signed_store_record().map_err(|_| ControlError::InvalidRecord)?,
-            if is_renewal {
-                aether_store::DirectoryEventType::Renewed
-            } else {
-                aether_store::DirectoryEventType::Published
-            },
-        )?;
+        // The request is the signed record alone, and a record is public.
+        // The store refuses one from before a revocation, which anyone
+        // could send again.
+        store
+            .publish_signed_record(
+                &wire.signed_store_record().map_err(|_| ControlError::InvalidRecord)?,
+                &wire.signing_key,
+                if is_renewal {
+                    aether_store::DirectoryEventType::Renewed
+                } else {
+                    aether_store::DirectoryEventType::Published
+                },
+            )
+            .map_err(|error| match error {
+                aether_store::StoreError::InvalidState => ControlError::Revoked,
+                error => ControlError::Store(error),
+            })?;
         // Held from the read to the write, so two publishes cannot interleave.
         drop(store);
         Ok(is_renewal)
@@ -139,7 +150,9 @@ impl ControlService {
         if decode_record(&existing.record)?.signing_key != wire.signing_key {
             return Err(ControlError::InvalidRecord);
         }
-        store.revoke_signed_record(agent_id).map_err(map_store_error)?;
+        store
+            .revoke_signed_record(agent_id, &wire.signing_key)
+            .map_err(map_store_error)?;
         // Held from the key check to the revocation.
         drop(store);
         Ok(())
@@ -284,6 +297,7 @@ impl IntoResponse for ControlError {
             Self::Forged => StatusCode::UNAUTHORIZED,
             Self::Expired => StatusCode::GONE,
             Self::NotFound => StatusCode::NOT_FOUND,
+            Self::Revoked => StatusCode::CONFLICT,
             Self::Store(_) | Self::Server(_) | Self::Io(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
@@ -521,6 +535,36 @@ mod tests {
                 .all(|change| change.cursor > changes[1].cursor)
         );
         assert!(matches!(service.changes_after(-1), Err(ControlError::InvalidRecord)));
+    }
+
+    #[test]
+    fn a_revoked_record_cannot_be_published_again() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let service =
+            ControlService::open(DataDir::new(directory.path()).control_store())
+                .expect("service must open");
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let record = record_for(&key);
+
+        service.publish(&record).expect("record must publish");
+        service.revoke("test-agent", &record).expect("record must revoke");
+        // The record is public, so this sender need not be its owner.
+        assert!(matches!(service.publish(&record), Err(ControlError::Revoked)));
+        assert!(matches!(service.resolve("test-agent"), Err(ControlError::NotFound)));
+        assert_eq!(service.changes_after(0).expect("changes must load").len(), 2);
+
+        let later = WireRecord::from_record(&signed_record(
+            &key,
+            "test-agent".to_owned(),
+            "endpoint".to_owned(),
+            vec!["127.0.0.1:9443".to_owned()],
+            "test-scope".to_owned(),
+            vec!["test".to_owned()],
+            SystemTime::now() + Duration::from_secs(7_200),
+        ));
+        assert!(!service.publish(&later).expect("a later record must publish"));
+        assert!(matches!(service.publish(&record), Err(ControlError::Revoked)));
+        assert_eq!(service.resolve("test-agent").expect("record must resolve"), later);
     }
 
     #[test]

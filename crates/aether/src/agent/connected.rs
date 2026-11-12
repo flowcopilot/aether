@@ -48,7 +48,28 @@ struct Shared {
 
 type Writer = Arc<Mutex<UnixStream>>;
 
-type Pending = Arc<Mutex<BTreeMap<String, mpsc::Sender<Reply>>>>;
+type Pending = Arc<Mutex<Turns>>;
+
+/// The turns that are open on one connection.
+///
+/// A turn holds this lock from the insert of its task until the `task`
+/// message is written. A cancel therefore finds a task here only after the
+/// agent got it, and `serve` closes the turns of a connection only between
+/// two such writes.
+#[derive(Default)]
+struct Turns {
+    open: BTreeMap<String, mpsc::Sender<Reply>>,
+    /// The connection was replaced or ended. No turn starts on it.
+    closed: bool,
+}
+
+impl Turns {
+    /// Closes the connection for turns and returns the open ones.
+    fn close(&mut self) -> BTreeMap<String, mpsc::Sender<Reply>> {
+        self.closed = true;
+        std::mem::take(&mut self.open)
+    }
+}
 
 struct Connection {
     generation: u64,
@@ -166,8 +187,17 @@ impl Shared {
         }
         let generation =
             self.generation.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-        let pending = Arc::new(Mutex::new(BTreeMap::new()));
+        let pending = Arc::new(Mutex::new(Turns::default()));
         let Ok(mut connection) = self.connection.lock() else { return };
+        // The replaced connection is closed for turns before the new one
+        // takes its place. A turn that took it writes no task to it after
+        // this, and no answer of its agent is read into a turn.
+        let cancelled = connection
+            .as_ref()
+            .and_then(|replaced| {
+                replaced.pending.lock().ok().map(|mut turns| turns.close())
+            })
+            .unwrap_or_default();
         let replaced = connection.replace(Connection {
             generation,
             stream: control,
@@ -176,14 +206,12 @@ impl Shared {
         });
         drop(connection);
         if let Some(replaced) = replaced {
-            if let Ok(pending) = replaced.pending.lock() {
-                for (task_id, sender) in pending.iter() {
-                    let _ = write_json_line(
-                        &replaced.writer,
-                        &NodeMessage::Cancel { id: task_id.as_str() },
-                    );
-                    let _ = sender.send(Reply::Cancelled);
-                }
+            for (task_id, sender) in cancelled {
+                let _ = write_json_line(
+                    &replaced.writer,
+                    &NodeMessage::Cancel { id: task_id.as_str() },
+                );
+                let _ = sender.send(Reply::Cancelled);
             }
             let _ = replaced.stream.shutdown(Shutdown::Both);
         }
@@ -195,21 +223,25 @@ impl Shared {
                 AgentMessage::Failed { id } => (id, Reply::Failed),
                 AgentMessage::Cancelled { id } => (id, Reply::Cancelled),
             };
-            if let Ok(pending) = pending.lock()
-                && let Some(sender) = pending.get(&id)
+            if let Ok(turns) = pending.lock()
+                && let Some(sender) = turns.open.get(&id)
             {
                 let _ = sender.send(reply);
             }
         }
-        if let Ok(mut connection) = self.connection.lock()
+        // Under the `connection` mutex, as in the replace path: a turn
+        // that took this connection but is not open yet does not start.
+        // Each sender is dropped, so a turn that waits fails.
+        let connection = self.connection.lock();
+        if let Ok(mut turns) = pending.lock() {
+            drop(turns.close());
+        }
+        if let Ok(mut connection) = connection
             && connection
                 .as_ref()
                 .is_some_and(|current| current.generation == generation)
         {
             *connection = None;
-        }
-        if let Ok(mut pending) = pending.lock() {
-            pending.clear();
         }
     }
 }
@@ -233,9 +265,9 @@ impl ConnectedAgent {
         ctx: &TurnContext,
         events: &mut dyn FnMut(ExecutionEvent),
     ) -> Result<String, ExecutionError> {
-        let (writer, pending, receiver) = {
-            // Held until the turn is pending, so that a cancel either finds
-            // it pending or is kept for this check.
+        let (writer, pending, receiver, sent) = {
+            // Held until the turn is open, so that a cancel either finds
+            // it open or is kept for this check.
             let mut cancels =
                 self.shared.cancels.lock().map_err(|_| ExecutionError::Unavailable)?;
             if cancels.take(&ctx.task_id) {
@@ -243,26 +275,34 @@ impl ConnectedAgent {
             }
             let (writer, pending) = self.connection()?;
             let (sender, receiver) = mpsc::channel();
-            {
-                let mut pending =
+            let sent = {
+                let mut turns =
                     pending.lock().map_err(|_| ExecutionError::Unavailable)?;
-                if pending.contains_key(&ctx.task_id) {
+                if turns.closed {
+                    return Err(ExecutionError::Unavailable);
+                }
+                if turns.open.contains_key(&ctx.task_id) {
                     return Err(ExecutionError::Protocol);
                 }
-                pending.insert(ctx.task_id.clone(), sender);
-            }
-            drop(cancels);
-            (writer, pending, receiver)
+                turns.open.insert(ctx.task_id.clone(), sender);
+                drop(cancels);
+                // Written before `turns` is unlocked: a cancel waits for
+                // this lock, so the agent gets the task first.
+                let sent = write_json_line(
+                    &writer,
+                    &NodeMessage::Task {
+                        id: &ctx.task_id,
+                        instructions: agent_instructions(&ctx.skill),
+                        text: &ctx.text,
+                    },
+                );
+                drop(turns);
+                sent
+            };
+            (writer, pending, receiver, sent)
         };
         let result = (|| {
-            write_json_line(
-                &writer,
-                &NodeMessage::Task {
-                    id: &ctx.task_id,
-                    instructions: agent_instructions(&ctx.skill),
-                    text: &ctx.text,
-                },
-            )?;
+            sent?;
             loop {
                 let remaining = ctx
                     .deadline
@@ -285,8 +325,8 @@ impl ConnectedAgent {
                 }
             }
         })();
-        if let Ok(mut pending) = pending.lock() {
-            pending.remove(&ctx.task_id);
+        if let Ok(mut turns) = pending.lock() {
+            turns.open.remove(&ctx.task_id);
         }
         if result == Err(ExecutionError::Timeout) {
             write_json_line(&writer, &NodeMessage::Cancel { id: &ctx.task_id })?;
@@ -311,7 +351,7 @@ impl Agent for ConnectedAgent {
     fn cancel(&self, task_id: &str) {
         let Ok(mut cancels) = self.shared.cancels.lock() else { return };
         if let Ok((writer, pending)) = self.connection()
-            && pending.lock().is_ok_and(|pending| pending.contains_key(task_id))
+            && pending.lock().is_ok_and(|turns| turns.open.contains_key(task_id))
         {
             drop(cancels);
             let _ = write_json_line(&writer, &NodeMessage::Cancel { id: task_id });
@@ -493,6 +533,13 @@ mod tests {
                 assert!(peer.take().expect("a connection").closed(), "{name}");
             } else if step["closes"] == "agent" {
                 peer = None;
+                // The node sees the close before the next step: an agent
+                // that attached earlier would replace the connection and
+                // cancel its turns.
+                while agent.generation().is_some() {
+                    assert!(Instant::now() < deadline, "{name}: the node must detach");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
             }
         }
         for (id, outcome) in case["outcomes"].as_object().expect("outcomes") {
@@ -702,6 +749,92 @@ mod tests {
         // not an early one for a turn that starts later.
         agent.cancel("task-1");
         assert_eq!(answer(&mut peer), Ok("answer".to_owned()));
+    }
+
+    #[test]
+    fn a_cancel_never_reaches_the_agent_before_its_task() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let path = crate::data_dir::DataDir::new(directory.path()).agent_socket();
+        let agent = ConnectedAgent::listen(&path).expect("listen");
+        let mut peer =
+            Peer::attach(&agent, &path, &json!({"type": "ready", "protocol": 1}));
+        peer.stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout must set");
+        let deadline =
+            Instant::now().checked_add(Duration::from_secs(5)).expect("deadline");
+        for round in 0..100 {
+            let id = format!("task-{round}");
+            let mut runner = agent.clone();
+            let ctx = turn_ctx(&id, "hello", deadline);
+            let turn = std::thread::spawn(move || runner.start_turn(&ctx));
+            // The cancels race with the start of the turn. One that comes
+            // before the start is kept and no task is sent.
+            let canceller = agent.clone();
+            let task = id.clone();
+            let cancels = std::thread::spawn(move || {
+                for _ in 0..20 {
+                    canceller.cancel(&task);
+                }
+            });
+            cancels.join().expect("cancels join");
+            // A marker turn ends the lines of this round.
+            let mut marker = agent.clone();
+            let mark = std::thread::spawn(move || {
+                marker.start_turn(&turn_ctx("marker", "hello", deadline))
+            });
+            let mut first = None;
+            loop {
+                let line = peer.read();
+                if line["id"] == "marker" {
+                    break;
+                }
+                first.get_or_insert(line);
+            }
+            if let Some(first) = first {
+                assert_eq!(first["type"], "task", "round {round}");
+                peer.write(&json!({"type": "cancelled", "id": id}));
+            }
+            peer.write(&json!({"type": "result", "id": "marker", "text": "m"}));
+            assert_eq!(mark.join().expect("marker joins"), Ok("m".to_owned()));
+            assert_eq!(
+                turn.join().expect("turn joins"),
+                Err(ExecutionError::Cancelled)
+            );
+        }
+    }
+
+    #[test]
+    fn a_connection_that_ended_takes_no_turn() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let path = crate::data_dir::DataDir::new(directory.path()).agent_socket();
+        let agent = ConnectedAgent::listen(&path).expect("listen");
+        let peer =
+            Peer::attach(&agent, &path, &json!({"type": "ready", "protocol": 1}));
+        // What a turn holds between `connection()` and its insert.
+        let (_, taken) = agent.connection().expect("a connection");
+        // The agent closes only its sending side: it still reads.
+        peer.stream.shutdown(std::net::Shutdown::Write).expect("half close");
+        let deadline =
+            Instant::now().checked_add(Duration::from_secs(5)).expect("deadline");
+        while !taken.lock().expect("turns lock").closed {
+            assert!(Instant::now() < deadline, "the connection must close");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn a_replaced_connection_takes_no_turn() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let path = crate::data_dir::DataDir::new(directory.path()).agent_socket();
+        let agent = ConnectedAgent::listen(&path).expect("listen");
+        let ready = json!({"type": "ready", "protocol": 1});
+        let _first = Peer::attach(&agent, &path, &ready);
+        let (_, taken) = agent.connection().expect("a connection");
+        let _second = Peer::attach(&agent, &path, &ready);
+        // `attach` returns when the new connection is in place; the old
+        // one was closed for turns before that.
+        assert!(taken.lock().expect("turns lock").closed);
     }
 
     #[test]

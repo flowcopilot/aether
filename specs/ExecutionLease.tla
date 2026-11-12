@@ -346,7 +346,8 @@ TurnEnds ==
     /\ w.phase = "turn"
     /\ \E o \in IF turn.interrupted THEN {"cancelled"} ELSE {"ok", "err"} :
          w' = [w EXCEPT !.phase = "finish", !.outcome = o]
-    /\ turn' = TurnOver(turn.early, turn.ended \cup {w.task}, turn.spurious)
+    /\ turn' = TurnOver(turn.early \ {w.task}, turn.ended \cup {w.task},
+                         turn.spurious)
     /\ UNCHANGED <<state, lease, now, nextExec, grant, signals, shutdown,
                    restarts, starts>>
 

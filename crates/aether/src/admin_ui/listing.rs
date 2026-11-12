@@ -209,7 +209,13 @@ mod tests {
         let (page, cookie, data_dir) = service_page(directory.path(), &hub).await;
         NodeStore::in_dir(&data_dir)
             .expect("store must open")
-            .apply_change(aether_store::ChangeKind::Limit, "queue_global", "3")
+            .apply_change(
+                aether_store::ChangeKind::Limit,
+                "queue_global",
+                "3",
+                aether_store::AuditActor::Ui,
+                1,
+            )
             .expect("limit must store");
         let home = get_with(page, "/", &cookie).await;
         assert!(

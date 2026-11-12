@@ -310,11 +310,21 @@ where
     }
 
     fn apply_workspace(&self, id: &str, path: &str) -> Result<(), AdminError> {
+        self.check_workspace(id, path)?;
+        self.service
+            .apply_workspace(Path::new(path))
+            .map_err(|_| AdminError::InvalidField("path"))
+    }
+
+    fn check_workspace(&self, id: &str, path: &str) -> Result<(), AdminError> {
         let path = Path::new(path);
         if !self.service.workspace_change_is_approved(id, path) {
             return Err(AdminError::InvalidField("id"));
         }
-        self.service.apply_workspace(path).map_err(|_| AdminError::InvalidField("path"))
+        if !path.is_dir() {
+            return Err(AdminError::InvalidField("path"));
+        }
+        Ok(())
     }
 
     fn workspace(&self) -> Option<String> {

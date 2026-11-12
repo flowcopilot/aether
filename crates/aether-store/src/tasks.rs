@@ -360,32 +360,54 @@ fn admit(
     let existing = tx
         .query_row(
             &format!(
-                "SELECT {REQUEST_COLUMNS},request_fingerprint FROM tasks WHERE caller_endpoint_id=?1 AND idempotency_key=?2"
+                "SELECT {REQUEST_COLUMNS},request_fingerprint,caller_task_id,caller_request_id FROM tasks WHERE caller_endpoint_id=?1 AND idempotency_key=?2"
             ),
             params![request.caller_endpoint_id.as_str(), input.idempotency_key],
-            |row| Ok((request_from_row(row, 0)?, row.get::<_, String>(8)?)),
+            |row| {
+                Ok((
+                    request_from_row(row, 0)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                ))
+            },
         )
         .optional()?;
-    if let Some((stored, fingerprint)) = existing {
-        return if stored == *request && fingerprint == input.request_fingerprint {
-            Ok(TaskAdmission::Existing(stored.task_id.as_str().to_owned()))
+    if let Some((stored, fingerprint, caller_task_id, caller_request_id)) = existing {
+        let task_id = stored.task_id.as_str().to_owned();
+        // The request as the caller sent it: a row that got its own IDs
+        // keeps the caller's IDs beside them.
+        let sent = Request {
+            task_id: caller_task_id.map_or_else(|| stored.task_id.clone(), TaskId::new),
+            id: caller_request_id.map_or_else(|| stored.id.clone(), RequestId::new),
+            ..stored
+        };
+        return if sent == *request && fingerprint == input.request_fingerprint {
+            Ok(TaskAdmission::Existing(task_id))
         } else {
             Err(StoreError::DuplicateConflict)
         };
     }
     if count(tx, None)? >= limits.global
-        || count(tx, Some(request.caller_agent_id.as_str()))? >= limits.per_peer
+        || count(tx, Some(request.caller_endpoint_id.as_str()))? >= limits.per_peer
     {
         return Err(StoreError::Overloaded);
     }
+    let own_ids = own_ids(tx, request)?;
+    let (task_id, request_id) = own_ids.as_ref().map_or_else(
+        || (request.task_id.as_str(), request.id.as_str()),
+        |(task_id, request_id)| (task_id.as_str(), request_id.as_str()),
+    );
+    let caller_ids =
+        own_ids.as_ref().map(|_| (request.task_id.as_str(), request.id.as_str()));
     tx.execute(
         &format!(
-            "INSERT INTO tasks({REQUEST_COLUMNS},idempotency_key,request_fingerprint,skill,remote_text,state,created_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)"
+            "INSERT INTO tasks({REQUEST_COLUMNS},idempotency_key,request_fingerprint,skill,remote_text,state,created_at,caller_task_id,caller_request_id)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)"
         ),
         params![
-            request.task_id.as_str(),
-            request.id.as_str(),
+            task_id,
+            request_id,
             request.caller_agent_id.as_str(),
             request.caller_endpoint_id.as_str(),
             request.scope_id.as_str(),
@@ -398,11 +420,60 @@ fn admit(
             input.remote_text,
             TaskState::Queued,
             now(),
+            caller_ids.map(|ids| ids.0),
+            caller_ids.map(|ids| ids.1),
         ],
     )?;
-    let task_id = request.task_id.as_str();
     event(tx, task_id, EventType::Entered(TaskState::Queued))?;
     Ok(TaskAdmission::Accepted(task_id.to_owned()))
+}
+
+/// The IDs that the row of a new request gets when it cannot have the IDs
+/// that the caller sent, and `None` when it can.
+///
+/// `tasks.id` and `tasks.request_id` are unique for the whole table, and the
+/// caller chooses both. A row of another endpoint that has one of them must
+/// not block this caller, and must not show that it exists, so the new row
+/// gets IDs that the node makes. The same endpoint cannot use an ID again
+/// for another idempotency key.
+fn own_ids(
+    tx: &Transaction<'_>,
+    request: &Request,
+) -> Result<Option<(String, String)>, StoreError> {
+    let endpoint = request.caller_endpoint_id.as_str();
+    let mut statement = tx.prepare(
+        "SELECT caller_endpoint_id FROM tasks
+         WHERE id=?1 OR request_id=?2
+            OR (caller_endpoint_id=?3 AND (caller_task_id=?1 OR caller_request_id=?2))",
+    )?;
+    let owners = statement
+        .query_map(
+            params![request.task_id.as_str(), request.id.as_str(), endpoint],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    if owners.is_empty() {
+        return Ok(None);
+    }
+    if owners.iter().any(|owner| owner == endpoint) {
+        return Err(StoreError::DuplicateConflict);
+    }
+    Ok(Some((random_id(tx)?, random_id(tx)?)))
+}
+
+/// A random ID in the form of a UUID.
+fn random_id(tx: &Transaction<'_>) -> Result<String, StoreError> {
+    let hex: String =
+        tx.query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))?;
+    let part = |range: std::ops::Range<usize>| hex.get(range).unwrap_or_default();
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        part(0..8),
+        part(8..12),
+        part(12..16),
+        part(16..20),
+        part(20..32)
+    ))
 }
 
 impl NodeStore {
@@ -741,25 +812,31 @@ impl NodeStore {
         cancel(self.connection.transaction()?, task_id)
     }
 
+    /// Cancels the task that `caller_endpoint_id` sent as `task_id` in
+    /// `scope_id`, and returns the ID of its row. The two IDs differ only
+    /// for a row that got its own ID (see [`own_ids`]).
     pub fn cancel_if_owned(
         &mut self,
         task_id: &str,
         caller_endpoint_id: &str,
         scope_id: &str,
-    ) -> Result<(), StoreError> {
+    ) -> Result<String, StoreError> {
         let tx = self.connection.transaction()?;
-        let (owner, scope): (String, String) = tx
+        let (id, owner, scope): (String, String, String) = tx
             .query_row(
-                "SELECT caller_endpoint_id,scope_id FROM tasks WHERE id=?1",
-                [task_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                "SELECT id,caller_endpoint_id,scope_id FROM tasks
+                 WHERE id=?1 OR (caller_endpoint_id=?2 AND caller_task_id=?1)
+                 ORDER BY caller_task_id IS NULL LIMIT 1",
+                params![task_id, caller_endpoint_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?
             .ok_or(StoreError::NotFound)?;
         if owner != caller_endpoint_id || scope != scope_id {
             return Err(StoreError::Unauthorized);
         }
-        cancel(tx, task_id)
+        cancel(tx, &id)?;
+        Ok(id)
     }
 
     pub fn task_execution_data(
@@ -861,14 +938,10 @@ fn accept_replay_key(
         params![caller_endpoint_id, scope_id],
         |row| row.get(0),
     )?;
-    let limit = sql_count(limit);
-    if count >= limit {
-        // Make room for the new entry: remove the oldest ones over the limit.
-        let excess = count.saturating_sub(limit).saturating_add(1);
-        tx.execute(
-            "DELETE FROM replay_entries WHERE rowid IN (SELECT rowid FROM replay_entries WHERE caller_endpoint_id=?1 AND scope_id=?2 ORDER BY expires_at, rowid LIMIT ?3)",
-            params![caller_endpoint_id, scope_id, excess],
-        )?;
+    if count >= sql_count(limit) {
+        // An entry stays until it expires. Removing the oldest one here
+        // would let the caller send that frame again.
+        return Err(StoreError::Overloaded);
     }
     tx.execute(
         "INSERT INTO replay_entries(caller_endpoint_id,scope_id,replay_key,expires_at) VALUES(?1,?2,?3,?4)",
@@ -880,7 +953,7 @@ fn accept_replay_key(
 fn count(tx: &Transaction<'_>, peer: Option<&str>) -> Result<usize, StoreError> {
     let count: i64 = match peer {
         Some(peer) => tx.query_row(
-            "SELECT COUNT(*) FROM tasks WHERE state=?1 AND caller_agent_id=?2",
+            "SELECT COUNT(*) FROM tasks WHERE state=?1 AND caller_endpoint_id=?2",
             params![TaskState::Queued, peer],
             |row| row.get(0),
         )?,
@@ -1107,10 +1180,16 @@ mod tests {
             .expect("expired key must store");
         accept_replay_key(&mut store, "a", "replacement", i64::MAX, 2)
             .expect("expired key must clear");
-        accept_replay_key(&mut store, "a", "limited", i64::MAX, 2)
-            .expect("limited key must store");
-        accept_replay_key(&mut store, "a", "newer", i64::MAX, 2)
-            .expect("oldest key must expire at the limit");
+        assert_eq!(
+            accept_replay_key(&mut store, "a", "newer", i64::MAX, 2),
+            Err(StoreError::Overloaded),
+            "a full table must refuse the frame and keep its unexpired keys"
+        );
+        assert_eq!(
+            accept_replay_key(&mut store, "a", "exchange", i64::MAX, 2),
+            Err(StoreError::DuplicateConflict),
+            "the oldest key must stay until it expires"
+        );
         drop(store);
         fs::remove_file(database).expect("database must remove");
     }
@@ -1150,8 +1229,11 @@ mod tests {
         );
         accept_replay_key(&mut store, "b", "peer-replay", i64::MAX, 1)
             .expect("other caller replay must store");
-        accept_replay_key(&mut store, "b", "peer-replay-new", i64::MAX, 1)
-            .expect("other caller capacity may replace only its own key");
+        assert_eq!(
+            accept_replay_key(&mut store, "b", "peer-replay-new", i64::MAX, 1),
+            Err(StoreError::Overloaded),
+            "a caller fills only its own part of the table"
+        );
         assert_eq!(
             accept_replay_key(&mut store, "a", "replay-one", i64::MAX, 1),
             Err(StoreError::DuplicateConflict)
@@ -1455,6 +1537,70 @@ mod tests {
             store.stored_task("task").expect("stored task must load").result,
             None
         );
+        fs::remove_file(database).expect("database must remove");
+    }
+
+    #[test]
+    fn the_per_peer_limit_counts_each_endpoint_apart() {
+        let (mut store, database) = store();
+        let limits = QueueLimits { global: 4, per_peer: 1 };
+        store.admit(&input("one", "a"), limits).expect("task must admit");
+        // The owner gave the same agent name to a second endpoint.
+        let mut other = input("two", "a");
+        other.request.caller_endpoint_id = EndpointId::new("endpoint-second");
+        assert_eq!(
+            store.admit(&other, limits),
+            Ok(TaskAdmission::Accepted("two".to_owned())),
+            "another endpoint with the same name must have its own limit"
+        );
+        assert_eq!(
+            store.admit(&input("three", "a"), limits),
+            Err(StoreError::Overloaded),
+            "the first endpoint is at its limit"
+        );
+        fs::remove_file(database).expect("database must remove");
+    }
+
+    #[test]
+    fn a_task_id_of_another_endpoint_does_not_block_a_caller() {
+        let (mut store, database) = store();
+        let limits = QueueLimits { global: 4, per_peer: 2 };
+        store.admit(&input("one", "a"), limits).expect("task must admit");
+        // Endpoint b sends its own request with the task ID and the request
+        // ID of a's task.
+        let mut clash = input("one", "b");
+        clash.idempotency_key = "key-b".to_owned();
+        let (TaskAdmission::Accepted(own_id) | TaskAdmission::Existing(own_id)) =
+            store.admit(&clash, limits).expect("the clash must not refuse b");
+        assert_ne!(own_id, "one", "b must not get the row of a");
+        assert_eq!(
+            store.admit(&clash, limits),
+            Ok(TaskAdmission::Existing(own_id.clone())),
+            "the same request again must find the task of b"
+        );
+        let mut changed = clash.clone();
+        changed.request_fingerprint = "changed".to_owned();
+        assert_eq!(store.admit(&changed, limits), Err(StoreError::DuplicateConflict));
+        let data = store.task_execution_data(&own_id).expect("the task of b must load");
+        assert_eq!(data.request.caller_endpoint_id, EndpointId::new("endpoint-b"));
+        // b cancels by the ID that it sent, and reaches only its own task.
+        assert_eq!(
+            store.cancel_if_owned("one", "endpoint-b", "scope"),
+            Ok(own_id.clone())
+        );
+        assert_eq!(store.state(&own_id), Ok(TaskState::Cancelled));
+        assert_eq!(store.state("one"), Ok(TaskState::Queued));
+        assert_eq!(
+            store.cancel_if_owned("one", "endpoint-a", "scope"),
+            Ok("one".to_owned())
+        );
+        // An endpoint cannot use its own task ID for a second request.
+        let mut reused = input("one", "a");
+        reused.idempotency_key = "key-second".to_owned();
+        assert_eq!(store.admit(&reused, limits), Err(StoreError::DuplicateConflict));
+        let mut reused = clash;
+        reused.idempotency_key = "key-b-second".to_owned();
+        assert_eq!(store.admit(&reused, limits), Err(StoreError::DuplicateConflict));
         fs::remove_file(database).expect("database must remove");
     }
 

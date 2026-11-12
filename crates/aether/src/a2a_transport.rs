@@ -61,6 +61,10 @@ impl<'a, T, P> A2aTransport<'a, T, P> {
             }
             _ => return Err(TransportError::BadFrame),
         };
+        // The ID that the caller sent. Every frame of the answer carries it;
+        // the node can keep the task under another ID (see `own_ids` in
+        // aether-store).
+        let sent_task_id = payload.task.id.clone();
         let task = Task {
             id: payload.task.id,
             skill: skill_for_direct_a2a_entry(
@@ -113,12 +117,12 @@ impl<'a, T, P> A2aTransport<'a, T, P> {
         let mut cursor = last_sequence;
         for event in events {
             let event_frame = Frame {
-                task_id: Some(task_id.clone()),
+                task_id: Some(sent_task_id.clone()),
                 ..Frame::reply_to(
                     &frame,
                     FrameKind::Event,
                     event_payload(
-                        &task_id,
+                        &sent_task_id,
                         event_status(event.event_type, state),
                         Some(event.sequence),
                     ),
@@ -135,12 +139,12 @@ impl<'a, T, P> A2aTransport<'a, T, P> {
             response.push(event_frame);
         }
         response.push(Frame {
-            task_id: Some(task_id.clone()),
+            task_id: Some(sent_task_id.clone()),
             ..Frame::reply_to(
                 &frame,
                 FrameKind::Result,
                 text_result_payload_with_progress(
-                    &task_id,
+                    &sent_task_id,
                     status,
                     &result_text,
                     cursor,
@@ -166,7 +170,8 @@ impl<'a, T, P> A2aTransport<'a, T, P> {
         if cancel.id != task_id {
             return Err(TransportError::BadFrame);
         }
-        self.proof
+        let stored_task_id = self
+            .proof
             .cancel_from(
                 task_id,
                 &EndpointId::new(authenticated_endpoint),
@@ -175,7 +180,7 @@ impl<'a, T, P> A2aTransport<'a, T, P> {
             .map_err(map_error)?;
         let event = self
             .proof
-            .events_after(task_id, 0)
+            .events_after(&stored_task_id, 0)
             .map_err(map_error)?
             .into_iter()
             .last()

@@ -139,7 +139,7 @@ impl McpServer {
 
     #[tool(
         name = "aether.settings.update_policy",
-        description = "Validate or save task policy limits and the task folder root. Omitted fields keep their values. Saved changes take effect after a node restart."
+        description = "Validate or save task policy limits and the task folder root. Omitted fields keep their values. A new task folder root or a higher limit waits for the owner's confirmation in the admin UI. Saved changes take effect after a node restart."
     )]
     async fn settings_update_policy(
         &self,
@@ -178,6 +178,14 @@ impl McpServer {
                 json!({
                     "status": "saved",
                     "restartRequired": true,
+                })
+                .to_string(),
+            ),
+            Ok(Response::Pending) => tool_success(
+                json!({
+                    "status": "pending",
+                    "restartRequired": false,
+                    "next": "The owner confirms this change on the Advanced page.",
                 })
                 .to_string(),
             ),
@@ -587,7 +595,8 @@ mod tests {
             None,
         )
         .expect("first policy must create");
-        let server = served(&data_dir, shared_in(&data_dir));
+        let administration = shared_in(&data_dir);
+        let server = served(&data_dir, administration.clone());
         let request = PolicyUpdateArguments {
             workspace: None,
             max_context_tokens: None,
@@ -610,7 +619,7 @@ mod tests {
                 workspace: None,
                 max_context_tokens: None,
                 max_seconds: Some(75),
-                queue_global: Some(2),
+                queue_global: None,
                 queue_per_peer: None,
                 dry_run: false,
             }))
@@ -621,7 +630,37 @@ mod tests {
             .expect("policy must read")
             .expect("policy must exist");
         assert_eq!(settings.max_seconds, 75);
-        assert_eq!(settings.queue.global, 2);
+
+        // A higher limit or another task folder root waits for the owner.
+        let other = directory.path().join("other");
+        std::fs::create_dir(&other).expect("folder must create");
+        let raised = server
+            .settings_update_policy(Parameters(PolicyUpdateArguments {
+                workspace: Some(other.display().to_string()),
+                max_context_tokens: None,
+                max_seconds: Some(76),
+                queue_global: Some(2),
+                queue_per_peer: None,
+                dry_run: false,
+            }))
+            .await;
+        assert_eq!(raised.is_error, Some(false), "{}", decode_text(&raised));
+        assert_eq!(decode(&raised)["status"], "pending");
+        let saved = || {
+            crate::policy::policy_settings(&data_dir)
+                .expect("policy must read")
+                .expect("policy must exist")
+        };
+        assert_eq!(saved().max_seconds, 75);
+        assert_ne!(saved().workspace, other);
+        administration
+            .lock()
+            .expect("administration must lock")
+            .confirm_ui("policy")
+            .expect("the owner must confirm the policy");
+        assert_eq!(saved().max_seconds, 76);
+        assert_eq!(saved().queue.global, 2);
+        assert_eq!(saved().workspace, other);
     }
 
     #[tokio::test]

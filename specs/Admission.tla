@@ -18,7 +18,8 @@
 (*                                          verify_grant                   *)
 (*   crates/aether-store/src/tasks.rs       admit_with_replay,             *)
 (*                                          accept_replay_key, admit,      *)
-(*                                          count, cancel_if_owned         *)
+(*                                          own_ids, count,                *)
+(*                                          cancel_if_owned                *)
 (*   crates/aether-store/src/access_groups.rs  access_group_allows         *)
 (*                                                                         *)
 (* Every endpoint is an attacker here: it can send any frame under its own *)
@@ -46,11 +47,15 @@
 (* frame for another scope has no claim that fits, and `policy_data`       *)
 (* refuses it. Only a cancel frame carries a scope here. The request ID    *)
 (* (`tasks.request_id`, also UNIQUE) is the task ID, as in `direct.rs`.    *)
+(* An ID that the node makes (`random_id`) is 128 random bits, so no       *)
+(* caller sends it: NodeIds and TaskIds share nothing.                     *)
 (* The replay table has one part for each endpoint and scope; with one     *)
 (* scope it has one part for each endpoint. All replay entries have the    *)
 (* same lifetime (REPLAY_TTL), so the oldest entry expires first, and an   *)
 (* expired entry is the same as no entry: `accept_replay_key` deletes the  *)
-(* expired entries before it reads.                                        *)
+(* expired entries before it reads. REPLAY_LIMIT has room for every frame  *)
+(* that the peer rate limit lets through in REPLAY_TTL; the model does not *)
+(* have the rate limit, so here an endpoint can fill its part.             *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets
 
@@ -60,12 +65,13 @@ CONSTANTS
     HonestName,  \* the name of the person that the last properties look at
     HonestEp,    \* and the endpoint of that person
     TaskIds,     \* task IDs (UUIDs that the caller chooses)
+    NodeIds,     \* task IDs that the node makes for a row
     Keys,        \* idempotency keys
     Data,        \* the rest of a request: its fingerprint
     Nonces,      \* `exchangeId:requestNonce` values
     ReplayLimit, \* REPLAY_LIMIT
     Global,      \* QueueLimits.global
-    PerPeer,     \* QueueLimits.per_peer
+    PerPeer,     \* QueueLimits.per_peer, for one endpoint
     DirectScope, \* the scope of every task
     OtherScope   \* another scope of the node
 
@@ -87,11 +93,17 @@ AccessStates == {"none", "live", "revoked"}
 TaskStates == {"queued", "ended"}
 NoTask == [owner |-> "none"]
 
-\* A `tasks` row. `auth` and `covered` are ghosts: the authenticated
-\* endpoint of the frame that made the row, and whether that endpoint had
-\* a live grant and a group membership under the name of the row then.
+\* The primary keys of `tasks`.
+RowIds == TaskIds \cup NodeIds
+
+\* A `tasks` row. `sent` is the task ID that the caller sent
+\* (`caller_task_id`, or `id` when that is NULL). `auth` and `covered` are
+\* ghosts: the authenticated endpoint of the frame that made the row, and
+\* whether that endpoint had a live grant and a group membership under the
+\* name of the row then.
 TaskRow == [owner : Eps, agent : Names, key : Keys, data : Data,
-            state : TaskStates, auth : Eps, covered : BOOLEAN]
+            sent : TaskIds, state : TaskStates, auth : Eps,
+            covered : BOOLEAN]
 
 \* A request frame. `cep` and `agent` are the caller endpoint and name in
 \* the authorization. `claim` is the person that the claim names; a claim
@@ -102,7 +114,7 @@ Frames == [cep : Eps, agent : Names, claim : AllPeople, id : TaskIds,
 VARIABLES
     access,     \* the claim and the grant of each person
     members,    \* access_group_members, of any group
-    tasks,      \* the `tasks` table, by task ID
+    tasks,      \* the `tasks` table, by `tasks.id`
     replay,     \* replay_entries of each endpoint, oldest first
     wrongAdmit, \* ghost: a frame that the host must refuse changed something
     leaked,     \* ghost: an answer showed a task of another endpoint
@@ -115,7 +127,7 @@ Range(s) == {s[i] : i \in 1..Len(s)}
 TypeOK ==
     /\ access \in [AllPeople -> AccessStates]
     /\ members \subseteq People
-    /\ tasks \in [TaskIds -> TaskRow \cup {NoTask}]
+    /\ tasks \in [RowIds -> TaskRow \cup {NoTask}]
     /\ replay \in [Eps -> Seq(Nonces)]
     /\ \A e \in Eps : Len(replay[e]) <= ReplayLimit
     /\ wrongAdmit \in BOOLEAN
@@ -125,16 +137,19 @@ TypeOK ==
 Init ==
     /\ access = [p \in AllPeople |-> "none"]
     /\ members = {}
-    /\ tasks = [id \in TaskIds |-> NoTask]
+    /\ tasks = [id \in RowIds |-> NoTask]
     /\ replay = [e \in Eps |-> <<>>]
     /\ wrongAdmit = FALSE
     /\ leaked = FALSE
     /\ badCancel = FALSE
 
-Rows == {id \in TaskIds : tasks[id] # NoTask}
+Rows == {id \in RowIds : tasks[id] # NoTask}
 Queued == {id \in Rows : tasks[id].state = "queued"}
-\* `count(tx, Some(peer))`: the queued tasks of one agent NAME.
-QueuedOf(name) == {id \in Queued : tasks[id].agent = name}
+\* `count(tx, Some(peer))`: the queued tasks of one ENDPOINT.
+QueuedOf(ep) == {id \in Queued : tasks[id].owner = ep}
+\* The row of `ep` that the caller sent as the task ID `sid`.
+OwnSent(ep, sid) ==
+    {id \in Rows : tasks[id].owner = ep /\ tasks[id].sent = sid}
 
 -----------------------------------------------------------------------------
 (* The owner and the clock.                                                *)
@@ -210,8 +225,9 @@ MayChange(ep, f) ==
     /\ Covered(f.agent, ep)
     /\ f.nonce \notin Range(replay[ep])
 
-\* `accept_replay_key`: keep the nonce; at the limit the oldest entry goes.
-Keep(s, n) == Append(IF Len(s) >= ReplayLimit THEN Tail(s) ELSE s, n)
+\* `accept_replay_key`: the part of `ep` has room for one more nonce. A
+\* full part refuses the frame; no entry goes before its time.
+ReplayRoom(ep) == Len(replay[ep]) < ReplayLimit
 
 \* The row of `ep` with this idempotency key
 \* (`WHERE caller_endpoint_id=?1 AND idempotency_key=?2`).
@@ -219,64 +235,80 @@ KeyRows(ep, key) == {id \in Rows : tasks[id].owner = ep /\ tasks[id].key = key}
 
 \* `stored == *request && fingerprint == input.request_fingerprint`.
 SameRequest(id, f) ==
-    /\ id = f.id
+    /\ tasks[id].sent = f.id
     /\ tasks[id].agent = f.agent
     /\ tasks[id].data = f.data
 
 \* `admit`: the queue is full for this frame (StoreError::Overloaded).
-Full(f) ==
+Full(ep) ==
     \/ Cardinality(Queued) >= Global
-    \/ Cardinality(QueuedOf(f.agent)) >= PerPeer
+    \/ Cardinality(QueuedOf(ep)) >= PerPeer
+
+\* `own_ids`: the `tasks.id` values that the row of a new frame can get.
+\* It is the ID of the frame when no row has it. When a row of another
+\* endpoint has it, it is an ID that the node makes. (A row of the same
+\* endpoint with this ID refuses the frame before; see Request.)
+StoreIds(f) ==
+    IF tasks[f.id] = NoTask THEN {f.id}
+    ELSE {m \in NodeIds : tasks[m] = NoTask}
 
 \* `A2aTransport::handle` -> `ProofNode::admit` -> `enqueue` ->
 \* `admit_with_replay`, and then `task_progress` of the admitted task. A
 \* frame that the policy, the group or the replay table refuses changes
 \* nothing, so it is no step here. An error of the transaction (a changed
-\* request under a known key, a full queue, a failed INSERT) rolls back the
-\* replay entry too, so it is no step either.
+\* request under a known key, a full queue, a task ID that the endpoint
+\* used for another key) rolls back the replay entry too, so it is no step
+\* either.
 Request(ep, f) ==
     /\ PolicyAdmits(ep, f)
     /\ GroupAllows(ep, f)
     /\ f.nonce \notin Range(replay[ep])          \* else DuplicateConflict
-    /\ replay' = [replay EXCEPT ![ep] = Keep(@, f.nonce)]
+    /\ ReplayRoom(ep)                            \* else Overloaded
+    /\ replay' = [replay EXCEPT ![ep] = Append(@, f.nonce)]
     /\ IF KeyRows(ep, f.key) # {}
        THEN \* TaskAdmission::Existing; else DuplicateConflict.
             \E id \in KeyRows(ep, f.key) :
                /\ SameRequest(id, f)
                /\ leaked' = (leaked \/ tasks[id].owner # ep)
                /\ wrongAdmit' = (wrongAdmit \/ ~MayChange(ep, f)
-                                 \/ id # f.id \/ tasks[id].data # f.data)
+                                 \/ tasks[id].sent # f.id
+                                 \/ tasks[id].data # f.data)
                /\ UNCHANGED tasks
-       ELSE \* TaskAdmission::Accepted; else Overloaded, or the INSERT
-            \* fails: `tasks.id` is the PRIMARY KEY of the whole table.
-            /\ ~Full(f)
-            /\ tasks[f.id] = NoTask
-            /\ tasks' = [tasks EXCEPT ![f.id] =
-                  [owner |-> ep, agent |-> f.agent, key |-> f.key,
-                   data |-> f.data, state |-> "queued", auth |-> ep,
-                   covered |-> Covered(f.agent, ep)]]
+       ELSE \* TaskAdmission::Accepted; else Overloaded, or
+            \* DuplicateConflict for a task ID of another row of `ep`.
+            /\ ~Full(ep)
+            /\ OwnSent(ep, f.id) = {}
+            /\ \E id \in StoreIds(f) :
+                  tasks' = [tasks EXCEPT ![id] =
+                     [owner |-> ep, agent |-> f.agent, key |-> f.key,
+                      data |-> f.data, sent |-> f.id, state |-> "queued",
+                      auth |-> ep, covered |-> Covered(f.agent, ep)]]
             /\ wrongAdmit' = (wrongAdmit \/ ~MayChange(ep, f))
             /\ UNCHANGED leaked
     /\ UNCHANGED <<access, members, badCancel>>
 
 \* `A2aTransport::cancel` -> `ProofNode::cancel_from` -> `cancel_if_owned`
 \* -> `cancel`. It needs no claim and no grant: the authenticated endpoint
-\* and the scope must be those of the row. A task that ended stays as it
-\* is (`TaskState::allows`), and a cancelled task stays cancelled.
-Cancel(ep, id, scope) ==
-    /\ id \in Rows
-    /\ tasks[id].owner = ep /\ scope = DirectScope   \* else Unauthorized
-    /\ tasks[id].state = "queued"
-    /\ tasks' = [tasks EXCEPT ![id].state = "ended"]
-    /\ badCancel' = (badCancel \/ tasks[id].auth # ep \/ scope # DirectScope)
-    /\ UNCHANGED <<access, members, replay, wrongAdmit, leaked>>
+\* and the scope must be those of the row. `sid` is the task ID that the
+\* caller sent; the row is the one of `ep` with it, whatever its
+\* `tasks.id`. A task that ended stays as it is (`TaskState::allows`), and
+\* a cancelled task stays cancelled.
+Cancel(ep, sid, scope) ==
+    \E id \in OwnSent(ep, sid) :                \* else NotFound, Unauthorized
+       /\ scope = DirectScope                    \* else Unauthorized
+       /\ tasks[id].state = "queued"
+       /\ tasks' = [tasks EXCEPT ![id].state = "ended"]
+       /\ badCancel' = (badCancel \/ tasks[id].auth # ep
+                        \/ scope # DirectScope)
+       /\ UNCHANGED <<access, members, replay, wrongAdmit, leaked>>
 
-\* A first frame of the honest caller: its own name, endpoint and claim, a
-\* key that it did not use, and a task ID that no row has.
+\* A first frame of the honest caller: its own name, endpoint and claim,
+\* and a key and a task ID that it did not use. Another endpoint can have
+\* a row with that task ID.
 HonestFrame(f) ==
     /\ f.cep = HonestEp /\ f.agent = HonestName /\ f.claim = Honest
     /\ KeyRows(HonestEp, f.key) = {}
-    /\ tasks[f.id] = NoTask
+    /\ OwnSent(HonestEp, f.id) = {}
 
 \* The host accepts a first frame of the honest caller.
 HonestAdmitted ==
@@ -288,7 +320,7 @@ HonestAdmitted ==
 Next ==
     \/ \E p \in People : Grant(p) \/ Revoke(p) \/ Expire(p) \/ Join(p) \/ Leave(p)
     \/ \E e \in Eps : ReplayExpires(e)
-    \/ \E id \in TaskIds : HostRuns(id)
+    \/ \E id \in RowIds : HostRuns(id)
     \* Any endpoint sends any frame. The policy reads only the first three
     \* fields, so they come first: TLC then drops a refused frame early.
     \/ \E e \in Eps, cep \in Eps, agent \in Names, claim \in AllPeople :
@@ -299,10 +331,12 @@ Next ==
                             nonce |-> nonce])
     \/ \E e \in Eps, id \in TaskIds, s \in Scopes : Cancel(e, id, s)
 
-\* The scheduler keeps working, and the honest caller sends its task again
-\* (see Outbox) with a new nonce for as long as it must.
+\* The scheduler keeps working, time passes for the replay entries, and
+\* the honest caller sends its task again (see Outbox) with a new nonce
+\* for as long as it must.
 Fairness ==
-    /\ \A id \in TaskIds : WF_vars(HostRuns(id))
+    /\ \A id \in RowIds : WF_vars(HostRuns(id))
+    /\ \A e \in Eps : WF_vars(ReplayExpires(e))
     /\ SF_vars(HonestAdmitted)
 
 Spec == Init /\ [][Next]_vars /\ Fairness
@@ -329,11 +363,17 @@ OneTaskPerKey ==
     \A a, b \in Rows :
         tasks[a].owner = tasks[b].owner /\ tasks[a].key = tasks[b].key => a = b
 
+\* An endpoint has one row for a task ID that it sent, so a cancel names
+\* one task.
+OneTaskPerSentId ==
+    \A a, b \in Rows :
+        tasks[a].owner = tasks[b].owner /\ tasks[a].sent = tasks[b].sent => a = b
+
 \* The queue holds at most `global` tasks, and at most `per_peer` tasks of
-\* one agent name.
+\* one endpoint.
 QueueWithinLimits ==
     /\ Cardinality(Queued) <= Global
-    /\ \A n \in Names : Cardinality(QueuedOf(n)) <= PerPeer
+    /\ \A e \in Eps : Cardinality(QueuedOf(e)) <= PerPeer
 
 \* A frame changes the tasks or the replay table only when the endpoint
 \* that sent it has a live grant and a membership and the nonce is new. A
@@ -348,7 +388,7 @@ NoForeignRead == ~leaked
 \* Only the owner endpoint, in the scope of the task, cancels a task.
 OnlyOwnerCancels == ~badCancel
 
-\* A row keeps its owner, name, key and data for ever: the same key with
+\* A row keeps its owner, name, key, data and sent ID for ever: the same key with
 \* changed data never changes the task, and no frame takes a task over.
 \* Only the state changes, and an ended task does not change.
 RowsAreStable ==
@@ -357,53 +397,48 @@ RowsAreStable ==
          /\ [tasks'[id] EXCEPT !.state = "queued"] = [tasks[id] EXCEPT !.state = "queued"]
          /\ tasks[id].state # "queued" => tasks'[id] = tasks[id]]_vars
 
-(***************************************************************************)
-(* Properties that TLC finds false. They are not in Admission.cfg; each    *)
-(* comment gives the counterexample.                                       *)
-(***************************************************************************)
+\* The node has no ID left to make. Only this small model has that state.
+NodeIdsUsedUp == NodeIds \subseteq Rows
 
-\* A frame of `ep` that has everything it needs (access, a new nonce, a new
-\* key, room in the queue) and still fails: another endpoint has a row with
-\* its task ID.
+\* A frame of `ep` that has everything it needs (access, a new nonce, room
+\* in the replay table, a key and a task ID that `ep` did not use, room in
+\* the queue) and still fails, because another endpoint has a row with its
+\* task ID.
 ClashRefused(ep, f) ==
     /\ PolicyAdmits(ep, f) /\ GroupAllows(ep, f)
-    /\ f.nonce \notin Range(replay[ep])
+    /\ f.nonce \notin Range(replay[ep]) /\ ReplayRoom(ep)
     /\ KeyRows(ep, f.key) = {}
-    /\ ~Full(f)
-    /\ tasks[f.id] # NoTask /\ tasks[f.id].owner # ep
+    /\ OwnSent(ep, f.id) = {}
+    /\ ~Full(ep)
+    /\ tasks[f.id] # NoTask
+    /\ StoreIds(f) = {}
 
-\* FALSE: a caller is never refused because of a task ID that another
-\* endpoint used. `tasks.id` is the PRIMARY KEY of the table (and
-\* `request_id` is UNIQUE), not unique for each endpoint, and `admit` looks
-\* only for a row of the same endpoint before the INSERT. Trace: the owner
-\* invites two people; the second person sends a task with the ID t1 and
-\* the host ends it; the first person sends its own task with the ID t1;
-\* the INSERT fails with a constraint error, the caller gets "task store
-\* unavailable", and every resend fails the same way, because rows stay.
-\* The second person must know the ID. It is a random UUID that only the
-\* first person and the host see, so the IDs keep the two apart, not the
-\* table.
-NoTaskIdClash == \A ep \in Eps, f \in Frames : ~ClashRefused(ep, f)
+\* A caller is never refused because of a task ID that another endpoint
+\* used. `tasks.id` is the PRIMARY KEY of the whole table, so the row of
+\* the second caller gets an ID that the node makes, and the answer and a
+\* cancel still use the ID that the caller sent.
+\* (The policy admits only a frame with the endpoint of the sender and its
+\* claim, and the data of a new frame decides nothing, so those fields have
+\* one value here.)
+NoTaskIdClash ==
+    \/ NodeIdsUsedUp
+    \/ \A ep \in Eps, agent \in Names, id \in TaskIds, key \in Keys,
+          nonce \in Nonces, data \in Data :
+          ~ClashRefused(ep, [cep |-> ep, agent |-> agent,
+                             claim |-> <<agent, ep>>, id |-> id, key |-> key,
+                             data |-> data, nonce |-> nonce])
 
-\* FALSE: the honest caller is refused as overloaded only for its own
-\* queued tasks or a full global queue. `count` uses `caller_agent_id` for
-\* the per-peer limit, so two endpoints that the owner invited under one
-\* name share one limit. Trace: the owner invites <<alice, e1>> and
-\* <<alice, e2>>; e2 fills the per-peer limit; the first task of e1 gets
-\* "overloaded". A caller cannot choose its name: the claim and the grant
-\* carry the name that the owner gave to that endpoint (PolicyAdmits).
+\* The honest caller is refused as overloaded only for its own queued
+\* tasks or a full global queue: two endpoints that the owner invited
+\* under one name do not share a limit.
 NoSharedQuota ==
-    ~ /\ Covered(HonestName, HonestEp)
-      /\ Cardinality(Queued) < Global
-      /\ Cardinality({id \in Queued : tasks[id].owner = HonestEp}) < PerPeer
-      /\ Cardinality(QueuedOf(HonestName)) >= PerPeer
+    Full(HonestEp) =>
+        \/ Cardinality(Queued) >= Global
+        \/ Cardinality({id \in Queued : tasks[id].auth = HonestEp}) >= PerPeer
 
-\* FALSE: a nonce stays in the replay table until REPLAY_TTL passes. At
-\* REPLAY_LIMIT entries `accept_replay_key` removes the oldest entry, so an
-\* endpoint that sends REPLAY_LIMIT more frames can send its own old frame
-\* again before the time passes. The frame then finds its task by the
-\* idempotency key (`Existing`) and makes no second task: OneTaskPerKey.
-\* (Only ReplayExpires makes the table of an endpoint shorter.)
+\* A nonce stays in the replay table until REPLAY_TTL passes, so an
+\* endpoint cannot send its own old frame again before that. (Only
+\* ReplayExpires makes the table of an endpoint shorter.)
 NoReplayBeforeExpiry ==
     [][\A e \in Eps :
          Len(replay'[e]) >= Len(replay[e])
@@ -414,13 +449,12 @@ NoReplayBeforeExpiry ==
 
 HonestCovered == Covered(HonestName, HonestEp)
 HonestHasTask == \E id \in Rows : tasks[id].owner = HonestEp
-\* Every task ID has a row, so this small model has no ID left.
-IdsUsedUp == Rows = TaskIds
 
 \* An honest caller that keeps its grant and its group membership gets a
 \* task in, whatever the other endpoints send: the queue gets room again,
-\* and no frame of another endpoint uses up its nonces or its keys.
+\* and no frame of another endpoint uses up its nonces, its keys or its
+\* task IDs.
 HonestGetsIn ==
-    <>[]HonestCovered => <>(HonestHasTask \/ IdsUsedUp)
+    <>[]HonestCovered => <>(HonestHasTask \/ NodeIdsUsedUp)
 
 =============================================================================

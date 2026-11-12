@@ -27,7 +27,9 @@
 (* One task and one caller. `mode` is chosen in Init and does not change,  *)
 (* so one TLC run checks both polling loops: "cli" is                      *)
 (* `request_with_polling_on`, which keeps every event frame; "outbox" is   *)
-(* `follow`, which keeps only the cursor and the answer.                   *)
+(* `follow`, which keeps only the cursor and the answer. A `follow` whose  *)
+(* window closes keeps the cursor in `sent_tasks`, and the next attempt    *)
+(* polls on from it, so the attempts of one task are one loop here.        *)
 (*                                                                         *)
 (* `task_progress` reads the state and the page in one store call, so the  *)
 (* host read is one step. At most one exchange is in flight: each loop     *)
@@ -247,16 +249,17 @@ CliReceive ==
     /\ rep' = None
     /\ UNCHANGED <<mode, state, expired, events, termSeq, ran, req, lost>>
 
-\* `follow` with `outcome`: stop when the state is not Working. It does not
-\* read `aetherMoreEvents`, and it keeps no event frames.
+\* `follow` with `outcome`: stop on an error, or on a state that is not
+\* Working whose page has no `aetherMoreEvents`. It keeps no event frames.
+\* When the window closes first, `still_working` keeps the task active.
 OutboxReceive ==
     /\ mode = "outbox"
     /\ c.phase = "sent"
     /\ rep # None
     /\ IF rep.kind = "error"
        THEN c' = [c EXCEPT !.phase = "error"]
-       ELSE c' = [c EXCEPT !.phase = IF rep.status = "working"
-                                     THEN "idle" ELSE "done",
+       ELSE c' = [c EXCEPT !.phase = IF Ended(rep.status) /\ ~rep.more
+                                     THEN "done" ELSE "idle",
                            !.cursor = Max(c.cursor, rep.cursor)]
     /\ rep' = None
     /\ UNCHANGED <<mode, state, expired, events, termSeq, ran, req, lost>>
@@ -362,27 +365,16 @@ CliInOrder ==
 CliComplete ==
     mode = "cli" /\ c.phase = "done" => termSeq > 0 /\ c.cursor >= termSeq
 
+\* The cursor that the outbox keeps for an ended task covers the event
+\* that ended it: `follow` polls on while a page has `aetherMoreEvents`,
+\* as the wire profile asks, also when the status looks terminal.
+OutboxReadsToEnd ==
+    mode = "outbox" /\ c.phase = "done" => termSeq > 0 /\ c.cursor >= termSeq
+
 \* An ended task lets the caller stop: with its last page, with an error
 \* frame, or (cli) with a lost exchange or the poll deadline.
 EndedTaskStops ==
     (state \in Terminal \cup {"unknown_result"})
         ~> (c.phase \in {"done", "error", "aborted"} \/ lost = MaxLost)
-
-(***************************************************************************)
-(* A property that TLC finds false. It is not in EventPaging.cfg.          *)
-(***************************************************************************)
-
-\* FALSE: the cursor that the outbox keeps for an ended task covers the
-\* event that ended it. `follow` stops as soon as `outcome` gives a state
-\* that is not Working, and neither reads `aetherMoreEvents`
-\* (outbox.rs `follow`, `outcome`). The wire profile says that a caller
-\* polls on while `aetherMoreEvents` is true, also when the status looks
-\* terminal. With PageLimit = 2 TLC finds: Start, Progress, Finish (4
-\* events), Poll, HostRead (events 1 and 2, status completed, more = TRUE),
-\* OutboxReceive: the task is answered with the cursor at 2.
-\* The outbox keeps only the answer, which is in every page of a succeeded
-\* task, so it loses no answer; the cursor in `sent_tasks` is short.
-OutboxReadsToEnd ==
-    mode = "outbox" /\ c.phase = "done" => c.cursor >= termSeq
 
 =============================================================================

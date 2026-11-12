@@ -9,7 +9,7 @@ use aether_store::DirectoryEventType;
 
 use crate::{
     discovery::{
-        validate_record,
+        DiscoveryError, validate_record,
         wire::{self, WireDirectoryEvent, WireRecord},
     },
     pinned_json::{self, HttpError, PinnedJsonClient},
@@ -30,6 +30,8 @@ pub enum DirectoryClientError {
     InvalidRecord,
     #[error("directory record signer is not trusted")]
     UntrustedRecord,
+    #[error("directory record has expired")]
+    ExpiredRecord,
 }
 
 impl From<HttpError> for DirectoryClientError {
@@ -84,7 +86,7 @@ impl DirectoryClient {
             &[StatusCode::OK],
         )
         .await?;
-        self.validate(&record)?;
+        self.validate_resolved(agent_id, &record)?;
         Ok(record)
     }
 
@@ -121,6 +123,13 @@ impl DirectoryClient {
         Ok(())
     }
 
+    /// The events of the directory after `cursor`, in order.
+    ///
+    /// The directory keeps each event for ever, and it takes a record of
+    /// any key for a free agent ID. So an honest directory also sends a
+    /// record that has expired since, or one that another key signed. Such
+    /// an event comes back without its record: the caller has nothing to
+    /// keep, and moves its cursor past the event.
     pub async fn events_after(
         &self,
         cursor: i64,
@@ -128,7 +137,7 @@ impl DirectoryClient {
         if cursor < 0 {
             return Err(DirectoryClientError::InvalidRecord);
         }
-        let events: Vec<WireDirectoryEvent> = pinned_json::json(
+        let mut events: Vec<WireDirectoryEvent> = pinned_json::json(
             self.http
                 .client()
                 .get(self.events_url()?)
@@ -142,8 +151,10 @@ impl DirectoryClient {
         ) {
             return Err(DirectoryClientError::InvalidRecord);
         }
-        for event in &events {
-            self.validate_event(event)?;
+        for event in &mut events {
+            if !self.validate_event(event)? {
+                event.record = None;
+            }
         }
         Ok(events)
     }
@@ -169,13 +180,35 @@ impl DirectoryClient {
         if record.signing_key != self.trusted_signing_key {
             return Err(DirectoryClientError::UntrustedRecord);
         }
-        validate_record(&record).map_err(|_| DirectoryClientError::InvalidRecord)
+        validate_record(&record).map_err(|error| match error {
+            DiscoveryError::Expired => DirectoryClientError::ExpiredRecord,
+            DiscoveryError::Forged | DiscoveryError::Malformed => {
+                DirectoryClientError::InvalidRecord
+            }
+        })
     }
 
+    /// Checks the answer of the directory to a question about `agent_id`.
+    /// The directory chooses the record that it sends, so a valid record of
+    /// another agent is refused here.
+    fn validate_resolved(
+        &self,
+        agent_id: &str,
+        record: &WireRecord,
+    ) -> Result<(), DirectoryClientError> {
+        if record.agent_id != agent_id {
+            return Err(DirectoryClientError::InvalidRecord);
+        }
+        self.validate(record)
+    }
+
+    /// Whether the caller can keep the record of `event`. `false` for a
+    /// record that expired or that another key signed; an event that is
+    /// malformed, or whose signature does not fit, is an error.
     fn validate_event(
         &self,
         event: &WireDirectoryEvent,
-    ) -> Result<(), DirectoryClientError> {
+    ) -> Result<bool, DirectoryClientError> {
         if event.scope_id.is_empty() {
             return Err(DirectoryClientError::InvalidRecord);
         }
@@ -189,9 +222,16 @@ impl DirectoryClient {
                 {
                     return Err(DirectoryClientError::InvalidRecord);
                 }
-                self.validate(record)
+                match self.validate(record) {
+                    Ok(()) => Ok(true),
+                    Err(
+                        DirectoryClientError::UntrustedRecord
+                        | DirectoryClientError::ExpiredRecord,
+                    ) => Ok(false),
+                    Err(error) => Err(error),
+                }
             }
-            DirectoryEventType::Revoked if event.record.is_none() => Ok(()),
+            DirectoryEventType::Revoked if event.record.is_none() => Ok(true),
             DirectoryEventType::Revoked => Err(DirectoryClientError::InvalidRecord),
         }
     }
@@ -262,12 +302,14 @@ pub async fn sync_directory(
         // `events_after` refuses a page whose cursors do not climb past
         // `cursor`, and an event whose record does not match its type, so
         // each change moves the cursor forward and needs no further check.
+        // It takes the record out of an event that this node cannot use.
         for change in changes {
             match change.event {
                 DirectoryEventType::Published | DirectoryEventType::Renewed => {
-                    let record = change.record.as_ref().ok_or(Failed)?;
-                    cache_wire_directory_record(&store, record)?;
-                    records = records.checked_add(1).ok_or(Failed)?;
+                    if let Some(record) = change.record.as_ref() {
+                        cache_wire_directory_record(&store, record)?;
+                        records = records.checked_add(1).ok_or(Failed)?;
+                    }
                 }
                 DirectoryEventType::Revoked => {
                     store.mark_directory_record_stale(
@@ -344,12 +386,24 @@ pub async fn request_via_directory(
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, time::Duration};
+    use std::{
+        fs,
+        time::{Duration, SystemTime},
+    };
 
+    use aether_store::DirectoryEventType;
     use axum_server::Handle;
 
-    use super::{DirectoryClient, DirectoryClientError};
-    use crate::{control_service::serve, discovery::wire::WireRecord};
+    use super::{
+        DirectoryClient, DirectoryClientError, cached_directory_record, sync_directory,
+    };
+    use crate::{
+        control_service::serve,
+        discovery::{
+            signed_record,
+            wire::{WireDirectoryEvent, WireRecord},
+        },
+    };
     use ed25519_dalek::SigningKey;
 
     fn trusted_signing_key() -> [u8; 32] {
@@ -433,6 +487,155 @@ mod tests {
             untrusted.validate(&WireRecord::test_record()),
             Err(DirectoryClientError::UntrustedRecord)
         ));
+    }
+
+    fn offline_client() -> DirectoryClient {
+        DirectoryClient::with_pinned_certificate(
+            "https://directory.test",
+            rcgen::generate_simple_self_signed(vec!["directory.test".to_owned()])
+                .expect("certificate must generate")
+                .cert
+                .der(),
+            trusted_signing_key(),
+        )
+        .expect("client must build")
+    }
+
+    fn record_of(key: u8, agent_id: &str, expires_at: SystemTime) -> WireRecord {
+        WireRecord::from_record(&signed_record(
+            &SigningKey::from_bytes(&[key; 32]),
+            agent_id.to_owned(),
+            "endpoint".to_owned(),
+            vec!["127.0.0.1:9443".to_owned()],
+            "test-scope".to_owned(),
+            vec!["test".to_owned()],
+            expires_at,
+        ))
+    }
+
+    fn published(record: WireRecord) -> WireDirectoryEvent {
+        WireDirectoryEvent {
+            cursor: 1,
+            event: DirectoryEventType::Published,
+            scope_id: record.scope_id.clone(),
+            agent_id: record.agent_id.clone(),
+            record: Some(record),
+        }
+    }
+
+    #[test]
+    fn a_resolved_record_of_another_agent_is_refused() {
+        let client = offline_client();
+        let record = WireRecord::test_record();
+        client
+            .validate_resolved("test-agent", &record)
+            .expect("the record of the agent must pass");
+        // A directory that answers with a valid record of another agent.
+        assert!(matches!(
+            client.validate_resolved("other-agent", &record),
+            Err(DirectoryClientError::InvalidRecord)
+        ));
+    }
+
+    #[test]
+    fn an_event_with_a_record_that_cannot_be_used_is_skipped_not_refused() {
+        let client = offline_client();
+        let soon = SystemTime::now() + Duration::from_secs(60);
+        let past = SystemTime::now() - Duration::from_secs(60);
+        assert!(matches!(
+            client.validate_event(&published(record_of(7, "agent", soon))),
+            Ok(true)
+        ));
+        // The record expired after the directory took it.
+        assert!(matches!(
+            client.validate_event(&published(record_of(7, "agent", past))),
+            Ok(false)
+        ));
+        // The directory takes a record of any key for a free agent ID.
+        assert!(matches!(
+            client.validate_event(&published(record_of(8, "agent", soon))),
+            Ok(false)
+        ));
+        let mut forged = published(record_of(7, "agent", soon));
+        if let Some(record) = forged.record.as_mut() {
+            record.endpoint_id = "changed".to_owned();
+        }
+        assert!(matches!(
+            client.validate_event(&forged),
+            Err(DirectoryClientError::InvalidRecord)
+        ));
+        let mut misfiled = published(record_of(7, "agent", soon));
+        misfiled.agent_id = "other".to_owned();
+        assert!(matches!(
+            client.validate_event(&misfiled),
+            Err(DirectoryClientError::InvalidRecord)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_record_of_another_key_in_the_log_does_not_stop_the_sync() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let data_dir = directory.path().join("control");
+        let node_dir = directory.path().join("node");
+        let handle = Handle::new();
+        let server = tokio::spawn({
+            let handle = handle.clone();
+            let data_dir = data_dir.clone();
+            async move { serve(&data_dir, 0, handle).await }
+        });
+        let address = tokio::time::timeout(Duration::from_secs(5), handle.listening())
+            .await
+            .expect("server must listen")
+            .expect("server address must exist");
+        let certificate =
+            fs::read(crate::data_dir::DataDir::new(&data_dir).control_certificate())
+                .expect("certificate must exist");
+        let url = format!("https://127.0.0.1:{}", address.port());
+        let client = DirectoryClient::with_pinned_certificate(
+            &url,
+            &certificate,
+            trusted_signing_key(),
+        )
+        .expect("client must trust the directory");
+        let soon = SystemTime::now() + Duration::from_secs(60);
+        let stranger = DirectoryClient::with_pinned_certificate(
+            &url,
+            &certificate,
+            SigningKey::from_bytes(&[8; 32]).verifying_key().to_bytes(),
+        )
+        .expect("client must build");
+        stranger
+            .publish(&record_of(8, "stranger", soon))
+            .await
+            .expect("the directory takes a record of any key");
+        let listed = record_of(7, "listed", soon);
+        client.publish(&listed).await.expect("record must publish");
+
+        let (cursor, records) =
+            sync_directory(&node_dir, &url, trusted_signing_key(), &client)
+                .await
+                .expect("the sync must pass the record of the other key");
+        assert_eq!((cursor, records), (2, 1));
+        assert!(
+            cached_directory_record(
+                &node_dir,
+                "test-scope",
+                "listed",
+                trusted_signing_key()
+            )
+            .is_ok()
+        );
+        assert!(
+            cached_directory_record(
+                &node_dir,
+                "test-scope",
+                "stranger",
+                trusted_signing_key()
+            )
+            .is_err()
+        );
+        handle.graceful_shutdown(Some(Duration::from_secs(5)));
+        server.await.expect("server task must finish").expect("server must stop");
     }
 
     #[tokio::test]

@@ -395,12 +395,36 @@ async fn follow(
             replayed = true;
             continue;
         }
+        // An ended status is not enough to stop: the host cut the page
+        // before the last event when it says that more events remain.
+        let more_events = result
+            .as_ref()
+            .is_ok_and(|frames| crate::transport::response_more_events_remain(frames));
         let outcome = outcome(&task.task_id, result);
         after = after.max(outcome.last_event_sequence);
-        if outcome.state != SentState::Working || started.elapsed() >= window {
+        let working = outcome.state == SentState::Working;
+        if !working && !more_events {
             return Ok(Outcome { last_event_sequence: after, ..outcome });
         }
-        tokio::time::sleep(POLL_INTERVAL).await;
+        if started.elapsed() >= window {
+            return Ok(still_working(outcome, after));
+        }
+        if working {
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+}
+
+/// The outcome of an attempt whose window closed before the last page of
+/// events: the task stays active, and the next attempt reads on from `after`.
+fn still_working(outcome: Outcome, after: u64) -> Outcome {
+    Outcome {
+        state: SentState::Working,
+        reason: None,
+        host_state: outcome.host_state,
+        answer: None,
+        last_event_sequence: after,
+        delay: Some(Delay::Working),
     }
 }
 
@@ -831,6 +855,73 @@ mod tests {
             .expect("read")
             .expect("the task exists");
         assert_eq!(kept.answer.as_deref(), Some("done"));
+    }
+
+    /// One page of an ended task: the cursor, and whether events remain.
+    #[expect(clippy::unnecessary_wraps, reason = "a scripted answer is a Result")]
+    fn page(cursor: i64, more_events: bool) -> Result<Vec<Frame>, TransportError> {
+        let task = "00000000-0000-4000-8000-000000000001";
+        Ok(vec![Frame {
+            version: 0,
+            kind: FrameKind::Result,
+            exchange_id: "e".to_owned(),
+            scope_id: "direct".to_owned(),
+            task_id: Some(task.to_owned()),
+            payload: crate::transport::text_result_payload_with_progress(
+                task,
+                A2aTaskStatus::Completed,
+                "done",
+                cursor,
+                more_events,
+            ),
+        }])
+    }
+
+    #[tokio::test]
+    async fn an_ended_task_is_read_to_its_last_event() {
+        let (_host, caller) = caller();
+        let task = enqueue(caller.path(), "tudor", "work", now()).expect("enqueue");
+        let courier = Scripted::with(vec![page(2, true), page(4, false)]);
+        let state =
+            attempt(caller.path(), courier.as_ref(), &task, Duration::from_secs(5))
+                .await
+                .expect("attempt");
+        assert_eq!(state, SentState::Answered);
+        let cursors: Vec<Option<u64>> = courier
+            .requests()
+            .iter()
+            .map(|frame| {
+                serde_json::from_value::<A2aRequest>(frame.payload.clone())
+                    .expect("payload")
+                    .last_event_sequence
+            })
+            .collect();
+        assert_eq!(cursors, [Some(0), Some(2)]);
+        let kept = NodeStore::in_dir(caller.path())
+            .expect("store")
+            .sent_task(&task.task_id)
+            .expect("read")
+            .expect("the task exists");
+        assert_eq!(kept.last_event_sequence, 4);
+        assert_eq!(kept.answer.as_deref(), Some("done"));
+    }
+
+    #[tokio::test]
+    async fn a_closed_window_keeps_a_task_with_more_events_active() {
+        let (_host, caller) = caller();
+        let task = enqueue(caller.path(), "tudor", "work", now()).expect("enqueue");
+        let courier = Scripted::with(vec![page(2, true)]);
+        let state = attempt(caller.path(), courier.as_ref(), &task, Duration::ZERO)
+            .await
+            .expect("attempt");
+        assert_eq!(state, SentState::Working);
+        let kept = NodeStore::in_dir(caller.path())
+            .expect("store")
+            .sent_task(&task.task_id)
+            .expect("read")
+            .expect("the task exists");
+        assert_eq!(kept.last_event_sequence, 2);
+        assert_eq!(kept.answer, None);
     }
 
     #[tokio::test]

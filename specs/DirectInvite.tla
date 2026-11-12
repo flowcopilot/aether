@@ -16,10 +16,13 @@
 (*   crates/aether/src/proof/admission.rs  admit, check_group              *)
 (*   crates/aether-core/src/lib.rs       PolicyEngine::admit, match_grant  *)
 (*                                                                         *)
-(* sign_direct_invite has three callers that share no lock for the whole   *)
-(* call: the host page (admin_ui/host.rs create_invite), the admin socket  *)
-(* (admin_socket.rs create_invite_response, for an MCP client), and the    *)
-(* hub worker (hub_workers.rs sign_and_pin). So two calls can interleave;  *)
+(* sign_direct_invite has three callers: the host page (admin_ui/host.rs   *)
+(* create_invite), the admin socket (admin_socket.rs                       *)
+(* create_invite_response, for an MCP client), and the hub worker          *)
+(* (hub_workers.rs sign_and_pin). All three run in the node process, and   *)
+(* sign_direct_invite_with holds the SIGNING lock of invites.rs for the    *)
+(* whole call, so one call runs at a time. The owner's other actions (a    *)
+(* revoke, a group change) and every request still interleave with a call; *)
 (* each store call and each Administration call is one atomic step.        *)
 (*                                                                         *)
 (* An invite line holds two separate signed things: the invitation (agent  *)
@@ -113,10 +116,14 @@ Init ==
 -----------------------------------------------------------------------------
 (* The host: one call of sign_direct_invite_with.                          *)
 
-\* create_card, sign_invite_access, and the first is_member read
-\* (`was_member` of sign_direct_invite_with).
+\* A call holds the SIGNING lock from its start to its end.
+Signing(i) == inv[i].pc \in {"signed", "joined", "applied"}
+
+\* SIGNING.lock, then create_card, sign_invite_access, and the first
+\* is_member read (`was_member` of sign_direct_invite_with).
 Start(i, p) ==
     /\ inv[i].pc = "idle"
+    /\ \A j \in Invites : ~Signing(j)
     /\ inv' = [inv EXCEPT ![i] = [pc |-> "signed", who |-> p,
                                   was1 |-> p \in members, was2 |-> FALSE]]
     /\ invited' = invited \cup {p}
@@ -303,37 +310,17 @@ NameKeepsEndpoint ==
          (Valid(n) /\ contacts'[n].ep # None) => contacts'[n].ep = contacts[n].ep
       ]_vars
 
-(***************************************************************************)
-(* Properties that TLC finds false. They are not in DirectInvite.cfg.      *)
-(***************************************************************************)
-
-\* FALSE: a person is in the group only through a call that reached the
-\* join and did not fail, so failed calls alone leave nobody in the group.
-\*
-\* TLC, with two calls for one person: Start(i1) (was1 = FALSE), Join(i1),
-\* Start(i2) (was1 = TRUE), Apply(i1) fails and takes the person out,
-\* Join(i2) (was2 = FALSE) puts the person back, Apply(i2), Encode(i2)
-\* fails. Encode uses the read of Start (was1 = TRUE), so it leaves the
-\* person in the group. Both calls failed and no grant is live, but the
-\* person stays a member. A member without a grant gets no task admitted
-\* (AdmitOnlyInvited holds), so this is a leftover row, not an access.
+\* A person is in the group only through a call that reached the join and
+\* did not fail, so failed calls alone leave nobody in the group.
 NoStrayMember ==
     \A p \in members :
         \E i \in Invites : inv[i].who = p /\ inv[i].pc \in {"joined", "applied", "done"}
 
-\* FALSE: a line that the host returned works. When no call for the person
-\* still runs, the grant is live, and the owner did not take the person out
-\* of the group, the person is in the group, so check_group admits them.
-\*
-\* TLC, with two calls for one person (for example the host page and an
-\* MCP client, or a double click): Start(i1), Join(i1) (was2 = FALSE),
-\* Start(i2) (was1 = TRUE), Join(i2) (was2 = TRUE), Apply(i1) fails and
-\* takes the person out of the group, Apply(i2), Encode(i2). The line of i2
-\* is returned and its grant is live, but the person is in no group, and
-\* every request with it is refused (ProofError::GroupDenied). The same
-\* happens when Encode(i1) fails after Start(i1) read was1 = FALSE.
-\* Each call decides "I added this person" from its own read and no lock
-\* covers the read and the later removal.
+\* A line that the host returned works. When no call for the person still
+\* runs, the grant is live, and the owner did not take the person out of
+\* the group, the person is in the group, so check_group admits them.
+\* Without the SIGNING lock a second call for the same person that fails
+\* takes the person out of the group under the first call's line.
 ReturnedLineWorks ==
     \A i \in lines :
         (/\ i \in live
