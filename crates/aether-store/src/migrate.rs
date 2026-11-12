@@ -66,7 +66,7 @@ pub fn backup_connection(
     path: &Path,
 ) -> Result<PathBuf, StoreError> {
     let backup = next_backup_path(path);
-    connection.backup(MAIN_DB, &backup, None)?;
+    connection.backup(MAIN_DB, &backup, None::<fn(rusqlite::backup::Progress)>)?;
     retain_backups(path)?;
     Ok(backup)
 }
