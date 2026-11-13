@@ -15,9 +15,8 @@ use super::{
     },
     wire::{
         A2aRequest, A2aTask, A2aTaskStatus, ALPN, EVENT_CURSOR, EVENT_SEQUENCE, Frame,
-        FrameKind, HANDSHAKE_TIMEOUT, MORE_EVENTS, OVERLOAD_RETRY_WINDOW,
-        RETRY_AFTER_MS, STREAM_TIMEOUT, TASK_POLL_DEADLINE, TransportError,
-        overload_retry_delay, task_poll_delay,
+        FrameKind, HANDSHAKE_TIMEOUT, MORE_EVENTS, RETRY_AFTER_MS, STREAM_TIMEOUT,
+        TASK_POLL_DEADLINE, TransportError, overload_retry_wait, task_poll_delay,
     },
 };
 
@@ -283,7 +282,7 @@ pub fn response_more_events_remain(response: &[Frame]) -> bool {
     )
 }
 
-async fn request_with_polling_on(
+pub(super) async fn request_with_polling_on(
     endpoint: &iroh::Endpoint,
     remote: iroh::EndpointAddr,
     mut request: Frame,
@@ -319,12 +318,15 @@ async fn request_with_polling_on(
         // key, so sending it again a little later is safe; after
         // `OVERLOAD_RETRY_WINDOW` the error goes to the caller. A full queue
         // is not retried: the host rejects that request at once, by design.
+        // No wait passes the end of the window or of `TASK_POLL_DEADLINE`.
         if is_rate_limited(&response) {
             let since = *overloaded_since.get_or_insert_with(std::time::Instant::now);
-            if since.elapsed() < OVERLOAD_RETRY_WINDOW
-                && started.elapsed() < TASK_POLL_DEADLINE
-            {
-                tokio::time::sleep(overload_retry_delay(overload_retries)).await;
+            if let Some(wait) = overload_retry_wait(
+                overload_retries,
+                since.elapsed(),
+                TASK_POLL_DEADLINE.saturating_sub(started.elapsed()),
+            ) {
+                tokio::time::sleep(wait).await;
                 overload_retries = overload_retries.saturating_add(1);
                 continue;
             }
@@ -362,7 +364,7 @@ async fn request_with_polling_on(
 
 /// Whether `response` is only the "node overloaded" error that the host's
 /// per-peer rate limit sends: the one with `RETRY_AFTER_MS` in its `data`.
-pub(super) fn is_rate_limited(response: &[Frame]) -> bool {
+pub(crate) fn is_rate_limited(response: &[Frame]) -> bool {
     matches!(response, [frame] if frame.kind == FrameKind::Error
         && frame.payload.get("message").and_then(serde_json::Value::as_str)
             == Some(a2a_error_message(&TransportError::Overloaded))

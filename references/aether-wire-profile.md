@@ -118,6 +118,32 @@ The receiver accepts a maximum of 32 concurrent connections. It sheds a
 request above that count and answers with an overload error frame. It accepts
 a maximum of 8 requests each second from one authenticated endpoint.
 
+### `retryAfterMs`
+
+A request above the per-peer limit gets the error frame "node overloaded",
+with the same code and message as any other overload. That error has one
+optional field, `data.retryAfterMs`, a number of milliseconds.
+
+- Only the per-peer rate limit sends `data.retryAfterMs`. An overload for any
+  other reason, such as a full handler queue, never carries it: that error
+  has no `data`.
+- The value is a fixed hint, the time for one token of the limit (125 ms at 8
+  requests each second). It is not the exact wait of the limiter, so a client
+  that sends again should wait at least that long and back off.
+- A host that sends the key has admitted nothing for that request: no task, no
+  replay entry, no events. A client may therefore send the same exchange again
+  (the same task ID and idempotency key; the reference client uses a new
+  exchange ID and request nonce) only when the key is present. A client that
+  gets "node overloaded" without it must not send the exchange again in the
+  same call; the host rejects it at once by design.
+- The reference client sends again for up to 2 seconds, starting at one token
+  and doubling to at most 1 second, and no wait passes the end of that window.
+  After that it returns the error. An outbox task that gets the error keeps
+  waiting and tries again after 2 seconds.
+
+A client or host that does not know the key sees no change, because the
+message and code stay the same.
+
 Every network stage has a time limit: 20 seconds for the connection handshake,
 10 seconds for stream acceptance, for a frame read, and for a frame write, and
 30 seconds for the request handler. A stage above its limit stops and returns a

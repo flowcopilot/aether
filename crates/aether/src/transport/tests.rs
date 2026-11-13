@@ -489,6 +489,184 @@ async fn a_rate_limited_peer_reads_the_overloaded_error_frame() {
     receiver.close().await;
 }
 
+/// A per-peer limiter that lets one request through in a second, so the
+/// second request of a peer in a row is shed.
+fn one_a_second() -> super::PeerLimiter {
+    super::peer_limiter_for(std::num::NonZeroU32::MIN)
+}
+
+/// A limiter that lets one request through in an hour: a shed peer stays shed.
+fn one_an_hour() -> super::PeerLimiter {
+    governor::RateLimiter::keyed(governor::Quota::per_hour(std::num::NonZeroU32::MIN))
+}
+
+#[test]
+fn a_rate_limited_response_passes_the_response_check() {
+    let frame = probe_request();
+    let request = std::slice::from_ref(&frame);
+    let response = super::server::rate_limited_response(request);
+    assert_eq!(super::validate_response(request, &response), Ok(()));
+}
+
+#[test]
+fn an_overload_wait_never_passes_the_window_or_the_budget() {
+    // Follows the loop of the callers: each wait adds to the time since the
+    // first shed answer, and the budget is what the caller's own limit leaves.
+    let total = |limit: Duration| {
+        let mut shed_for = Duration::ZERO;
+        let mut retries: u32 = 0;
+        while let Some(wait) = super::overload_retry_wait(
+            retries,
+            shed_for,
+            limit.saturating_sub(shed_for),
+        ) {
+            assert!(!wait.is_zero());
+            assert!(wait <= super::overload_retry_delay(retries));
+            shed_for += wait;
+            retries += 1;
+        }
+        shed_for
+    };
+    // The last send is at the end of the window, not up to a second after it.
+    assert_eq!(total(Duration::MAX), super::OVERLOAD_RETRY_WINDOW);
+    assert_eq!(total(Duration::from_millis(300)), Duration::from_millis(300));
+    assert_eq!(total(Duration::ZERO), Duration::ZERO);
+    assert_eq!(
+        super::overload_retry_wait(0, super::OVERLOAD_RETRY_WINDOW, Duration::MAX),
+        None
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_exchange_that_the_peer_limit_shed_is_sent_again_and_answers() {
+    let (receiver, lookup) = bound_receiver().await;
+    let peer = bind_peer(&lookup).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let router = super::router_with_limiter(
+        receiver.clone(),
+        {
+            let calls = Arc::clone(&calls);
+            move |_peer, frames| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let request = frames.first().ok_or(TransportError::BadFrame)?;
+                Ok(vec![matching_result(request)])
+            }
+        },
+        one_a_second(),
+    );
+    let started = std::time::Instant::now();
+    for _ in 0..2 {
+        let response = super::client::request_with_polling_on(
+            &peer,
+            receiver.addr(),
+            probe_request(),
+        )
+        .await
+        .expect("the request must answer");
+        assert_eq!(response.last().map(|frame| frame.kind), Some(FrameKind::Result));
+    }
+    // The limiter lets the second request through one second after the first,
+    // so the second call was shed, waited, and sent again.
+    assert!(started.elapsed() >= Duration::from_millis(900), "{:?}", started.elapsed());
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "a shed exchange is not admitted");
+    router.shutdown().await.expect("router must stop");
+    receiver.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peer_that_stays_shed_gets_the_error_at_the_end_of_the_window() {
+    let (receiver, lookup) = bound_receiver().await;
+    let peer = bind_peer(&lookup).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let router = super::router_with_limiter(
+        receiver.clone(),
+        {
+            let calls = Arc::clone(&calls);
+            move |_peer, frames| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let request = frames.first().ok_or(TransportError::BadFrame)?;
+                Ok(vec![matching_result(request)])
+            }
+        },
+        one_an_hour(),
+    );
+    super::client::request_with_polling_on(&peer, receiver.addr(), probe_request())
+        .await
+        .expect("the first request must answer");
+    let started = std::time::Instant::now();
+    let response =
+        super::client::request_with_polling_on(&peer, receiver.addr(), probe_request())
+            .await
+            .expect("a shed request ends with the error frame");
+    let elapsed = started.elapsed();
+    assert!(super::client::is_rate_limited(&response));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    // No wait starts before the end of the window and runs past it.
+    assert!(elapsed >= super::OVERLOAD_RETRY_WINDOW, "{elapsed:?}");
+    assert!(
+        elapsed < super::OVERLOAD_RETRY_WINDOW + Duration::from_millis(600),
+        "{elapsed:?}"
+    );
+    router.shutdown().await.expect("router must stop");
+    receiver.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_full_queue_is_returned_at_once_and_not_sent_again() {
+    let (receiver, lookup) = bound_receiver().await;
+    let peer = bind_peer(&lookup).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let router = super::router(receiver.clone(), {
+        let calls = Arc::clone(&calls);
+        move |_peer, _frames| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err(TransportError::Overloaded)
+        }
+    });
+    let response =
+        super::client::request_with_polling_on(&peer, receiver.addr(), probe_request())
+            .await
+            .expect("an error frame is an answer");
+    assert_eq!(response.len(), 1);
+    assert_eq!(response[0].kind, FrameKind::Error);
+    assert_eq!(response[0].payload["message"], "node overloaded");
+    assert!(response[0].payload.get("data").is_none());
+    assert!(!super::client::is_rate_limited(&response));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    router.shutdown().await.expect("router must stop");
+    receiver.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_link_passes_the_rate_limited_error_through_the_response_check() {
+    let (receiver, lookup) = bound_receiver().await;
+    let peer = bind_peer(&lookup).await;
+    let router = super::router_with_limiter(
+        receiver.clone(),
+        |_peer, frames| {
+            let request = frames.first().ok_or(TransportError::BadFrame)?;
+            Ok(vec![matching_result(request)])
+        },
+        one_an_hour(),
+    );
+    let mut link = super::Link::default();
+    let first = link
+        .exchange(&peer, receiver.addr(), probe_request())
+        .await
+        .expect("the first exchange must answer");
+    assert_eq!(first[0].kind, FrameKind::Result);
+    // `Link::exchange` runs `validate_response` on what it reads: the shed
+    // answer must pass it, or the caller would see an error and not retry.
+    let shed = link
+        .exchange(&peer, receiver.addr(), probe_request())
+        .await
+        .expect("the shed exchange must pass the response check");
+    assert!(super::client::is_rate_limited(&shed));
+    drop(link);
+    router.shutdown().await.expect("router must stop");
+    receiver.close().await;
+}
+
 #[tokio::test]
 async fn a_link_returns_one_snapshot_for_each_exchange_on_one_connection() {
     let (receiver, lookup) = bound_receiver().await;

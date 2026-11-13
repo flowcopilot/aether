@@ -120,6 +120,13 @@ Init ==
 -----------------------------------------------------------------------------
 (* The sender's store. Each action is one SQLite transaction.              *)
 
+\* The loop of `run` reaches the store through a `KeptStore`, which opens
+\* the file again when the path names another file (a restored backup) or
+\* its `user_version` is not that of this binary (it fails closed for a
+\* newer one). So the store of the processes here is always the file that
+\* `enqueue` writes to, which is what the model assumes. This is below the
+\* abstraction, not a change to an action.
+
 \* `state IN ('waiting','working') AND (lease_until IS NULL OR
 \* lease_until <= now)`.
 Claimable(t) ==
@@ -270,6 +277,15 @@ TimeOut(p, t) ==
 
 -----------------------------------------------------------------------------
 (* The host.                                                               *)
+
+\* The per-peer rate limit of the host sheds a frame before this action:
+\* it answers "node overloaded" with `retryAfterMs`, and the host does not
+\* change `seen` or `hostTasks`. `follow` sends a new frame for up to
+\* `OVERLOAD_RETRY_WINDOW` (and not past the attempt window), which is a
+\* `Send` whose frame arrives later: a stutter step here. When the window
+\* ends, `outcome` maps the error to Waiting with `Delay::RateLimited`, as
+\* it maps "busy" to Waiting with `Delay::Busy`; the model does not track
+\* the delays. A full queue is the "busy" reply below and is not sent again.
 
 \* `NodeService::handle` -> `ProofNode::admit` -> `admit_with_replay`. The
 \* policy check comes first; the replay key `exchange_id:nonce` is checked

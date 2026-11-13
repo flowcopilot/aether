@@ -264,6 +264,17 @@ OutboxReceive ==
     /\ rep' = None
     /\ UNCHANGED <<mode, state, expired, events, termSeq, ran, req, lost>>
 
+\* A shed exchange is not an action: the per-peer rate limit of the host
+\* answers "node overloaded" with `retryAfterMs`, before the host admits
+\* anything or reads the journal. `request_with_polling_on` and `follow`
+\* send the frame again with the same cursor for up to
+\* `OVERLOAD_RETRY_WINDOW`, with every wait cut to the end of that window
+\* and of the poll deadline or attempt window. No state that this model
+\* tracks changes (the journal, the cursor, `got`), so it is a stutter step
+\* of `Poll`. When the window ends, the caller gets the error, which
+\* `CliReceive` and `OutboxReceive` take as an "error" reply. A full queue
+\* sends the same message without `retryAfterMs` and is not sent again.
+
 \* The frame or its answer is lost, or the exchange times out. The cli loop
 \* returns the error and drops what it collected. The outbox keeps the
 \* cursor in `sent_tasks` (`record_sent_attempt`), and the next attempt

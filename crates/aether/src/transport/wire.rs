@@ -44,9 +44,14 @@ pub(crate) const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 /// response.
 pub(crate) const RESPONSE_LINGER: Duration = Duration::from_secs(2);
 /// The longest wait between two polls of one task: at most half of
-/// `PEER_REQUESTS_PER_SECOND`, so one polling task never trips the node's
-/// per-peer rate limit and a second concurrent task from the same peer
-/// still fits under it.
+/// `PEER_REQUESTS_PER_SECOND`, so a task that has run for a while polls at
+/// 4 requests a second, and two such tasks fill the limit. The first second
+/// of a task is faster (see `TASK_POLL_INITIAL`): its submit and early polls
+/// are about 7 requests, so two tasks that start together send about 14 in
+/// that second. They fit only because the limiter allows a burst of
+/// `PEER_REQUESTS_PER_SECOND` and refills 8 tokens a second, and because the
+/// client sends an exchange again when the limit sheds it (see
+/// `overload_retry_wait`).
 pub(crate) const TASK_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// The wait before the first re-poll. A task that finishes within moments
 /// of its submit answers the first re-poll instead of waiting out
@@ -83,6 +88,22 @@ pub(crate) fn overload_retry_delay(retries_so_far: u32) -> Duration {
         .checked_div(PEER_REQUESTS_PER_SECOND)
         .unwrap_or(OVERLOAD_RETRY_MAX);
     token.saturating_mul(factor).min(OVERLOAD_RETRY_MAX)
+}
+
+/// How long to wait before sending a shed exchange again, or `None` when the
+/// caller gives up and returns the error. `shed_for` is the time since the
+/// first shed answer of this run; `budget` is the time that the caller's own
+/// limit leaves (`TASK_POLL_DEADLINE`, the window of an outbox attempt). The
+/// wait never passes the end of `OVERLOAD_RETRY_WINDOW` or the budget, so
+/// the last send is at the end of the window, not up to
+/// `OVERLOAD_RETRY_MAX` after it.
+pub(crate) fn overload_retry_wait(
+    retries_so_far: u32,
+    shed_for: Duration,
+    budget: Duration,
+) -> Option<Duration> {
+    let left = OVERLOAD_RETRY_WINDOW.saturating_sub(shed_for).min(budget);
+    (!left.is_zero()).then(|| overload_retry_delay(retries_so_far).min(left))
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
