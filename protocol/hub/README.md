@@ -22,7 +22,8 @@ tests check the copies against these files.
   when the row is a contact of the node that asks.
 - `routes`: each route with its method, path, `auth` (`none`, `signed`, or
   `account` when the node needs a name), body keys, success `status`
-  (default 200) and the reply object.
+  (default 200), the reply object, and `cacheSeconds` when the reply can be
+  cached: the `max-age` that the hub sends, with an `age` header.
 
 ## `vectors.json`
 

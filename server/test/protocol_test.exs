@@ -163,6 +163,11 @@ defmodule AetherHub.ProtocolTest do
     end
   end
 
+  test "the directory's max-age is the contract's cacheSeconds" do
+    [route] = Enum.filter(Contract.get(["routes"]), &(&1["path"] == "/directory.json"))
+    assert Protocol.directory_cache_seconds() == route["cacheSeconds"]
+  end
+
   test "the router has every route of the contract" do
     opts = AetherHub.Router.init([])
 

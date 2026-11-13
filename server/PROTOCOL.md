@@ -95,6 +95,7 @@ its code in `errors`.
 | `too_large` | The body is larger than `limits.maxBodyBytes` |
 | `upgrade_required` | The request has no protocol header: the node is older than the hub |
 | `rate_limited` | A request is over one of the rate limits below |
+| `unavailable` | The hub cannot serve the answer now; try again after `retry-after` seconds |
 
 ## Limits
 
@@ -466,7 +467,7 @@ no account, and it counts against the directory limit of the client address.
 - `people` is the count of personal agents. The directory shows no
   presence of a person, and no name of a person except an owner.
 
-The hub builds the directory once in 15 seconds and serves that view to
+The hub builds the directory once in `cacheSeconds` (15) seconds and serves that view to
 every reader in between. Every answer has `cache-control: public, max-age=15`
 and an `age` header with the whole seconds since the hub built the view. A
 cache that honours `age` keeps the answer for `15 - age` seconds, so no
@@ -478,7 +479,7 @@ shows within 15 seconds.
 When a build fails, the hub keeps serving the last view, with a growing
 `age`, and does not try again for 2 seconds. With no view to serve, it answers
 `503` with `{"error": "unavailable"}`, `cache-control: no-store` and
-`retry-after: 2`. `503` is not an error code of the contract. It also
+`retry-after: 2`: the error code `unavailable`. It also
 answers while the hub restarts its cache.
 
 ## Owner links

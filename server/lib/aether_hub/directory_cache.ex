@@ -40,7 +40,7 @@ defmodule AetherHub.DirectoryCache do
     defexception message: "the directory cache is not available"
   end
 
-  @default_ttl :timer.seconds(15)
+  @default_ttl :timer.seconds(AetherHub.Protocol.directory_cache_seconds())
   @default_retry :timer.seconds(2)
   @call_timeout :timer.seconds(30)
 

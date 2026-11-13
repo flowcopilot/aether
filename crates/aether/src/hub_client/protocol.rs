@@ -239,6 +239,7 @@ pub fn wire_error(status: u16, code: Option<&str>) -> HubError {
         (400 | 413, _) => HubError::Invalid,
         (429, _) => HubError::RateLimited,
         (426, _) => HubError::OldNode,
+        (503, _) => HubError::Unreachable,
         _ => HubError::Unexpected,
     }
 }
@@ -451,6 +452,7 @@ mod tests {
                 "limit" => HubError::Limit,
                 "upgrade_required" => HubError::OldNode,
                 "rate_limited" => HubError::RateLimited,
+                "unavailable" => HubError::Unreachable,
                 _ => HubError::Unexpected,
             };
             assert_eq!(mapped, expected, "{code}");

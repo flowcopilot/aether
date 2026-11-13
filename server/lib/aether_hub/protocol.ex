@@ -23,7 +23,8 @@ defmodule AetherHub.Protocol do
     limit: 409,
     too_large: 413,
     upgrade_required: 426,
-    rate_limited: 429
+    rate_limited: 429,
+    unavailable: 503
   }
   @patterns %{
     endpoint: "^[0-9a-f]{64}$",
@@ -94,6 +95,9 @@ defmodule AetherHub.Protocol do
   def header(name), do: Map.fetch!(@headers, name)
   def errors, do: @errors
   def status(code), do: Map.fetch!(@errors, code)
+
+  @doc "How long a reader may keep `/directory.json`: the route's `cacheSeconds`."
+  def directory_cache_seconds, do: 15
   def kinds, do: @kinds
   def default_kind, do: @default_kind
   def kind(name), do: Map.fetch!(@kind, name)

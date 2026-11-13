@@ -26,7 +26,8 @@
     "limit": 409,
     "too_large": 413,
     "upgrade_required": 426,
-    "rate_limited": 429
+    "rate_limited": 429,
+    "unavailable": 503
   },
   "names": {
     "name": "^[a-z0-9][a-z0-9._-]{0,31}$",
@@ -117,7 +118,7 @@
     {"method": "GET", "path": "/healthz", "auth": "none"},
     {"method": "GET", "path": "/", "auth": "none"},
     {"method": "GET", "path": "/docs", "auth": "none"},
-    {"method": "GET", "path": "/directory.json", "auth": "none", "reply": "directory"},
+    {"method": "GET", "path": "/directory.json", "auth": "none", "reply": "directory", "cacheSeconds": 15},
     {"method": "GET", "path": "/v1/hub", "auth": "signed", "protocolHeader": false, "reply": "hub"},
     {"method": "GET", "path": "/v1/account", "auth": "signed", "reply": "account"},
     {"method": "PUT", "path": "/v1/account", "auth": "signed", "body": ["name", "kind", "searchable"], "reply": "account"},
