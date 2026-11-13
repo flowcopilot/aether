@@ -462,7 +462,7 @@ pub async fn run(options: NodeServeOptions) -> Result<(), NodeRunError> {
     let router = transport::router(endpoint.clone(), move |peer, frames| {
         service.a2a().handle(peer, frames)
     });
-    let mut result = match tokio::signal::ctrl_c().await {
+    let mut result = match shutdown_signal().await {
         Ok(()) => router
             .shutdown()
             .await
@@ -647,6 +647,39 @@ async fn publish_record(
     Some((directory_publication, record))
 }
 
+/// Makes `ring` the process-wide rustls crypto provider, once.
+///
+/// Without a default, reqwest builds its TLS client on `aws-lc-rs`, whose
+/// first `RAND_bytes` call (the `ClientHello` random) seeds a jitter-entropy
+/// source that costs about 100 ms of CPU. `ring` draws from the operating
+/// system's generator, as `iroh` and the control service already do. A
+/// default that is already installed stays.
+pub fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+/// Resolves when the process is asked to stop: Ctrl-C everywhere, and on
+/// unix also SIGTERM, which `docker stop` and systemd send. An error means
+/// a signal handler could not be installed.
+///
+/// # Errors
+/// Returns the I/O error from installing the signal handler.
+pub async fn shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -703,6 +736,29 @@ mod tests {
             .await
             .is_err()
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sigterm_ends_the_wait_for_a_shutdown_signal() {
+        let signal = super::shutdown_signal();
+        tokio::pin!(signal);
+        // The first poll installs the handler; only then is SIGTERM safe to
+        // send to this process.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut signal)
+                .await
+                .is_err()
+        );
+        let status = std::process::Command::new("kill")
+            .args(["-TERM", &std::process::id().to_string()])
+            .status()
+            .expect("kill must run");
+        assert!(status.success());
+        tokio::time::timeout(std::time::Duration::from_secs(5), signal)
+            .await
+            .expect("SIGTERM must end the wait")
+            .expect("the handler must install");
     }
 
     #[test]
