@@ -7,9 +7,10 @@ defmodule AetherHub.AccountCacheTest do
   """
   use ExUnit.Case, async: true
 
+  import Ecto.Query
   import AetherHub.TestClient
 
-  alias AetherHub.{Account, AccountCache, Accounts, Repo}
+  alias AetherHub.{Account, AccountCache, Accounts, Clock, Repo}
 
   defp account(node), do: json(request(node, "GET", "/v1/account"))
 
@@ -54,7 +55,9 @@ defmodule AetherHub.AccountCacheTest do
     node = claimed_node()
     account(node)
 
-    assert [{_, %Account{version: nil}}] = :ets.lookup(:aether_hub_accounts, node.endpoint)
+    assert [{_, %Account{version: nil}, _loaded_at}] =
+             :ets.lookup(:aether_hub_accounts, node.endpoint)
+
     assert Repo.get!(Account, node.endpoint).version > 0
   end
 
@@ -174,13 +177,87 @@ defmodule AetherHub.AccountCacheTest do
       account = Accounts.get(endpoint)
       assert {:ok, _} = Accounts.put(endpoint, account, %{"name" => name})
 
-      # The write returned: the cache never answers with the old name.
+      # The write returned: the cache never answers with the old name, and
+      # the table never holds a copy of it, not even for a moment.
       assert AccountCache.fetch(endpoint).name == name
+
+      for _ <- 1..50 do
+        case :ets.lookup(:aether_hub_accounts, endpoint) do
+          [{_, %Account{name: held}, _loaded_at}] -> assert held == name
+          _ -> :ok
+        end
+      end
     end
 
     for reader <- readers, do: send(reader, :stop)
     for reader <- readers, do: assert_receive({:done, ^reader}, 1_000)
 
     assert AccountCache.fetch(endpoint) == %{Repo.get!(Account, endpoint) | version: nil}
+  end
+
+  describe "the time to live" do
+    # A write that the hub does not see: no `invalidate/1`.
+    defp write_outside(node, changes) do
+      from(a in Account, where: a.endpoint == ^node.endpoint)
+      |> Repo.update_all(set: changes)
+    end
+
+    setup do
+      on_exit(fn -> Clock.set(nil) end)
+    end
+
+    test "a copy ends after 60 seconds, and a write from outside shows then" do
+      node = claimed_node()
+      start = Clock.now()
+      Clock.set(start)
+
+      assert AccountCache.fetch(node.endpoint).searchable == false
+      write_outside(node, searchable: true)
+
+      Clock.set(start + 59)
+      assert AccountCache.fetch(node.endpoint).searchable == false
+
+      Clock.set(start + 60)
+      assert AccountCache.fetch(node.endpoint).searchable == true
+
+      # The new copy lives its own 60 seconds, without a read of the database.
+      Clock.set(start + 61)
+      assert queries(fn -> assert AccountCache.fetch(node.endpoint).searchable == true end) == 0
+    end
+
+    test "a copy from a clock that is ahead is not trusted by a clock that is behind" do
+      node = claimed_node()
+      start = Clock.now()
+
+      Clock.set(start + 1_000)
+      assert AccountCache.fetch(node.endpoint).searchable == false
+      write_outside(node, searchable: true)
+
+      Clock.set(start)
+      assert AccountCache.fetch(node.endpoint).searchable == true
+    end
+  end
+
+  describe "the mark of a reader" do
+    test "a reader that finds the mark of another one reads, and stores nothing" do
+      node = claimed_node()
+      mark = {make_ref(), System.monotonic_time(:second)}
+      :ets.insert(:aether_hub_accounts, {node.endpoint, :loading, mark})
+
+      assert AccountCache.fetch(node.endpoint).name == node.name
+      assert :ets.lookup(:aether_hub_accounts, node.endpoint) == [{node.endpoint, :loading, mark}]
+
+      AccountCache.invalidate(node.endpoint)
+    end
+
+    test "a mark that a killed reader left is taken over" do
+      node = claimed_node()
+      mark = {make_ref(), System.monotonic_time(:second) - 11}
+      :ets.insert(:aether_hub_accounts, {node.endpoint, :loading, mark})
+
+      assert AccountCache.fetch(node.endpoint).name == node.name
+      assert cached?(node)
+      assert [{_, %Account{}, _}] = :ets.lookup(:aether_hub_accounts, node.endpoint)
+    end
   end
 end

@@ -3,6 +3,8 @@ defmodule AetherHub.AccountCache do
   The accounts that signed requests load, kept in memory by endpoint, so a
   signed request does not read the database for its own account.
 
+  ## What keeps a copy right
+
   The cache is right only while every write to the `accounts` table ends
   with `invalidate/1` for that endpoint. The writes are in
   `AetherHub.Accounts` (a claim, a change, a rename and a deletion), and
@@ -13,30 +15,58 @@ defmodule AetherHub.AccountCache do
   `AetherHub.Versions.current/1` instead. A new write to `accounts` anywhere
   else must call `invalidate/1`.
 
-  A reader that misses loads the row and stores it, unless a write ended in
-  between. Every `invalidate/1` also counts up a number: the reader notes it
-  before it loads the row, and it takes its copy back out when the number
-  changed. So a copy that was loaded before a write never stays.
+  A copy is also dropped after 60 seconds (`AetherHub.Clock` time), so a
+  write that does not go through this VM, such as a `sqlite3` shell or
+  another hub on the same file, shows after one minute at most. The cache
+  cannot see such a write, and nothing else ends the copy.
+
+  ## How a reader stores a copy
+
+  A reader that misses does not insert its copy blindly. It first claims the
+  endpoint with `:ets.insert_new/2`, which puts a `:loading` mark in the
+  row. Then it reads the database, and `:ets.select_replace/2` turns its own
+  mark into the copy, in one atomic step on that one row. `invalidate/1`
+  deletes the row, mark or copy, so:
+
+    * a write that ends after the claim deletes the mark, the replace finds
+      no mark and stores nothing (the reader still answers with what it
+      read, which is not older than its request);
+    * a write that ends after the copy is stored deletes the copy.
+
+  A copy that a finished write overtook is never in the table, not even for
+  a moment: there is no insert that a delete has to undo. A reader that
+  finds a mark of another reader does not wait: it reads the database and
+  stores nothing. The reader removes its mark when it fails, and a mark
+  older than 10 seconds, left by a process that was killed, is taken over.
 
   An endpoint without an account is never stored, so unknown keys cannot
   fill the table. The process owns the table and does nothing else.
   """
   use GenServer
 
-  alias AetherHub.{Account, Repo}
+  alias AetherHub.{Account, Clock, Repo}
 
   @table :aether_hub_accounts
-  # The numbers that count the writes: one for each group of endpoints, so
-  # a write to one account rarely drops the copy that another one loads.
-  @slots 1024
+  # How long a copy stays, in seconds.
+  @ttl 60
+  # How long a mark of a reader that never came back stays, in seconds.
+  @claim_ttl 10
 
   def start_link(_opts), do: GenServer.start_link(__MODULE__, nil, name: __MODULE__)
 
   @doc "The account of `endpoint`, or `nil`, as the database has it."
   def fetch(endpoint) do
     case :ets.lookup(@table, endpoint) do
-      [{^endpoint, account}] -> account
-      [] -> load(endpoint)
+      [{^endpoint, %Account{} = account, loaded_at}] = row ->
+        if fresh?(loaded_at), do: account, else: reload(endpoint, row)
+
+      [{^endpoint, :loading, {_ref, started}}] = row ->
+        if System.monotonic_time(:second) - started > @claim_ttl,
+          do: reload(endpoint, row),
+          else: read(endpoint)
+
+      [] ->
+        claim(endpoint)
     end
   end
 
@@ -45,36 +75,62 @@ defmodule AetherHub.AccountCache do
   inside the transaction that makes the write and again after it.
   """
   def invalidate(endpoint) do
-    :ets.update_counter(@table, slot(endpoint), 1)
     :ets.delete(@table, endpoint)
     :ok
   end
 
-  defp load(endpoint) do
-    epoch = epoch(endpoint)
+  # A copy of a clock that is behind its own load time (a test moved it) is
+  # not trusted.
+  defp fresh?(loaded_at) do
+    now = Clock.now()
+    loaded_at <= now and now - loaded_at < @ttl
+  end
 
-    case Repo.get(Account, endpoint) do
+  # An old copy or an abandoned mark goes, and the reader claims the row. If
+  # another reader claimed it first, this one only reads.
+  defp reload(endpoint, [row]) do
+    :ets.delete_object(@table, row)
+    claim(endpoint)
+  end
+
+  defp claim(endpoint) do
+    mark = {make_ref(), System.monotonic_time(:second)}
+
+    if :ets.insert_new(@table, {endpoint, :loading, mark}) do
+      load(endpoint, mark)
+    else
+      read(endpoint)
+    end
+  end
+
+  defp load(endpoint, mark) do
+    # The time before the read: the copy is not younger than this.
+    loaded_at = Clock.now()
+
+    case read(endpoint) do
       nil ->
         nil
 
       account ->
-        account = %{account | version: nil}
-        :ets.insert(@table, {endpoint, account})
-        # A write that ended since the read above has counted the number
-        # up: the copy may be older than the row.
-        if epoch(endpoint) != epoch, do: :ets.delete_object(@table, {endpoint, account})
+        spec = [{{endpoint, :loading, mark}, [], [{{endpoint, {:const, account}, loaded_at}}]}]
+        :ets.select_replace(@table, spec)
         account
     end
+  after
+    # Gone already when the copy replaced it, or when a write took it.
+    :ets.delete_object(@table, {endpoint, :loading, mark})
   end
 
-  defp epoch(endpoint), do: :ets.lookup_element(@table, slot(endpoint), 2)
-
-  defp slot(endpoint), do: {:epoch, :erlang.phash2(endpoint, @slots)}
+  defp read(endpoint) do
+    case Repo.get(Account, endpoint) do
+      nil -> nil
+      account -> %{account | version: nil}
+    end
+  end
 
   @impl true
   def init(nil) do
     :ets.new(@table, [:named_table, :public, :set, read_concurrency: true])
-    :ets.insert(@table, for(slot <- 0..(@slots - 1), do: {{:epoch, slot}, 0}))
     {:ok, nil}
   end
 end
