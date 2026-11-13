@@ -2,6 +2,7 @@ use std::sync::LazyLock;
 
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
+use crate::CachedSql;
 use crate::{NodeStore, StoreError, column_u64, sql_count, sql_named, sql_names};
 
 /// The state of a task that this node sent. The strings are the
@@ -122,7 +123,7 @@ fn sent_task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SentTask> {
 impl NodeStore {
     /// Keeps a new task for the outbox, waiting and due at once.
     pub fn insert_sent_task(&self, input: &SentTaskInput) -> Result<(), StoreError> {
-        self.connection.execute(
+        self.connection.execute_cached(
             "INSERT INTO sent_tasks(task_id,idempotency_key,agent_id,endpoint_id,authorization_json,text,state,created_at,updated_at,next_attempt_at,expires_at) VALUES (?1,?2,?3,?4,?5,?6,?9,?7,?7,?7,?8)",
             params![
                 input.task_id,
@@ -142,7 +143,7 @@ impl NodeStore {
     pub fn sent_task(&self, task_id: &str) -> Result<Option<SentTask>, StoreError> {
         Ok(self
             .connection
-            .query_row(
+            .query_row_cached(
                 &format!("SELECT {SENT_COLUMNS} FROM sent_tasks WHERE task_id=?1"),
                 [task_id],
                 sent_task_from_row,
@@ -155,7 +156,7 @@ impl NodeStore {
         clause: &str,
         values: &[&dyn rusqlite::ToSql],
     ) -> Result<Vec<SentTask>, StoreError> {
-        let mut statement = self.connection.prepare(&format!(
+        let mut statement = self.connection.prepare_cached(&format!(
             "SELECT {SENT_COLUMNS} FROM sent_tasks WHERE {clause}"
         ))?;
         let rows = statement.query_map(values, sent_task_from_row)?;
@@ -176,7 +177,7 @@ impl NodeStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let candidates = {
-            let mut statement = transaction.prepare(&format!(
+            let mut statement = transaction.prepare_cached(&format!(
                 "SELECT {SENT_COLUMNS} FROM sent_tasks s WHERE {ACTIVE} AND next_attempt_at<=?1 AND (lease_until IS NULL OR lease_until<=?1) AND NOT EXISTS (SELECT 1 FROM sent_tasks o WHERE o.endpoint_id=s.endpoint_id AND o.task_id<>s.task_id AND o.{ACTIVE} AND o.lease_until>?1) ORDER BY next_attempt_at, created_at, task_id", ACTIVE = ACTIVE.as_str()
             ))?;
             let rows = statement.query_map([now], sent_task_from_row)?;
@@ -191,7 +192,7 @@ impl NodeStore {
             if !endpoints.insert(task.endpoint_id.clone()) {
                 continue;
             }
-            transaction.execute(
+            transaction.execute_cached(
                 "UPDATE sent_tasks SET lease_until=?2 WHERE task_id=?1",
                 params![task.task_id, lease_until],
             )?;
@@ -213,7 +214,7 @@ impl NodeStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed = transaction.execute(
+        let changed = transaction.execute_cached(
             &format!("UPDATE sent_tasks SET lease_until=?3 WHERE task_id=?1 AND {ACTIVE} AND (lease_until IS NULL OR lease_until<=?2)", ACTIVE = ACTIVE.as_str()),
             params![task_id, now, lease_until],
         )?;
@@ -237,7 +238,7 @@ impl NodeStore {
         now: i64,
     ) -> Result<bool, StoreError> {
         let finished = (!attempt.state.is_active()).then_some(now);
-        let changed = self.connection.execute(
+        let changed = self.connection.execute_cached(
             &format!("UPDATE sent_tasks SET state=?2, reason=?3, host_state=?4, answer=?5, last_event_sequence=?6, next_attempt_at=?7, attempts=attempts+1, updated_at=?8, finished_at=?9, lease_until=NULL WHERE task_id=?1 AND {ACTIVE} AND lease_until IS ?10", ACTIVE = ACTIVE.as_str()),
             params![
                 task_id,
@@ -263,7 +264,7 @@ impl NodeStore {
         endpoint_id: &str,
         now: i64,
     ) -> Result<usize, StoreError> {
-        Ok(self.connection.execute(
+        Ok(self.connection.execute_cached(
             &format!("UPDATE sent_tasks SET next_attempt_at=?2 WHERE endpoint_id=?1 AND {ACTIVE} AND next_attempt_at>?2", ACTIVE = ACTIVE.as_str()),
             params![endpoint_id, now],
         )?)
@@ -276,7 +277,7 @@ impl NodeStore {
         endpoint_id: &str,
         until: i64,
     ) -> Result<usize, StoreError> {
-        Ok(self.connection.execute(
+        Ok(self.connection.execute_cached(
             &format!("UPDATE sent_tasks SET next_attempt_at=MAX(next_attempt_at, ?2) WHERE endpoint_id=?1 AND {ACTIVE} AND lease_until IS NULL", ACTIVE = ACTIVE.as_str()),
             params![endpoint_id, until],
         )?)
@@ -290,7 +291,7 @@ impl NodeStore {
     }
 
     pub fn has_active_sent_tasks(&self) -> Result<bool, StoreError> {
-        Ok(self.connection.query_row(
+        Ok(self.connection.query_row_cached(
             &format!(
                 "SELECT EXISTS (SELECT 1 FROM sent_tasks WHERE {ACTIVE})",
                 ACTIVE = ACTIVE.as_str()
@@ -307,7 +308,7 @@ impl NodeStore {
         reason: &str,
         now: i64,
     ) -> Result<usize, StoreError> {
-        Ok(self.connection.execute(
+        Ok(self.connection.execute_cached(
             &format!("UPDATE sent_tasks SET state=?4, reason=?2, updated_at=?3, finished_at=?3, lease_until=NULL WHERE endpoint_id=?1 AND {ACTIVE}", ACTIVE = ACTIVE.as_str()),
             params![endpoint_id, reason, now, SentState::NotDelivered],
         )?)
@@ -320,7 +321,7 @@ impl NodeStore {
         now: i64,
         reason: &str,
     ) -> Result<usize, StoreError> {
-        Ok(self.connection.execute(
+        Ok(self.connection.execute_cached(
             &format!("UPDATE sent_tasks SET state=?3, reason=?2, updated_at=?1, finished_at=?1, lease_until=NULL WHERE {ACTIVE} AND expires_at<=?1", ACTIVE = ACTIVE.as_str()),
             params![now, reason, SentState::NotDelivered],
         )?)
@@ -351,7 +352,7 @@ impl NodeStore {
         task_id: &str,
         now: i64,
     ) -> Result<bool, StoreError> {
-        Ok(self.connection.execute(
+        Ok(self.connection.execute_cached(
             &format!("UPDATE sent_tasks SET read_at=COALESCE(read_at, ?2) WHERE task_id=?1 AND NOT {ACTIVE}", ACTIVE = ACTIVE.as_str()),
             params![task_id, now],
         )? == 1)
@@ -359,7 +360,7 @@ impl NodeStore {
 
     /// Deletes the ended tasks that ended at `before` or earlier.
     pub fn purge_sent_tasks(&self, before: i64) -> Result<usize, StoreError> {
-        Ok(self.connection.execute(
+        Ok(self.connection.execute_cached(
             &format!(
                 "DELETE FROM sent_tasks WHERE NOT {ACTIVE} AND finished_at<=?1",
                 ACTIVE = ACTIVE.as_str()
@@ -432,7 +433,7 @@ mod tests {
         let claimed = store.claim_due_sent_tasks(10, 100, 4).expect("claim");
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].lease_until, Some(100));
-        assert!(store.claim_due_sent_tasks(20, 120, 4).expect("claim").is_empty());
+        assert_eq!(store.claim_due_sent_tasks(20, 120, 4).expect("claim"), Vec::new());
         assert_eq!(store.claim_sent_task("task", 20, 120).expect("claim"), None);
         assert!(
             store
@@ -492,7 +493,7 @@ mod tests {
             .map(|task| task.task_id)
             .collect();
         assert_eq!(first, ["a", "c"]);
-        assert!(store.claim_due_sent_tasks(30, 130, 4).expect("claim").is_empty());
+        assert_eq!(store.claim_due_sent_tasks(30, 130, 4).expect("claim"), Vec::new());
         let waiting = SentAttempt { state: SentState::Waiting, ..answered(40) };
         store.record_sent_attempt("a", Some(100), &waiting, 40).expect("record");
         let next: Vec<String> = store

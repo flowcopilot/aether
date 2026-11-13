@@ -34,6 +34,8 @@ pub const LEASE: Duration = Duration::from_secs(90);
 pub const MAX_PARALLEL: usize = 4;
 pub const RETENTION: Duration = Duration::from_hours(7 * 24);
 pub const OFFLINE_PROBE: Duration = Duration::from_mins(30);
+/// The longest pause between rounds while rounds fail.
+const ERROR_PAUSE_CAP: Duration = Duration::from_secs(30);
 
 const UNREACHABLE: &str = "the agent cannot be reached; it may be offline";
 const ACCESS_ENDED: &str = "the access to this agent ended";
@@ -149,7 +151,6 @@ pub fn enqueue(
         created_at: now,
         expires_at: now.saturating_add(seconds(MAX_WAIT)).min(access_ends),
     };
-    let store = NodeStore::in_dir(data_dir).map_err(|_| OutboxError::Unavailable)?;
     store.insert_sent_task(&input).map_err(|_| OutboxError::Unavailable)?;
     store.sent_task(&ids.task_id).ok().flatten().ok_or(OutboxError::Unavailable)
 }
@@ -477,15 +478,36 @@ pub async fn run_once(
     presence: Option<&BTreeMap<String, bool>>,
     now: i64,
 ) -> Result<RoundReport, OutboxError> {
+    let store = open_shared(data_dir).await?;
+    run_round(&store, courier, presence, now).await
+}
+
+/// Opens the node store of `data_dir`, for rounds to share.
+async fn open_shared(data_dir: &Path) -> Result<SharedStore, OutboxError> {
     let data_dir = data_dir.to_path_buf();
+    off_runtime(move || {
+        NodeStore::in_dir(&data_dir)
+            .map(|store| Arc::new(Mutex::new(store)))
+            .map_err(|_| OutboxError::Unavailable)
+    })
+    .await
+}
+
+/// One round on an open `store`; [`run`] keeps one store for all its rounds.
+async fn run_round(
+    store: &SharedStore,
+    courier: Arc<dyn Courier>,
+    presence: Option<&BTreeMap<String, bool>>,
+    now: i64,
+) -> Result<RoundReport, OutboxError> {
     let presence = presence.cloned();
-    let Round { store, contacts, claimed } =
-        off_runtime(move || start_round(&data_dir, presence.as_ref(), now)).await?;
-    let store: SharedStore = Arc::new(Mutex::new(store));
+    let Round { contacts, claimed } =
+        with_store(store, move |store| start_round(store, presence.as_ref(), now))
+            .await?;
     let mut attempts = tokio::task::JoinSet::new();
     for task in claimed {
         let courier = Arc::clone(&courier);
-        let store = Arc::clone(&store);
+        let store = Arc::clone(store);
         let bundle = contacts.get(&task.endpoint_id).cloned();
         attempts.spawn(async move {
             let state =
@@ -500,7 +522,7 @@ pub async fn run_once(
             report.attempted.push((task_id, state));
         }
     }
-    report.active = with_store(&store, move |store| {
+    report.active = with_store(store, move |store| {
         purge_hourly(store, now);
         store.has_active_sent_tasks().map_err(|_| OutboxError::Unavailable)
     })
@@ -510,7 +532,6 @@ pub async fn run_once(
 
 /// A round after its store part, before its attempts.
 struct Round {
-    store: NodeStore,
     /// The bundle of each contact, by endpoint.
     contacts: BTreeMap<String, InvitationBundle>,
     claimed: Vec<SentTask>,
@@ -519,17 +540,15 @@ struct Round {
 /// The store part of a round before its attempts: it ends, wakes and defers
 /// tasks, and claims the due ones.
 fn start_round(
-    data_dir: &Path,
+    store: &mut NodeStore,
     presence: Option<&BTreeMap<String, bool>>,
     now: i64,
 ) -> Result<Round, OutboxError> {
-    let mut store =
-        NodeStore::in_dir(data_dir).map_err(|_| OutboxError::Unavailable)?;
     let busy = |_: StoreError| OutboxError::Unavailable;
     store.expire_sent_tasks(now, EXPIRED).map_err(busy)?;
     let active = store.active_sent_tasks().map_err(busy)?;
     // A contact that cannot be read counts as gone, as each lookup did.
-    let contacts = crate::direct::contacts_by_endpoint(&store).unwrap_or_default();
+    let contacts = crate::direct::contacts_by_endpoint(store).unwrap_or_default();
     let mut endpoints: BTreeMap<String, Vec<&SentTask>> = BTreeMap::new();
     for task in &active {
         endpoints.entry(task.endpoint_id.clone()).or_default().push(task);
@@ -560,7 +579,7 @@ fn start_round(
     let claimed = store
         .claim_due_sent_tasks(now, now.saturating_add(seconds(LEASE)), MAX_PARALLEL)
         .map_err(busy)?;
-    Ok(Round { store, contacts, claimed })
+    Ok(Round { contacts, claimed })
 }
 
 /// Deletes the tasks that ended more than [`RETENTION`] ago, at most once an
@@ -577,6 +596,32 @@ fn purge_hourly(store: &NodeStore, now: i64) {
     if store.purge_sent_tasks(now.saturating_sub(seconds(RETENTION))).is_ok() {
         let _ = store.put_configuration(PURGE_KEY, &now.to_string());
     }
+}
+
+/// The pause after `failures` rounds in a row that failed: [`POLL_INTERVAL`]
+/// doubled for each failure after the first, up to [`ERROR_PAUSE_CAP`].
+fn error_pause(failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(16);
+    let factor = 1_u32.checked_shl(doublings).unwrap_or(1);
+    POLL_INTERVAL.saturating_mul(factor).min(ERROR_PAUSE_CAP)
+}
+
+/// One round of [`run`] on the open `store`, which it opens first when
+/// there is none.
+async fn next_round(
+    store: &mut Option<SharedStore>,
+    data_dir: &Path,
+    courier: &Arc<dyn Courier>,
+    presence: Option<&BTreeMap<String, bool>>,
+) -> Result<RoundReport, OutboxError> {
+    let open = if let Some(open) = store {
+        Arc::clone(open)
+    } else {
+        let open = open_shared(data_dir).await?;
+        *store = Some(Arc::clone(&open));
+        open
+    };
+    run_round(&open, Arc::clone(courier), presence, now()).await
 }
 
 /// Runs the outbox until the task is aborted.
@@ -596,6 +641,10 @@ pub async fn run(
     let mut presence: Option<BTreeMap<String, bool>> = None;
     let mut presence_read: Option<std::time::Instant> = None;
     let mut active = true;
+    // The store stays open between rounds. A failed round drops it, so the
+    // next round opens the file again.
+    let mut store: Option<SharedStore> = None;
+    let mut failures: u32 = 0;
     loop {
         if active
             && presence_read.is_none_or(|read| read.elapsed() >= PRESENCE_INTERVAL)
@@ -616,12 +665,23 @@ pub async fn run(
             };
             presence_read = Some(std::time::Instant::now());
         }
-        match run_once(&data_dir, Arc::clone(&courier), presence.as_ref(), now()).await
-        {
-            Ok(report) => active = report.active,
-            Err(_) => active = true,
+        let round =
+            next_round(&mut store, &data_dir, &courier, presence.as_ref()).await;
+        if let Ok(report) = round {
+            active = report.active;
+            failures = 0;
+        } else {
+            active = true;
+            failures = failures.saturating_add(1);
+            store = None;
         }
-        let pause = if active { POLL_INTERVAL } else { Duration::from_secs(30) };
+        let pause = if failures > 0 {
+            error_pause(failures)
+        } else if active {
+            POLL_INTERVAL
+        } else {
+            Duration::from_secs(30)
+        };
         tokio::select! {
             () = wake.notified() => {}
             () = tokio::time::sleep(pause) => {}
@@ -640,6 +700,15 @@ mod tests {
     };
 
     use aether_store::{NodeStore, SentState};
+
+    #[test]
+    fn failed_rounds_back_off_to_a_cap_and_a_good_round_resets_the_pause() {
+        let pauses: Vec<u64> =
+            (1..=8).map(|failures| super::error_pause(failures).as_secs()).collect();
+        assert_eq!(pauses, [1, 2, 4, 8, 16, 30, 30, 30]);
+        assert_eq!(super::error_pause(u32::MAX), super::ERROR_PAUSE_CAP);
+        assert_eq!(super::error_pause(0), super::POLL_INTERVAL);
+    }
 
     #[test]
     fn response_linger_outlives_the_poll_interval() {

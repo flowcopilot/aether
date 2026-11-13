@@ -100,6 +100,50 @@ impl PartialEq for StoreError {
 
 impl Eq for StoreError {}
 
+/// Statements that the connection prepares once and keeps, so a hot path
+/// does not parse its SQL on every call. Each statement text is one cache
+/// entry, so the text must not carry values; bind them as parameters.
+pub(crate) trait CachedSql {
+    fn execute_cached<P: rusqlite::Params>(
+        &self,
+        sql: &str,
+        params: P,
+    ) -> rusqlite::Result<usize>;
+
+    fn query_row_cached<T, P, F>(
+        &self,
+        sql: &str,
+        params: P,
+        map: F,
+    ) -> rusqlite::Result<T>
+    where
+        P: rusqlite::Params,
+        F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>;
+}
+
+impl CachedSql for Connection {
+    fn execute_cached<P: rusqlite::Params>(
+        &self,
+        sql: &str,
+        params: P,
+    ) -> rusqlite::Result<usize> {
+        self.prepare_cached(sql)?.execute(params)
+    }
+
+    fn query_row_cached<T, P, F>(
+        &self,
+        sql: &str,
+        params: P,
+        map: F,
+    ) -> rusqlite::Result<T>
+    where
+        P: rusqlite::Params,
+        F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    {
+        self.prepare_cached(sql)?.query_row(params, map)
+    }
+}
+
 pub struct NodeStore {
     pub(crate) connection: Connection,
 }
@@ -123,7 +167,7 @@ pub(crate) fn put_scope(
     id: &str,
     kind: ScopeKind,
 ) -> Result<(), StoreError> {
-    connection.execute(
+    connection.execute_cached(
         "INSERT INTO scopes(id,kind) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET kind=excluded.kind",
         params![id, kind.as_str()],
     )?;
@@ -137,12 +181,12 @@ pub(crate) fn ensure_scope(
     id: &str,
     kind: ScopeKind,
 ) -> Result<(), StoreError> {
-    connection.execute(
+    connection.execute_cached(
         "INSERT INTO scopes(id,kind) VALUES(?1,?2) ON CONFLICT(id) DO NOTHING",
         params![id, kind.as_str()],
     )?;
     let stored: Option<String> = connection
-        .query_row("SELECT kind FROM scopes WHERE id=?1", [id], |row| row.get(0))
+        .query_row_cached("SELECT kind FROM scopes WHERE id=?1", [id], |row| row.get(0))
         .optional()?;
     if stored.as_deref() == Some(kind.as_str()) {
         Ok(())

@@ -1,5 +1,6 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
+    sync::{Mutex, PoisonError},
     time::{Duration, SystemTime},
 };
 
@@ -9,7 +10,51 @@ use aether_core::{
 };
 use ed25519_dalek::SigningKey;
 
-use crate::signed::{SignedBytes, sign, verify};
+use crate::{
+    settings::KeptStore,
+    signed::{SignedBytes, sign, verify},
+};
+
+/// A signature that verified: the issuer key, the signature and the exact
+/// bytes that it signs.
+type VerifiedSignature = ([u8; 32], Vec<u8>, Vec<u8>);
+
+/// How many verified signatures the node remembers.
+const VERIFIED_CAPACITY: usize = 1024;
+
+/// The signatures that [`verify_cached`] verified.
+static VERIFIED: Mutex<Option<HashSet<VerifiedSignature>>> = Mutex::new(None);
+
+/// [`verify`] with a memory of the signatures that verified. A signature
+/// that verified once verifies again for the same key and bytes, so an
+/// admission does not run the ed25519 check twice for one grant. This keeps
+/// only that cryptographic result. Whether the issuer is trusted, and the
+/// expiry, scope and every other check, still run on each admission, and a
+/// failed signature is not kept.
+fn verify_cached(
+    signing_key: &[u8; 32],
+    message: &[u8],
+    signature: &[u8],
+) -> Result<(), crate::signed::Forged> {
+    let key: VerifiedSignature = (*signing_key, signature.to_vec(), message.to_vec());
+    if VERIFIED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .is_some_and(|verified| verified.contains(&key))
+    {
+        return Ok(());
+    }
+    verify(signing_key, message, signature)?;
+    let mut guard = VERIFIED.lock().unwrap_or_else(PoisonError::into_inner);
+    let verified = guard.get_or_insert_with(HashSet::new);
+    if verified.len() >= VERIFIED_CAPACITY {
+        verified.clear();
+    }
+    verified.insert(key);
+    drop(guard);
+    Ok(())
+}
 
 /// The issuer name of the node's own signing key, which the node always
 /// trusts. The admin UI signs a friend's access with it.
@@ -22,7 +67,8 @@ pub struct SignedClaims {
 
 pub struct RosterClaims {
     signed_claims: SignedClaims,
-    data_dir: crate::data_dir::DataDir,
+    /// The roster store, which stays open between admissions.
+    roster: Mutex<KeptStore>,
 }
 
 pub struct ClaimInput {
@@ -87,11 +133,14 @@ struct Signed<'a> {
 
 impl RosterClaims {
     #[must_use]
-    pub const fn new(
+    pub fn new(
         signed_claims: SignedClaims,
-        data_dir: crate::data_dir::DataDir,
+        data_dir: &crate::data_dir::DataDir,
     ) -> Self {
-        Self { signed_claims, data_dir }
+        Self {
+            signed_claims,
+            roster: Mutex::new(KeptStore::new(data_dir.path().to_path_buf(), true)),
+        }
     }
 }
 
@@ -115,9 +164,10 @@ impl TrustProvider for SignedClaims {
         {
             return Err(ProviderError::Invalid("claim is not trusted".to_owned()));
         }
-        verify(&claim.signing_key, &claim_bytes(claim), &claim.signature).map_err(
-            |_| ProviderError::Invalid("claim signature is invalid".to_owned()),
-        )
+        verify_cached(&claim.signing_key, &claim_bytes(claim), &claim.signature)
+            .map_err(|_| {
+                ProviderError::Invalid("claim signature is invalid".to_owned())
+            })
     }
 
     fn verify_grant(&self, grant: &Grant, scope: &Scope) -> Result<(), ProviderError> {
@@ -132,9 +182,10 @@ impl TrustProvider for SignedClaims {
         if !self.trusts(&signed, scope) {
             return Err(ProviderError::Invalid("grant is not trusted".to_owned()));
         }
-        verify(&grant.signing_key, &grant_bytes(grant), &grant.signature).map_err(
-            |_| ProviderError::Invalid("grant signature is invalid".to_owned()),
-        )
+        verify_cached(&grant.signing_key, &grant_bytes(grant), &grant.signature)
+            .map_err(|_| {
+                ProviderError::Invalid("grant signature is invalid".to_owned())
+            })
     }
 }
 
@@ -149,18 +200,19 @@ impl TrustProvider for RosterClaims {
         if scope.kind != ScopeKind::Managed {
             return Ok(());
         }
-        let store = self.data_dir.store().map_err(|_| ProviderError::Unavailable)?;
         let now = aether_core::time::unix_timestamp(SystemTime::now())
             .ok_or(ProviderError::Unavailable)?;
-        let active = store
-            .managed_members(scope.id.as_str())
-            .map_err(|_| ProviderError::Unavailable)?
-            .into_iter()
-            .any(|member| {
-                member.agent_id == claim.subject_agent_id.as_str()
-                    && member.endpoint_id == authenticated_endpoint.as_str()
-                    && member.is_active(now)
-            });
+        let members = self
+            .roster
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .read(|store| store.managed_members(scope.id.as_str()))
+            .map_err(|_| ProviderError::Unavailable)?;
+        let active = members.into_iter().any(|member| {
+            member.agent_id == claim.subject_agent_id.as_str()
+                && member.endpoint_id == authenticated_endpoint.as_str()
+                && member.is_active(now)
+        });
         if active {
             Ok(())
         } else {
@@ -637,7 +689,7 @@ mod tests {
                 nonce: [6; 32],
             },
         );
-        let trust = RosterClaims::new(provider(&key), data_dir);
+        let trust = RosterClaims::new(provider(&key), &data_dir);
         let scope = Scope { id: ScopeId::new("managed"), kind: ScopeKind::Managed };
         assert!(trust.verify(&claim, &EndpointId::new("endpoint"), &scope,).is_ok());
         store
@@ -668,5 +720,89 @@ mod tests {
         assert_eq!(super::encode_grant(&parsed).expect("grant must encode"), text);
         assert_eq!(claim.subject_endpoint_id.as_str(), "friend-endpoint");
         assert_eq!(claim.signing_key, grant.signing_key);
+    }
+
+    #[test]
+    fn a_remembered_signature_does_not_skip_the_other_grant_checks() {
+        let key = SigningKey::from_bytes(&[8; 32]);
+        let valid = signed_test_grant(&key, |_| {});
+        assert!(verify_grant(&provider(&key), &valid));
+        // The signature is remembered now; the issuer is still checked.
+        assert!(!verify_grant(
+            &SignedClaims::new(BTreeMap::new(), Duration::ZERO),
+            &valid
+        ));
+        // An expired grant is refused although its signature verified.
+        let expired = signed_test_grant(&key, |input| {
+            input.issued_at = SystemTime::now() - Duration::from_secs(120);
+            input.expires_at = SystemTime::now() - Duration::from_secs(60);
+        });
+        super::verify_cached(
+            &expired.signing_key,
+            &super::grant_bytes(&expired),
+            &expired.signature,
+        )
+        .expect("the signature is valid");
+        assert!(!verify_grant(&provider(&key), &expired));
+        // Another scope is refused too.
+        assert!(
+            provider(&key)
+                .verify_grant(
+                    &valid,
+                    &Scope { id: ScopeId::new("other"), kind: ScopeKind::Direct },
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_remembered_signature_is_for_its_exact_bytes_and_key() {
+        let key = SigningKey::from_bytes(&[9; 32]);
+        let other = SigningKey::from_bytes(&[10; 32]);
+        let valid = signed_test_grant(&key, |_| {});
+        let bytes = super::grant_bytes(&valid);
+        super::verify_cached(&valid.signing_key, &bytes, &valid.signature)
+            .expect("valid");
+        super::verify_cached(&valid.signing_key, &bytes, &valid.signature)
+            .expect("valid again, from memory");
+        let mut changed = bytes.clone();
+        changed.push(0);
+        assert!(
+            super::verify_cached(&valid.signing_key, &changed, &valid.signature)
+                .is_err()
+        );
+        let mut forged = valid.signature.clone();
+        forged.reverse();
+        assert!(super::verify_cached(&valid.signing_key, &bytes, &forged).is_err());
+        assert!(
+            super::verify_cached(
+                &other.verifying_key().to_bytes(),
+                &bytes,
+                &valid.signature
+            )
+            .is_err()
+        );
+        // A failure is not remembered as a success.
+        assert!(
+            super::verify_cached(&valid.signing_key, &changed, &valid.signature)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn the_memory_of_signatures_stays_bounded() {
+        let key = SigningKey::from_bytes(&[11; 32]);
+        for index in 0..super::VERIFIED_CAPACITY.saturating_add(10) {
+            let message = index.to_le_bytes();
+            let signature = super::sign(&key, &message);
+            super::verify_cached(&key.verifying_key().to_bytes(), &message, &signature)
+                .expect("valid");
+        }
+        let size = super::VERIFIED
+            .lock()
+            .expect("lock")
+            .as_ref()
+            .map_or(0, std::collections::HashSet::len);
+        assert!(size <= super::VERIFIED_CAPACITY);
     }
 }

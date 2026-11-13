@@ -4,6 +4,7 @@ use aether_core::{
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
+use crate::CachedSql;
 use crate::{NodeStore, StoreError, now, sql_count, sql_named, sql_names};
 
 pub const CONTENT_RETENTION_SECONDS: i64 = 24 * 60 * 60;
@@ -289,7 +290,7 @@ impl NodeStore {
     }
 
     pub fn last_tasks(&self, scope_id: &str) -> Result<Vec<LastTask>, StoreError> {
-        let mut statement = self.connection.prepare(
+        let mut statement = self.connection.prepare_cached(
             "SELECT caller_endpoint_id,state,created_at,remote_text,final_result FROM (
                  SELECT caller_endpoint_id,state,created_at,remote_text,final_result,
                         ROW_NUMBER() OVER (
@@ -358,7 +359,7 @@ fn admit(
 ) -> Result<TaskAdmission, StoreError> {
     let request = &input.request;
     let existing = tx
-        .query_row(
+        .query_row_cached(
             &format!(
                 "SELECT {REQUEST_COLUMNS},request_fingerprint,caller_task_id,caller_request_id FROM tasks WHERE caller_endpoint_id=?1 AND idempotency_key=?2"
             ),
@@ -400,7 +401,7 @@ fn admit(
     );
     let caller_ids =
         own_ids.as_ref().map(|_| (request.task_id.as_str(), request.id.as_str()));
-    tx.execute(
+    tx.execute_cached(
         &format!(
             "INSERT INTO tasks({REQUEST_COLUMNS},idempotency_key,request_fingerprint,skill,remote_text,state,created_at,caller_task_id,caller_request_id)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)"
@@ -441,7 +442,7 @@ fn own_ids(
     request: &Request,
 ) -> Result<Option<(String, String)>, StoreError> {
     let endpoint = request.caller_endpoint_id.as_str();
-    let mut statement = tx.prepare(
+    let mut statement = tx.prepare_cached(
         "SELECT caller_endpoint_id FROM tasks
          WHERE id=?1 OR request_id=?2
             OR (caller_endpoint_id=?3 AND (caller_task_id=?1 OR caller_request_id=?2))",
@@ -464,7 +465,7 @@ fn own_ids(
 /// A random ID in the form of a UUID.
 fn random_id(tx: &Transaction<'_>) -> Result<String, StoreError> {
     let hex: String =
-        tx.query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))?;
+        tx.query_row_cached("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))?;
     let part = |range: std::ops::Range<usize>| hex.get(range).unwrap_or_default();
     Ok(format!(
         "{}-{}-{}-{}-{}",
@@ -479,7 +480,7 @@ fn random_id(tx: &Transaction<'_>) -> Result<String, StoreError> {
 impl NodeStore {
     pub fn state(&self, task_id: &str) -> Result<TaskState, StoreError> {
         self.connection
-            .query_row("SELECT state FROM tasks WHERE id=?1", [task_id], |row| {
+            .query_row_cached("SELECT state FROM tasks WHERE id=?1", [task_id], |row| {
                 row.get(0)
             })
             .optional()?
@@ -499,7 +500,7 @@ impl NodeStore {
             Option<String>,
         ) = self
             .connection
-            .query_row(
+            .query_row_cached(
                 "SELECT id,state,skill,remote_text,final_result FROM tasks WHERE id=?1",
                 [task_id],
                 |row| {
@@ -529,7 +530,7 @@ impl NodeStore {
         task_id: &str,
         last_sequence: i64,
     ) -> Result<Vec<TaskEvent>, StoreError> {
-        let mut statement = self.connection.prepare("SELECT sequence,event_type FROM task_events WHERE task_id=?1 AND sequence>?2 ORDER BY sequence")?;
+        let mut statement = self.connection.prepare_cached("SELECT sequence,event_type FROM task_events WHERE task_id=?1 AND sequence>?2 ORDER BY sequence")?;
         Ok(statement
             .query_map(params![task_id, last_sequence], TaskEvent::from_row)?
             .collect::<Result<_, _>>()?)
@@ -545,7 +546,7 @@ impl NodeStore {
         limit: usize,
     ) -> Result<(Vec<TaskEvent>, bool), StoreError> {
         let fetch = sql_count(limit.saturating_add(1));
-        let mut statement = self.connection.prepare(
+        let mut statement = self.connection.prepare_cached(
             "SELECT sequence,event_type FROM task_events WHERE task_id=?1 AND sequence>?2 ORDER BY sequence LIMIT ?3",
         )?;
         let mut events = statement
@@ -563,7 +564,7 @@ impl NodeStore {
         task_id: &str,
     ) -> Result<(TaskState, Option<String>), StoreError> {
         self.connection
-            .query_row(
+            .query_row_cached(
                 "SELECT state,final_result FROM tasks WHERE id=?1",
                 [task_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
@@ -596,7 +597,7 @@ impl NodeStore {
         cursor: i64,
         limit: usize,
     ) -> Result<Vec<TaskActivity>, StoreError> {
-        let mut statement = self.connection.prepare(
+        let mut statement = self.connection.prepare_cached(
             "SELECT rowid,task_id,event_type FROM task_events WHERE rowid>?1 ORDER BY rowid LIMIT ?2",
         )?;
         Ok(statement
@@ -630,7 +631,7 @@ impl NodeStore {
     ) -> Result<Option<String>, StoreError> {
         let tx = self.connection.transaction()?;
         let task = tx
-            .query_row(
+            .query_row_cached(
                 &format!(
                     "SELECT queued.id FROM tasks queued WHERE queued.state=?1
                      ORDER BY (SELECT COUNT(*) FROM tasks active WHERE active.caller_agent_id=queued.caller_agent_id AND active.state IN ({})), queued.created_at, queued.id LIMIT 1",
@@ -642,7 +643,7 @@ impl NodeStore {
             .optional()?;
         let Some(task) = task else { return Ok(None) };
         enter(&tx, &task, TaskState::Leased)?;
-        tx.execute("INSERT INTO execution_leases(task_id,owner,execution_id,expires_at) VALUES(?1,?2,?3,?4)", params![task,owner,execution_id,expires_at])?;
+        tx.execute_cached("INSERT INTO execution_leases(task_id,owner,execution_id,expires_at) VALUES(?1,?2,?3,?4)", params![task,owner,execution_id,expires_at])?;
         tx.commit()?;
         Ok(Some(task))
     }
@@ -674,7 +675,7 @@ impl NodeStore {
         expires_at: i64,
         now: i64,
     ) -> Result<(), StoreError> {
-        if self.connection.execute(
+        if self.connection.execute_cached(
             "UPDATE execution_leases SET expires_at=?1 WHERE task_id=?2 AND execution_id=?3 AND expires_at>?4",
             params![expires_at, task_id, execution_id, now],
         )? == 0 {
@@ -702,7 +703,7 @@ impl NodeStore {
             return Err(StoreError::NotFound);
         }
         end(&tx, task_id, TaskState::Succeeded)?;
-        tx.execute(
+        tx.execute_cached(
             "UPDATE tasks SET final_result=?1,result_expires_at=?2 WHERE id=?3",
             params![result, result_expires_at, task_id],
         )?;
@@ -722,7 +723,7 @@ impl NodeStore {
     ) -> Result<usize, StoreError> {
         let tx = self.connection.transaction()?;
         let ids = {
-            let mut statement = tx.prepare(&format!(
+            let mut statement = tx.prepare_cached(&format!(
                 "SELECT id FROM tasks
                  WHERE content_expired_at IS NULL
                    AND state IN ({})
@@ -738,7 +739,7 @@ impl NodeStore {
                 .collect::<Result<Vec<_>, _>>()?
         };
         for task_id in &ids {
-            tx.execute(
+            tx.execute_cached(
                 "UPDATE tasks SET remote_text='',final_result=NULL,result_expires_at=NULL,content_expired_at=?1 WHERE id=?2",
                 params![timestamp, task_id],
             )?;
@@ -750,7 +751,7 @@ impl NodeStore {
 
     pub fn content_is_expired(&self, task_id: &str) -> Result<bool, StoreError> {
         self.connection
-            .query_row(
+            .query_row_cached(
                 "SELECT content_expired_at IS NOT NULL FROM tasks WHERE id=?1",
                 [task_id],
                 |row| row.get(0),
@@ -823,7 +824,7 @@ impl NodeStore {
     ) -> Result<String, StoreError> {
         let tx = self.connection.transaction()?;
         let (id, owner, scope): (String, String, String) = tx
-            .query_row(
+            .query_row_cached(
                 "SELECT id,caller_endpoint_id,scope_id FROM tasks
                  WHERE id=?1 OR (caller_endpoint_id=?2 AND caller_task_id=?1)
                  ORDER BY caller_task_id IS NULL LIMIT 1",
@@ -844,7 +845,7 @@ impl NodeStore {
         task_id: &str,
     ) -> Result<TaskExecutionData, StoreError> {
         self.connection
-            .query_row(
+            .query_row_cached(
                 &format!(
                     "SELECT {REQUEST_COLUMNS},skill,remote_text FROM tasks WHERE id=?1"
                 ),
@@ -884,8 +885,9 @@ impl NodeStore {
     ) -> Result<Vec<String>, StoreError> {
         let tx = self.connection.transaction()?;
         let ids = {
-            let mut statement = tx
-                .prepare("SELECT task_id FROM execution_leases WHERE expires_at<=?1")?;
+            let mut statement = tx.prepare_cached(
+                "SELECT task_id FROM execution_leases WHERE expires_at<=?1",
+            )?;
             statement
                 .query_map([timestamp], |row| row.get::<_, String>(0))?
                 .collect::<Result<Vec<_>, _>>()?
@@ -921,11 +923,11 @@ fn accept_replay_key(
     expires_at: i64,
     limit: usize,
 ) -> Result<(), StoreError> {
-    tx.execute(
+    tx.execute_cached(
         "DELETE FROM replay_entries WHERE caller_endpoint_id=?1 AND scope_id=?2 AND expires_at<=?3",
         params![caller_endpoint_id, scope_id, now()],
     )?;
-    let exists: bool = tx.query_row(
+    let exists: bool = tx.query_row_cached(
         "SELECT EXISTS(SELECT 1 FROM replay_entries WHERE caller_endpoint_id=?1 AND scope_id=?2 AND replay_key=?3)",
         params![caller_endpoint_id, scope_id, replay_key],
         |row| row.get(0),
@@ -933,7 +935,7 @@ fn accept_replay_key(
     if exists {
         return Err(StoreError::DuplicateConflict);
     }
-    let count: i64 = tx.query_row(
+    let count: i64 = tx.query_row_cached(
         "SELECT COUNT(*) FROM replay_entries WHERE caller_endpoint_id=?1 AND scope_id=?2",
         params![caller_endpoint_id, scope_id],
         |row| row.get(0),
@@ -943,7 +945,7 @@ fn accept_replay_key(
         // would let the caller send that frame again.
         return Err(StoreError::Overloaded);
     }
-    tx.execute(
+    tx.execute_cached(
         "INSERT INTO replay_entries(caller_endpoint_id,scope_id,replay_key,expires_at) VALUES(?1,?2,?3,?4)",
         params![caller_endpoint_id, scope_id, replay_key, expires_at],
     )?;
@@ -952,12 +954,12 @@ fn accept_replay_key(
 
 fn count(tx: &Transaction<'_>, peer: Option<&str>) -> Result<usize, StoreError> {
     let count: i64 = match peer {
-        Some(peer) => tx.query_row(
+        Some(peer) => tx.query_row_cached(
             "SELECT COUNT(*) FROM tasks WHERE state=?1 AND caller_endpoint_id=?2",
             params![TaskState::Queued, peer],
             |row| row.get(0),
         )?,
-        None => tx.query_row(
+        None => tx.query_row_cached(
             "SELECT COUNT(*) FROM tasks WHERE state=?1",
             [TaskState::Queued],
             |row| row.get(0),
@@ -971,7 +973,7 @@ fn lease_matches(
     task_id: &str,
     execution_id: &str,
 ) -> Result<bool, StoreError> {
-    tx.query_row(
+    tx.query_row_cached(
         "SELECT EXISTS(SELECT 1 FROM execution_leases WHERE task_id=?1 AND execution_id=?2)",
         params![task_id, execution_id],
         |row| row.get(0),
@@ -980,9 +982,11 @@ fn lease_matches(
 }
 
 fn state(tx: &Transaction<'_>, task_id: &str) -> Result<TaskState, StoreError> {
-    tx.query_row("SELECT state FROM tasks WHERE id=?1", [task_id], |row| row.get(0))
-        .optional()?
-        .ok_or(StoreError::NotFound)
+    tx.query_row_cached("SELECT state FROM tasks WHERE id=?1", [task_id], |row| {
+        row.get(0)
+    })
+    .optional()?
+    .ok_or(StoreError::NotFound)
 }
 
 /// Moves the task to the terminal state `next`, starts its input's
@@ -1003,12 +1007,12 @@ fn cancel(tx: Transaction<'_>, task_id: &str) -> Result<(), StoreError> {
 }
 
 fn delete_lease(tx: &Transaction<'_>, task_id: &str) -> Result<(), StoreError> {
-    tx.execute("DELETE FROM execution_leases WHERE task_id=?1", [task_id])?;
+    tx.execute_cached("DELETE FROM execution_leases WHERE task_id=?1", [task_id])?;
     Ok(())
 }
 
 fn set_input_expiry(tx: &Transaction<'_>, task_id: &str) -> Result<(), StoreError> {
-    tx.execute(
+    tx.execute_cached(
         "UPDATE tasks SET input_expires_at=?1 WHERE id=?2 AND input_expires_at IS NULL",
         params![now().saturating_add(CONTENT_RETENTION_SECONDS), task_id],
     )?;
@@ -1036,7 +1040,7 @@ fn change(
     }
     // Write only over the state just checked, so the guard holds even if
     // another writer changed the row in between.
-    if tx.execute(
+    if tx.execute_cached(
         "UPDATE tasks SET state=?1 WHERE id=?2 AND state=?3",
         params![next, task_id, current],
     )? == 0
@@ -1051,12 +1055,12 @@ fn event(
     task_id: &str,
     event_type: EventType,
 ) -> Result<(), StoreError> {
-    let sequence: i64 = tx.query_row(
+    let sequence: i64 = tx.query_row_cached(
         "SELECT COALESCE(MAX(sequence),0)+1 FROM task_events WHERE task_id=?1",
         [task_id],
         |row| row.get(0),
     )?;
-    tx.execute(
+    tx.execute_cached(
         "INSERT INTO task_events(task_id,sequence,event_type,data,created_at) VALUES(?1,?2,?3,'{}',?4)",
         params![task_id, sequence, event_type, now()],
     )?;
@@ -1105,7 +1109,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             [("endpoint-a", TaskState::Queued), ("endpoint-b", TaskState::Cancelled)]
         );
-        assert!(store.last_tasks("other").expect("last tasks must load").is_empty());
+        assert_eq!(
+            store.last_tasks("other").expect("last tasks must load"),
+            Vec::new()
+        );
         drop(store);
         fs::remove_file(database).expect("database must remove");
     }

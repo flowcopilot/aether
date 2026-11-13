@@ -170,7 +170,7 @@ fn build(
     store
         .initialize_access_groups(&initial_members)
         .map_err(|_| PolicyError::Invalid)?;
-    let trust = RosterClaims::new(signed_claims, layout.clone());
+    let trust = RosterClaims::new(signed_claims, &layout);
     let workspace = resolve_workspace(&policy.workspace, &layout)?;
     let agent = match sandbox {
         Some(sandbox) => NodeAgent::Codex(codex_agent(
