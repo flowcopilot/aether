@@ -95,6 +95,7 @@ impl HubClient {
     /// A client for the hub at `origin` that signs with `key`.
     pub fn new(origin: &str, key: iroh::SecretKey) -> Result<Self, HubError> {
         let origin = parse_origin(origin)?;
+        crate::node_runtime::install_crypto_provider();
         // The long poll holds a request open for up to MAX_WAIT_SECONDS.
         let client = Client::builder()
             .redirect(Policy::none())
