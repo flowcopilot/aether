@@ -38,6 +38,9 @@ _load_plugin()
 from aether_plugin_core import mcp_client, node, tools  # noqa: E402
 
 CONTRACT = json.loads((PROTOCOL / "contract.json").read_text())
+
+# The `ready` that the plugin sends: the protocol and how many tasks it takes.
+READY = {"type": "ready", "protocol": 1, "max_tasks": node.MAX_TASKS}
 TRANSCRIPT = json.loads((PROTOCOL / "transcript.json").read_text())
 
 
@@ -54,6 +57,9 @@ class ContractTest(unittest.TestCase):
         self.assertEqual(node.SOCKET_FILE, CONTRACT["socket_file"])
         self.assertEqual(node.MAX_LINE, CONTRACT["max_line_bytes"])
         self.assertEqual(node.RECONNECT_SECONDS, CONTRACT["reconnect_seconds"])
+        # The plugin takes more than the default of one task at once, and says so.
+        self.assertGreater(node.MAX_TASKS, CONTRACT["default_max_tasks"])
+        self.assertIn("max_tasks", CONTRACT["messages"]["optional_fields"]["ready"])
         self.assertEqual(node.socket_path(Path("/srv")), Path("/srv") / CONTRACT["socket_file"])
 
     def test_the_default_data_dir_follows_the_contract(self) -> None:
@@ -170,7 +176,7 @@ class TranscriptTest(unittest.TestCase):
                 message = step["agent"]
                 if message["type"] == "ready":
                     fake.accept()
-                    self.assertEqual(fake.read(), message)
+                    self.assertEqual(fake.read(), READY)
                     continue
                 # The host answers only after the plugin has read every node line.
                 _wait(lambda: len(received) == sent, "the plugin must read the node's lines")
@@ -240,7 +246,7 @@ class NodeLinkTest(unittest.TestCase):
         self.addCleanup(stop.set)
 
         fake.accept()
-        self.assertEqual(fake.read(), {"type": "ready", "protocol": 1})
+        self.assertEqual(fake.read(), READY)
         for task_id in ("task-1", "task-2"):
             fake.write(json.dumps({"type": "task", "id": task_id, "instructions": "", "text": "hi"}).encode() + b"\n")
         fake.write(b'{"type":"cancel","id":"task-1"}\n')
@@ -249,11 +255,27 @@ class NodeLinkTest(unittest.TestCase):
         _wait(lambda: statuses == [True, False], "the session must report that it closed")
         self.assertEqual(host.stopped, ["task-2"])
         fake.accept()
-        self.assertEqual(fake.read(), {"type": "ready", "protocol": 1})
+        self.assertEqual(fake.read(), READY)
         self.assertTrue(runner.is_alive())
 
 
 class TasksTest(unittest.TestCase):
+    def test_two_open_tasks_are_answered_and_stopped_separately(self) -> None:
+        sent: list[dict] = []
+        stopped: list[str] = []
+        tasks = node.Tasks(send=sent.append, start=lambda task_id, message: task_id, stop=stopped.append)
+        for task_id in ("task-1", "task-2"):
+            tasks.receive({"type": "task", "id": task_id, "instructions": "", "text": "hi"})
+        tasks.result("task-2", "two")
+        tasks.receive({"type": "cancel", "id": "task-1"})
+        # A late answer of a task that is closed changes nothing.
+        tasks.result("task-1", "late")
+        self.assertEqual(
+            sent,
+            [{"type": "result", "id": "task-2", "text": "two"}, {"type": "cancelled", "id": "task-1"}],
+        )
+        self.assertEqual(stopped, ["task-1"])
+
     def test_a_turn_that_cannot_start_fails_its_task(self) -> None:
         sent: list[dict] = []
 

@@ -111,6 +111,15 @@ and a second Aether data directory, as a second agent.
 - The node's time limit (`maxSeconds`) applies to each Hermes turn. At the
   limit, the node cancels the turn.
 
+## Tasks at once
+
+The plugin takes up to 32 tasks at once and says so in its `ready` message
+(`max_tasks`). Each task is its own gateway session, so the gateway runs
+them side by side, and a cancel or an answer of one task never touches
+another. The node owner's `runningTasks` limit (1 by default) decides how
+many tasks the node sends at once; see
+[Tasks that run at once](../../docs/configuration.md#tasks-that-run-at-once).
+
 ## Tests
 
 ```sh

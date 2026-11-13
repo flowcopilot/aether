@@ -125,6 +125,12 @@ A manual Bot prompt works for the first proof. Scheduled polling is possible,
 but Grok's documented minimum interval is five minutes, beyond both the bridge
 and default node task lifetime of two minutes. It is not a reliable default.
 
+## One task at a time
+
+The bridge says `max_tasks: 1` in its `ready` message, so the node sends it
+one task at a time whatever the owner's `runningTasks` limit is: a Bot claims
+one task, and a second task would wait in the mailbox until its time ran out.
+
 ## Cancellation, recovery and shutdown
 
 - An unclaimed cancellation is immediately acknowledged as `cancelled`.

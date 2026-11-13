@@ -86,6 +86,21 @@
         { "agent": { "type": "result", "id": "task-7", "text": "late" }, "ignored": true }
       ],
       "outcomes": { "task-7": "lost" }
+    },
+    {
+      "name": "two open tasks are answered and cancelled separately",
+      "concurrent": true,
+      "steps": [
+        { "agent": { "type": "ready", "protocol": 1, "max_tasks": 2 } },
+        { "node": { "type": "task", "id": "task-8", "instructions": "Do the task.", "text": "first" } },
+        { "node": { "type": "task", "id": "task-9", "instructions": "Do the task.", "text": "second" } },
+        { "agent": { "type": "progress", "id": "task-9" } },
+        { "agent": { "type": "result", "id": "task-9", "text": "the second answer" } },
+        { "node": { "type": "cancel", "id": "task-8" } },
+        { "agent": { "type": "cancelled", "id": "task-8" } },
+        { "agent": { "type": "result", "id": "task-8", "text": "late" }, "ignored": true }
+      ],
+      "outcomes": { "task-8": "cancelled", "task-9": "answered" }
     }
   ]
 }

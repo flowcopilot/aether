@@ -47,7 +47,9 @@ export class NodeLink {
         socket.on('connect', () => {
           this.socket = socket;
           connected = true;
-          this.send({ type: 'ready', protocol: contract.protocol });
+          // One task at a time: a Bot claims one task and the rest wait in the mailbox
+          // until their time runs out, so the node must not send more than one.
+          this.send({ type: 'ready', protocol: contract.protocol, max_tasks: 1 });
           this.status(true);
         });
         socket.on('data', chunk => {
