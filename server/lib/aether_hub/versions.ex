@@ -8,10 +8,18 @@ defmodule AetherHub.Versions do
 
   import Ecto.Query
 
-  alias AetherHub.{Account, Notify, Repo}
+  alias AetherHub.{Account, Notify, ReadRepo, Repo}
 
+  # Endpoints in one `IN` list. SQLite refuses a statement with more than
+  # 32,766 variables (999 before 3.32), so a bump goes in bounded chunks.
+  @bump_chunk 500
+
+  @doc """
+  The version of `endpoint`, from the read pool. Inside a write transaction,
+  read it with `Repo` instead.
+  """
   def current(endpoint),
-    do: Repo.one(from a in Account, where: a.endpoint == ^endpoint, select: a.version)
+    do: ReadRepo.one(from a in Account, where: a.endpoint == ^endpoint, select: a.version)
 
   @doc """
   Runs `fun` in a transaction. `fun` returns `{value, touched}`: the
@@ -35,13 +43,12 @@ defmodule AetherHub.Versions do
     end
   end
 
-  defp bump([]), do: :ok
-
   defp bump(endpoints) do
-    Repo.update_all(from(a in Account, where: a.endpoint in ^Enum.uniq(endpoints)),
-      inc: [version: 1]
-    )
-
-    :ok
+    endpoints
+    |> Enum.uniq()
+    |> Enum.chunk_every(@bump_chunk)
+    |> Enum.each(fn chunk ->
+      Repo.update_all(from(a in Account, where: a.endpoint in ^chunk), inc: [version: 1])
+    end)
   end
 end

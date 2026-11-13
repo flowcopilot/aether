@@ -24,10 +24,14 @@ defmodule AetherHub.Invites do
     Notify,
     Params,
     Protocol,
+    ReadRepo,
     Repo,
     Versions
   }
 
+  # Rows that one sweep transaction deletes. 500 rows and up to 1,000
+  # endpoints stay far under the variable limit of SQLite (32,766).
+  @sweep_chunk 500
   @ttl Protocol.limit(:invite_seconds)
   @days Protocol.limit(:access_days)
   @bundle_prefix Protocol.limit(:invite_prefix)
@@ -285,8 +289,10 @@ defmodule AetherHub.Invites do
     end
   end
 
+  # A pure read: one deferred transaction on the read pool, so the rows and
+  # the version come from one committed state and the read takes no write lock.
   defp snapshot(endpoint) do
-    Repo.atomic(fn ->
+    ReadRepo.snapshot(fn ->
       invites =
         from(i in open(),
           join: s in Account,
@@ -298,7 +304,7 @@ defmodule AetherHub.Invites do
           order_by: [asc: i.created_at, asc: i.id],
           select: {i, s, r}
         )
-        |> Repo.all()
+        |> ReadRepo.all()
         |> limit_requests(endpoint)
         |> Enum.map(fn {i, from, to} ->
           json(i, Account.full_name(from), Account.full_name(to), endpoint)
@@ -356,13 +362,40 @@ defmodule AetherHub.Invites do
     :ok
   end
 
-  @doc "Deletes every expired row and wakes both sides of each."
-  def delete_expired do
-    Versions.commit(fn ->
-      expired = Repo.all(from i in Invite, where: i.created_at <= ^cutoff())
-      Repo.delete_all(from i in Invite, where: i.id in ^Enum.map(expired, & &1.id))
-      {:ok, Enum.flat_map(expired, &[&1.sender_endpoint, &1.receiver_endpoint])}
-    end)
+  @doc """
+  Deletes every expired row and wakes both sides of each. It deletes at most
+  `chunk` rows in one transaction, and bumps the versions of that chunk's
+  endpoints in the same transaction: a large backlog neither exceeds the
+  variable limit of SQLite nor holds the writer for long. `:ok`, or the
+  `{:error, reason}` of the chunk that failed.
+  """
+  def delete_expired(chunk \\ @sweep_chunk) when is_integer(chunk) and chunk > 0 do
+    delete_expired_chunks(cutoff(), chunk)
+  end
+
+  defp delete_expired_chunks(cutoff, chunk) do
+    result =
+      Versions.commit(fn ->
+        rows =
+          Repo.all(
+            from i in Invite,
+              where: i.created_at <= ^cutoff,
+              limit: ^chunk,
+              select: {i.id, i.sender_endpoint, i.receiver_endpoint}
+          )
+
+        ids = for {id, _sender, _receiver} <- rows, do: id
+        Repo.delete_all(from i in Invite, where: i.id in ^ids)
+
+        touched = Enum.flat_map(rows, fn {_id, sender, receiver} -> [sender, receiver] end)
+        {length(rows), Enum.uniq(touched)}
+      end)
+
+    case result do
+      {:ok, ^chunk} -> delete_expired_chunks(cutoff, chunk)
+      {:ok, _fewer} -> :ok
+      {:error, _} = error -> error
+    end
   end
 
   ## Helpers
