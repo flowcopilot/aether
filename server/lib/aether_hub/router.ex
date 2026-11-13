@@ -53,9 +53,21 @@ defmodule AetherHub.Router do
   get "/directory.json" do
     case RateLimit.hit(:directory_ip, conn.assigns.client_ip) do
       :ok ->
-        conn
-        |> put_resp_header("cache-control", "public, max-age=15")
-        |> reply({:ok, Directory.cached()})
+        case Directory.cached() do
+          # `age` makes the 15 seconds honest: a view that is 10 seconds old
+          # is fresh for 5 more, not for 15.
+          {:ok, view, age} ->
+            conn
+            |> put_resp_header("cache-control", "public, max-age=15")
+            |> put_resp_header("age", Integer.to_string(age))
+            |> reply({:ok, view})
+
+          {:error, :unavailable} ->
+            conn
+            |> put_resp_header("cache-control", "no-store")
+            |> put_resp_header("retry-after", "2")
+            |> Reply.json(503, %{"error" => "unavailable"})
+        end
 
       :rate_limited ->
         reply(conn, {:error, :rate_limited})

@@ -22,9 +22,15 @@ defmodule AetherHub.Directory do
 
   @doc """
   The directory as the route serves it: the cached view, at most 15 seconds
-  old. See `AetherHub.DirectoryCache`.
+  old, with its age in whole seconds. `{:error, :unavailable}` when the cache
+  cannot answer. See `AetherHub.DirectoryCache`.
   """
-  def cached, do: DirectoryCache.get()
+  def cached do
+    {view, age_ms} = DirectoryCache.fetch()
+    {:ok, view, div(age_ms, 1000)}
+  rescue
+    DirectoryCache.Unavailable -> {:error, :unavailable}
+  end
 
   @doc """
   Builds the directory now: the listed service agents, online agents first,
@@ -35,7 +41,7 @@ defmodule AetherHub.Directory do
   listing text of the agents on the page. The hub checked each listing when
   the node sent it, so the counts do not decode. A listing that does not
   read is a bad row: the page leaves it out and the next agent takes its
-  place.
+  place, but `listed` and `online` still count it.
   """
   def snapshot do
     rows =
