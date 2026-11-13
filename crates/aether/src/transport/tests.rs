@@ -376,6 +376,32 @@ fn task_polling_stays_under_the_peer_rate_limit() {
     assert!(polls_per_second * 2 <= u128::from(super::PEER_REQUESTS_PER_SECOND));
 }
 
+#[test]
+fn task_poll_delay_starts_short_doubles_and_stops_at_the_interval() {
+    let delays: Vec<Duration> = (0..8).map(super::task_poll_delay).collect();
+    assert_eq!(delays.first(), Some(&super::TASK_POLL_INITIAL));
+    assert!(delays.windows(2).all(|pair| pair[0] <= pair[1]));
+    assert_eq!(delays.last(), Some(&super::TASK_POLL_INTERVAL));
+    assert_eq!(super::task_poll_delay(u32::MAX), super::TASK_POLL_INTERVAL);
+    assert!(super::TASK_POLL_INITIAL < super::TASK_POLL_INTERVAL / 4);
+}
+
+#[test]
+fn early_task_polls_leave_room_under_the_peer_rate_limit() {
+    // The submit and every re-poll in the first second use at most half of
+    // the per-second quota, so a second task from the same peer still fits.
+    let mut elapsed = Duration::ZERO;
+    let mut requests: u32 = 1;
+    for polls in 0.. {
+        elapsed += super::task_poll_delay(polls);
+        if elapsed > Duration::from_secs(1) {
+            break;
+        }
+        requests += 1;
+    }
+    assert!(requests <= super::PEER_REQUESTS_PER_SECOND, "{requests} requests");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_connection_serves_one_stream_after_another() {
     let (receiver, lookup) = bound_receiver().await;
