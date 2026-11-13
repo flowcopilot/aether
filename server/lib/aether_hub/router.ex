@@ -55,7 +55,7 @@ defmodule AetherHub.Router do
       :ok ->
         conn
         |> put_resp_header("cache-control", "public, max-age=15")
-        |> reply({:ok, Directory.snapshot()})
+        |> reply({:ok, Directory.cached()})
 
       :rate_limited ->
         reply(conn, {:error, :rate_limited})
@@ -213,7 +213,7 @@ defmodule AetherHub.Router do
     case RateLimit.hit(:request, endpoint) do
       :ok ->
         Presence.seen(endpoint)
-        assign(conn, :account, Accounts.get(endpoint))
+        assign(conn, :account, Accounts.fetch(endpoint))
 
       :rate_limited ->
         conn |> Reply.error(:rate_limited) |> halt()
