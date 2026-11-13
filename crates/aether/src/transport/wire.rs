@@ -64,6 +64,27 @@ pub(crate) fn task_poll_delay(polls_so_far: u32) -> Duration {
     TASK_POLL_INITIAL.saturating_mul(factor).min(TASK_POLL_INTERVAL)
 }
 
+/// The key in the `data` of a "node overloaded" error that the per-peer rate
+/// limit sent: the milliseconds until the peer has one more token. A full
+/// queue sends no `data`, and a caller does not retry it.
+pub(crate) const RETRY_AFTER_MS: &str = "retryAfterMs";
+/// How long a request keeps sending an exchange again while the host
+/// answers that its rate limit shed it, before the error goes to the caller.
+pub(crate) const OVERLOAD_RETRY_WINDOW: Duration = Duration::from_secs(2);
+/// The longest wait between two of those sends.
+const OVERLOAD_RETRY_MAX: Duration = Duration::from_secs(1);
+
+/// The wait before the next send after `retries_so_far` overloaded answers:
+/// one token of the per-peer rate limit (`1 s / PEER_REQUESTS_PER_SECOND`),
+/// doubled for each earlier retry and capped at `OVERLOAD_RETRY_MAX`.
+pub(crate) fn overload_retry_delay(retries_so_far: u32) -> Duration {
+    let factor = 1u32.checked_shl(retries_so_far).unwrap_or(u32::MAX);
+    let token = Duration::from_secs(1)
+        .checked_div(PEER_REQUESTS_PER_SECOND)
+        .unwrap_or(OVERLOAD_RETRY_MAX);
+    token.saturating_mul(factor).min(OVERLOAD_RETRY_MAX)
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FrameKind {

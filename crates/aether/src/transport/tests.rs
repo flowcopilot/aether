@@ -388,8 +388,9 @@ fn task_poll_delay_starts_short_doubles_and_stops_at_the_interval() {
 
 #[test]
 fn early_task_polls_leave_room_under_the_peer_rate_limit() {
-    // The submit and every re-poll in the first second use at most half of
-    // the per-second quota, so a second task from the same peer still fits.
+    // The submit and every re-poll in the first second fit in one burst of
+    // the per-peer quota. A second task from the same peer can exceed it;
+    // the client then sends again (see `overload_retry_delay`).
     let mut elapsed = Duration::ZERO;
     let mut requests: u32 = 1;
     for polls in 0.. {
@@ -400,6 +401,36 @@ fn early_task_polls_leave_room_under_the_peer_rate_limit() {
         requests += 1;
     }
     assert!(requests <= super::PEER_REQUESTS_PER_SECOND, "{requests} requests");
+}
+
+#[test]
+fn overload_retries_start_at_one_rate_token_and_stay_in_the_window() {
+    let first = super::overload_retry_delay(0);
+    assert_eq!(first * super::PEER_REQUESTS_PER_SECOND, Duration::from_secs(1));
+    let delays: Vec<Duration> = (0..8).map(super::overload_retry_delay).collect();
+    assert!(delays.windows(2).all(|pair| pair[0] <= pair[1]));
+    assert!(super::overload_retry_delay(u32::MAX) <= super::OVERLOAD_RETRY_WINDOW);
+    // At least two sends fit in the window, so a burst from one peer clears.
+    assert!(first + super::overload_retry_delay(1) < super::OVERLOAD_RETRY_WINDOW);
+}
+
+#[test]
+fn only_the_rate_limit_error_is_retried_not_a_full_queue() {
+    let frame = request();
+    let request = std::slice::from_ref(&frame);
+    let rate_limited = super::server::rate_limited_response(request);
+    assert!(super::client::is_rate_limited(&rate_limited));
+    // Same message and code as every other overloaded error.
+    let full_queue =
+        super::server::error_response(request, &TransportError::Overloaded);
+    assert_eq!(rate_limited[0].payload["message"], full_queue[0].payload["message"]);
+    assert_eq!(rate_limited[0].payload["code"], full_queue[0].payload["code"]);
+    assert!(!super::client::is_rate_limited(&full_queue));
+    let denied =
+        super::server::error_response(request, &TransportError::PermissionDenied);
+    assert!(!super::client::is_rate_limited(&denied));
+    assert!(!super::client::is_rate_limited(&[]));
+    assert!(!super::client::is_rate_limited(&[result()]));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

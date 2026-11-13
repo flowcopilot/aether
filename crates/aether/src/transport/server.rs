@@ -17,8 +17,9 @@ use tower::{
 use super::wire::{
     A2aError, ALPN, Frame, FrameKind, HANDLER_TIMEOUT, MAX_CONNECTIONS,
     MAX_EXCHANGE_BYTES, MAX_FRAME_BYTES, MAX_FRAMES, PEER_REQUESTS_PER_SECOND,
-    RESPONSE_LINGER, STREAM_TIMEOUT, TransportError, events_then_outcome, key_error,
-    payload, validate_header, validate_order, validate_payloads,
+    RESPONSE_LINGER, RETRY_AFTER_MS, STREAM_TIMEOUT, TransportError,
+    events_then_outcome, key_error, overload_retry_delay, payload, validate_header,
+    validate_order, validate_payloads,
 };
 
 type PeerLimiter = DefaultKeyedRateLimiter<String>;
@@ -205,7 +206,7 @@ async fn serve_stream(
 ) -> Result<(), TransportError> {
     let request = read_frames(&mut receive).await?;
     if limiter.check_key(&authenticated_endpoint.to_owned()).is_err() {
-        let response = error_response(&request, &TransportError::Overloaded);
+        let response = rate_limited_response(&request);
         write_frames(&mut send, &response).await?;
         return send
             .finish()
@@ -330,6 +331,22 @@ const fn a2a_error_code(error: &TransportError) -> i32 {
 /// Safe state data a caller can act on without parsing the error message.
 /// Never includes task input or output, matching the redaction rules that
 /// already govern logs, UI, and MCP responses.
+/// The "node overloaded" error of an exchange that the per-peer rate limit
+/// shed. Its `data` names the wait (`RETRY_AFTER_MS`) for one more token, so
+/// a caller can tell it from a full queue, which it must not retry. The
+/// message and code are those of every other overloaded error, so a caller
+/// that does not read `data` sees no change.
+pub(crate) fn rate_limited_response(request: &[Frame]) -> Vec<Frame> {
+    let mut response = error_response(request, &TransportError::Overloaded);
+    let wait = u64::try_from(overload_retry_delay(0).as_millis()).unwrap_or(u64::MAX);
+    if let Some(payload) =
+        response.first_mut().and_then(|frame| frame.payload.as_object_mut())
+    {
+        payload.insert("data".to_owned(), serde_json::json!({ RETRY_AFTER_MS: wait }));
+    }
+    response
+}
+
 fn a2a_error_data(error: &TransportError) -> Option<serde_json::Value> {
     match error {
         TransportError::OperatorReviewRequired(state) => {
@@ -339,7 +356,7 @@ fn a2a_error_data(error: &TransportError) -> Option<serde_json::Value> {
     }
 }
 
-const fn a2a_error_message(error: &TransportError) -> &'static str {
+pub(super) const fn a2a_error_message(error: &TransportError) -> &'static str {
     match error {
         TransportError::UnsupportedVersion => "unsupported version",
         TransportError::PermissionDenied => "permission denied",
