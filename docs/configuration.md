@@ -29,7 +29,48 @@ A connected agent speaks one JSON object on each line. It sends
 `progress`, `result` (`text`), `failed` or `cancelled`, each with the task
 `id`. The node sends no keys, grants, endpoint IDs or caller names. The
 socket file mode is `0600`. When no agent is connected, the node fails each
-task as not available. At `maxSeconds`, the node cancels the turn.
+task as not available. At `maxSeconds`, the node cancels the turn. The
+`ready` message can also say `"max_tasks"`: how many tasks the agent takes at
+once (see "Tasks that run at once").
+
+## Tasks that run at once
+
+The node runs one task at a time unless its owner says more. The policy field
+`runningTasks` is how many tasks run at the same time, for all callers
+together. It is 1 for a new node and for a policy file that does not have the
+field, so a node that you upgrade behaves as before. It can be 1 to 32: each
+running task is a turn of the agent, and for Codex its own `codex app-server`
+process, so a higher number needs a computer that can run that many agents.
+
+It is separate from the waiting limits `queueGlobal` and `queuePerPeer`,
+which say how many tasks wait. A task that comes while `runningTasks` tasks
+run waits in the queue, in the order that the node always used, and counts
+against those limits. There is no limit for one caller or one group of running
+tasks.
+
+Change it like the waiting limits, with the same checks and audit records:
+
+- On the **Advanced** page, **Task policy**, **Tasks running at once**. Saved
+  policy changes take effect after a restart.
+- With `aether.settings.update_policy` (`running_tasks`) or with
+  `aether.change` (`{"type": "limit", "id": "running_tasks", "limit": 2}`).
+  `aether.change` changes the running node at once: a task that waits starts
+  as soon as there is room. A higher value waits for your confirmation under
+  Pending changes on the Advanced page; a lower value applies at once.
+
+Lowering the limit never stops a task that runs. The node starts no new task
+until fewer than the new number of tasks run.
+
+The agent can allow fewer tasks than you do; the node uses the smaller
+number:
+
+| Agent | Tasks at once |
+| --- | --- |
+| Codex, `sandbox` `task-folder` (default) | As many as `runningTasks`. Each task has its own folder and its own Codex process. |
+| Codex, `sandbox` `workspace-write` | One. All tasks would write the same folder. |
+| Hermes plugin, OpenClaw plugin | Up to 32: each task is its own session, and the plugin says so in `ready`. |
+| Grok Bot bridge | One: a Bot claims one task at a time. |
+| A connected agent that does not say `max_tasks` | One. |
 
 ## Real Codex
 

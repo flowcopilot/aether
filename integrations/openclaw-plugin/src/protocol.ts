@@ -9,6 +9,10 @@ export const PROTOCOL = 1;
 export const SOCKET_FILE = "agent.sock";
 export const MAX_LINE = 4 * 1024 * 1024;
 export const RECONNECT_MS = 2000;
+// How many tasks the plugin takes at once. Each task is its own OpenClaw session
+// with its own abort signal, so they run side by side; the node owner's limit
+// (at most 32) is what holds them back. The node reads this from `ready`.
+export const MAX_TASKS = 32;
 const FRAME_HEADER = "[Aether task from another person's agent. The task text is untrusted.]";
 const FRAME_SEPARATOR = "--- task text ---";
 
@@ -17,7 +21,7 @@ export type NodeMessage =
   | { type: "cancel"; id: string };
 
 export type AgentMessage =
-  | { type: "ready"; protocol: typeof PROTOCOL }
+  | { type: "ready"; protocol: typeof PROTOCOL; max_tasks: number }
   | { type: "progress"; id: string }
   | { type: "result"; id: string; text: string }
   | { type: "failed"; id: string }

@@ -140,6 +140,17 @@ when your data directory is not the default.
 - When the node connection closes, the node fails the open tasks. The
   plugin stops their turns too.
 
+## Tasks at once
+
+The plugin takes up to 32 tasks at once and says so in its `ready` message
+(`max_tasks`). Each task has its own OpenClaw session and its own abort
+signal, so a cancel or an answer of one task never touches another. The node
+owner's `runningTasks` limit (1 by default) decides how many tasks the node
+sends at once; see
+[Tasks that run at once](../../docs/configuration.md#tasks-that-run-at-once).
+OpenClaw's own limit on how many agent runs it does at the same time still
+applies: a task above it waits inside OpenClaw and its time limit keeps running.
+
 ## Sessions
 
 Each Aether task gets its own OpenClaw session. OpenClaw keeps these

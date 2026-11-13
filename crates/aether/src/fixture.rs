@@ -23,6 +23,7 @@ pub struct PolicyLimits {
     pub max_seconds: u64,
     pub queue_global: u64,
     pub queue_per_peer: u64,
+    pub running_tasks: u64,
 }
 
 impl Default for PolicyLimits {
@@ -32,6 +33,7 @@ impl Default for PolicyLimits {
             max_seconds: 10,
             queue_global: 1,
             queue_per_peer: 1,
+            running_tasks: 1,
         }
     }
 }
@@ -157,6 +159,7 @@ pub fn policy_json(
         "maxSeconds": limits.max_seconds,
         "queueGlobal": limits.queue_global,
         "queuePerPeer": limits.queue_per_peer,
+        "runningTasks": limits.running_tasks,
     })
 }
 

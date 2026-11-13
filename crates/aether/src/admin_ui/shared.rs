@@ -121,8 +121,14 @@ pub(super) fn queue_text(data_dir: &Path) -> String {
             } else {
                 format!("{} waiting tasks", limits.global)
             };
+            let running = match crate::policy::running_limit(data_dir) {
+                Ok(Some(1) | None) | Err(_) => "It runs one task at a time.".to_owned(),
+                Ok(Some(running)) => {
+                    format!("It runs up to {running} tasks at a time.")
+                }
+            };
             format!(
-                "Your agent keeps {tasks} in all and {} for each person. People who get access by request share these places.",
+                "Your agent keeps {tasks} in all and {} for each person. {running} People who get access by request share these places.",
                 limits.per_peer
             )
         }

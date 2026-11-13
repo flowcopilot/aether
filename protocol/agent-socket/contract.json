@@ -3,6 +3,7 @@
   "socket_file": "agent.sock",
   "max_line_bytes": 4194304,
   "reconnect_seconds": 2,
+  "default_max_tasks": 1,
   "messages": {
     "node_to_agent": {
       "task": ["id", "instructions", "text"],
@@ -14,6 +15,9 @@
       "result": ["id", "text"],
       "failed": ["id"],
       "cancelled": ["id"]
+    },
+    "optional_fields": {
+      "ready": ["max_tasks"]
     }
   },
   "data_dir": {

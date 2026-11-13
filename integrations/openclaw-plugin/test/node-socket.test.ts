@@ -5,10 +5,11 @@ import path from "node:path";
 import { test } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 import { NodeSocket } from "../src/node-socket.ts";
+import { MAX_TASKS } from "../src/protocol.ts";
 import type { NodeMessage } from "../src/protocol.ts";
 import { FakeNode, contract } from "./fake-node.ts";
 
-const ready = { type: "ready", protocol: contract.protocol };
+const ready = { type: "ready", protocol: contract.protocol, max_tasks: MAX_TASKS };
 
 test("reads a task split over two writes, reconnects, and stops on abort", async () => {
   const fake = new FakeNode();

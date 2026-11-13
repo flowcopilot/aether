@@ -2,7 +2,7 @@
 // message to onMessage, and connects again when the connection closes.
 import net from "node:net";
 import { setTimeout as sleep } from "node:timers/promises";
-import { MAX_LINE, PROTOCOL, RECONNECT_MS, encode, parseNodeLine } from "./protocol.ts";
+import { MAX_LINE, MAX_TASKS, PROTOCOL, RECONNECT_MS, encode, parseNodeLine } from "./protocol.ts";
 import type { AgentMessage, NodeMessage } from "./protocol.ts";
 
 export interface NodeSocketOptions {
@@ -52,7 +52,7 @@ export class NodeSocket {
       signal.addEventListener("abort", stop, { once: true });
 
       socket.on("connect", () => {
-        socket.write(encode({ type: "ready", protocol: PROTOCOL }));
+        socket.write(encode({ type: "ready", protocol: PROTOCOL, max_tasks: MAX_TASKS }));
         this.#socket = socket;
         this.#onStatus(true);
       });

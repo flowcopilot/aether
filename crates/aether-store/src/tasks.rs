@@ -629,15 +629,39 @@ impl NodeStore {
         execution_id: &str,
         expires_at: i64,
     ) -> Result<Option<String>, StoreError> {
+        self.lease_next_except(owner, execution_id, expires_at, &[])
+    }
+
+    /// Leases the next queued task that is not in `skip`. A node that runs
+    /// several tasks at once passes the tasks that a run of its own still
+    /// holds: such a task can be queued again (its lease ran out before the
+    /// run could renew it), and it must not get a second run while the first
+    /// one lives.
+    pub fn lease_next_except(
+        &mut self,
+        owner: &str,
+        execution_id: &str,
+        expires_at: i64,
+        skip: &[String],
+    ) -> Result<Option<String>, StoreError> {
         let tx = self.connection.transaction()?;
+        let skipped = if skip.is_empty() {
+            String::new()
+        } else {
+            let marks = (0..skip.len()).map(|_| "?").collect::<Vec<_>>().join(",");
+            format!(" AND queued.id NOT IN ({marks})")
+        };
+        let parameters = std::iter::once(TaskState::Queued.as_str())
+            .chain(skip.iter().map(String::as_str))
+            .collect::<Vec<_>>();
         let task = tx
             .query_row_cached(
                 &format!(
-                    "SELECT queued.id FROM tasks queued WHERE queued.state=?1
+                    "SELECT queued.id FROM tasks queued WHERE queued.state=?1{skipped}
                      ORDER BY (SELECT COUNT(*) FROM tasks active WHERE active.caller_agent_id=queued.caller_agent_id AND active.state IN ({})), queued.created_at, queued.id LIMIT 1",
                     TaskState::sql_list(&TaskState::ACTIVE),
                 ),
-                [TaskState::Queued],
+                rusqlite::params_from_iter(parameters),
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
@@ -1565,6 +1589,28 @@ mod tests {
             Err(StoreError::Overloaded),
             "the first endpoint is at its limit"
         );
+        fs::remove_file(database).expect("database must remove");
+    }
+
+    #[test]
+    fn a_lease_skips_the_tasks_that_a_live_run_still_holds() {
+        let (mut store, database) = store();
+        for (id, peer) in [("one", "a"), ("two", "b"), ("three", "c")] {
+            store
+                .admit(&input(id, peer), QueueLimits { global: 3, per_peer: 1 })
+                .expect("task must admit");
+        }
+        let skip = ["one".to_owned(), "two".to_owned()];
+        assert_eq!(
+            store.lease_next_except("worker", "first", 10, &skip),
+            Ok(Some("three".to_owned()))
+        );
+        // Nothing else is left to lease.
+        assert_eq!(store.lease_next_except("worker", "second", 10, &skip), Ok(None));
+        // A skipped task is still queued, and the next lease without a list
+        // takes the oldest of them.
+        assert_eq!(store.state("one"), Ok(TaskState::Queued));
+        assert_eq!(store.lease_next("worker", "third", 10), Ok(Some("one".to_owned())));
         fs::remove_file(database).expect("database must remove");
     }
 

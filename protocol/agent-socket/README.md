@@ -26,6 +26,14 @@ constants, and their tests compare the copies with `contract.json`.
   connection whose first message is not `ready` with its protocol. When a
   second agent says `ready`, the node closes the first connection, and the
   tasks of the first connection fail.
+- `ready` may carry `max_tasks`, a whole number: how many open tasks the
+  agent takes at once. Without it the agent takes `default_max_tasks` (one).
+  The node starts a task only while fewer tasks run than the smaller of
+  `max_tasks` and the owner's running-task limit. It reads `max_tasks` from
+  the first `ready` of a connection. An agent that says `max_tasks` of 2
+  or more runs those tasks side by side: each task is answered, cancelled
+  and stopped by its own ID, and an answer or a cancel for one task never
+  touches another.
 - The node sends `task` and `cancel`. The agent sends `progress`, `result`,
   `failed` and `cancelled`. The node sends only the task text and its
   instructions: no keys, grants, endpoint IDs or caller names. The agent
@@ -58,6 +66,10 @@ tasks. A test replays the case with its own side under test and a fake peer.
     gets it and does not change the task.
   - On a node `task`, an agent under test starts no second turn. A node
     under test refuses to send it: the turn fails at once.
+- `"concurrent": true` on a case: it has more than one open task at once.
+  An agent that takes one task at a time (the Grok Bot bridge) skips it.
+  The `ready` that an agent under test sends carries its own `max_tasks`, so
+  a replay compares only the `type` and `protocol` of a `ready`.
 - `{"agent_line": text}`, `{"node_line": text}`: a line that the fake peer
   writes. The side under test never sends one, so its replay skips the step.
 - `{"agent_line_bytes": n}`, `{"node_line_bytes": n}`: as above, a line of

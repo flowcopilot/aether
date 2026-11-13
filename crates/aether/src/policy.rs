@@ -20,12 +20,28 @@ pub struct QueuePolicyLimits {
     pub global: usize,
     #[serde(rename = "queuePerPeer")]
     pub per_peer: usize,
+    /// How many tasks the node runs at once. A policy file without it runs
+    /// one at a time, as every node did before the limit existed.
+    #[serde(rename = "runningTasks", default = "default_running")]
+    pub running: usize,
+}
+
+const fn default_running() -> usize {
+    1
 }
 
 impl QueuePolicyLimits {
+    /// Limits that run one task at a time.
     #[must_use]
     pub const fn new(global: usize, per_peer: usize) -> Self {
-        Self { global, per_peer }
+        Self { global, per_peer, running: default_running() }
+    }
+
+    /// These limits with `running` tasks at once.
+    #[must_use]
+    pub const fn with_running(mut self, running: usize) -> Self {
+        self.running = running;
+        self
     }
 
     #[must_use]
@@ -33,6 +49,7 @@ impl QueuePolicyLimits {
         match id {
             QueueLimitId::Global => self.global,
             QueueLimitId::PerPeer => self.per_peer,
+            QueueLimitId::Running => self.running,
         }
     }
 
@@ -40,6 +57,7 @@ impl QueuePolicyLimits {
         match id {
             QueueLimitId::Global => self.global = value,
             QueueLimitId::PerPeer => self.per_peer = value,
+            QueueLimitId::Running => self.running = value,
         }
     }
 }
@@ -368,7 +386,7 @@ pub fn save_policy_settings_in_store(
         ..policy
     };
     keep(store, &serde_json::to_string(&policy).map_err(|_| PolicyError::Invalid)?)?;
-    for id in [QueueLimitId::Global, QueueLimitId::PerPeer] {
+    for id in QueueLimitId::ALL {
         store
             .remove_applied_change(aether_store::ChangeKind::Limit, id.as_str())
             .map_err(|_| PolicyError::Read)?;
@@ -390,8 +408,9 @@ pub fn validate_policy_settings(settings: &PolicySettings) -> Result<(), PolicyE
     }
     if settings.max_context_tokens == 0
         || settings.max_seconds == 0
-        || settings.queue.get(QueueLimitId::Global) == 0
-        || settings.queue.get(QueueLimitId::PerPeer) == 0
+        || !QueueLimitId::ALL.into_iter().all(|id| {
+            u32::try_from(settings.queue.get(id)).is_ok_and(|value| id.accepts(value))
+        })
     {
         return Err(PolicyError::InvalidField("limits".to_owned()));
     }
@@ -422,17 +441,47 @@ pub(crate) fn stored_queue_limits(
     })
 }
 
+/// How many tasks the node runs at once in force at the next node start:
+/// the stored policy with the `admin.limit.running_tasks` override. `None`
+/// when no policy is stored.
+pub fn running_limit(data_dir: &Path) -> Result<Option<usize>, PolicyError> {
+    let store = NodeStore::in_dir(data_dir).map_err(|_| PolicyError::Read)?;
+    let Some(policy) = stored(&store)? else {
+        return Ok(None);
+    };
+    stored_running_limit(&store, policy.queue).map(Some)
+}
+
+/// How many tasks the node runs at once: the policy's value with the
+/// `admin.limit.running_tasks` override that `store` holds. A value outside
+/// the range that the owner can set is an invalid policy.
+pub(crate) fn stored_running_limit(
+    store: &NodeStore,
+    queue: QueuePolicyLimits,
+) -> Result<usize, PolicyError> {
+    let id = QueueLimitId::Running;
+    let running = stored_limit(store, id, queue.get(id))?;
+    if u32::try_from(running).is_ok_and(|value| id.accepts(value)) {
+        Ok(running)
+    } else {
+        Err(PolicyError::InvalidField("runningTasks".to_owned()))
+    }
+}
+
 fn stored_limit(
     store: &NodeStore,
     id: QueueLimitId,
     fallback: usize,
 ) -> Result<usize, PolicyError> {
     match store.applied_change(aether_store::ChangeKind::Limit, id.as_str()) {
-        Ok(Some(value)) => {
-            value.parse::<usize>().ok().filter(|value| *value > 0).ok_or_else(|| {
+        Ok(Some(value)) => value
+            .parse::<u32>()
+            .ok()
+            .filter(|value| id.accepts(*value))
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| {
                 PolicyError::InvalidField(format!("admin.limit.{}", id.as_str()))
-            })
-        }
+            }),
         Ok(None) => Ok(fallback),
         Err(_) => Err(PolicyError::Invalid),
     }
@@ -471,7 +520,13 @@ pub(crate) fn decode_key(value: &str) -> Result<[u8; 32], PolicyError> {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{AgentAdapter, PolicyFile, PolicySandbox};
+    use aether_core::limits::QueueLimitId;
+    use aether_store::NodeStore;
+
+    use super::{
+        AgentAdapter, PolicyError, PolicyFile, PolicySandbox, PolicySettings,
+        QueuePolicyLimits, stored_running_limit, validate_policy_settings,
+    };
 
     #[test]
     fn a_policy_file_with_a_pact_section_still_loads() {
@@ -502,6 +557,71 @@ mod tests {
         assert_eq!(pact.public_url, "http://127.0.0.1:8080");
         assert_eq!(pact.brands.len(), 1);
         assert_eq!(pact.brands[0].scope.id, "review:read_only");
+    }
+
+    #[test]
+    fn a_policy_file_without_a_running_limit_runs_one_task_at_a_time() {
+        let policy = |extra: &str| {
+            format!(
+                r#"{{
+                "scope": {{ "id": "direct", "kind": "direct" }},
+                "workspace": "/tmp/w",
+                "maxContextTokens": 4000,
+                "maxSeconds": 120,
+                "queueGlobal": 4,
+                "queuePerPeer": 2{extra}
+            }}"#
+            )
+        };
+        let old = PolicyFile::parse(policy("").as_bytes()).expect("policy must decode");
+        assert_eq!(old.queue.running, 1);
+        let new = PolicyFile::parse(policy(r#", "runningTasks": 3"#).as_bytes())
+            .expect("policy must decode");
+        assert_eq!(new.queue.running, 3);
+        // The setting stays when the policy is saved and read again.
+        let source = serde_json::to_vec(&new).expect("policy must encode");
+        assert_eq!(
+            PolicyFile::parse(&source).expect("policy must decode").queue.running,
+            3
+        );
+    }
+
+    #[test]
+    fn the_running_limit_must_be_in_range_and_the_stored_change_wins() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let mut store = NodeStore::in_dir(directory.path()).expect("store must open");
+        let queue = QueuePolicyLimits::new(4, 2);
+        assert_eq!(stored_running_limit(&store, queue), Ok(1));
+        assert_eq!(stored_running_limit(&store, queue.with_running(8)), Ok(8));
+        for bad in [0, 33] {
+            assert_eq!(
+                stored_running_limit(&store, queue.with_running(bad)),
+                Err(PolicyError::InvalidField("runningTasks".to_owned()))
+            );
+        }
+        store
+            .apply_change(
+                aether_store::ChangeKind::Limit,
+                QueueLimitId::Running.as_str(),
+                "5",
+                aether_store::AuditActor::Ui,
+                1,
+            )
+            .expect("limit must store");
+        assert_eq!(stored_running_limit(&store, queue), Ok(5));
+        let settings = |running| PolicySettings {
+            workspace: directory.path().to_path_buf(),
+            max_context_tokens: 1,
+            max_seconds: 1,
+            queue: queue.with_running(running),
+        };
+        assert!(validate_policy_settings(&settings(32)).is_ok());
+        for bad in [0, 33] {
+            assert_eq!(
+                validate_policy_settings(&settings(bad)),
+                Err(PolicyError::InvalidField("limits".to_owned()))
+            );
+        }
     }
 
     #[test]

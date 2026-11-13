@@ -167,6 +167,10 @@ pub struct State {
     root: Scratch,
     agent: Agent,
     max_context_tokens: Option<u64>,
+    /// How many tasks the owner lets the host run at once.
+    running_tasks: Option<u64>,
+    /// How many tasks the owner lets the host keep waiting.
+    waiting_tasks: Option<u64>,
     owner_codex_home: Option<PathBuf>,
     callers: Vec<Caller>,
     /// The next claim or grant nonce.
@@ -408,6 +412,12 @@ impl State {
         let mut limits = PolicyLimits::default();
         if let Some(tokens) = self.max_context_tokens {
             limits.max_context_tokens = tokens;
+        }
+        if let Some(running) = self.running_tasks {
+            limits.running_tasks = running;
+        }
+        if let Some(waiting) = self.waiting_tasks {
+            limits.queue_global = waiting;
         }
         let mut policy = policy_for_grants(
             &workspace,
@@ -719,6 +729,16 @@ fn owner_mcp_server(world: &mut World, name: String) {
 #[given(expr = "the host node takes tasks of at most {int} context token(s)")]
 const fn max_context_tokens(world: &mut World, tokens: u64) {
     world.tasks.max_context_tokens = Some(tokens);
+}
+
+#[given(expr = "the host node runs {int} tasks at once")]
+const fn running_tasks(world: &mut World, tasks: u64) {
+    world.tasks.running_tasks = Some(tasks);
+}
+
+#[given(expr = "the host node keeps {int} waiting tasks")]
+const fn waiting_tasks(world: &mut World, tasks: u64) {
+    world.tasks.waiting_tasks = Some(tasks);
 }
 
 #[given("the host node is running")]
@@ -1173,6 +1193,98 @@ async fn caller_task_in_state(world: &mut World, caller: usize, wanted: String) 
         ..world.tasks.request(&format!("request {index}"))
     };
     world.tasks.start_in_background(request, wanted).await;
+}
+
+/// Starts one `node request` for each of the first `count` callers, all
+/// before any of them is admitted.
+#[when(expr = "{int} callers send a task at the same time")]
+fn callers_send_together(world: &mut World, count: usize) {
+    let state = &mut world.tasks;
+    for index in 0..count {
+        let request = Request {
+            caller: index,
+            task_id: Some(overload_task_id(index)),
+            ..state.request(&format!("request {index}"))
+        };
+        let child = state
+            .request_command(&request)
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("request command must start");
+        state.running.0.push(child);
+    }
+}
+
+/// The states of the tasks that the callers sent together, as the store of
+/// the host holds them.
+async fn states_of_sent_tasks(world: &mut World, count: usize) -> Vec<TaskState> {
+    let ids = (0..count).map(overload_task_id).collect::<Vec<_>>();
+    world
+        .tasks
+        .store(move |store| {
+            ids.iter().filter_map(|id| store.state(id).ok()).collect::<Vec<_>>()
+        })
+        .await
+}
+
+/// Polls until `done` holds for the states of the first `count` tasks. The
+/// agent takes a second to answer, so the states hold while a poll sees them.
+async fn wait_for_states(
+    world: &mut World,
+    count: usize,
+    what: &str,
+    done: impl Fn(&[TaskState]) -> bool,
+) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let states = states_of_sent_tasks(world, count).await;
+        if done(&states) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {what}, last states {states:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[then("both tasks run at the same time")]
+async fn both_tasks_run_together(world: &mut World) {
+    wait_for_states(world, 2, "both tasks to run", |states| {
+        states.len() == 2 && states.iter().all(|state| *state == TaskState::Running)
+    })
+    .await;
+}
+
+/// With one slot, the second task is admitted and waits until the first
+/// ends: no poll ever sees both of them running.
+#[then("one task runs while the other waits")]
+async fn one_task_runs_the_other_waits(world: &mut World) {
+    wait_for_states(world, 2, "one task to run and one to wait", |states| {
+        let running =
+            states.iter().filter(|state| **state == TaskState::Running).count();
+        let queued = states.iter().filter(|state| **state == TaskState::Queued).count();
+        states.len() == 2 && running == 1 && queued == 1
+    })
+    .await;
+    // Both end, one after the other, and never run together.
+    let mut together = false;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let states = states_of_sent_tasks(world, 2).await;
+        together |=
+            states.iter().filter(|state| **state == TaskState::Running).count() > 1;
+        if states.iter().all(|state| *state == TaskState::Succeeded) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the tasks must end, last states {states:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!together, "a node with one slot ran two tasks at once");
 }
 
 #[when(expr = "caller {int} sends a task")]

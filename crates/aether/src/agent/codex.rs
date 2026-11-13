@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     process::{ChildStdin, Stdio},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, PoisonError,
         atomic::{AtomicU64, Ordering},
         mpsc::{self, Receiver},
     },
@@ -148,6 +148,15 @@ fn spawn_environment(
     }
     environment
 }
+
+/// Held from the copy of the Codex binary into a task folder until the
+/// `codex app-server` process of that task has started, by every turn of the
+/// node. While a thread copies a file, it holds the file open for writing,
+/// and a process that another thread forks at that moment holds it too until
+/// its own `exec`. A third thread that starts the copied file in that time
+/// gets `ETXTBSY` and its turn fails. Turns that run side by side would meet
+/// there; one at a time they never did.
+static SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone)]
 pub struct CodexAppServer {
@@ -345,6 +354,7 @@ impl CodexAppServer {
         } else {
             ctx.workspace.clone()
         };
+        let spawn_guard = SPAWN_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         let (binary, arguments, environment) = match &task_folder {
             Some(folder) => {
                 let mut arguments = self.arguments.clone();
@@ -362,7 +372,9 @@ impl CodexAppServer {
             ),
         };
         let session =
-            AppServerSession::spawn(&binary, &arguments, ctx.deadline, &environment)?;
+            AppServerSession::spawn(&binary, &arguments, ctx.deadline, &environment);
+        drop(spawn_guard);
+        let session = session?;
         session.request("initialize", &initialize_params(), events)?;
         let thread_id = self.start_thread(&session, &workspace, &ctx.skill, events)?;
         self.run_turn(&session, &workspace, &ctx.task_id, &thread_id, &ctx.text, events)
@@ -587,6 +599,17 @@ impl Agent for CodexAppServer {
     fn forget(&self, task_id: &str) {
         if let Ok(mut turns) = self.turns.lock() {
             turns.cancels.forget(task_id);
+        }
+    }
+
+    /// A task folder is the turn's own: its own folder, its own
+    /// `codex app-server` process and its own profile, so turns run side by
+    /// side. `WorkspaceWrite` lets every turn write one shared folder, so
+    /// turns would overwrite each other's files: one at a time.
+    fn capacity(&self) -> usize {
+        match self.limits.sandbox {
+            CodexSandbox::TaskFolder => usize::MAX,
+            CodexSandbox::WorkspaceWrite => 1,
         }
     }
 }
@@ -1311,6 +1334,97 @@ done
             turn.join().expect("turn thread must join"),
             Err(ExecutionError::Cancelled)
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn two_turns_run_side_by_side_and_a_cancel_stops_only_its_turn() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let limits = CodexLimits {
+            sandbox: CodexSandbox::WorkspaceWrite,
+            allow_network: false,
+            environment: BTreeMap::new(),
+        };
+        let script = r#"
+while IFS= read -r request; do
+  case "$request" in
+    *'"id":1'*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}' ;;
+    *'"id":2'*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread"}}}' ;;
+    *'"id":3'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn"}}}'
+      printf '%s\n' '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thread","turnId":"turn","delta":"waiting"}}'
+      IFS= read -r interrupt
+      printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{}}'
+      printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread","turn":{"id":"turn","status":"interrupted","items":[]}}}'
+      ;;
+  esac
+done
+"#;
+        let server = CodexAppServer::with_arguments(
+            PathBuf::from("sh"),
+            vec!["-c".to_owned(), script.to_owned()],
+            limits,
+        )
+        .expect("limits must be valid");
+        let (ready_sender, ready_receiver) = mpsc::channel();
+        let start = |task: &'static str| {
+            let mut running = server.clone();
+            let ready = ready_sender.clone();
+            let workspace = directory.path().to_path_buf();
+            std::thread::spawn(move || {
+                running.start_turn_with_events(
+                    &turn_ctx(&workspace, task, "review", "untrusted", 30),
+                    &mut |event| {
+                        if event == ExecutionEvent::Progress {
+                            let _ = ready.send(task);
+                        }
+                    },
+                )
+            })
+        };
+        let first = start("first");
+        let second = start("second");
+        // Both turns are active at the same time.
+        let mut active = [
+            ready_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("a turn is active"),
+            ready_receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("a turn is active"),
+        ];
+        active.sort_unstable();
+        assert_eq!(active, ["first", "second"]);
+        server.cancel("first");
+        assert_eq!(
+            first.join().expect("turn thread must join"),
+            Err(ExecutionError::Cancelled)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!second.is_finished(), "a cancel of one turn must not stop the other");
+        server.cancel("second");
+        assert_eq!(
+            second.join().expect("turn thread must join"),
+            Err(ExecutionError::Cancelled)
+        );
+    }
+
+    #[test]
+    fn only_a_task_folder_lets_turns_run_side_by_side() {
+        let capacity = |sandbox| {
+            CodexAppServer::new(
+                PathBuf::from("codex"),
+                CodexLimits {
+                    sandbox,
+                    allow_network: false,
+                    environment: BTreeMap::new(),
+                },
+            )
+            .expect("limits must be valid")
+            .capacity()
+        };
+        assert_eq!(capacity(CodexSandbox::TaskFolder), usize::MAX);
+        assert_eq!(capacity(CodexSandbox::WorkspaceWrite), 1);
     }
 
     #[test]
