@@ -12,6 +12,10 @@ use crate::{StoreError, now};
 
 pub const BACKUP_RETENTION: usize = 3;
 
+/// How many prepared statements a connection keeps. The node store has
+/// about a hundred statements; the default of 16 would evict them in turn.
+const STATEMENT_CACHE: usize = 256;
+
 /// The database files that this process has migrated and checked.
 static MIGRATED: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(Mutex::default);
 
@@ -25,6 +29,7 @@ pub fn open_connection(
     migrations: &[&str],
 ) -> Result<Connection, StoreError> {
     let mut connection = Connection::open(path)?;
+    connection.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
     connection.busy_timeout(std::time::Duration::from_secs(1))?;
     connection.pragma_update(None, "foreign_keys", "ON")?;
     connection.pragma_update_and_check(None, "journal_mode", "WAL", |row| {
@@ -222,7 +227,7 @@ mod tests {
         assert_eq!(names, ["friends", "requests"]);
         assert_eq!(groups[0].members.len(), 1);
         assert_eq!(groups[0].members[0].agent_id, "ana");
-        assert!(groups[1].members.is_empty());
+        assert_eq!(groups[1].members, Vec::new());
         assert_eq!(backup_count(&database), 1);
         drop(store);
 

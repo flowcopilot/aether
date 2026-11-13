@@ -6,6 +6,7 @@
 use aether_core::ScopeKind;
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::CachedSql;
 use crate::{NodeStore, StoreError, ensure_scope, managed, put_scope};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -36,7 +37,7 @@ pub fn upsert_record(
     id: &str,
     record: &SignedRecord,
 ) -> Result<(), StoreError> {
-    connection.execute(
+    connection.execute_cached(
         &format!(
             "INSERT INTO signed_records(id,{RECORD_COLUMNS}) VALUES(?1,?2,?3,?4,?5)
              ON CONFLICT(id) DO UPDATE SET scope_id=excluded.scope_id,agent_id=excluded.agent_id,record=excluded.record,expires_at=excluded.expires_at"
@@ -76,10 +77,10 @@ impl NodeStore {
 
     /// [`StoreError::NotFound`] when there is no contact `agent_id`.
     pub fn remove_contact_record(&self, agent_id: &str) -> Result<(), StoreError> {
-        match self
-            .connection
-            .execute("DELETE FROM signed_records WHERE id=?1", [contact_id(agent_id)])?
-        {
+        match self.connection.execute_cached(
+            "DELETE FROM signed_records WHERE id=?1",
+            [contact_id(agent_id)],
+        )? {
             0 => Err(StoreError::NotFound),
             _ => Ok(()),
         }
@@ -115,7 +116,7 @@ impl NodeStore {
         scope_id: &str,
         agent_id: &str,
     ) -> Result<bool, StoreError> {
-        Ok(self.connection.execute(
+        Ok(self.connection.execute_cached(
             "UPDATE signed_records SET expires_at=0 WHERE id=?1 AND expires_at<>0",
             [directory_id(scope_id, agent_id)],
         )? != 0)
@@ -147,7 +148,7 @@ impl NodeStore {
 
     /// The records that have not expired at `now`.
     pub fn live_record_count(&self, now: i64) -> Result<usize, StoreError> {
-        let count: i64 = self.connection.query_row(
+        let count: i64 = self.connection.query_row_cached(
             "SELECT COUNT(*) FROM signed_records WHERE expires_at>?1",
             [now],
             |row| row.get(0),
@@ -157,7 +158,7 @@ impl NodeStore {
 
     fn record(&self, id: &str) -> Result<SignedRecord, StoreError> {
         self.connection
-            .query_row(
+            .query_row_cached(
                 &format!("SELECT {RECORD_COLUMNS} FROM signed_records WHERE id=?1"),
                 [id],
                 SignedRecord::from_row,

@@ -6,18 +6,21 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::CachedSql;
 use crate::{NodeStore, StoreError};
 
 pub fn get(connection: &Connection, key: &str) -> Result<Option<String>, StoreError> {
     Ok(connection
-        .query_row("SELECT value FROM configuration WHERE key=?1", [key], |row| {
-            row.get(0)
-        })
+        .query_row_cached(
+            "SELECT value FROM configuration WHERE key=?1",
+            [key],
+            |row| row.get(0),
+        )
         .optional()?)
 }
 
 pub fn put(connection: &Connection, key: &str, value: &str) -> Result<(), StoreError> {
-    connection.execute(
+    connection.execute_cached(
         "INSERT INTO configuration(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         params![key, value],
     )?;
@@ -26,7 +29,7 @@ pub fn put(connection: &Connection, key: &str, value: &str) -> Result<(), StoreE
 
 /// Removing a key that is not there is not an error.
 pub fn delete(connection: &Connection, key: &str) -> Result<(), StoreError> {
-    connection.execute("DELETE FROM configuration WHERE key=?1", [key])?;
+    connection.execute_cached("DELETE FROM configuration WHERE key=?1", [key])?;
     Ok(())
 }
 
@@ -35,7 +38,7 @@ pub fn values(
     connection: &Connection,
     prefix: &str,
 ) -> Result<Vec<String>, StoreError> {
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare_cached(
         "SELECT value FROM configuration WHERE substr(key,1,length(?1))=?1 ORDER BY key",
     )?;
     Ok(statement.query_map([prefix], |row| row.get(0))?.collect::<Result<_, _>>()?)
@@ -43,7 +46,7 @@ pub fn values(
 
 /// How many keys start with `prefix`.
 pub fn count(connection: &Connection, prefix: &str) -> Result<usize, StoreError> {
-    let count: i64 = connection.query_row(
+    let count: i64 = connection.query_row_cached(
         "SELECT COUNT(*) FROM configuration WHERE substr(key,1,length(?1))=?1",
         [prefix],
         |row| row.get(0),
@@ -90,8 +93,9 @@ mod tests {
             store.configuration_values("caller.card.").expect("values must load"),
             ["a", "b"]
         );
-        assert!(
-            store.configuration_values("CALLER.").expect("values must load").is_empty()
+        assert_eq!(
+            store.configuration_values("CALLER.").expect("values must load"),
+            Vec::<String>::new()
         );
     }
 }

@@ -6,6 +6,7 @@ use std::path::Path;
 use aether_core::ScopeKind;
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::CachedSql;
 use crate::{
     ManagedMember, SignedRecord, StoreError,
     directory::{RECORD_COLUMNS, upsert_record},
@@ -98,7 +99,7 @@ impl ControlStore {
         }
         let transaction = self.connection.transaction()?;
         let revoked_through: Option<i64> = transaction
-            .query_row(
+            .query_row_cached(
                 "SELECT revoked_through FROM directory_record_marks WHERE agent_id=?1 AND signing_key=?2",
                 params![record.agent_id, signing_key],
                 |row| row.get(0),
@@ -111,7 +112,7 @@ impl ControlStore {
         put_scope(&transaction, &record.scope_id, ScopeKind::Directory)?;
         upsert_record(&transaction, &record.agent_id, record)?;
         mark_latest(&transaction, &record.agent_id, signing_key, record.expires_at)?;
-        transaction.execute(
+        transaction.execute_cached(
             "INSERT INTO directory_events(event_type,scope_id,agent_id,record,created_at) VALUES(?1,?2,?3,?4,?5)",
             params![event, record.scope_id, record.agent_id, record.record, now()],
         )?;
@@ -121,7 +122,7 @@ impl ControlStore {
 
     pub fn signed_record(&self, agent_id: &str) -> Result<SignedRecord, StoreError> {
         self.connection
-            .query_row(
+            .query_row_cached(
                 &format!(
                     "SELECT {RECORD_COLUMNS} FROM signed_records WHERE agent_id=?1 ORDER BY expires_at DESC LIMIT 1"
                 ),
@@ -142,22 +143,24 @@ impl ControlStore {
     ) -> Result<(), StoreError> {
         let transaction = self.connection.transaction()?;
         let (scope_id, expires_at): (String, i64) = transaction
-            .query_row(
+            .query_row_cached(
                 "SELECT scope_id,expires_at FROM signed_records WHERE agent_id=?1 ORDER BY expires_at DESC LIMIT 1",
                 [agent_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?
             .ok_or(StoreError::NotFound)?;
-        transaction
-            .execute("DELETE FROM signed_records WHERE agent_id=?1", [agent_id])?;
+        transaction.execute_cached(
+            "DELETE FROM signed_records WHERE agent_id=?1",
+            [agent_id],
+        )?;
         // A record from before the marks table has no mark yet.
         mark_latest(&transaction, agent_id, signing_key, expires_at)?;
-        transaction.execute(
+        transaction.execute_cached(
             "UPDATE directory_record_marks SET revoked_through=latest_expires_at WHERE agent_id=?1 AND signing_key=?2",
             params![agent_id, signing_key],
         )?;
-        transaction.execute(
+        transaction.execute_cached(
             "INSERT INTO directory_events(event_type,scope_id,agent_id,record,created_at) VALUES(?1,?2,?3,NULL,?4)",
             params![DirectoryEventType::Revoked, scope_id, agent_id, now()],
         )?;
@@ -169,7 +172,7 @@ impl ControlStore {
         &self,
         timestamp: i64,
     ) -> Result<Vec<SignedRecord>, StoreError> {
-        let mut statement = self.connection.prepare(&format!(
+        let mut statement = self.connection.prepare_cached(&format!(
             "SELECT {RECORD_COLUMNS} FROM signed_records WHERE expires_at>?1 ORDER BY agent_id"
         ))?;
         Ok(statement
@@ -185,7 +188,7 @@ impl ControlStore {
         if sequence < 0 || limit == 0 {
             return Err(StoreError::InvalidState);
         }
-        let mut statement = self.connection.prepare(
+        let mut statement = self.connection.prepare_cached(
             "SELECT sequence,event_type,scope_id,agent_id,record FROM directory_events WHERE sequence>?1 ORDER BY sequence LIMIT ?2",
         )?;
         Ok(statement
@@ -213,7 +216,7 @@ impl ControlStore {
         }
         let transaction = self.connection.transaction()?;
         ensure_scope(&transaction, scope_id, ScopeKind::Managed)?;
-        transaction.execute(
+        transaction.execute_cached(
             "INSERT INTO managed_invitations(id,scope_id,token_hash,expires_at) VALUES(?1,?2,?3,?4)",
             params![id, scope_id, token_hash, expires_at],
         )?;
@@ -229,18 +232,18 @@ impl ControlStore {
         let timestamp = now();
         member.check_new(timestamp)?;
         let transaction = self.connection.transaction()?;
-        let changed = transaction.execute(
+        let changed = transaction.execute_cached(
             "UPDATE managed_invitations SET redeemed_at=?1,redeemed_agent_id=?2 WHERE token_hash=?3 AND redeemed_at IS NULL AND expires_at>?1 AND scope_id=?4",
             params![timestamp, member.agent_id, token_hash, member.scope_id],
         )?;
         if changed != 1 {
             return Err(StoreError::NotFound);
         }
-        transaction.execute(
+        transaction.execute_cached(
             "INSERT INTO managed_members(scope_id,agent_id,endpoint_id,role,expires_at,revoked_at) VALUES(?1,?2,?3,?4,?5,NULL)",
             params![member.scope_id, member.agent_id, member.endpoint_id, member.role, member.expires_at],
         )?;
-        transaction.execute(
+        transaction.execute_cached(
             "INSERT INTO managed_events(event_type,scope_id,agent_id,endpoint_id,role,expires_at,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",
             params![ManagedEventType::Joined, member.scope_id, member.agent_id, member.endpoint_id, member.role, member.expires_at, timestamp],
         )?;
@@ -258,13 +261,13 @@ impl ControlStore {
         }
         let timestamp = now();
         let transaction = self.connection.transaction()?;
-        if transaction.execute(
+        if transaction.execute_cached(
             "UPDATE managed_members SET revoked_at=?1 WHERE scope_id=?2 AND agent_id=?3 AND revoked_at IS NULL",
             params![timestamp, scope_id, agent_id],
         )? != 1 {
             return Err(StoreError::NotFound);
         }
-        transaction.execute(
+        transaction.execute_cached(
             "INSERT INTO managed_events(event_type,scope_id,agent_id,endpoint_id,role,expires_at,created_at) VALUES(?1,?2,?3,NULL,NULL,NULL,?4)",
             params![ManagedEventType::Revoked, scope_id, agent_id, timestamp],
         )?;
@@ -288,7 +291,7 @@ impl ControlStore {
         if scope_id.is_empty() || sequence < 0 || limit == 0 {
             return Err(StoreError::InvalidState);
         }
-        let mut statement = self.connection.prepare(
+        let mut statement = self.connection.prepare_cached(
             "SELECT sequence,event_type,scope_id,agent_id,endpoint_id,role,expires_at FROM managed_events WHERE scope_id=?1 AND sequence>?2 ORDER BY sequence LIMIT ?3",
         )?;
         Ok(statement
@@ -325,7 +328,7 @@ fn mark_latest(
     signing_key: &[u8; 32],
     expires_at: i64,
 ) -> Result<(), StoreError> {
-    connection.execute(
+    connection.execute_cached(
         "INSERT INTO directory_record_marks(agent_id,signing_key,latest_expires_at) VALUES(?1,?2,?3)
          ON CONFLICT(agent_id,signing_key) DO UPDATE SET latest_expires_at=MAX(latest_expires_at,excluded.latest_expires_at)",
         params![agent_id, signing_key, expires_at],
@@ -411,7 +414,10 @@ mod tests {
         let mut store = ControlStore::open(&database).expect("control must reopen");
         assert_eq!(store.signed_record("agent"), Ok(record("agent", 2)));
         assert_eq!(store.active_signed_records(1).expect("records must load").len(), 1);
-        assert!(store.active_signed_records(2).expect("records must load").is_empty());
+        assert_eq!(
+            store.active_signed_records(2).expect("records must load"),
+            Vec::new()
+        );
         store.revoke_signed_record("agent", &KEY).expect("record must revoke");
         assert_eq!(store.signed_record("agent"), Err(StoreError::NotFound));
         assert_eq!(

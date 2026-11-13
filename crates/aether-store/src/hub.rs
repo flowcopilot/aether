@@ -1,5 +1,6 @@
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
+use crate::CachedSql;
 use crate::{NodeStore, StoreError, sql_named};
 
 /// The side of a hub invite that this node's page acted on. The strings are
@@ -78,7 +79,7 @@ pub const MAX_ACCESS_REQUEST_DRAFTS: i64 = 5;
 impl NodeStore {
     /// Keeps `approval`, in place of a record with the same invite id.
     pub fn put_hub_approval(&self, approval: &HubApproval) -> Result<(), StoreError> {
-        self.connection.execute(
+        self.connection.execute_cached(
             "INSERT OR REPLACE INTO hub_approvals(invite_id,side,kind,peer_name,peer_endpoint,days,access_group,bundle,created_at,expires_at,listing,listing_signature,listing_expires_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![
                 approval.invite_id,
@@ -105,7 +106,7 @@ impl NodeStore {
     ) -> Result<Option<HubApproval>, StoreError> {
         Ok(self
             .connection
-            .query_row(
+            .query_row_cached(
                 "SELECT invite_id,side,kind,peer_name,peer_endpoint,days,access_group,bundle,created_at,expires_at,listing,listing_signature,listing_expires_at FROM hub_approvals WHERE invite_id=?1",
                 [invite_id],
                 |row| {
@@ -145,7 +146,7 @@ impl NodeStore {
         bundle: &str,
     ) -> Result<(), StoreError> {
         let invite_id = approval.invite_id.as_str();
-        let changed = self.connection.execute(
+        let changed = self.connection.execute_cached(
             "UPDATE hub_approvals SET peer_endpoint=?2, bundle=?3 WHERE invite_id=?1 AND peer_name=?4 AND created_at=?5 AND (peer_endpoint IS NULL OR peer_endpoint=?2)",
             params![invite_id, endpoint, bundle, approval.peer_name, approval.created_at],
         )?;
@@ -161,17 +162,20 @@ impl NodeStore {
     /// Removes the approval of `invite_id`. Removing one that is not there is
     /// not an error.
     pub fn remove_hub_approval(&self, invite_id: &str) -> Result<(), StoreError> {
-        self.connection
-            .execute("DELETE FROM hub_approvals WHERE invite_id=?1", [invite_id])?;
+        self.connection.execute_cached(
+            "DELETE FROM hub_approvals WHERE invite_id=?1",
+            [invite_id],
+        )?;
         Ok(())
     }
 
     /// Removes every approval that expired at Unix time `now`, and returns
     /// how many it removed.
     pub fn clear_expired_hub_approvals(&self, now: i64) -> Result<usize, StoreError> {
-        Ok(self
-            .connection
-            .execute("DELETE FROM hub_approvals WHERE expires_at <= ?1", [now])?)
+        Ok(self.connection.execute_cached(
+            "DELETE FROM hub_approvals WHERE expires_at <= ?1",
+            [now],
+        )?)
     }
 
     /// Keeps a draft that waits for the person. [`StoreError::Overloaded`]
@@ -184,7 +188,7 @@ impl NodeStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let open: i64 = transaction.query_row(
+        let open: i64 = transaction.query_row_cached(
             "SELECT COUNT(*) FROM access_request_drafts WHERE expires_at > ?1",
             [draft.created_at],
             |row| row.get(0),
@@ -192,11 +196,11 @@ impl NodeStore {
         if open >= MAX_ACCESS_REQUEST_DRAFTS {
             return Err(StoreError::Overloaded);
         }
-        transaction.execute(
+        transaction.execute_cached(
             "DELETE FROM access_request_drafts WHERE expires_at <= ?1",
             [draft.created_at],
         )?;
-        let inserted = transaction.execute(
+        let inserted = transaction.execute_cached(
             "INSERT OR IGNORE INTO access_request_drafts(id,target_name,listing,signature,listing_expires_at,days,created_at,expires_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
             params![
                 draft.id,
@@ -221,7 +225,7 @@ impl NodeStore {
         &self,
         now: i64,
     ) -> Result<Vec<AccessRequestDraft>, StoreError> {
-        let mut statement = self.connection.prepare(
+        let mut statement = self.connection.prepare_cached(
             "SELECT id,target_name,listing,signature,listing_expires_at,days,created_at,expires_at FROM access_request_drafts WHERE expires_at > ?1 ORDER BY created_at, id",
         )?;
         let drafts = statement
@@ -236,7 +240,7 @@ impl NodeStore {
     ) -> Result<Option<AccessRequestDraft>, StoreError> {
         Ok(self
             .connection
-            .query_row(
+            .query_row_cached(
                 "SELECT id,target_name,listing,signature,listing_expires_at,days,created_at,expires_at FROM access_request_drafts WHERE id=?1",
                 [id],
                 draft_from_row,
@@ -248,14 +252,14 @@ impl NodeStore {
     /// error.
     pub fn remove_access_request_draft(&self, id: &str) -> Result<(), StoreError> {
         self.connection
-            .execute("DELETE FROM access_request_drafts WHERE id=?1", [id])?;
+            .execute_cached("DELETE FROM access_request_drafts WHERE id=?1", [id])?;
         Ok(())
     }
 
     /// Whether this node asked the agent `name` for access, or prepared a
     /// request to it, and the request is open at Unix time `now`.
     pub fn access_requested(&self, name: &str, now: i64) -> Result<bool, StoreError> {
-        Ok(self.connection.query_row(
+        Ok(self.connection.query_row_cached(
             "SELECT EXISTS(SELECT 1 FROM access_request_drafts WHERE target_name=?1 AND expires_at > ?2) OR EXISTS(SELECT 1 FROM hub_approvals WHERE peer_name=?1 AND side=?3 AND kind=?4 AND expires_at > ?2)",
             params![name, now, ApprovalSide::Receiver, ApprovalKind::Request],
             |row| row.get(0),
@@ -270,7 +274,7 @@ impl NodeStore {
         name: &str,
         now: i64,
     ) -> Result<(), StoreError> {
-        self.connection.execute(
+        self.connection.execute_cached(
             "INSERT OR IGNORE INTO hub_blocks(endpoint,name,created_at) VALUES (?1,?2,?3)",
             params![endpoint, name, now],
         )?;
@@ -278,7 +282,7 @@ impl NodeStore {
     }
 
     pub fn hub_blocked(&self, endpoint: &str) -> Result<bool, StoreError> {
-        Ok(self.connection.query_row(
+        Ok(self.connection.query_row_cached(
             "SELECT EXISTS(SELECT 1 FROM hub_blocks WHERE endpoint=?1)",
             [endpoint],
             |row| row.get(0),
@@ -289,7 +293,7 @@ impl NodeStore {
     /// an error.
     pub fn remove_hub_block(&self, endpoint: &str) -> Result<(), StoreError> {
         self.connection
-            .execute("DELETE FROM hub_blocks WHERE endpoint=?1", [endpoint])?;
+            .execute_cached("DELETE FROM hub_blocks WHERE endpoint=?1", [endpoint])?;
         Ok(())
     }
 }

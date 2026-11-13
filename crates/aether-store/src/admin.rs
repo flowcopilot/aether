@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::CachedSql;
 use crate::{NodeStore, StoreError, config, now, sql_count, sql_named};
 
 /// The kind of an admin change. The names are the
@@ -140,7 +141,7 @@ fn audit(
     actor: AuditActor,
     result: AuditResult,
 ) -> Result<i64, StoreError> {
-    connection.execute(
+    connection.execute_cached(
         "INSERT INTO audit_records(actor_type,action,result,created_at) VALUES(?1,?2,?3,?4)",
         params![actor, AuditAction::Change, result, now()],
     )?;
@@ -177,13 +178,13 @@ fn keep_change(
 fn delete_expired(transaction: &Connection) -> Result<(), StoreError> {
     let expired = {
         let mut statement = transaction
-            .prepare("SELECT id FROM pending_changes WHERE expires_at<=?1")?;
+            .prepare_cached("SELECT id FROM pending_changes WHERE expires_at<=?1")?;
         statement
             .query_map([now()], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?
     };
     for id in expired {
-        transaction.execute("DELETE FROM pending_changes WHERE id=?1", [&id])?;
+        transaction.execute_cached("DELETE FROM pending_changes WHERE id=?1", [&id])?;
         config::delete(transaction, &pending_revision_key(&id))?;
     }
     Ok(())
@@ -257,7 +258,7 @@ impl NodeStore {
     ) -> Result<(), StoreError> {
         let transaction = self.connection.transaction()?;
         delete_expired(&transaction)?;
-        transaction.execute(
+        transaction.execute_cached(
             "INSERT INTO pending_changes(id,change_type,value,expires_at) VALUES(?1,?2,?3,?4)",
             params![id, kind, value, expires_at],
         )?;
@@ -286,7 +287,7 @@ impl NodeStore {
 
     /// Marks the audit record `audit` as failed.
     pub fn fail_change(&self, audit: i64) -> Result<(), StoreError> {
-        self.connection.execute(
+        self.connection.execute_cached(
             "UPDATE audit_records SET result=?1 WHERE id=?2",
             params![AuditResult::Failed, audit],
         )?;
@@ -320,7 +321,7 @@ impl NodeStore {
                 None => config::delete(&transaction, CURRENT_WORKSPACE_KEY)?,
             }
         }
-        transaction.execute(
+        transaction.execute_cached(
             "UPDATE audit_records SET result=?1 WHERE id=?2",
             params![AuditResult::Failed, replaced.audit],
         )?;
@@ -339,7 +340,7 @@ impl NodeStore {
     ) -> Result<Replaced, StoreError> {
         let transaction = self.connection.transaction()?;
         let (kind, value, expires_at): (ChangeKind, String, i64) = transaction
-            .query_row(
+            .query_row_cached(
                 "SELECT change_type,value,expires_at FROM pending_changes WHERE id=?1",
                 [id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -351,7 +352,7 @@ impl NodeStore {
             transaction.commit()?;
             return Err(StoreError::InvalidState);
         }
-        transaction.execute("DELETE FROM pending_changes WHERE id=?1", [id])?;
+        transaction.execute_cached("DELETE FROM pending_changes WHERE id=?1", [id])?;
         config::delete(&transaction, &pending_revision_key(id))?;
         audit(&transaction, AuditActor::Ui, AuditResult::Confirmed)?;
         let replaced =
@@ -361,7 +362,7 @@ impl NodeStore {
     }
 
     pub fn pending_changes(&self) -> Result<Vec<PendingChange>, StoreError> {
-        let mut statement = self.connection.prepare(
+        let mut statement = self.connection.prepare_cached(
             "SELECT id,change_type,value FROM pending_changes WHERE expires_at>?1 ORDER BY id",
         )?;
         Ok(statement
@@ -375,7 +376,7 @@ impl NodeStore {
         id: &str,
     ) -> Result<PendingChange, StoreError> {
         self.connection
-            .query_row(
+            .query_row_cached(
                 "SELECT id,change_type,value FROM pending_changes WHERE id=?1",
                 [id],
                 PendingChange::from_row,
@@ -420,7 +421,7 @@ impl NodeStore {
         skip: usize,
         limit: usize,
     ) -> Result<Vec<AuditRecord>, StoreError> {
-        let mut statement = self.connection.prepare(
+        let mut statement = self.connection.prepare_cached(
             "SELECT actor_type,action,result FROM audit_records ORDER BY id LIMIT ?1 OFFSET ?2",
         )?;
         Ok(statement
@@ -439,7 +440,7 @@ impl NodeStore {
         &self,
     ) -> Result<usize, StoreError> {
         self.connection
-            .execute(
+            .execute_cached(
                 "INSERT INTO audit_records(actor_type,action,result,created_at) VALUES('mcp','change','private-credential',0)",
                 [],
             )

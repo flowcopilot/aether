@@ -1,6 +1,7 @@
 use aether_core::ScopeKind;
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::CachedSql;
 use crate::{NodeStore, StoreError, ensure_scope, now};
 
 /// A member of a managed scope. Its JSON form is the control service wire
@@ -61,7 +62,7 @@ pub fn members_in_scope(
     if scope_id.is_empty() {
         return Err(StoreError::InvalidState);
     }
-    let mut statement = connection.prepare(&format!(
+    let mut statement = connection.prepare_cached(&format!(
         "SELECT {MEMBER_COLUMNS} FROM managed_members WHERE scope_id=?1 ORDER BY agent_id"
     ))?;
     Ok(statement
@@ -105,7 +106,7 @@ impl NodeStore {
         let transaction = self.connection.transaction()?;
         advance_cursor(&transaction, &cursor_key(control, &member.scope_id), cursor)?;
         ensure_scope(&transaction, &member.scope_id, ScopeKind::Managed)?;
-        transaction.execute(
+        transaction.execute_cached(
             &format!(
                 "INSERT INTO managed_members({MEMBER_COLUMNS}) VALUES(?1,?2,?3,?4,?5,NULL)
                  ON CONFLICT(scope_id,agent_id) DO UPDATE SET endpoint_id=excluded.endpoint_id,role=excluded.role,expires_at=excluded.expires_at
@@ -133,7 +134,7 @@ impl NodeStore {
         }
         let transaction = self.connection.transaction()?;
         advance_cursor(&transaction, &cursor_key(control, scope_id), cursor)?;
-        if transaction.execute(
+        if transaction.execute_cached(
             "UPDATE managed_members SET revoked_at=COALESCE(revoked_at,?1) WHERE scope_id=?2 AND agent_id=?3",
             params![now(), scope_id, agent_id],
         )? != 1 {
@@ -153,7 +154,7 @@ impl NodeStore {
     /// The members of every managed scope who are not revoked and have not
     /// expired at `now`.
     pub fn active_member_count(&self, now: i64) -> Result<usize, StoreError> {
-        let count: i64 = self.connection.query_row(
+        let count: i64 = self.connection.query_row_cached(
             "SELECT COUNT(*) FROM managed_members WHERE expires_at>?1 AND revoked_at IS NULL",
             [now],
             |row| row.get(0),
@@ -162,7 +163,7 @@ impl NodeStore {
     }
 
     pub fn all_managed_members(&self) -> Result<Vec<ManagedMember>, StoreError> {
-        let mut statement = self.connection.prepare(&format!(
+        let mut statement = self.connection.prepare_cached(&format!(
             "SELECT {MEMBER_COLUMNS} FROM managed_members ORDER BY scope_id,agent_id"
         ))?;
         Ok(statement
@@ -174,9 +175,11 @@ impl NodeStore {
 /// The cursor kept under `key`; 0 when there is none.
 pub fn cursor(connection: &Connection, key: &str) -> Result<i64, StoreError> {
     let stored: Option<String> = connection
-        .query_row("SELECT value FROM configuration WHERE key=?1", [key], |row| {
-            row.get(0)
-        })
+        .query_row_cached(
+            "SELECT value FROM configuration WHERE key=?1",
+            [key],
+            |row| row.get(0),
+        )
         .optional()?;
     match stored {
         None => Ok(0),
@@ -197,7 +200,7 @@ pub fn advance_cursor(
     if next <= cursor(connection, key)? {
         return Err(StoreError::InvalidState);
     }
-    connection.execute(
+    connection.execute_cached(
         "INSERT INTO configuration(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         params![key, next.to_string()],
     )?;
