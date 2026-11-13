@@ -1,5 +1,6 @@
 use rusqlite::params;
 
+use crate::CachedSql;
 use crate::{NodeStore, StoreError};
 
 /// The default group of direct contacts. Migration 011 makes it.
@@ -28,7 +29,7 @@ pub struct AccessGroupMember {
 impl NodeStore {
     pub fn create_access_group(&self, name: &str) -> Result<(), StoreError> {
         self.connection
-            .execute("INSERT INTO access_groups(name) VALUES (?1)", [name])?;
+            .execute_cached("INSERT INTO access_groups(name) VALUES (?1)", [name])?;
         Ok(())
     }
 
@@ -39,19 +40,19 @@ impl NodeStore {
         identities: &[(String, String)],
     ) -> Result<(), StoreError> {
         let transaction = self.connection.transaction()?;
-        let initialized: bool = transaction.query_row(
+        let initialized: bool = transaction.query_row_cached(
             "SELECT EXISTS(SELECT 1 FROM configuration WHERE key=?1)",
             [INITIALIZED_KEY],
             |row| row.get(0),
         )?;
         if !initialized {
             for (agent, endpoint) in identities {
-                transaction.execute(
+                transaction.execute_cached(
                     "INSERT OR IGNORE INTO access_group_members(group_name,agent_id,endpoint_id) VALUES (?1,?2,?3)",
                     params![FRIENDS_GROUP, agent, endpoint],
                 )?;
             }
-            transaction.execute(
+            transaction.execute_cached(
                 "INSERT INTO configuration(key,value) VALUES (?1,'1')",
                 [INITIALIZED_KEY],
             )?;
@@ -61,7 +62,9 @@ impl NodeStore {
     }
 
     pub fn delete_access_group(&self, name: &str) -> Result<(), StoreError> {
-        if self.connection.execute("DELETE FROM access_groups WHERE name=?1", [name])?
+        if self
+            .connection
+            .execute_cached("DELETE FROM access_groups WHERE name=?1", [name])?
             == 0
         {
             return Err(StoreError::NotFound);
@@ -75,14 +78,14 @@ impl NodeStore {
         agent_id: &str,
         endpoint_id: &str,
     ) -> Result<(), StoreError> {
-        if !self.connection.query_row(
+        if !self.connection.query_row_cached(
             "SELECT EXISTS(SELECT 1 FROM access_groups WHERE name=?1)",
             [group],
             |row| row.get::<_, bool>(0),
         )? {
             return Err(StoreError::NotFound);
         }
-        self.connection.execute(
+        self.connection.execute_cached(
             "INSERT OR IGNORE INTO access_group_members(group_name,agent_id,endpoint_id) VALUES (?1,?2,?3)",
             params![group, agent_id, endpoint_id],
         )?;
@@ -95,7 +98,7 @@ impl NodeStore {
         agent_id: &str,
         endpoint_id: &str,
     ) -> Result<(), StoreError> {
-        if self.connection.execute(
+        if self.connection.execute_cached(
             "DELETE FROM access_group_members WHERE group_name=?1 AND agent_id=?2 AND endpoint_id=?3",
             params![group, agent_id, endpoint_id],
         )? == 0 {
@@ -109,7 +112,7 @@ impl NodeStore {
         agent_id: &str,
         endpoint_id: &str,
     ) -> Result<bool, StoreError> {
-        self.connection.query_row(
+        self.connection.query_row_cached(
             "SELECT EXISTS(SELECT 1 FROM access_group_members WHERE agent_id=?1 AND endpoint_id=?2)",
             params![agent_id, endpoint_id],
             |row| row.get(0),
@@ -117,9 +120,10 @@ impl NodeStore {
     }
 
     pub fn access_groups(&self) -> Result<Vec<AccessGroup>, StoreError> {
-        let mut groups =
-            self.connection.prepare("SELECT name FROM access_groups ORDER BY name")?;
-        let mut members = self.connection.prepare(
+        let mut groups = self
+            .connection
+            .prepare_cached("SELECT name FROM access_groups ORDER BY name")?;
+        let mut members = self.connection.prepare_cached(
             "SELECT agent_id,endpoint_id FROM access_group_members WHERE group_name=?1 ORDER BY agent_id,endpoint_id",
         )?;
         groups

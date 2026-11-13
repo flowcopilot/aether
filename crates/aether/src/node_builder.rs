@@ -25,6 +25,7 @@ use crate::{
     policy::{
         AgentAdapter, PolicyError, PolicyFile, PolicySandbox, decode_key,
         default_sandbox, keep, load_or_create, parse_scopes, stored_queue_limits,
+        stored_running_limit,
     },
     proof::ProofNode,
 };
@@ -136,6 +137,7 @@ fn build(
         signed_claims.verify_grant(grant, scope).map_err(|_| PolicyError::Invalid)?;
     }
     let queue_limits = stored_queue_limits(&store, queue)?;
+    let running_limit = stored_running_limit(&store, queue)?;
     let stored_workspace =
         store.current_workspace().map_err(|_| PolicyError::Invalid)?;
     let stored_grants = store
@@ -170,7 +172,7 @@ fn build(
     store
         .initialize_access_groups(&initial_members)
         .map_err(|_| PolicyError::Invalid)?;
-    let trust = RosterClaims::new(signed_claims, layout.clone());
+    let trust = RosterClaims::new(signed_claims, &layout);
     let workspace = resolve_workspace(&policy.workspace, &layout)?;
     let agent = match sandbox {
         Some(sandbox) => NodeAgent::Codex(codex_agent(
@@ -205,6 +207,7 @@ fn build(
         scopes,
     )
     .map_err(|_| PolicyError::Invalid)?;
+    node.set_running_limit(running_limit).map_err(|_| PolicyError::Invalid)?;
     let task_folder_mode = matches!(sandbox, Some(PolicySandbox::TaskFolder));
     // Fail closed the same way the policy file's own `workspace` field
     // already does: a named-but-missing approved directory is a
@@ -501,6 +504,53 @@ mod tests {
         )
         .expect("policy must write");
         path
+    }
+
+    #[test]
+    fn the_node_runs_one_task_at_a_time_unless_its_owner_says_more() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let root = directory.path().to_path_buf();
+        // A policy file from before the limit existed.
+        let path = minimal_policy(&root);
+        let service = load_service(&path, &root, "codex".into()).expect("policy loads");
+        assert_eq!(service.running_limit().expect("limit reads"), 1);
+        drop(service);
+        // A limit that the owner changed on the running node is kept.
+        let mut store = NodeStore::in_dir(&root).expect("store must open");
+        store
+            .apply_change(
+                aether_store::ChangeKind::Limit,
+                aether_core::limits::QueueLimitId::Running.as_str(),
+                "3",
+                aether_store::AuditActor::Ui,
+                1,
+            )
+            .expect("running limit must store");
+        drop(store);
+        let service = load_service(&path, &root, "codex".into())
+            .expect("stored running limit must load");
+        assert_eq!(service.running_limit().expect("limit reads"), 3);
+        drop(service);
+        // A policy file that names the limit starts with it.
+        let mut policy: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("policy reads"))
+                .expect("policy decodes");
+        policy["runningTasks"] = json!(2);
+        let other = tempfile::tempdir().expect("directory must create");
+        let other_root = other.path().to_path_buf();
+        let other_path = minimal_policy(&other_root);
+        policy["workspace"] = json!(other_root.join("workspace"));
+        fs::write(&other_path, policy.to_string()).expect("policy writes");
+        let service = load_service(&other_path, &other_root, "codex".into())
+            .expect("policy with a running limit loads");
+        assert_eq!(service.running_limit().expect("limit reads"), 2);
+        // A value that the owner could not set is refused at start.
+        policy["runningTasks"] = json!(33);
+        fs::write(&other_path, policy.to_string()).expect("policy writes");
+        assert!(matches!(
+            load_service(&other_path, &other_root, "codex".into()),
+            Err(PolicyError::InvalidField(field)) if field == "runningTasks"
+        ));
     }
 
     #[test]

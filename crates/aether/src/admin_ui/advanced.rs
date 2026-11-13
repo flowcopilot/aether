@@ -200,6 +200,11 @@ pub(super) async fn dashboard(
                                 label(attrs: attributes! { for="queue_per_peer" }, "Max waiting tasks per person")
                                 input(attrs: attributes! { id="queue_per_peer" name="queue_per_peer" type="number" min="1" required="" value=(policy.queue.get(aether_core::limits::QueueLimitId::PerPeer).to_string()) })
                             </div>
+                            <div class="flex flex-col gap-1.5 sm:col-span-2">
+                                label(attrs: attributes! { for="running_tasks" }, "Tasks running at once")
+                                input(attrs: attributes! { id="running_tasks" name="running_tasks" type="number" min=(aether_core::limits::QueueLimitId::Running.minimum().to_string()) max=(aether_core::limits::MAX_RUNNING_TASKS.to_string()) required="" value=(policy.queue.get(aether_core::limits::QueueLimitId::Running).to_string()) })
+                                <p class="text-sm text-muted-foreground">"For all people together. One runs a task at a time. A higher number uses more of this computer, and other tasks wait until one ends. Lowering it never stops a running task. An agent that takes fewer tasks at once, such as Codex with a shared workspace or a connected agent that takes one, still runs that many."</p>
+                            </div>
                         </div>
                         button(variant: ButtonVariant::Primary, attrs: attributes! { type="submit" class="w-fit" }, "Save task policy")
                     </form>
@@ -334,6 +339,7 @@ pub(super) struct PolicyForm {
     max_seconds: u64,
     queue_global: usize,
     queue_per_peer: usize,
+    running_tasks: usize,
 }
 
 #[page(POST "/policy")]
@@ -350,12 +356,13 @@ pub(super) async fn save_policy(
         queue: crate::policy::QueuePolicyLimits::new(
             form.queue_global,
             form.queue_per_peer,
-        ),
+        )
+        .with_running(form.running_tasks),
     };
     administration(cx)
         .save_policy_settings(&settings, aether_store::AuditActor::Ui)
         .map_err(|_| {
-            bad_request("use an existing absolute folder and limits above zero")
+            bad_request("use an existing absolute folder and limits in range")
         })?;
     Ok(view! { dashboard(policy_saved: true) })
 }
@@ -480,7 +487,8 @@ mod tests {
             .append_pair("max_context_tokens", "12000")
             .append_pair("max_seconds", "90")
             .append_pair("queue_global", "3")
-            .append_pair("queue_per_peer", "2");
+            .append_pair("queue_per_peer", "2")
+            .append_pair("running_tasks", "3");
         let denied = post(
             application.clone(),
             "/policy",
@@ -505,6 +513,7 @@ mod tests {
         assert_eq!(settings.max_seconds, 90);
         assert_eq!(settings.queue.global, 3);
         assert_eq!(settings.queue.per_peer, 2);
+        assert_eq!(settings.queue.running, 3);
     }
 
     #[tokio::test]

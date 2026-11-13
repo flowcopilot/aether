@@ -14,9 +14,12 @@ defmodule AetherHub.Application do
       [
         AetherHub.Repo,
         {Ecto.Migrator, repos: [AetherHub.Repo], skip: false},
+        AetherHub.ReadRepo,
         {Registry, keys: :duplicate, name: AetherHub.Waiters},
         AetherHub.RateLimit,
         AetherHub.Presence,
+        AetherHub.AccountCache,
+        AetherHub.DirectoryCache,
         AetherHub.Sweeper
       ] ++ server()
 

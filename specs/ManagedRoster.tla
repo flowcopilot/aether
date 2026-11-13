@@ -274,6 +274,12 @@ Rekey(p, k) ==
 \* that endpoint, not revoked.
 \* It reads the roster and changes nothing, so it is a predicate here, not
 \* an action: the claim admits work in each state where it holds.
+\* `RosterClaims` reads through a `KeptStore`, which stays open between
+\* calls. Each read starts a new read transaction, so it sees the roster as
+\* committed at that moment, as a new open did; the store opens again when
+\* the file is replaced or its `user_version` differs, and a store that
+\* cannot open gives `ProviderError::Unavailable`, which admits nothing.
+\* That is the same predicate: a stutter step, not a change to the model.
 Admits(a, e) ==
     roster[a].st = "active" /\ roster[a].ep = e
 

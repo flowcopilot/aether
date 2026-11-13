@@ -185,6 +185,12 @@ where
         self.proof().queue_limits()
     }
 
+    /// How many tasks the node runs at once, as its owner set it. The agent
+    /// can run fewer; see [`ProofNode::effective_running_limit`].
+    pub fn running_limit(&self) -> Result<u32, ProofError> {
+        self.proof().current_queue_limit(aether_core::limits::QueueLimitId::Running)
+    }
+
     pub fn shutdown(&self)
     where
         T: TrustProvider + 'static,

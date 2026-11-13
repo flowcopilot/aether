@@ -95,6 +95,7 @@ its code in `errors`.
 | `too_large` | The body is larger than `limits.maxBodyBytes` |
 | `upgrade_required` | The request has no protocol header: the node is older than the hub |
 | `rate_limited` | A request is over one of the rate limits below |
+| `unavailable` | The hub cannot serve the answer now; try again after `retry-after` seconds |
 
 ## Limits
 
@@ -459,9 +460,27 @@ no account, and it counts against the directory limit of the client address.
   `online` (as in [`GET /v1/contacts`](#get-v1contacts)), and `owner` (as
   in a [search row](#search)). It has no endpoint and no signature.
 - `listed` is the count of listed service agents, and `online` is the count
-  of the ones that are online.
+  of the ones that are online. Both count every live listing, including a
+  listing that the hub cannot decode: such a listing has no row in
+  `agents`, so `listed` and `online` can be larger than the rows that
+  `agents` would show for them.
 - `people` is the count of personal agents. The directory shows no
   presence of a person, and no name of a person except an owner.
+
+The hub builds the directory once in `cacheSeconds` (15) seconds and serves that view to
+every reader in between. Every answer has `cache-control: public, max-age=15`
+and an `age` header with the whole seconds since the hub built the view. A
+cache that honours `age` keeps the answer for `15 - age` seconds, so no
+reader sees a view that is older than 15 seconds. A client that ignores `age`
+can see a view of up to about 30 seconds: one that the hub built 15 seconds
+ago, kept for another 15. A new listing, an owner or a change of presence
+shows within 15 seconds.
+
+When a build fails, the hub keeps serving the last view, with a growing
+`age`, and does not try again for 2 seconds. With no view to serve, it answers
+`503` with `{"error": "unavailable"}`, `cache-control: no-store` and
+`retry-after: 2`: the error code `unavailable`. It also
+answers while the hub restarts its cache.
 
 ## Owner links
 

@@ -264,7 +264,9 @@ defmodule AetherHub.Listings do
         [match, Clock.now(), limit]
       )
 
-    contacts = Contacts.known(asker, Enum.map(rows, &hd/1))
+    endpoints = Enum.map(rows, &hd/1)
+    contacts = Contacts.known(asker, endpoints)
+    owners = OwnerLinks.active_owners(endpoints)
 
     agents =
       rows
@@ -276,7 +278,7 @@ defmodule AetherHub.Listings do
           expires_at: expires_at
         }
 
-        row(listing, Names.format(name, number), contacts)
+        row(listing, Names.format(name, number), contacts, owners[endpoint])
       end)
       |> Enum.sort_by(&(not &1["online"]))
 
@@ -300,11 +302,13 @@ defmodule AetherHub.Listings do
         {:error, :not_found}
 
       {listing, account} ->
-        {:ok, row(listing, Account.full_name(account), Contacts.known(asker, [listing.endpoint]))}
+        contacts = Contacts.known(asker, [listing.endpoint])
+        owner = OwnerLinks.active_owner(listing.endpoint)
+        {:ok, row(listing, Account.full_name(account), contacts, owner)}
     end
   end
 
-  defp row(%Listing{endpoint: endpoint} = listing, handle, contacts) do
+  defp row(%Listing{endpoint: endpoint} = listing, handle, contacts, owner) do
     contact = MapSet.member?(contacts, endpoint)
 
     row = %{
@@ -316,7 +320,7 @@ defmodule AetherHub.Listings do
       "contact" => contact,
       # The full name of the owner only: never the owner's presence or
       # endpoint.
-      "owner" => OwnerLinks.active_owner(endpoint)
+      "owner" => owner
     }
 
     if contact, do: Map.put(row, "endpoint", endpoint), else: row

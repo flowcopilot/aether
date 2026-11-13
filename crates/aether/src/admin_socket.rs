@@ -55,6 +55,7 @@ pub enum Request {
         max_seconds: Option<u64>,
         queue_global: Option<usize>,
         queue_per_peer: Option<usize>,
+        running_tasks: Option<usize>,
         dry_run: bool,
     },
 }
@@ -290,6 +291,7 @@ fn handle(
             max_seconds,
             queue_global,
             queue_per_peer,
+            running_tasks,
             dry_run,
         } => with_lock(administration, |administration| {
             let Some(mut settings) =
@@ -311,6 +313,9 @@ fn handle(
             }
             if let Some(value) = queue_per_peer {
                 settings.queue.set(aether_core::limits::QueueLimitId::PerPeer, value);
+            }
+            if let Some(value) = running_tasks {
+                settings.queue.set(aether_core::limits::QueueLimitId::Running, value);
             }
             if dry_run {
                 match crate::policy::validate_policy_settings(&settings) {

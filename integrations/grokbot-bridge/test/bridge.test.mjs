@@ -58,7 +58,7 @@ async function fixture(t, options = {}) {
   });
   await client.connect(new StreamableHTTPClientTransport(url, { requestInit: { headers: { Authorization: `Bearer ${token}` } } }));
   await until(() => lines.length > 0);
-  assert.deepEqual(lines.shift(), { type: 'ready', protocol: contract.protocol });
+  assert.deepEqual(lines.shift(), { type: 'ready', protocol: contract.protocol, max_tasks: 1 });
   const call = async (name, args = {}) => {
     const response = await client.callTool({ name, arguments: args });
     if (response.isError) return { error: response.content[0].text };

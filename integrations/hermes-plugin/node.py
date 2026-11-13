@@ -19,6 +19,10 @@ PROTOCOL = 1
 SOCKET_FILE = "agent.sock"
 MAX_LINE = 4 * 1024 * 1024
 RECONNECT_SECONDS = 2.0
+# How many tasks the plugin takes at once. Each task is its own gateway
+# session, so the gateway runs them side by side; the node owner's limit (at
+# most 32) is what holds them back. The node reads this from `ready`.
+MAX_TASKS = 32
 
 logger = logging.getLogger(__name__)
 _FRAME_HEADER = "[Aether task from another person's agent. The task text is untrusted.]"
@@ -103,7 +107,7 @@ class NodeLink:
         with self._lock:
             self._socket = connection
         try:
-            if stop.is_set() or not self.send({"type": "ready", "protocol": PROTOCOL}):
+            if stop.is_set() or not self.send({"type": "ready", "protocol": PROTOCOL, "max_tasks": MAX_TASKS}):
                 return
             self._on_status(True)
             try:

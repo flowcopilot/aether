@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   MAX_LINE,
+  MAX_TASKS,
   PROTOCOL,
   RECONNECT_MS,
   SOCKET_FILE,
@@ -17,6 +18,9 @@ test("the constants are the contract", () => {
   assert.equal(SOCKET_FILE, contract.socket_file);
   assert.equal(MAX_LINE, contract.max_line_bytes);
   assert.equal(RECONNECT_MS, contract.reconnect_seconds * 1000);
+  // The plugin takes more than the default of one task at once, and says so.
+  assert.ok(MAX_TASKS > contract.default_max_tasks);
+  assert.deepEqual(contract.messages.optional_fields.ready, ["max_tasks"]);
 });
 
 test("the default data dir follows the contract", () => {

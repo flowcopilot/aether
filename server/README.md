@@ -45,6 +45,29 @@ The search on listings uses the SQLite FTS5 module. `exqlite` (pinned in
 `EXQLITE_USE_SYSTEM`: a system SQLite can be without FTS5, and then the
 listings migration fails at boot. A test checks the compile option.
 
+## Database connections
+
+The hub opens its SQLite file (WAL mode) through two pools:
+
+- `AetherHub.Repo` is the writer: one connection, `BEGIN IMMEDIATE`. Every
+  write, and every read that a write depends on, runs here, so a read that
+  decides a write sees no other write between the two. The migrations run
+  here.
+- `AetherHub.ReadRepo` is a pool of 4 read-only connections with deferred
+  transactions. It serves the reads that decide nothing about a write: the
+  invite list (`Invites.list`, one consistent snapshot) and the version that
+  a long poll compares (`Versions.current`). It takes no write lock, so
+  reads and the writer do not wait for each other. It starts after the
+  migrations, because a read-only connection cannot create the file.
+
+A read that starts after a commit returned sees that commit, so a long poll
+that a write woke reads the new state. A long poll holds no connection while
+it waits.
+
+The sweeper removes expired invites in transactions of at most 500 rows, so
+a large backlog stays under the limit of SQLite on the variables of one
+statement and does not hold the writer for long.
+
 ## Behind a proxy
 
 A hub behind a proxy must have `TRUSTED_PROXIES` before the deploy. Without

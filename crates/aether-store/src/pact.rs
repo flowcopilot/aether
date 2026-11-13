@@ -10,6 +10,7 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
+use crate::CachedSql;
 use crate::{StoreError, migrate::open_connection, sql_named};
 
 pub const PACT_DATABASE: &str = "pact.sqlite";
@@ -130,7 +131,7 @@ impl PactStore {
         pa_subject: &str,
         now: i64,
     ) -> Result<(), StoreError> {
-        self.connection.execute(
+        self.connection.execute_cached(
             "INSERT INTO pact_contexts(context_id, brand_id, pa_issuer, pa_subject, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
             params![context_id, brand_id, pa_issuer, pa_subject, now],
         )?;
@@ -140,7 +141,7 @@ impl PactStore {
     pub fn context(&self, context_id: &str) -> Result<Option<PactContext>, StoreError> {
         Ok(self
             .connection
-            .query_row(
+            .query_row_cached(
                 "SELECT context_id, brand_id, pa_issuer, pa_subject, brand_user, closed_at IS NOT NULL FROM pact_contexts WHERE context_id=?1",
                 [context_id],
                 |row| {
@@ -165,7 +166,7 @@ impl PactStore {
         context_id: &str,
         brand_user: &str,
     ) -> Result<(), StoreError> {
-        let changed = self.connection.execute(
+        let changed = self.connection.execute_cached(
             "UPDATE pact_contexts SET brand_user=?2 WHERE context_id=?1 AND (brand_user IS NULL OR brand_user=?2)",
             params![context_id, brand_user],
         )?;
@@ -181,11 +182,11 @@ impl PactStore {
         now: i64,
     ) -> Result<usize, StoreError> {
         let transaction = self.connection.unchecked_transaction()?;
-        let closed = transaction.execute(
+        let closed = transaction.execute_cached(
             "UPDATE pact_contexts SET closed_at=?2 WHERE closed_at IS NULL AND updated_at < ?1",
             params![idle_before, now],
         )?;
-        transaction.execute(
+        transaction.execute_cached(
             "DELETE FROM pact_messages WHERE context_id IN (SELECT context_id FROM pact_contexts WHERE closed_at IS NOT NULL)",
             [],
         )?;
@@ -206,7 +207,7 @@ impl PactStore {
     ) -> Result<Reservation, StoreError> {
         let transaction = self.connection.unchecked_transaction()?;
         let existing: Option<Option<String>> = transaction
-            .query_row(
+            .query_row_cached(
                 "SELECT response FROM pact_messages WHERE context_id=?1 AND message_id=?2",
                 params![context_id, message_id],
                 |row| row.get(0),
@@ -215,14 +216,14 @@ impl PactStore {
         if let Some(response) = existing {
             return Ok(Reservation::Existing(response));
         }
-        let open = transaction.execute(
+        let open = transaction.execute_cached(
             "UPDATE pact_contexts SET updated_at=?2 WHERE context_id=?1 AND closed_at IS NULL",
             params![context_id, now],
         )?;
         if open != 1 {
             return Err(StoreError::NotFound);
         }
-        transaction.execute(
+        transaction.execute_cached(
             "INSERT INTO pact_messages(context_id, message_id, sequence, request_text, created_at) VALUES (?1, ?2, (SELECT COALESCE(MAX(sequence), 0) + 1 FROM pact_messages WHERE context_id=?1), ?3, ?4)",
             params![context_id, message_id, request_text, now],
         )?;
@@ -240,7 +241,7 @@ impl PactStore {
         reply_text: Option<&str>,
         response: &str,
     ) -> Result<(), StoreError> {
-        let changed = self.connection.execute(
+        let changed = self.connection.execute_cached(
             "UPDATE pact_messages SET reply_text=?3, response=?4 WHERE context_id=?1 AND message_id=?2 AND response IS NULL",
             params![context_id, message_id, reply_text, response],
         )?;
@@ -254,7 +255,7 @@ impl PactStore {
         context_id: &str,
         message_id: &str,
     ) -> Result<(), StoreError> {
-        self.connection.execute(
+        self.connection.execute_cached(
             "DELETE FROM pact_messages WHERE context_id=?1 AND message_id=?2 AND response IS NULL",
             params![context_id, message_id],
         )?;
@@ -270,7 +271,7 @@ impl PactStore {
         limit: usize,
     ) -> Result<Vec<(String, String)>, StoreError> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let mut statement = self.connection.prepare(
+        let mut statement = self.connection.prepare_cached(
             "SELECT request_text, reply_text FROM (SELECT sequence, request_text, reply_text FROM pact_messages WHERE context_id=?1 AND reply_text IS NOT NULL AND sequence < (SELECT sequence FROM pact_messages WHERE context_id=?1 AND message_id=?2) ORDER BY sequence DESC LIMIT ?3) ORDER BY sequence",
         )?;
         statement
@@ -287,7 +288,7 @@ impl PactStore {
         &self,
         authorization: &NewDeviceAuthorization,
     ) -> Result<(), StoreError> {
-        self.connection.execute(
+        self.connection.execute_cached(
             "INSERT INTO pact_device_authorizations(device_code_hash, user_code, brand_id, pa_issuer, pa_subject, scopes, status, interval_seconds, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?10, ?7, ?8, ?9)",
             params![
                 authorization.device_code_hash,
@@ -313,7 +314,7 @@ impl PactStore {
     ) -> Result<Option<PendingDevice>, StoreError> {
         Ok(self
             .connection
-            .query_row(
+            .query_row_cached(
                 "SELECT user_code, brand_id, pa_issuer, pa_subject, scopes, expires_at FROM pact_device_authorizations WHERE user_code=?1 AND status=?3 AND expires_at > ?2",
                 params![user_code, now, DeviceStatus::Pending],
                 |row| {
@@ -339,7 +340,7 @@ impl PactStore {
         now: i64,
     ) -> Result<(), StoreError> {
         let transaction = self.connection.unchecked_transaction()?;
-        let changed = transaction.execute(
+        let changed = transaction.execute_cached(
             "UPDATE pact_device_authorizations SET status=?4, grant_id=?2 WHERE user_code=?1 AND status=?5 AND expires_at > ?3",
             params![
                 user_code,
@@ -360,7 +361,7 @@ impl PactStore {
     /// Denies the pending authorization `user_code`. `NotFound` when it is
     /// no longer pending, or has expired.
     pub fn deny_device(&self, user_code: &str, now: i64) -> Result<(), StoreError> {
-        let changed = self.connection.execute(
+        let changed = self.connection.execute_cached(
             "UPDATE pact_device_authorizations SET status=?2 WHERE user_code=?1 AND status=?3 AND expires_at > ?4",
             params![user_code, DeviceStatus::Denied, DeviceStatus::Pending, now],
         )?;
@@ -384,7 +385,7 @@ impl PactStore {
             TransactionBehavior::Immediate,
         )?;
         let row: Option<DeviceRow> = transaction
-            .query_row(
+            .query_row_cached(
                 "SELECT status, grant_id, interval_seconds, last_polled_at, expires_at FROM pact_device_authorizations WHERE device_code_hash=?1 AND brand_id=?2 AND pa_issuer=?3 AND pa_subject=?4",
                 params![device_code_hash, brand_id, pa_issuer, pa_subject],
                 |row| {
@@ -412,7 +413,7 @@ impl PactStore {
                 DeviceStatus::Pending => {
                     let slow_down = last_polled_at
                         .is_some_and(|last| now.saturating_sub(last) < interval);
-                    transaction.execute(
+                    transaction.execute_cached(
                         "UPDATE pact_device_authorizations SET last_polled_at=?2 WHERE device_code_hash=?1 AND status=?3",
                         params![device_code_hash, now, DeviceStatus::Pending],
                     )?;
@@ -421,7 +422,7 @@ impl PactStore {
                 DeviceStatus::Approved => {
                     // Like every transition here, the update names the state
                     // it leaves, so only one poll can consume an approval.
-                    let consumed = transaction.execute(
+                    let consumed = transaction.execute_cached(
                         "UPDATE pact_device_authorizations SET status=?2 WHERE device_code_hash=?1 AND status=?3 AND expires_at > ?4",
                         params![
                             device_code_hash,
@@ -455,7 +456,7 @@ impl PactStore {
         grant_id: &str,
         expires_at: i64,
     ) -> Result<(), StoreError> {
-        self.connection.execute(
+        self.connection.execute_cached(
             "INSERT INTO pact_refresh_tokens(token_hash, grant_id, expires_at) VALUES (?1, ?2, ?3)",
             params![token_hash, grant_id, expires_at],
         )?;
@@ -479,7 +480,7 @@ impl PactStore {
             TransactionBehavior::Immediate,
         )?;
         let grant_id: Option<String> = transaction
-            .query_row(
+            .query_row_cached(
                 "UPDATE pact_refresh_tokens SET used_at=?2 WHERE token_hash=?1 AND used_at IS NULL AND expires_at > ?2 AND grant_id IN (SELECT grant_id FROM pact_grants WHERE brand_id=?3 AND pa_issuer=?4 AND pa_subject=?5) RETURNING grant_id",
                 params![token_hash, now, brand_id, pa_issuer, pa_subject],
                 |row| row.get(0),
@@ -504,7 +505,7 @@ impl PactStore {
         jws: &str,
         now: i64,
     ) -> Result<(), StoreError> {
-        self.connection.execute(
+        self.connection.execute_cached(
             "INSERT INTO pact_receipts(context_id, message_id, grant_id, jws, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![context_id, message_id, grant_id, jws, now],
         )?;
@@ -513,7 +514,7 @@ impl PactStore {
 
     /// The receipts stored for `grant_id`, oldest first.
     pub fn receipts(&self, grant_id: &str) -> Result<Vec<String>, StoreError> {
-        let mut statement = self.connection.prepare(
+        let mut statement = self.connection.prepare_cached(
             "SELECT jws FROM pact_receipts WHERE grant_id=?1 ORDER BY created_at, context_id, message_id",
         )?;
         statement
@@ -552,7 +553,7 @@ struct DeviceRow {
 }
 
 fn insert_grant(connection: &Connection, grant: &PactGrant) -> Result<(), StoreError> {
-    connection.execute(
+    connection.execute_cached(
         &format!("INSERT INTO pact_grants({GRANT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"),
         params![
             grant.grant_id,
@@ -573,7 +574,7 @@ fn query_grant(
     grant_id: &str,
 ) -> Result<Option<PactGrant>, StoreError> {
     Ok(connection
-        .query_row(
+        .query_row_cached(
             &format!("SELECT {GRANT_COLUMNS} FROM pact_grants WHERE grant_id=?1"),
             [grant_id],
             PactGrant::from_row,

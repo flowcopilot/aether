@@ -53,6 +53,8 @@ pub struct PolicyUpdateArguments {
     pub max_seconds: Option<u64>,
     pub queue_global: Option<usize>,
     pub queue_per_peer: Option<usize>,
+    /// How many tasks the node runs at once, from 1 to 32.
+    pub running_tasks: Option<usize>,
     #[serde(default)]
     pub dry_run: bool,
 }
@@ -114,6 +116,7 @@ impl McpServer {
                     "maxSeconds": settings.max_seconds,
                     "queueGlobal": settings.queue.global,
                     "queuePerPeer": settings.queue.per_peer,
+                    "runningTasks": settings.queue.running,
                 })
             }),
             Err(_) => return tool_error("the node policy is unavailable"),
@@ -151,6 +154,7 @@ impl McpServer {
             && arguments.max_seconds.is_none()
             && arguments.queue_global.is_none()
             && arguments.queue_per_peer.is_none()
+            && arguments.running_tasks.is_none()
         {
             return tool_error("give at least one policy field");
         }
@@ -165,6 +169,7 @@ impl McpServer {
             max_seconds: arguments.max_seconds,
             queue_global: arguments.queue_global,
             queue_per_peer: arguments.queue_per_peer,
+            running_tasks: arguments.running_tasks,
             dry_run: arguments.dry_run,
         }) {
             Ok(Response::Validated) => tool_success(
@@ -603,6 +608,7 @@ mod tests {
             max_seconds: Some(75),
             queue_global: Some(2),
             queue_per_peer: None,
+            running_tasks: None,
             dry_run: true,
         };
         let validated = server.settings_update_policy(Parameters(request)).await;
@@ -621,6 +627,7 @@ mod tests {
                 max_seconds: Some(75),
                 queue_global: None,
                 queue_per_peer: None,
+                running_tasks: None,
                 dry_run: false,
             }))
             .await;
@@ -641,6 +648,7 @@ mod tests {
                 max_seconds: Some(76),
                 queue_global: Some(2),
                 queue_per_peer: None,
+                running_tasks: None,
                 dry_run: false,
             }))
             .await;

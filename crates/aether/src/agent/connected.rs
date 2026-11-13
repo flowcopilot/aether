@@ -71,8 +71,14 @@ impl Turns {
     }
 }
 
+/// How many tasks an agent takes at once when its `ready` does not say: one,
+/// as every agent did before the node ran tasks side by side.
+const DEFAULT_MAX_TASKS: usize = 1;
+
 struct Connection {
     generation: u64,
+    /// The most open tasks that the agent said it takes at once.
+    max_tasks: usize,
     stream: UnixStream,
     writer: Writer,
     pending: Pending,
@@ -96,11 +102,28 @@ enum NodeMessage<'a> {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum AgentMessage {
-    Ready { protocol: u64 },
-    Progress { id: String },
-    Result { id: String, text: String },
-    Failed { id: String },
-    Cancelled { id: String },
+    Ready {
+        protocol: u64,
+        /// Any JSON value, so that a `ready` with a `max_tasks` that is not
+        /// a whole number still attaches the agent, which then takes one
+        /// task at a time. As a `u64` such a line would not parse, and the
+        /// node would skip it and wait for a `ready` that never comes.
+        #[serde(default)]
+        max_tasks: Option<serde_json::Value>,
+    },
+    Progress {
+        id: String,
+    },
+    Result {
+        id: String,
+        text: String,
+    },
+    Failed {
+        id: String,
+    },
+    Cancelled {
+        id: String,
+    },
 }
 
 impl ConnectedAgent {
@@ -181,10 +204,14 @@ impl Shared {
             return;
         };
         let mut reader = BufReader::new(stream);
-        match read_message(&mut reader) {
-            Some(AgentMessage::Ready { protocol: PROTOCOL }) => {}
+        let max_tasks = match read_message(&mut reader) {
+            Some(AgentMessage::Ready { protocol: PROTOCOL, max_tasks }) => max_tasks
+                .as_ref()
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|tasks| usize::try_from(tasks).ok())
+                .map_or(DEFAULT_MAX_TASKS, |tasks| tasks.max(1)),
             _ => return,
-        }
+        };
         let generation =
             self.generation.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
         let pending = Arc::new(Mutex::new(Turns::default()));
@@ -200,6 +227,7 @@ impl Shared {
             .unwrap_or_default();
         let replaced = connection.replace(Connection {
             generation,
+            max_tasks,
             stream: control,
             writer: Arc::new(Mutex::new(writer)),
             pending: Arc::clone(&pending),
@@ -364,6 +392,17 @@ impl Agent for ConnectedAgent {
         if let Ok(mut cancels) = self.shared.cancels.lock() {
             cancels.forget(task_id);
         }
+    }
+
+    /// What the attached agent said in its `ready`; one when it said
+    /// nothing, or when no agent is attached.
+    fn capacity(&self) -> usize {
+        self.shared
+            .connection
+            .lock()
+            .ok()
+            .and_then(|connection| connection.as_ref().map(|current| current.max_tasks))
+            .unwrap_or(DEFAULT_MAX_TASKS)
     }
 }
 
@@ -609,6 +648,74 @@ mod tests {
                 "the node reads {kind}"
             );
         }
+    }
+
+    #[test]
+    fn the_optional_fields_and_the_default_match_the_contract() {
+        let contract = json_file(CONTRACT);
+        assert_eq!(contract["default_max_tasks"], super::DEFAULT_MAX_TASKS);
+        assert_eq!(
+            contract["messages"]["optional_fields"]["ready"],
+            json!(["max_tasks"])
+        );
+        let ready = json!({"type": "ready", "protocol": PROTOCOL, "max_tasks": 3});
+        assert!(matches!(
+            serde_json::from_value::<AgentMessage>(ready),
+            Ok(AgentMessage::Ready { protocol: PROTOCOL, max_tasks: Some(tasks) })
+                if tasks == json!(3)
+        ));
+    }
+
+    #[test]
+    fn the_agent_says_how_many_tasks_it_takes_at_once() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let path = crate::data_dir::DataDir::new(directory.path()).agent_socket();
+        let agent = ConnectedAgent::listen(&path).expect("listen");
+        // No agent: the capacity is the default.
+        assert_eq!(agent.capacity(), 1);
+        for (ready, capacity) in [
+            (json!({"type": "ready", "protocol": 1}), 1),
+            (json!({"type": "ready", "protocol": 1, "max_tasks": 3}), 3),
+            (json!({"type": "ready", "protocol": 1, "max_tasks": 0}), 1),
+            // Not a whole number: the agent still attaches, with one task.
+            (json!({"type": "ready", "protocol": 1, "max_tasks": 2.5}), 1),
+            (json!({"type": "ready", "protocol": 1, "max_tasks": -1}), 1),
+            (json!({"type": "ready", "protocol": 1, "max_tasks": "2"}), 1),
+            (json!({"type": "ready", "protocol": 1, "max_tasks": null}), 1),
+        ] {
+            let _peer = Peer::attach(&agent, &path, &ready);
+            assert_eq!(agent.capacity(), capacity, "{ready}");
+        }
+    }
+
+    #[test]
+    fn two_turns_are_open_on_one_connection_and_end_separately() {
+        let directory = tempfile::tempdir().expect("directory must create");
+        let path = crate::data_dir::DataDir::new(directory.path()).agent_socket();
+        let agent = ConnectedAgent::listen(&path).expect("listen");
+        let mut peer = Peer::attach(
+            &agent,
+            &path,
+            &json!({"type": "ready", "protocol": 1, "max_tasks": 2}),
+        );
+        let deadline =
+            Instant::now().checked_add(Duration::from_secs(5)).expect("deadline");
+        let start = |id: &'static str| {
+            let mut runner = agent.clone();
+            std::thread::spawn(move || runner.start_turn(&turn_ctx(id, id, deadline)))
+        };
+        let first = start("task-1");
+        assert_eq!(peer.read()["id"], "task-1");
+        let second = start("task-2");
+        assert_eq!(peer.read()["id"], "task-2");
+        // An answer of the second task ends only the second turn.
+        peer.write(&json!({"type": "result", "id": "task-2", "text": "two"}));
+        assert_eq!(second.join().expect("turn joins"), Ok("two".to_owned()));
+        // A cancel reaches only the task that it names.
+        agent.cancel("task-1");
+        assert_eq!(peer.read(), json!({"type": "cancel", "id": "task-1"}));
+        peer.write(&json!({"type": "cancelled", "id": "task-1"}));
+        assert_eq!(first.join().expect("turn joins"), Err(ExecutionError::Cancelled));
     }
 
     #[test]

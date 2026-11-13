@@ -22,11 +22,19 @@
 (*   crates/aether/src/admin_ui/advanced.rs  the confirm and the policy    *)
 (*       form of the UI (AuditActor::Ui)                                   *)
 (*   crates/aether/src/policy.rs         save_policy_settings_in_store,    *)
-(*       stored_queue_limits                                               *)
+(*       stored_queue_limits, stored_running_limit                         *)
 (*   crates/aether/src/node_builder.rs   the replay at node start: grants  *)
 (*       of the policy file without the revoked ones, then the stored      *)
-(*       grants, the stored limit, admin.current.workspace                 *)
+(*       grants, the stored limits, admin.current.workspace                *)
 (*   crates/aether/src/node_service.rs   impl LiveNode for RunningNode     *)
+(*   crates/aether/src/proof/mod.rs      ProofNode::set_queue_limit,       *)
+(*       set_running_limit                                                 *)
+(*                                                                         *)
+(* There are two limits (`QueueLimitId`): "queue", which stands for the    *)
+(* two limits of the waiting tasks (they take the same path and behave     *)
+(* alike), and "running", the number of tasks that run at once. Each has   *)
+(* its own stored value, live value and value in the stored policy. A      *)
+(* limit change names its limit; the policy settings carry both.           *)
 (*                                                                         *)
 (* One process holds the Administration behind a mutex, so one request     *)
 (* runs at a time; `op` is that request between its store and node calls.  *)
@@ -48,8 +56,8 @@
 (* clock (a pending change expires at any moment), the audit records       *)
 (* other than `applied` (an audit record has no value column, so it holds  *)
 (* no secret by its type), grant expiry and a stored grant that no longer  *)
-(* verifies at start, the two limit ids and the two task limits of the     *)
-(* policy (one limit here), the `admin.<kind>.<id>` values of workspace,   *)
+(* verifies at start, the range of a limit (the running limit is 1 to 32;  *)
+(* here every limit is 1 to 3), the `admin.<kind>.<id>` values of workspace, *)
 (* capability, directory and policy changes (nothing reads them at         *)
 (* start), set_relay, cancel_task, access groups, and the store writes of  *)
 (* save_policy_settings_in_store, which are one step here. A live revoke   *)
@@ -73,19 +81,24 @@ Kinds == {"grant", "workspace", "limit", "capability", "directory", "policy"}
 \* every other grant.
 GVals == {"lo", "hi"}
 WVals == {"w1", "w2"}
+LimIds == {"queue", "running"}
 Limits == 1..3
-InitLimit == 2
+\* The limits of a new node: two waiting tasks, one running task (the
+\* default of `running_tasks`).
+InitLimit == [l \in LimIds |-> IF l = "queue" THEN 2 ELSE 1]
+NoLimits == [l \in LimIds |-> 0]
 InitWs == "w1"
 
-\* The value of a change: `val` for a grant or a workspace, `num` for a
-\* limit, both for the policy settings. Capability and directory changes
-\* have one value.
+\* The value of a change: `val` for a grant or a workspace, `num` for the
+\* limit that `lim` names, `lims` (both limits) for the policy settings.
+\* Capability and directory changes have one value.
 ValsOf(kind) ==
-    CASE kind = "grant" -> [val : GVals, num : {0}]
-      [] kind = "workspace" -> [val : WVals, num : {0}]
-      [] kind = "limit" -> [val : {None}, num : Limits]
-      [] kind = "policy" -> [val : WVals, num : Limits]
-      [] OTHER -> [val : {None}, num : {0}]
+    CASE kind = "grant" -> [val : GVals, num : {0}, lim : {None}, lims : {NoLimits}]
+      [] kind = "workspace" -> [val : WVals, num : {0}, lim : {None}, lims : {NoLimits}]
+      [] kind = "limit" -> [val : {None}, num : Limits, lim : LimIds, lims : {NoLimits}]
+      [] kind = "policy" -> [val : WVals, num : {0}, lim : {None},
+                             lims : [LimIds -> Limits]]
+      [] OTHER -> [val : {None}, num : {0}, lim : {None}, lims : {NoLimits}]
 
 \* Change::is_high_risk.
 HighRisk(kind, v) ==
@@ -98,15 +111,15 @@ VARIABLES
     mode,        \* "serve": a node runs in the process; "admin": none
     op,          \* the request that holds the Administration mutex
     durGrant,    \* store: admin.grant.<id>
-    durLimit,    \* store: admin.limit.<id>, 0 when not set
+    durLimit,    \* store: admin.limit.<id> of each limit, 0 when not set
     curWs,       \* store: admin.current.workspace
-    pol,         \* store: workspace and queue limit of the stored policy
+    pol,         \* store: workspace and limits of the stored policy
     revoked,     \* store: admin.revoked.<id>
     pending,     \* store: pending_changes and admin.pending_revision.<id>
     drev,        \* store: admin.revision
     mrev,        \* Administration::revision, in memory
     liveGrant,   \* node: the grants of the live policy
-    liveLimit,   \* node: the queue limit
+    liveLimit,   \* node: each limit
     liveWs,      \* node: the workspace
     liveCap,     \* node: a capability was published
     audits,      \* store: the `applied` audit records
@@ -114,7 +127,7 @@ VARIABLES
     \* Ghosts.
     grOk,        \* grants that a UI action asked for or confirmed
     wsOk,        \* workspaces that a UI action asked for or confirmed
-    limOk,       \* the highest limit that a UI action asked for
+    limOk,       \* the highest value of each limit that a UI action asked for
     capOk,       \* a UI action confirmed a capability
     dead,        \* grants revoked, with no new apply of the id since
     applies,     \* changes, revokes and policy saves that took effect
@@ -130,10 +143,11 @@ flags == <<mcpRevived, staleConfirmed, otherConfirmed, expiredApplied>>
 vars == <<mode, op, store, mrev, node, nOps, restarts, approvals, dead,
           applies, flags>>
 
-NoPending == [kind |-> None, val |-> None, num |-> 0, base |-> 0,
-              expired |-> FALSE, landed |-> "no"]
+NoPending == [kind |-> None, val |-> None, num |-> 0, lim |-> None,
+              lims |-> NoLimits, base |-> 0, expired |-> FALSE, landed |-> "no"]
 Idle == [pc |-> "idle", actor |-> "ui", kind |-> "grant",
          id |-> CHOOSE i \in Ids : TRUE, val |-> None, num |-> 0,
+         lim |-> None, lims |-> NoLimits,
          prevVal |-> None, prevNum |-> 0, prevCur |-> None]
 
 Max(a, b) == IF a >= b THEN a ELSE b
@@ -142,27 +156,29 @@ TypeOK ==
     /\ mode \in {"serve", "admin"}
     /\ op \in [pc : Pcs, actor : Actors, kind : Kinds, id : Ids,
                val : GVals \cup WVals \cup {None}, num : 0..3,
+               lim : LimIds \cup {None}, lims : [LimIds -> 0..3],
                prevVal : GVals \cup {None}, prevNum : 0..3,
                prevCur : WVals \cup {None}]
     /\ durGrant \in [Ids -> GVals \cup {None}]
-    /\ durLimit \in 0..3
+    /\ durLimit \in [LimIds -> 0..3]
     /\ curWs \in WVals \cup {None}
-    /\ pol \in [ws : WVals, limit : Limits]
+    /\ pol \in [ws : WVals, limit : [LimIds -> Limits]]
     /\ revoked \subseteq Ids
     /\ pending \in [Ids -> [kind : Kinds \cup {None},
                             val : GVals \cup WVals \cup {None}, num : 0..3,
+                            lim : LimIds \cup {None}, lims : [LimIds -> 0..3],
                             base : 0..MaxOps, expired : BOOLEAN,
                             landed : {"no", "other", "change"}]]
     /\ drev \in 0..MaxOps /\ mrev \in 0..MaxOps
     /\ liveGrant \in [Ids -> GVals \cup {None}]
-    /\ liveLimit \in Limits
+    /\ liveLimit \in [LimIds -> Limits]
     /\ liveWs \in WVals
     /\ liveCap \in BOOLEAN
     /\ audits \in 0..MaxOps /\ applies \in 0..MaxOps
     /\ nOps \in 0..MaxOps /\ restarts \in 0..MaxRestarts
     /\ grOk \subseteq Ids \X GVals
     /\ wsOk \subseteq WVals
-    /\ limOk \in Limits
+    /\ limOk \in [LimIds -> Limits]
     /\ capOk \in BOOLEAN
     /\ dead \subseteq Ids
     /\ mcpRevived \in BOOLEAN /\ staleConfirmed \in BOOLEAN
@@ -180,7 +196,7 @@ Init ==
     /\ mode = "serve"
     /\ op = Idle
     /\ durGrant = [id \in Ids |-> None]
-    /\ durLimit = 0
+    /\ durLimit = NoLimits
     /\ curWs = None
     /\ pol = [ws |-> InitWs, limit |-> InitLimit]
     /\ revoked = {}
@@ -212,8 +228,9 @@ Approve(kind, id, v) ==
     /\ grOk' = IF kind = "grant" THEN grOk \cup {<<id, v.val>>} ELSE grOk
     /\ wsOk' = IF kind \in {"workspace", "policy"} THEN wsOk \cup {v.val}
                ELSE wsOk
-    /\ limOk' = IF kind \in {"limit", "policy"} THEN Max(limOk, v.num)
-                ELSE limOk
+    /\ limOk' = CASE kind = "limit" -> [limOk EXCEPT ![v.lim] = Max(@, v.num)]
+                  [] kind = "policy" -> [l \in LimIds |-> Max(limOk[l], v.lims[l])]
+                  [] OTHER -> limOk
     /\ capOk' = (capOk \/ kind = "capability")
 
 -----------------------------------------------------------------------------
@@ -222,13 +239,15 @@ Approve(kind, id, v) ==
 (* the hub workers, the policy form).                                      *)
 
 \* change_requires_confirmation. A limit from MCP is free only when the
-\* live node reads a limit that is not lower. Policy settings from MCP are
-\* free only when they keep the workspace and raise no limit
-\* (policy_is_wider).
+\* live node reads a value of that limit that is not lower. Policy settings
+\* from MCP are free only when they keep the workspace and raise no limit
+\* (policy_is_wider: each limit of `QueueLimitId::ALL`, the running limit
+\* too).
 NeedsConfirmation(actor, kind, v) ==
     /\ actor = "mcp"
-    /\ CASE kind = "limit" -> ~(mode = "serve" /\ v.num <= liveLimit)
-         [] kind = "policy" -> v.val # pol.ws \/ v.num > pol.limit
+    /\ CASE kind = "limit" -> ~(mode = "serve" /\ v.num <= liveLimit[v.lim])
+         [] kind = "policy" -> \/ v.val # pol.ws
+                               \/ \E l \in LimIds : v.lims[l] > pol.limit[l]
          [] OTHER -> HighRisk(kind, v)
 
 \* Administration::apply or save_policy_settings -> queue_pending ->
@@ -241,6 +260,7 @@ Queue(actor, kind, id, v) ==
     /\ IF pending[id].kind = None \/ pending[id].expired
        THEN \/ pending' = [pending EXCEPT ![id] =
                              [kind |-> kind, val |-> v.val, num |-> v.num,
+                              lim |-> v.lim, lims |-> v.lims,
                               base |-> mrev, expired |-> FALSE, landed |-> "no"]]
             \/ Fault /\ UNCHANGED pending
        ELSE UNCHANGED pending
@@ -253,13 +273,14 @@ Queue(actor, kind, id, v) ==
 \* `p` is the pending table without the row that a confirm removes.
 Keep(actor, kind, id, v, p) ==
     /\ op' = [pc |-> "live", actor |-> actor, kind |-> kind, id |-> id,
-              val |-> v.val, num |-> v.num,
+              val |-> v.val, num |-> v.num, lim |-> v.lim, lims |-> v.lims,
               prevVal |-> IF kind = "grant" THEN durGrant[id] ELSE None,
-              prevNum |-> IF kind = "limit" THEN durLimit ELSE 0,
+              prevNum |-> IF kind = "limit" THEN durLimit[v.lim] ELSE 0,
               prevCur |-> curWs]
     /\ durGrant' = IF kind = "grant" THEN [durGrant EXCEPT ![id] = v.val]
                    ELSE durGrant
-    /\ durLimit' = IF kind = "limit" THEN v.num ELSE durLimit
+    /\ durLimit' = IF kind = "limit" THEN [durLimit EXCEPT ![v.lim] = v.num]
+                   ELSE durLimit
     /\ curWs' = IF kind = "workspace" THEN v.val ELSE curWs
     /\ drev' = mrev + 1 /\ mrev' = mrev + 1
     /\ audits' = audits + 1
@@ -296,7 +317,7 @@ Confirm(id) ==
     /\ pending[id].kind # None
     /\ nOps' = nOps + 1
     /\ LET p == pending[id]
-           v == [val |-> p.val, num |-> p.num]
+           v == [val |-> p.val, num |-> p.num, lim |-> p.lim, lims |-> p.lims]
            nothing == UNCHANGED <<op, durGrant, durLimit, curWs, drev, mrev,
                                   audits, pending, dead, approvals,
                                   staleConfirmed, otherConfirmed,
@@ -344,7 +365,9 @@ ApplyLive ==
                  \/ mode = "serve" /\ refuse
             [] op.kind = "limit" ->
                  /\ LiveDone
-                 /\ liveLimit' = IF mode = "serve" THEN op.num ELSE liveLimit
+                 /\ liveLimit' = IF mode = "serve"
+                                 THEN [liveLimit EXCEPT ![op.lim] = op.num]
+                                 ELSE liveLimit
                  /\ UNCHANGED <<liveGrant, liveWs, liveCap, pol, durLimit>>
             [] op.kind = "workspace" ->
                  \/ /\ LiveDone
@@ -359,8 +382,8 @@ ApplyLive ==
                  \/ refuse
             [] op.kind = "policy" ->
                  \/ /\ LiveDone
-                    /\ pol' = [ws |-> op.val, limit |-> op.num]
-                    /\ durLimit' = 0
+                    /\ pol' = [ws |-> op.val, limit |-> op.lims]
+                    /\ durLimit' = NoLimits
                     /\ UNCHANGED node
                  \/ Fault /\ refuse
             [] OTHER ->
@@ -376,7 +399,9 @@ PutBack ==
     /\ durGrant' = IF op.kind = "grant"
                    THEN [durGrant EXCEPT ![op.id] = op.prevVal]
                    ELSE durGrant
-    /\ durLimit' = IF op.kind = "limit" THEN op.prevNum ELSE durLimit
+    /\ durLimit' = IF op.kind = "limit"
+                   THEN [durLimit EXCEPT ![op.lim] = op.prevNum]
+                   ELSE durLimit
     /\ curWs' = IF op.kind = "workspace" THEN op.prevCur ELSE curWs
     /\ audits' = audits - 1
     /\ op' = Idle
@@ -440,15 +465,15 @@ RevokeLive ==
 \* Administration::save_policy_settings -> save_policy_settings_in_store.
 \* The audit record is written first (record_change); when the save fails,
 \* fail_change marks it, and when that fails too the record stays. The
-\* save keeps the workspace and the limit in the stored policy and removes
-\* the stored limit of `aether.change`. The running node keeps its
-\* settings until it starts again.
+\* save keeps the workspace and the limits in the stored policy and removes
+\* the stored limit of `aether.change` of every limit. The running node
+\* keeps its settings until it starts again.
 SavePolicy(actor, v) ==
     /\ op.pc = "idle" /\ nOps < MaxOps
     /\ ~NeedsConfirmation(actor, "policy", v)
     /\ nOps' = nOps + 1
-    /\ \/ /\ pol' = [ws |-> v.val, limit |-> v.num]
-          /\ durLimit' = 0
+    /\ \/ /\ pol' = [ws |-> v.val, limit |-> v.lims]
+          /\ durLimit' = NoLimits
           /\ audits' = audits + 1
           /\ applies' = applies + 1
           /\ pending' = Landed(pending, "other")
@@ -482,7 +507,8 @@ Restart(m) ==
     /\ op' = Idle
     /\ mrev' = drev
     /\ liveGrant' = [id \in Ids |-> IF m = "serve" THEN StartGrant(id) ELSE None]
-    /\ liveLimit' = IF durLimit # 0 THEN durLimit ELSE pol.limit
+    /\ liveLimit' = [l \in LimIds |->
+                       IF durLimit[l] # 0 THEN durLimit[l] ELSE pol.limit[l]]
     /\ liveWs' = IF curWs # None THEN curWs ELSE pol.ws
     /\ liveCap' = FALSE
     /\ UNCHANGED <<store, nOps, approvals, dead, applies, flags>>
@@ -522,22 +548,22 @@ CapabilityNeedsUi == liveCap => capOk
 \* than a limit that a UI action asked for.
 StoredFromUi ==
     /\ curWs # None => curWs \in wsOk
-    /\ durLimit <= limOk
-    /\ pol.ws \in wsOk /\ pol.limit <= limOk
+    /\ \A l \in LimIds : durLimit[l] <= limOk[l]
+    /\ pol.ws \in wsOk /\ \A l \in LimIds : pol.limit[l] <= limOk[l]
 
-\* The live workspace and limit come from a UI action only. An MCP client
-\* moves the workspace or raises the limit neither with a change nor with
-\* UpdatePolicy and a node start.
+\* The live workspace and limits come from a UI action only. An MCP client
+\* moves the workspace or raises a limit (the running-task limit too)
+\* neither with a change nor with UpdatePolicy and a node start.
 LiveFromUi ==
     /\ liveWs \in wsOk
-    /\ liveLimit <= limOk
+    /\ \A l \in LimIds : liveLimit[l] <= limOk[l]
 
 \* When no request runs and no undo waits, the node and the store agree,
 \* also after a store write failed.
 Agree ==
     /\ \A id \in Ids : liveGrant[id] = StartGrant(id)
     /\ curWs # None => liveWs = curWs
-    /\ durLimit # 0 => liveLimit = durLimit
+    /\ \A l \in LimIds : durLimit[l] # 0 => liveLimit[l] = durLimit[l]
 LiveMatchesStore == (mode = "serve" /\ op.pc = "idle") => Agree
 
 \* A revoked grant is not live and not in the store, and a node start does

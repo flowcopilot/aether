@@ -83,3 +83,25 @@ test("the hooks of a cancelled run do not answer a later run with the same id", 
     { type: "result", id: "t1", text: "new answer" },
   ]);
 });
+
+test("two open tasks are answered and cancelled separately", () => {
+  const { runner, sent, calls } = setup();
+  runner.handle({ type: "task", id: "t1", instructions: "", text: "one" });
+  runner.handle({ type: "task", id: "t2", instructions: "", text: "two" });
+  assert.deepEqual(
+    calls.map((call) => call.id),
+    ["t1", "t2"],
+  );
+  // The answer of t2 ends only t2.
+  calls[1].hooks.deliver("two", "final");
+  assert.deepEqual(sent, [{ type: "result", id: "t2", text: "two" }]);
+  assert.equal(calls[0].signal.aborted, false);
+  // The cancel of t1 aborts only t1; the closed t2 is not touched again.
+  runner.handle({ type: "cancel", id: "t1" });
+  assert.deepEqual(sent.at(-1), { type: "cancelled", id: "t1" });
+  assert.equal(calls[0].signal.aborted, true);
+  assert.equal(calls[1].signal.aborted, false);
+  // A late answer of t1 changes nothing.
+  calls[0].hooks.deliver("late", "final");
+  assert.equal(sent.length, 2);
+});

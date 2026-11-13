@@ -55,6 +55,20 @@ impl Agent for NodeAgent {
             Self::Connected(agent) => agent.cancel(task_id),
         }
     }
+
+    fn forget(&self, task_id: &str) {
+        match self {
+            Self::Codex(agent) => agent.forget(task_id),
+            Self::Connected(agent) => agent.forget(task_id),
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        match self {
+            Self::Codex(agent) => agent.capacity(),
+            Self::Connected(agent) => agent.capacity(),
+        }
+    }
 }
 
 /// Writes `message` to `writer` as one line of JSON.

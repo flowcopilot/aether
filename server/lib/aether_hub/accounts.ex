@@ -5,14 +5,20 @@ defmodule AetherHub.Accounts do
   listed here, in one place.
   """
 
-  alias AetherHub.{Account, Blocks, Clock, Contacts, Invites, Listings, Names, OwnerLinks}
-  alias AetherHub.{Protocol, Repo, Versions}
+  alias AetherHub.{Account, AccountCache, Blocks, Clock, Contacts, Invites, Listings, Names}
+  alias AetherHub.{OwnerLinks, Protocol, Repo, Versions}
 
   @kinds Protocol.kinds()
   @service Protocol.kind(:service)
   @account_keys ["name", "kind", "searchable"]
 
   def get(endpoint), do: Repo.get(Account, endpoint)
+
+  @doc """
+  The account that a signed request acts as, from `AetherHub.AccountCache`.
+  Every write to the `accounts` table in this module invalidates the cache.
+  """
+  def fetch(endpoint), do: AccountCache.fetch(endpoint)
 
   def json(%Account{} = account) do
     %{
@@ -42,7 +48,13 @@ defmodule AetherHub.Accounts do
   name or the search setting of `account`. A rename keeps the current
   number when it is free for the new name.
   """
-  def put(endpoint, account, %{} = body) do
+  def put(endpoint, account, body) do
+    result = write(endpoint, account, body)
+    AccountCache.invalidate(endpoint)
+    result
+  end
+
+  defp write(endpoint, account, %{} = body) do
     with :ok <- valid_body(body) do
       # The values after the change: the body over the current ones.
       wanted = Map.merge(current(account), body)
@@ -56,7 +68,7 @@ defmodule AetherHub.Accounts do
     end
   end
 
-  def put(_endpoint, _account, _body), do: {:error, :invalid}
+  defp write(_endpoint, _account, _body), do: {:error, :invalid}
 
   defp valid_body(body) do
     valid =
@@ -86,16 +98,19 @@ defmodule AetherHub.Accounts do
         Repo.atomic(fn ->
           name = wanted["name"]
 
-          Repo.insert!(%Account{
-            endpoint: endpoint,
-            name: name,
-            number: number!(name, endpoint, Names.released_numbers(name, endpoint)),
-            kind: kind,
-            searchable: searchable,
-            created_at: Clock.now(),
-            version: 1
-          })
-          |> json()
+          account =
+            Repo.insert!(%Account{
+              endpoint: endpoint,
+              name: name,
+              number: number!(name, endpoint, Names.released_numbers(name, endpoint)),
+              kind: kind,
+              searchable: searchable,
+              created_at: Clock.now(),
+              version: 1
+            })
+
+          AccountCache.invalidate(endpoint)
+          json(account)
         end)
     end
   end
@@ -109,8 +124,11 @@ defmodule AetherHub.Accounts do
         rename(account, name, searchable)
 
       true ->
-        {:ok,
-         account |> Ecto.Changeset.change(searchable: searchable) |> Repo.update!() |> json()}
+        Repo.atomic(fn ->
+          changed = account |> Ecto.Changeset.change(searchable: searchable) |> Repo.update!()
+          AccountCache.invalidate(account.endpoint)
+          json(changed)
+        end)
     end
   end
 
@@ -125,6 +143,7 @@ defmodule AetherHub.Accounts do
         |> Ecto.Changeset.change(name: name, number: number, searchable: searchable)
         |> Repo.update!()
 
+      AccountCache.invalidate(endpoint)
       {json(renamed), [endpoint | Invites.counterparts(endpoint)]}
     end)
   end
@@ -147,15 +166,20 @@ defmodule AetherHub.Accounts do
   Its tag stays with the key, with its type; blocks stay too.
   """
   def delete(%Account{endpoint: endpoint} = account) do
-    Versions.commit(fn ->
-      touched = Enum.uniq(Invites.counterparts(endpoint) ++ Contacts.of(endpoint))
-      Names.release(account.name, account.number, endpoint, account.kind)
-      Invites.delete_for(endpoint)
-      Contacts.delete_for(endpoint)
-      end_named_rows(endpoint)
-      Repo.delete!(account)
-      {:ok, touched}
-    end)
+    result =
+      Versions.commit(fn ->
+        touched = Enum.uniq(Invites.counterparts(endpoint) ++ Contacts.of(endpoint))
+        Names.release(account.name, account.number, endpoint, account.kind)
+        Invites.delete_for(endpoint)
+        Contacts.delete_for(endpoint)
+        end_named_rows(endpoint)
+        Repo.delete!(account)
+        AccountCache.invalidate(endpoint)
+        {:ok, touched}
+      end)
+
+    AccountCache.invalidate(endpoint)
+    result
   end
 
   ## Blocks

@@ -10,11 +10,13 @@ use uuid::Uuid;
 use crate::discovery::{Record, validate_record};
 
 use super::{
-    server::{bind_node, read_frames, validate_response, write_frames},
+    server::{
+        a2a_error_message, bind_node, read_frames, validate_response, write_frames,
+    },
     wire::{
         A2aRequest, A2aTask, A2aTaskStatus, ALPN, EVENT_CURSOR, EVENT_SEQUENCE, Frame,
-        FrameKind, HANDSHAKE_TIMEOUT, MORE_EVENTS, STREAM_TIMEOUT, TASK_POLL_DEADLINE,
-        TASK_POLL_INTERVAL, TransportError,
+        FrameKind, HANDSHAKE_TIMEOUT, MORE_EVENTS, RETRY_AFTER_MS, STREAM_TIMEOUT,
+        TASK_POLL_DEADLINE, TransportError, overload_retry_wait, task_poll_delay,
     },
 };
 
@@ -280,7 +282,7 @@ pub fn response_more_events_remain(response: &[Frame]) -> bool {
     )
 }
 
-async fn request_with_polling_on(
+pub(super) async fn request_with_polling_on(
     endpoint: &iroh::Endpoint,
     remote: iroh::EndpointAddr,
     mut request: Frame,
@@ -297,6 +299,9 @@ async fn request_with_polling_on(
     // last poll's response.
     let mut collected: Vec<Frame> = Vec::new();
     let mut link = Link::default();
+    let mut polls: u32 = 0;
+    let mut overloaded_since: Option<std::time::Instant> = None;
+    let mut overload_retries: u32 = 0;
 
     loop {
         payload.idempotency_key = idempotency_key.clone();
@@ -308,6 +313,27 @@ async fn request_with_polling_on(
         request.payload =
             serde_json::to_value(&payload).map_err(|_| TransportError::BadFrame)?;
         let response = link.exchange(endpoint, remote.clone(), request.clone()).await?;
+        // A host whose per-peer rate limit shed the exchange admitted nothing
+        // and sent no events. Every exchange carries the same idempotency
+        // key, so sending it again a little later is safe; after
+        // `OVERLOAD_RETRY_WINDOW` the error goes to the caller. A full queue
+        // is not retried: the host rejects that request at once, by design.
+        // No wait passes the end of the window or of `TASK_POLL_DEADLINE`.
+        if is_rate_limited(&response) {
+            let since = *overloaded_since.get_or_insert_with(std::time::Instant::now);
+            if let Some(wait) = overload_retry_wait(
+                overload_retries,
+                since.elapsed(),
+                TASK_POLL_DEADLINE.saturating_sub(started.elapsed()),
+            ) {
+                tokio::time::sleep(wait).await;
+                overload_retries = overload_retries.saturating_add(1);
+                continue;
+            }
+        } else {
+            overloaded_since = None;
+            overload_retries = 0;
+        }
         let is_error =
             response.last().is_some_and(|frame| frame.kind == FrameKind::Error);
         last_sequence = last_sequence.max(response_last_event_sequence(&response));
@@ -329,8 +355,20 @@ async fn request_with_polling_on(
         if started.elapsed() >= TASK_POLL_DEADLINE {
             return Err(TransportError::Timeout);
         }
-        tokio::time::sleep(TASK_POLL_INTERVAL).await;
+        // Poll again soon after the submit and back off to the steady
+        // rate; the wire protocol is unchanged, so old hosts still work.
+        tokio::time::sleep(task_poll_delay(polls)).await;
+        polls = polls.saturating_add(1);
     }
+}
+
+/// Whether `response` is only the "node overloaded" error that the host's
+/// per-peer rate limit sends: the one with `RETRY_AFTER_MS` in its `data`.
+pub(crate) fn is_rate_limited(response: &[Frame]) -> bool {
+    matches!(response, [frame] if frame.kind == FrameKind::Error
+        && frame.payload.get("message").and_then(serde_json::Value::as_str)
+            == Some(a2a_error_message(&TransportError::Overloaded))
+        && frame.payload.pointer(&format!("/data/{RETRY_AFTER_MS}")).is_some())
 }
 
 async fn exchange_stream(

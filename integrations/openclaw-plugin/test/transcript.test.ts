@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { NodeSocket } from "../src/node-socket.ts";
-import { parseNodeLine } from "../src/protocol.ts";
+import { MAX_TASKS, parseNodeLine } from "../src/protocol.ts";
 import { TaskRunner } from "../src/task-runner.ts";
 import type { Dispatch } from "../src/task-runner.ts";
 import { FakeNode, noise, transcript, waitFor } from "./fake-node.ts";
@@ -47,7 +47,12 @@ async function replay(steps: any[], outcomes: Record<string, string>): Promise<v
         const message = step.agent;
         if (message.type === "ready") {
           await fake.accept();
-          assert.deepEqual(await fake.read(), message);
+          // The plugin says its own `max_tasks`, not the one of the transcript.
+          assert.deepEqual(await fake.read(), {
+            type: message.type,
+            protocol: message.protocol,
+            max_tasks: MAX_TASKS,
+          });
           continue;
         }
         // The host answers only after the plugin has read every node line.

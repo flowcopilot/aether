@@ -124,7 +124,38 @@ pub trait Agent {
     /// for a turn that has not started drops it here, so that the cancel
     /// does not stop a later turn of the same task.
     fn forget(&self, _task_id: &str) {}
+    /// How many turns this agent runs at once, whatever the owner's limit
+    /// says. The node never runs more. An adapter that cannot run turns
+    /// side by side (they would share a folder, or the agent takes one task
+    /// at a time) says 1.
+    fn capacity(&self) -> usize {
+        usize::MAX
+    }
 }
+
+/// One turn that the executor checked and prepared. It owns its agent
+/// handle, so it runs without the executor: other turns run at the same
+/// time.
+pub struct PreparedTurn<P> {
+    agent: P,
+    ctx: TurnContext,
+    max_context_tokens: u32,
+}
+
+impl<P: Agent> PreparedTurn<P> {
+    /// Confirms the start with `on_confirmed_start`, then runs the turn.
+    /// The start is confirmed once, before the agent gets the task.
+    pub fn run(
+        mut self,
+        on_confirmed_start: &mut dyn FnMut() -> Result<(), ExecutionError>,
+        events: &mut dyn FnMut(ExecutionEvent),
+    ) -> Result<String, ExecutionError> {
+        on_confirmed_start()?;
+        let result = self.agent.start_turn_with_events(&self.ctx, events)?;
+        bounded_output(result, self.max_context_tokens)
+    }
+}
+
 pub struct Executor<P> {
     process: P,
     allowed_root: PathBuf,
@@ -151,12 +182,9 @@ impl<P: Agent> Executor<P> {
         self.allowed_root.canonicalize().map_err(|_| ExecutionError::Path)
     }
 
-    pub fn execute_with_confirmed_start(
-        &mut self,
-        task: &Task,
-        on_confirmed_start: &mut dyn FnMut() -> Result<(), ExecutionError>,
-        events: &mut dyn FnMut(ExecutionEvent),
-    ) -> Result<String, ExecutionError> {
+    /// Checks `task` against the limits and the workspace, and builds the
+    /// context of its turn.
+    fn turn_context(&self, task: &Task) -> Result<TurnContext, ExecutionError> {
         if self.max_context_tokens == 0
             || self.max_seconds == 0
             || input_tokens(task) > self.max_context_tokens
@@ -175,20 +203,27 @@ impl<P: Agent> Executor<P> {
         let deadline = Instant::now()
             .checked_add(std::time::Duration::from_secs(self.max_seconds))
             .ok_or(ExecutionError::Limits)?;
-        let ctx = TurnContext {
+        Ok(TurnContext {
             task_id: task.id.clone(),
             skill: task.skill.clone(),
             text: task.remote_text.clone(),
             workspace,
             deadline,
-        };
+        })
+    }
+
+    pub fn execute_with_confirmed_start(
+        &mut self,
+        task: &Task,
+        on_confirmed_start: &mut dyn FnMut() -> Result<(), ExecutionError>,
+        events: &mut dyn FnMut(ExecutionEvent),
+    ) -> Result<String, ExecutionError> {
+        let ctx = self.turn_context(task)?;
         on_confirmed_start()?;
         let result = self.process.start_turn_with_events(&ctx, events)?;
-        if token_count(&result) > self.max_context_tokens {
-            return Err(ExecutionError::Limits);
-        }
-        Ok(result)
+        bounded_output(result, self.max_context_tokens)
     }
+
     pub fn cancel(&self, task_id: &str) {
         self.process.cancel(task_id);
     }
@@ -208,6 +243,22 @@ impl<P: Agent> Executor<P> {
 }
 
 impl<P: Agent + Clone> Executor<P> {
+    /// Checks `task` and takes a handle of the agent for its turn. The
+    /// caller runs the turn without the executor, so turns of several tasks
+    /// run at the same time; the executor is needed only for this call.
+    ///
+    /// # Errors
+    ///
+    /// The `ExecutionError` of a task that the limits or the workspace
+    /// refuse.
+    pub fn prepare_turn(&self, task: &Task) -> Result<PreparedTurn<P>, ExecutionError> {
+        Ok(PreparedTurn {
+            ctx: self.turn_context(task)?,
+            agent: self.process.clone(),
+            max_context_tokens: self.max_context_tokens,
+        })
+    }
+
     #[must_use]
     pub fn cancellation_handle(&self) -> P {
         self.process.clone()
@@ -217,6 +268,17 @@ impl<P: Agent + Clone> Executor<P> {
     pub fn workspace(&self) -> Workspace {
         self.workspace.clone()
     }
+}
+
+/// `result`, unless it is longer than `max_context_tokens`.
+fn bounded_output(
+    result: String,
+    max_context_tokens: u32,
+) -> Result<String, ExecutionError> {
+    if token_count(&result) > max_context_tokens {
+        return Err(ExecutionError::Limits);
+    }
+    Ok(result)
 }
 
 fn input_tokens(task: &Task) -> u32 {

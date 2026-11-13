@@ -151,19 +151,29 @@ defmodule AetherHub.OwnerLinks do
   end
 
   @doc "The full name of the active owner of the service agent `service`, or `nil`."
-  def active_owner(service) do
+  def active_owner(service), do: Map.get(active_owners([service]), service)
+
+  @doc """
+  The full names of the active owners of the service agents in `services`,
+  as a map from the service endpoint, in one query. A service without an
+  active owner is not a key.
+  """
+  def active_owners([]), do: %{}
+
+  def active_owners(services) when is_list(services) do
     from(l in live(),
       join: p in Account,
       on: p.endpoint == l.personal_endpoint,
-      where: l.service_endpoint == ^service and not is_nil(l.confirm_signature),
-      select: p,
-      limit: 1
+      where: l.service_endpoint in ^services and not is_nil(l.confirm_signature),
+      order_by: [asc: l.created_at, asc: l.id],
+      select: {l.service_endpoint, p.name, p.number}
     )
-    |> Repo.one()
-    |> case do
-      nil -> nil
-      personal -> Account.full_name(personal)
-    end
+    |> Repo.all()
+    # A service has at most one active owner; the oldest link wins if a bad
+    # row ever gives it two.
+    |> Enum.reduce(%{}, fn {service, name, number}, owners ->
+      Map.put_new(owners, service, Names.format(name, number))
+    end)
   end
 
   @doc "Removes the expired links, and the claims that waited too long."
