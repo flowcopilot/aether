@@ -14,7 +14,7 @@ use super::{
     wire::{
         A2aRequest, A2aTask, A2aTaskStatus, ALPN, EVENT_CURSOR, EVENT_SEQUENCE, Frame,
         FrameKind, HANDSHAKE_TIMEOUT, MORE_EVENTS, STREAM_TIMEOUT, TASK_POLL_DEADLINE,
-        TASK_POLL_INTERVAL, TransportError,
+        TransportError, task_poll_delay,
     },
 };
 
@@ -297,6 +297,7 @@ async fn request_with_polling_on(
     // last poll's response.
     let mut collected: Vec<Frame> = Vec::new();
     let mut link = Link::default();
+    let mut polls: u32 = 0;
 
     loop {
         payload.idempotency_key = idempotency_key.clone();
@@ -329,7 +330,10 @@ async fn request_with_polling_on(
         if started.elapsed() >= TASK_POLL_DEADLINE {
             return Err(TransportError::Timeout);
         }
-        tokio::time::sleep(TASK_POLL_INTERVAL).await;
+        // Poll again soon after the submit and back off to the steady
+        // rate; the wire protocol is unchanged, so old hosts still work.
+        tokio::time::sleep(task_poll_delay(polls)).await;
+        polls = polls.saturating_add(1);
     }
 }
 

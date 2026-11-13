@@ -193,9 +193,9 @@ where
     }
 
     fn notify_task(&self, task_id: &str) {
-        if self.event_sender.send(task_id.to_owned()).is_err() {
-            eprintln!("aether: scheduler event broadcast failed for {task_id}");
-        }
+        // `send` fails only when no receiver is subscribed. That is normal:
+        // a poll that nobody waits on needs no wake-up.
+        let _ = self.event_sender.send(task_id.to_owned());
     }
 
     /// Ends a leased task that will not run with `end`
@@ -483,11 +483,8 @@ where
                             event_error = true;
                             return;
                         }
-                        if event_sender.send(dispatch_task_id.clone()).is_err() {
-                            eprintln!(
-                                "aether: scheduler event broadcast failed for {dispatch_task_id}"
-                            );
-                        }
+                        // No receiver is normal; see `notify_task`.
+                        let _ = event_sender.send(dispatch_task_id.clone());
                     },
                 )
             },

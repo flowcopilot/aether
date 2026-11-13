@@ -279,6 +279,7 @@ struct McpServe {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    aether::node_runtime::install_crypto_provider();
     match Arguments::parse().command {
         CliCommand::Node(node) => Box::pin(run_node(*node)).await,
         CliCommand::Control(process) => run_control(process).await,
@@ -327,7 +328,7 @@ async fn run_control(control: Control) -> ExitCode {
     let handle = axum_server::Handle::new();
     let shutdown = handle.clone();
     tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
+        if aether::node_runtime::shutdown_signal().await.is_ok() {
             shutdown.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
         }
     });

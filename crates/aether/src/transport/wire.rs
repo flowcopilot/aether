@@ -43,12 +43,26 @@ pub(crate) const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 /// close would), so this does not truncate an already-`finish()`ed
 /// response.
 pub(crate) const RESPONSE_LINGER: Duration = Duration::from_secs(2);
-/// At most half of `PEER_REQUESTS_PER_SECOND`, so one polling task never
-/// trips the node's per-peer rate limit and a second concurrent task from
-/// the same peer still fits under it.
+/// The longest wait between two polls of one task: at most half of
+/// `PEER_REQUESTS_PER_SECOND`, so one polling task never trips the node's
+/// per-peer rate limit and a second concurrent task from the same peer
+/// still fits under it.
 pub(crate) const TASK_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// The wait before the first re-poll. A task that finishes within moments
+/// of its submit answers the first re-poll instead of waiting out
+/// `TASK_POLL_INTERVAL`. Each later wait doubles, up to
+/// `TASK_POLL_INTERVAL`, so a long task polls at the steady rate.
+pub(crate) const TASK_POLL_INITIAL: Duration = Duration::from_millis(20);
 pub(crate) const TASK_POLL_DEADLINE: Duration = Duration::from_secs(120);
 pub(crate) const PEER_REQUESTS_PER_SECOND: u32 = 8;
+
+/// The wait before the next poll, after `polls_so_far` re-polls:
+/// `TASK_POLL_INITIAL`, doubled for each earlier re-poll and capped at
+/// `TASK_POLL_INTERVAL`.
+pub(crate) fn task_poll_delay(polls_so_far: u32) -> Duration {
+    let factor = 1u32.checked_shl(polls_so_far).unwrap_or(u32::MAX);
+    TASK_POLL_INITIAL.saturating_mul(factor).min(TASK_POLL_INTERVAL)
+}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
