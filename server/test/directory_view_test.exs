@@ -196,6 +196,30 @@ defmodule AetherHub.DirectoryViewTest do
       assert count <= 5
     end
 
+    test "tells the age of the cached view, so a cache counts the 15 seconds from the build" do
+      DirectoryCache.clear()
+      assert Plug.Conn.get_resp_header(public_request(:get, "/directory.json"), "age") == ["0"]
+
+      # A view that is a few seconds old says so; the clock of the cache is
+      # in milliseconds and cannot be moved, so wait for one whole second.
+      Process.sleep(1_100)
+      assert Plug.Conn.get_resp_header(public_request(:get, "/directory.json"), "age") == ["1"]
+    end
+
+    test "answers 503 when the cache does not answer, and works again after it restarts" do
+      DirectoryCache.clear()
+      :ok = Supervisor.terminate_child(AetherHub.Supervisor, AetherHub.DirectoryCache)
+      on_exit(fn -> Supervisor.restart_child(AetherHub.Supervisor, AetherHub.DirectoryCache) end)
+
+      conn = public_request(:get, "/directory.json")
+      assert conn.status == 503
+      assert json(conn) == %{"error" => "unavailable"}
+      assert Plug.Conn.get_resp_header(conn, "cache-control") == ["no-store"]
+
+      {:ok, _} = Supervisor.restart_child(AetherHub.Supervisor, AetherHub.DirectoryCache)
+      assert public_request(:get, "/directory.json").status == 200
+    end
+
     test "keeps its shape and its cache header" do
       conn = public_request(:get, "/directory.json")
 
