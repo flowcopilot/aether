@@ -186,7 +186,7 @@ impl ChangeRequest {
         let expires_at = SystemTime::now()
             .checked_add(std::time::Duration::from_secs(300))
             .ok_or(AdminError::InvalidField("expires_at"))?;
-        if matches!(self, Self::Limit { limit: 0, .. }) {
+        if matches!(&self, Self::Limit { id, limit } if !id.accepts(*limit)) {
             return Err(AdminError::InvalidField("limit"));
         }
         valid(self.id(), "id")?;
@@ -838,7 +838,6 @@ impl Administration {
     /// stored policy. A policy that cannot be read proves nothing, so it
     /// counts as wider.
     fn policy_is_wider(&self, settings: &crate::policy::PolicySettings) -> bool {
-        use aether_core::limits::QueueLimitId::{Global, PerPeer};
         let Ok(Some(current)) = crate::policy::policy_settings_in_store(&self.store)
         else {
             return true;
@@ -846,8 +845,9 @@ impl Administration {
         settings.workspace != current.workspace
             || settings.max_context_tokens > current.max_context_tokens
             || settings.max_seconds > current.max_seconds
-            || settings.queue.get(Global) > current.queue.get(Global)
-            || settings.queue.get(PerPeer) > current.queue.get(PerPeer)
+            || aether_core::limits::QueueLimitId::ALL
+                .into_iter()
+                .any(|id| settings.queue.get(id) > current.queue.get(id))
     }
 
     /// Confirms a durably pending change the same way `apply_now` applies an
@@ -1264,6 +1264,45 @@ mod tests {
                 id: "queue_per_peer".to_owned(),
                 kind: "limit".to_owned()
             }]
+        );
+    }
+
+    #[test]
+    fn the_running_limit_follows_the_rules_of_the_queue_limits() {
+        use aether_core::limits::{MAX_RUNNING_TASKS, QueueLimitId::Running};
+        // A decrease applies at once, with an audit entry like any limit.
+        let (_directory, mut administration) = in_temp_dir();
+        let node = Arc::new(FakeNode::default().with_queue_limit(4));
+        administration.set_live(node.clone());
+        administration
+            .submit(&limit_change(Running, 2), aether_store::AuditActor::Mcp, false)
+            .expect("a lower running limit must apply");
+        assert_eq!(node.calls(), ["limit running_tasks 2"]);
+        assert!(administration.pending().expect("pending").is_empty());
+        // An increase waits for the owner in the UI.
+        let (_directory, mut administration) = in_temp_dir();
+        administration.set_live(Arc::new(FakeNode::default().with_queue_limit(1)));
+        administration
+            .submit(&limit_change(Running, 2), aether_store::AuditActor::Mcp, false)
+            .expect("a higher running limit must queue");
+        assert_eq!(
+            administration.pending().expect("pending"),
+            [PendingChange {
+                id: "running_tasks".to_owned(),
+                kind: "limit".to_owned()
+            }]
+        );
+        // Zero and more than the maximum are not limits.
+        for limit in [0, MAX_RUNNING_TASKS.saturating_add(1)] {
+            assert!(matches!(
+                ChangeRequest::Limit { id: Running, limit }.into_change(),
+                Err(AdminError::InvalidField("limit"))
+            ));
+        }
+        assert!(
+            ChangeRequest::Limit { id: Running, limit: MAX_RUNNING_TASKS }
+                .into_change()
+                .is_ok()
         );
     }
 

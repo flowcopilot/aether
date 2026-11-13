@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, SyncSender},
     },
     thread::{self, JoinHandle},
@@ -12,7 +12,7 @@ use std::{
 
 use aether_core::{
     Claim, Denial, EndpointId, PolicyEngine, Request, Scope, ScopeKind, TrustProvider,
-    limits::QueueLimitId,
+    limits::{DEFAULT_RUNNING_TASKS, QueueLimitId},
 };
 use aether_store::{NodeStore, QueueLimits, StoreError, TaskState};
 use tokio::sync::broadcast;
@@ -90,10 +90,12 @@ pub(crate) fn timestamp_after(duration: Duration) -> i64 {
 }
 
 mod admission;
+#[cfg(test)]
+mod running_tests;
 mod scheduler;
 mod worker;
 
-use scheduler::SchedulerContext;
+use scheduler::{RunningTasks, SchedulerContext};
 use worker::StoreWorker;
 
 pub struct ProofNode<T, P> {
@@ -107,8 +109,10 @@ pub struct ProofNode<T, P> {
     shutdown: Arc<AtomicBool>,
     scheduler_wake: SyncSender<()>,
     scheduler_thread: Mutex<Option<JoinHandle<()>>>,
-    active_task: Arc<Mutex<Option<String>>>,
-    execution_thread: Arc<Mutex<Option<JoinHandle<()>>>>,
+    running: Arc<RunningTasks>,
+    /// How many tasks the owner lets the node run at once.
+    running_limit: Arc<AtomicUsize>,
+    execution_threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
     dispatch_serial: Arc<Mutex<()>>,
     executor: Arc<Mutex<Executor<P>>>,
     workspace: Workspace,
@@ -171,9 +175,11 @@ where
         let canceller = executor.cancellation_handle();
         let (event_sender, _) = broadcast::channel(64);
         let shutdown = Arc::new(AtomicBool::new(false));
-        let executing = Arc::new(AtomicBool::new(false));
-        let active_task = Arc::new(Mutex::new(None));
-        let execution_thread = Arc::new(Mutex::new(None));
+        let running = Arc::new(RunningTasks::default());
+        let running_limit = Arc::new(AtomicUsize::new(
+            usize::try_from(DEFAULT_RUNNING_TASKS).unwrap_or(1),
+        ));
+        let execution_threads = Arc::new(Mutex::new(Vec::new()));
         let dispatch_serial = Arc::new(Mutex::new(()));
         let (scheduler_wake, scheduler_wake_rx) = mpsc::sync_channel(64);
         let executor = Arc::new(Mutex::new(executor));
@@ -184,9 +190,9 @@ where
             canceller: canceller.clone(),
             event_sender: event_sender.clone(),
             shutdown: Arc::clone(&shutdown),
-            executing: Arc::clone(&executing),
-            active_task: Arc::clone(&active_task),
-            execution_thread: Arc::clone(&execution_thread),
+            running: Arc::clone(&running),
+            running_limit: Arc::clone(&running_limit),
+            execution_threads: Arc::clone(&execution_threads),
             workspace: workspace.clone(),
             dispatch_serial: Arc::clone(&dispatch_serial),
             scheduler_wake: scheduler_wake.clone(),
@@ -208,8 +214,9 @@ where
             shutdown,
             scheduler_wake,
             scheduler_thread: Mutex::new(Some(scheduler_thread)),
-            active_task,
-            execution_thread,
+            running,
+            running_limit,
+            execution_threads,
             dispatch_serial,
             executor,
             workspace,
@@ -222,11 +229,7 @@ where
         }
         let started = Instant::now();
         let _ = self.scheduler_wake.try_send(());
-        if let Ok(active) = self.active_task.lock()
-            && let Some(task_id) = active.as_deref()
-        {
-            let task_id = task_id.to_owned();
-            drop(active);
+        for task_id in self.running.active() {
             let _ = self.cancel(&task_id);
         }
         // Stop the scheduler loop first so it leases no further work, then
@@ -239,21 +242,24 @@ where
             let _ = handle.join();
         }
         // With the scheduler stopped, no new execution can start. Wait for
-        // the last execution (and, transitively, lease-renewal) thread within
-        // the deadline so storage never closes while it is still writing the
-        // task's final state. Past the deadline the thread is left to finish
-        // on its own rather than block shutdown forever.
-        let execution =
-            self.execution_thread.lock().ok().and_then(|mut slot| slot.take());
-        if let Some(handle) = execution {
-            while !handle.is_finished() && started.elapsed() < SHUTDOWN_DEADLINE {
-                if let Ok(active) = self.active_task.lock()
-                    && let Some(task_id) = active.as_deref()
-                {
-                    self.canceller.cancel(task_id);
-                }
-                thread::sleep(Duration::from_millis(20));
+        // every execution (and, transitively, lease-renewal) thread within
+        // the deadline so storage never closes while one is still writing
+        // its task's final state. Past the deadline the threads are left to
+        // finish on their own rather than block shutdown forever.
+        let executions = self
+            .execution_threads
+            .lock()
+            .map(|mut threads| std::mem::take(&mut *threads))
+            .unwrap_or_default();
+        while executions.iter().any(|handle| !handle.is_finished())
+            && started.elapsed() < SHUTDOWN_DEADLINE
+        {
+            for task_id in self.running.active() {
+                self.canceller.cancel(&task_id);
             }
+            thread::sleep(Duration::from_millis(20));
+        }
+        for handle in executions {
             if handle.is_finished() {
                 let _ = handle.join();
             }
@@ -291,23 +297,52 @@ where
         id: QueueLimitId,
         limit: u32,
     ) -> Result<(), ProofError> {
-        let limit = usize::try_from(limit).map_err(|_| ProofError::Internal)?;
+        let value = usize::try_from(limit).map_err(|_| ProofError::Internal)?;
         let mut limits = self.limits.lock().map_err(|_| ProofError::Internal)?;
         match id {
-            QueueLimitId::Global => limits.global = limit,
-            QueueLimitId::PerPeer => limits.per_peer = limit,
+            QueueLimitId::Global => limits.global = value,
+            QueueLimitId::PerPeer => limits.per_peer = value,
+            QueueLimitId::Running => {
+                drop(limits);
+                return self.set_running_limit(value);
+            }
         }
         drop(limits);
         Ok(())
     }
 
+    /// Sets how many tasks the node runs at once. It takes effect at the
+    /// next dispatch, without a restart. A lower value never stops a task
+    /// that runs: no task starts until fewer than `limit` run.
+    ///
+    /// # Errors
+    ///
+    /// `ProofError::Internal` when `limit` is not one that the owner can set.
+    pub fn set_running_limit(&self, limit: usize) -> Result<(), ProofError> {
+        if !u32::try_from(limit).is_ok_and(|value| QueueLimitId::Running.accepts(value))
+        {
+            return Err(ProofError::Internal);
+        }
+        self.running_limit.store(limit, Ordering::Release);
+        // A higher limit may let a waiting task start now.
+        let _ = self.scheduler_wake.try_send(());
+        Ok(())
+    }
+
     pub fn current_queue_limit(&self, id: QueueLimitId) -> Result<u32, ProofError> {
-        let limits = self.queue_limits()?;
         let limit = match id {
-            QueueLimitId::Global => limits.global,
-            QueueLimitId::PerPeer => limits.per_peer,
+            QueueLimitId::Global => self.queue_limits()?.global,
+            QueueLimitId::PerPeer => self.queue_limits()?.per_peer,
+            QueueLimitId::Running => self.running_limit.load(Ordering::Acquire),
         };
         u32::try_from(limit).map_err(|_| ProofError::Internal)
+    }
+
+    /// How many tasks the node runs at once now: the owner's limit, or the
+    /// agent's own capacity when that is lower.
+    #[must_use]
+    pub fn effective_running_limit(&self) -> usize {
+        self.running_limit.load(Ordering::Acquire).min(self.canceller.capacity()).max(1)
     }
 
     /// Moves the executor and its agent to `path`. The executor
@@ -603,7 +638,7 @@ mod tests {
         fn cancel(&self, _task_id: &str) {}
     }
 
-    fn test_grant(peer: &str, endpoint: &EndpointId) -> Grant {
+    pub(super) fn test_grant(peer: &str, endpoint: &EndpointId) -> Grant {
         let now = SystemTime::now();
         Grant {
             id: GrantId::new(format!("grant-{peer}")),
@@ -723,7 +758,7 @@ mod tests {
     }
 
     /// Admits a task as an Iroh caller and returns its id.
-    fn admit_task<T, P>(
+    pub(super) fn admit_task<T, P>(
         node: &ProofNode<T, P>,
         request: &Request,
         claim: &Claim,
@@ -782,7 +817,7 @@ mod tests {
 
     /// Polls instead of sleeping a fixed time: a loaded CI runner can take
     /// far longer than any fixed sleep to reach the state under test.
-    fn wait_until(what: &str, condition: impl Fn() -> bool) {
+    pub(super) fn wait_until(what: &str, condition: impl Fn() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !condition() {
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
@@ -790,7 +825,10 @@ mod tests {
         }
     }
 
-    fn test_request(id: &str, peer: &str) -> (Request, Claim, EndpointId, Task) {
+    pub(super) fn test_request(
+        id: &str,
+        peer: &str,
+    ) -> (Request, Claim, EndpointId, Task) {
         let endpoint = EndpointId::new(format!("endpoint-{peer}"));
         let request = Request {
             id: RequestId::new(format!("request-{id}")),

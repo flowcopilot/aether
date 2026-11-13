@@ -14,7 +14,7 @@ database. `--policy` selects another file for this one-time import. After that,
 the database is the policy source and changes to the old file have no effect.
 
 On the **Advanced** page, **Task policy** sets the task folder root, context
-and time limits, and queue limits. The folder must exist. Restart the node
+and time limits, queue limits, and how many tasks run at once. The folder must exist. Restart the node
 after you save a policy change. **Permissions** links to the invite and access
 group controls on the Sharing page.
 
@@ -27,7 +27,8 @@ The default policy has these values:
   "maxContextTokens": 20000,
   "maxSeconds": 120,
   "queueGlobal": 1,
-  "queuePerPeer": 1
+  "queuePerPeer": 1,
+  "runningTasks": 1
 }
 ```
 
@@ -80,7 +81,8 @@ endpoint ID. The default `friends` group stays available for new invites.
 The same node data directory serves MCP tools for these groups, task policy,
 relay and hub URLs, your hub name, invites, and direct access. Use
 `aether.settings.get` to read the saved policy and URLs. Use
-`aether.settings.update_policy` to edit task limits or the task folder root.
+`aether.settings.update_policy` to edit task limits (`queue_global`, `queue_per_peer`,
+`running_tasks`) or the task folder root.
 A new task folder root or a higher limit waits until you confirm it under
 Pending changes on the Advanced page. Policy changes need a node restart.
 `aether.settings.set_relay` changes a running node at once, and
@@ -215,6 +217,8 @@ list the agent again after a rename or a change of the card text.
 - People who get access by request share the task queue with your friends:
   the node keeps `queueGlobal` waiting tasks in all and `queuePerPeer` for
   each person. Change them in **Advanced**.
+  They wait for a free place to run: the node runs `runningTasks` tasks at the
+  same time, one by default (see [Tasks that run at once](configuration.md#tasks-that-run-at-once)).
 
 ## Access requests
 

@@ -1,8 +1,8 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, RecvTimeoutError, SyncSender},
     },
     thread::{self, JoinHandle},
@@ -89,36 +89,136 @@ fn settlement(run: RunReport, cancelled: impl FnOnce() -> bool) -> Option<Settle
     }
 }
 
-/// Holds the scheduler's single execution slot for one task. Dropping it
-/// clears the active task if it still names this one, frees the slot and
-/// wakes the scheduler, on every exit of the run.
-struct ExecutionSlot {
-    executing: Arc<AtomicBool>,
-    active_task: Arc<Mutex<Option<String>>>,
-    scheduler_wake: SyncSender<()>,
+/// The execution slots of the scheduler: how many runs hold one, and which
+/// tasks they run. A run takes a slot before the scheduler leases its task,
+/// and gives it back when it ends, whatever the end.
+#[derive(Default)]
+pub(in crate::proof) struct RunningTasks {
+    inner: Mutex<Running>,
+}
+
+#[derive(Default)]
+struct Running {
+    /// Slots that are taken: runs that are leased, being prepared or running.
+    reserved: usize,
+    /// Each run that leased a task and has not ended, by execution ID.
+    runs: BTreeMap<String, Run>,
+}
+
+struct Run {
     task_id: String,
+    /// The run is registered and can be cancelled.
+    active: bool,
+}
+
+impl RunningTasks {
+    /// Takes a slot unless `limit` slots are taken. A lowered limit never
+    /// stops a run: it only refuses new slots until fewer are taken.
+    pub(in crate::proof) fn reserve(&self, limit: usize) -> bool {
+        let Ok(mut running) = self.inner.lock() else { return false };
+        if running.reserved >= limit {
+            return false;
+        }
+        running.reserved = running.reserved.saturating_add(1);
+        true
+    }
+
+    /// Gives back a slot that did not become a run.
+    pub(in crate::proof) fn release(&self) {
+        if let Ok(mut running) = self.inner.lock() {
+            running.reserved = running.reserved.saturating_sub(1);
+        }
+    }
+
+    /// Records that the slot now holds the run `execution_id` of `task_id`.
+    pub(in crate::proof) fn begin(&self, execution_id: &str, task_id: &str) {
+        if let Ok(mut running) = self.inner.lock() {
+            running.runs.insert(
+                execution_id.to_owned(),
+                Run { task_id: task_id.to_owned(), active: false },
+            );
+        }
+    }
+
+    fn set_active(&self, execution_id: &str, active: bool) {
+        if let Ok(mut running) = self.inner.lock()
+            && let Some(run) = running.runs.get_mut(execution_id)
+        {
+            run.active = active;
+        }
+    }
+
+    /// The run `execution_id` ended: its slot is free.
+    fn end(&self, execution_id: &str) {
+        if let Ok(mut running) = self.inner.lock() {
+            running.runs.remove(execution_id);
+            running.reserved = running.reserved.saturating_sub(1);
+        }
+    }
+
+    /// The tasks whose run can be cancelled now.
+    pub(in crate::proof) fn active(&self) -> Vec<String> {
+        let tasks = self.inner.lock().map_or_else(
+            |_| BTreeSet::new(),
+            |running| {
+                running
+                    .runs
+                    .values()
+                    .filter(|run| run.active)
+                    .map(|run| run.task_id.clone())
+                    .collect::<BTreeSet<_>>()
+            },
+        );
+        tasks.into_iter().collect()
+    }
+
+    /// The tasks that a run holds from its lease to its end. The scheduler
+    /// leases none of them again: a task that recovery gave back to the
+    /// queue while its first run still lives would get a second run, and the
+    /// first run's lost lease would cancel the second.
+    pub(in crate::proof) fn tasks_in_flight(&self) -> Vec<String> {
+        let tasks = self.inner.lock().map_or_else(
+            |_| BTreeSet::new(),
+            |running| {
+                running
+                    .runs
+                    .values()
+                    .map(|run| run.task_id.clone())
+                    .collect::<BTreeSet<_>>()
+            },
+        );
+        tasks.into_iter().collect()
+    }
+
+    /// How many slots are taken.
+    #[cfg(test)]
+    pub(in crate::proof) fn reserved(&self) -> usize {
+        self.inner.lock().map_or(0, |running| running.reserved)
+    }
+}
+
+/// Holds one execution slot for one run. Dropping it ends the run: it leaves
+/// the run set, the slot is free and the scheduler wakes, on every exit of
+/// the run.
+struct ExecutionSlot {
+    running: Arc<RunningTasks>,
+    scheduler_wake: SyncSender<()>,
+    execution_id: String,
 }
 
 impl ExecutionSlot {
     fn activate(&self) {
-        if let Ok(mut active) = self.active_task.lock() {
-            *active = Some(self.task_id.clone());
-        }
+        self.running.set_active(&self.execution_id, true);
     }
 
     fn deactivate(&self) {
-        if let Ok(mut active) = self.active_task.lock()
-            && active.as_deref() == Some(self.task_id.as_str())
-        {
-            *active = None;
-        }
+        self.running.set_active(&self.execution_id, false);
     }
 }
 
 impl Drop for ExecutionSlot {
     fn drop(&mut self) {
-        self.deactivate();
-        self.executing.store(false, Ordering::Release);
+        self.running.end(&self.execution_id);
         let _ = self.scheduler_wake.try_send(());
     }
 }
@@ -129,9 +229,10 @@ pub(in crate::proof) struct SchedulerContext<T, P> {
     pub(in crate::proof) canceller: P,
     pub(in crate::proof) event_sender: broadcast::Sender<String>,
     pub(in crate::proof) shutdown: Arc<AtomicBool>,
-    pub(in crate::proof) executing: Arc<AtomicBool>,
-    pub(in crate::proof) active_task: Arc<Mutex<Option<String>>>,
-    pub(in crate::proof) execution_thread: Arc<Mutex<Option<JoinHandle<()>>>>,
+    pub(in crate::proof) running: Arc<RunningTasks>,
+    /// The owner's limit on running tasks; the agent can lower it.
+    pub(in crate::proof) running_limit: Arc<AtomicUsize>,
+    pub(in crate::proof) execution_threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
     pub(in crate::proof) workspace: Workspace,
     pub(in crate::proof) dispatch_serial: Arc<Mutex<()>>,
     pub(in crate::proof) scheduler_wake: SyncSender<()>,
@@ -147,9 +248,9 @@ impl<T, P: Clone> Clone for SchedulerContext<T, P> {
             canceller: self.canceller.clone(),
             event_sender: self.event_sender.clone(),
             shutdown: Arc::clone(&self.shutdown),
-            executing: Arc::clone(&self.executing),
-            active_task: Arc::clone(&self.active_task),
-            execution_thread: Arc::clone(&self.execution_thread),
+            running: Arc::clone(&self.running),
+            running_limit: Arc::clone(&self.running_limit),
+            execution_threads: Arc::clone(&self.execution_threads),
             workspace: self.workspace.clone(),
             dispatch_serial: Arc::clone(&self.dispatch_serial),
             scheduler_wake: self.scheduler_wake.clone(),
@@ -241,20 +342,34 @@ where
         let _dispatch_guard =
             self.dispatch_serial.lock().map_err(|_| ProofError::Internal)?;
         let execution_id = Uuid::new_v4().to_string();
+        // Only this thread starts runs, so no run is added to this list
+        // before the lease below; a run that ends meanwhile only makes the
+        // list longer than it needs to be.
+        let in_flight = self.running.tasks_in_flight();
         let leased = self.store.call({
             let execution_id = execution_id.clone();
             move |store| {
-                store.lease_next("scheduler", &execution_id, timestamp_after(LEASE_TTL))
+                store.lease_next_except(
+                    "scheduler",
+                    &execution_id,
+                    timestamp_after(LEASE_TTL),
+                    &in_flight,
+                )
             }
         })?;
         let Some(task_id) = leased else {
             return Ok(None);
         };
         let prepared = self.prepare_leased(task_id, execution_id);
-        if !matches!(prepared, Ok(Some(_))) {
+        match &prepared {
+            Ok(Some(bundle)) => {
+                self.running.begin(&bundle.execution_id, &bundle.task_id);
+            }
             // The leased task does not run, so the next queued task does
             // not wait for the fallback poll.
-            let _ = self.scheduler_wake.try_send(());
+            _ => {
+                let _ = self.scheduler_wake.try_send(());
+            }
         }
         prepared
     }
@@ -313,10 +428,9 @@ where
     fn run_execution(&self, bundle: ExecutionBundle) {
         let ExecutionBundle { task_id, execution_id, task } = bundle;
         let slot = ExecutionSlot {
-            executing: Arc::clone(&self.executing),
-            active_task: Arc::clone(&self.active_task),
+            running: Arc::clone(&self.running),
             scheduler_wake: self.scheduler_wake.clone(),
-            task_id: task_id.clone(),
+            execution_id: execution_id.clone(),
         };
         if self.shutdown.load(Ordering::Acquire) {
             // Shutdown landed before this worker could register as the
@@ -405,90 +519,94 @@ where
         let confirmed_flag = Arc::clone(&start_confirmed);
         let mut event_error = false;
         let mut settled_at_start = false;
-        let result = executor.lock().map_err(|_| ExecutionError::Unavailable).and_then(
-            |mut executor| {
-                executor.execute_with_confirmed_start(
-                    &task,
-                    &mut || {
-                        let _dispatch_guard = dispatch_serial
-                            .lock()
-                            .map_err(|_| ExecutionError::Unavailable)?;
-                        if shutdown.load(Ordering::Acquire) {
-                            // The process never started, so the task goes
-                            // back to the queue, as it does when shutdown
-                            // lands before this worker registered.
+        // The executor is locked only to prepare the turn, so that turns of
+        // other tasks run at the same time. The start is still confirmed
+        // once for this task, under `dispatch_serial`.
+        let prepared = executor
+            .lock()
+            .map_err(|_| ExecutionError::Unavailable)
+            .and_then(|executor| executor.prepare_turn(&task));
+        let result = prepared.and_then(|turn| {
+            turn.run(
+                &mut || {
+                    let _dispatch_guard = dispatch_serial
+                        .lock()
+                        .map_err(|_| ExecutionError::Unavailable)?;
+                    if shutdown.load(Ordering::Acquire) {
+                        // The process never started, so the task goes
+                        // back to the queue, as it does when shutdown
+                        // lands before this worker registered.
+                        let task_id = dispatch_task_id.clone();
+                        settled_at_start = start_store
+                            .call(move |store| store.requeue_leased(&task_id))
+                            .is_ok();
+                        return Err(ExecutionError::Cancelled);
+                    }
+                    let execution_data = start_store
+                        .call({
                             let task_id = dispatch_task_id.clone();
-                            settled_at_start = start_store
-                                .call(move |store| store.requeue_leased(&task_id))
-                                .is_ok();
-                            return Err(ExecutionError::Cancelled);
-                        }
-                        let execution_data = start_store
-                            .call({
-                                let task_id = dispatch_task_id.clone();
-                                move |store| store.task_execution_data(&task_id)
-                            })
-                            .map_err(|_| ExecutionError::Unavailable)?;
-                        if dispatch_ctx.dispatch_allowed(&execution_data).is_err() {
-                            let rejected = dispatch_ctx.end_leased(
-                                &dispatch_task_id,
-                                &start_execution_id,
-                                NodeStore::mark_rejected,
-                            );
-                            settled_at_start = rejected.is_ok();
-                            Self::log_store("reject at start", rejected);
-                            return Err(ExecutionError::Unavailable);
-                        }
-                        start_store
-                            .call({
-                                let task_id = dispatch_task_id.clone();
-                                let execution_id = start_execution_id.clone();
-                                move |store| store.mark_running(&task_id, &execution_id)
-                            })
-                            .map_err(|_| ExecutionError::Unavailable)?;
-                        let outcome = match start_store.call({
+                            move |store| store.task_execution_data(&task_id)
+                        })
+                        .map_err(|_| ExecutionError::Unavailable)?;
+                    if dispatch_ctx.dispatch_allowed(&execution_data).is_err() {
+                        let rejected = dispatch_ctx.end_leased(
+                            &dispatch_task_id,
+                            &start_execution_id,
+                            NodeStore::mark_rejected,
+                        );
+                        settled_at_start = rejected.is_ok();
+                        Self::log_store("reject at start", rejected);
+                        return Err(ExecutionError::Unavailable);
+                    }
+                    start_store
+                        .call({
                             let task_id = dispatch_task_id.clone();
-                            move |store| store.state(&task_id)
-                        }) {
-                            Ok(TaskState::Cancelled) => Err(ExecutionError::Cancelled),
-                            Ok(TaskState::Leased | TaskState::Running) => Ok(()),
-                            Ok(_) | Err(_) => Err(ExecutionError::Unavailable),
-                        };
-                        if outcome.is_ok() {
-                            confirmed_flag.store(true, Ordering::Release);
-                        }
-                        outcome
-                    },
-                    &mut |event| {
-                        if event_error {
-                            return;
-                        }
-                        if event == ExecutionEvent::Completed {
-                            let event_task_id = dispatch_task_id.clone();
-                            if matches!(
-                                store.call(move |store| store.state(&event_task_id)),
-                                Ok(TaskState::Cancelled)
-                            ) {
-                                return;
-                            }
-                        }
+                            let execution_id = start_execution_id.clone();
+                            move |store| store.mark_running(&task_id, &execution_id)
+                        })
+                        .map_err(|_| ExecutionError::Unavailable)?;
+                    let outcome = match start_store.call({
+                        let task_id = dispatch_task_id.clone();
+                        move |store| store.state(&task_id)
+                    }) {
+                        Ok(TaskState::Cancelled) => Err(ExecutionError::Cancelled),
+                        Ok(TaskState::Leased | TaskState::Running) => Ok(()),
+                        Ok(_) | Err(_) => Err(ExecutionError::Unavailable),
+                    };
+                    if outcome.is_ok() {
+                        confirmed_flag.store(true, Ordering::Release);
+                    }
+                    outcome
+                },
+                &mut |event| {
+                    if event_error {
+                        return;
+                    }
+                    if event == ExecutionEvent::Completed {
                         let event_task_id = dispatch_task_id.clone();
-                        let event_type = event.event_type();
-                        if store
-                            .call(move |store| {
-                                store.append_event(&event_task_id, event_type)
-                            })
-                            .is_err()
-                        {
-                            event_error = true;
+                        if matches!(
+                            store.call(move |store| store.state(&event_task_id)),
+                            Ok(TaskState::Cancelled)
+                        ) {
                             return;
                         }
-                        // No receiver is normal; see `notify_task`.
-                        let _ = event_sender.send(dispatch_task_id.clone());
-                    },
-                )
-            },
-        );
+                    }
+                    let event_task_id = dispatch_task_id.clone();
+                    let event_type = event.event_type();
+                    if store
+                        .call(move |store| {
+                            store.append_event(&event_task_id, event_type)
+                        })
+                        .is_err()
+                    {
+                        event_error = true;
+                        return;
+                    }
+                    // No receiver is normal; see `notify_task`.
+                    let _ = event_sender.send(dispatch_task_id.clone());
+                },
+            )
+        });
         let _ = renewal.0.send(());
         let _ = renewal.1.join();
         slot.deactivate();
@@ -523,51 +641,75 @@ where
         self.notify_task(&task_id);
     }
 
-    fn dispatch_one(&self) {
-        if self.shutdown.load(Ordering::Acquire) {
-            return;
+    /// How many tasks may run at once now: the owner's limit, or the
+    /// agent's own capacity when that is lower. It is read at each dispatch,
+    /// so a change takes effect at the next one; a task that runs is never
+    /// stopped by it.
+    fn effective_running_limit(&self) -> usize {
+        self.running_limit.load(Ordering::Acquire).min(self.canceller.capacity()).max(1)
+    }
+
+    /// Joins the threads of runs that ended, so that their handles do not
+    /// pile up while the node runs.
+    fn reap_finished(&self) {
+        let Ok(mut threads) = self.execution_threads.lock() else { return };
+        let (finished, live): (Vec<_>, Vec<_>) = std::mem::take(&mut *threads)
+            .into_iter()
+            .partition(JoinHandle::is_finished);
+        *threads = live;
+        drop(threads);
+        for handle in finished {
+            let _ = handle.join();
         }
-        if self.executing.swap(true, Ordering::AcqRel) {
-            return;
+    }
+
+    /// Leases the next queued task and starts its run, if a slot is free.
+    /// Returns whether the scheduler should try for another task now.
+    fn dispatch_one(&self) -> bool {
+        if self.shutdown.load(Ordering::Acquire) {
+            return false;
+        }
+        if !self.running.reserve(self.effective_running_limit()) {
+            return false;
         }
         let bundle = match self.prepare_execution() {
             Ok(Some(bundle)) => bundle,
             Ok(None) => {
-                self.executing.store(false, Ordering::Release);
-                return;
+                self.running.release();
+                return false;
             }
             Err(error) => {
                 eprintln!("aether: scheduler prepare execution: {error:?}");
-                self.executing.store(false, Ordering::Release);
+                self.running.release();
                 let _ = self.scheduler_wake.try_send(());
-                return;
+                // A task that the policy refused ended as rejected; the
+                // next queued task may run.
+                return matches!(
+                    error,
+                    ProofError::Denied(_) | ProofError::GroupDenied
+                );
             }
         };
-        // Join the previous execution thread's handle before replacing it.
-        // The `executing` gate above guarantees it has already returned; this
-        // just reclaims the `JoinHandle` so shutdown never has to guess
-        // whether a stale handle is still live.
-        if let Ok(mut previous) = self.execution_thread.lock()
-            && let Some(handle) = previous.take()
-        {
-            let _ = handle.join();
-        }
+        self.reap_finished();
         let ctx = self.clone();
         let task_id = bundle.task_id.clone();
+        let execution_id = bundle.execution_id.clone();
         if let Ok(handle) = thread::Builder::new()
             .name("aether-execution".to_owned())
             .spawn(move || ctx.run_execution(bundle))
         {
-            if let Ok(mut slot) = self.execution_thread.lock() {
-                *slot = Some(handle);
+            if let Ok(mut threads) = self.execution_threads.lock() {
+                threads.push(handle);
             }
+            true
         } else {
             // The task never started: give the execution slot back and
             // return the lease to the queue so the scheduler retries it
             // instead of leaving it stranded in `Leased` forever.
-            self.executing.store(false, Ordering::Release);
+            self.running.end(&execution_id);
             let _ = self.store.call(move |store| store.requeue_leased(&task_id));
             let _ = self.scheduler_wake.try_send(());
+            false
         }
     }
 
@@ -582,11 +724,13 @@ where
                 self.maintain();
                 last_maintenance = Instant::now();
             }
-            self.dispatch_one();
+            // Fill every free slot: one wake-up may free, or add, room for
+            // more than one task.
+            while self.dispatch_one() {}
         }
     }
 
-    fn maintain(&self) {
+    pub(in crate::proof) fn maintain(&self) {
         let now = timestamp_after(Duration::ZERO);
         match self.store.call(move |store| store.recover_expired_leases(now)) {
             Ok(recovered) => self.stop_recovered(&recovered),
@@ -602,14 +746,14 @@ where
     }
 
     fn stop_recovered(&self, recovered: &[String]) {
-        let active = self.active_task.lock().ok().and_then(|active| active.clone());
-        if let Some(active_id) = active
-            && recovered.contains(&active_id)
-        {
-            // The active worker's lease was just reclaimed as
-            // `UnknownResult`; stop it promptly instead of letting it
-            // keep running unsupervised past its recovered deadline.
-            self.canceller.cancel(&active_id);
+        for active_id in self.running.active() {
+            if recovered.contains(&active_id) {
+                // The worker's lease was just reclaimed as `UnknownResult`;
+                // stop it promptly instead of letting it keep running
+                // unsupervised past its recovered deadline. The other
+                // running tasks keep their leases and run on.
+                self.canceller.cancel(&active_id);
+            }
         }
         for task_id in recovered {
             self.notify_task(task_id);
