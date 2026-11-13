@@ -162,8 +162,10 @@ static SPAWN_LOCK: Mutex<()> = Mutex::new(());
 pub struct CodexAppServer {
     binary: PathBuf,
     /// The file of `binary`, found once when the server is made. A task
-    /// folder gets a link to it or a copy of it.
-    source: Option<PathBuf>,
+    /// folder gets a link to it or a copy of it. Shared by the clones that
+    /// run each turn, so a binary found again after an update is kept for
+    /// the next turns.
+    source: Arc<Mutex<Option<PathBuf>>>,
     arguments: Vec<String>,
     limits: CodexLimits,
     turns: Arc<Mutex<Turns>>,
@@ -239,7 +241,7 @@ impl CodexAppServer {
             return Err(ExecutionError::Limits);
         }
         Ok(Self {
-            source: resolve_binary(&binary).ok(),
+            source: Arc::new(Mutex::new(resolve_binary(&binary).ok())),
             binary,
             arguments,
             limits,
@@ -249,15 +251,16 @@ impl CodexAppServer {
 
     /// The Codex binary in `folder`. When the file found at start is gone
     /// (an update moved it), it finds the binary again.
-    fn task_binary(&mut self, folder: &TaskFolder) -> Result<PathBuf, ExecutionError> {
+    fn task_binary(&self, folder: &TaskFolder) -> Result<PathBuf, ExecutionError> {
+        let known = self.source.lock().unwrap_or_else(PoisonError::into_inner).clone();
         if let Some(binary) =
-            self.source.as_deref().and_then(|source| folder.codex_binary(source).ok())
+            known.as_deref().and_then(|source| folder.codex_binary(source).ok())
         {
             return Ok(binary);
         }
         let source = resolve_binary(&self.binary)?;
         let binary = folder.codex_binary(&source)?;
-        self.source = Some(source);
+        *self.source.lock().unwrap_or_else(PoisonError::into_inner) = Some(source);
         Ok(binary)
     }
 
@@ -336,7 +339,7 @@ impl CodexAppServer {
     }
 
     fn start(
-        &mut self,
+        &self,
         ctx: &TurnContext,
         events: &mut dyn FnMut(ExecutionEvent),
     ) -> Result<String, ExecutionError> {

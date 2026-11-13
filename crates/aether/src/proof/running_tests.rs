@@ -421,6 +421,37 @@ fn shutdown_cancels_and_joins_every_running_task() {
 }
 
 #[test]
+fn a_task_requeued_while_its_run_lives_gets_no_second_run() {
+    let rig = Rig::new(2, 1);
+    // The run waits before its turn: it holds a slot and the lease, and has
+    // not started the agent yet.
+    let executor = locked(&rig.node.executor);
+    let id = rig.admit(0);
+    rig.wait_for_state(&id, TaskState::Leased);
+    // The lease runs out and recovery puts the task back in the queue while
+    // its first run still lives.
+    rig.node
+        .store
+        .call(|store| store.recover_expired_leases(i64::MAX))
+        .expect("recovery must run");
+    assert_eq!(rig.state(&id), TaskState::Queued);
+    for _ in 0..5 {
+        let _ = rig.node.scheduler_wake.try_send(());
+        thread::sleep(Duration::from_millis(30));
+    }
+    // The scheduler leases it again only after that run ends: a second run
+    // now would be cancelled by the first run's lost lease.
+    assert_eq!(rig.state(&id), TaskState::Queued);
+    assert_eq!(rig.node.running.reserved(), 1);
+    drop(executor);
+    rig.wait_for_state(&id, TaskState::Running);
+    rig.log.release(&id);
+    rig.wait_for_state(&id, TaskState::Succeeded);
+    assert_eq!(rig.log.started(), std::slice::from_ref(&id), "the agent saw one turn");
+    rig.finish();
+}
+
+#[test]
 fn the_default_limit_runs_tasks_one_at_a_time_as_before() {
     let rig = Rig::new(1, 3);
     let ids = (0..3).map(|index| rig.admit(index)).collect::<Vec<_>>();

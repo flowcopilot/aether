@@ -27,10 +27,15 @@ constants, and their tests compare the copies with `contract.json`.
   second agent says `ready`, the node closes the first connection, and the
   tasks of the first connection fail.
 - `ready` may carry `max_tasks`, a whole number: how many open tasks the
-  agent takes at once. Without it the agent takes `default_max_tasks` (one).
-  The node starts a task only while fewer tasks run than the smaller of
+  agent takes at once. Without it, or when it is not a whole number, the
+  agent takes `default_max_tasks` (one); a `max_tasks` of 0 also counts as
+  one. The node starts a task only while fewer tasks run than the smaller of
   `max_tasks` and the owner's running-task limit. It reads `max_tasks` from
-  the first `ready` of a connection. An agent that says `max_tasks` of 2
+  the first `ready` of a connection. The node checks the limit when it
+  reserves a slot for a task, not again when it sends the `task` line: when
+  a new agent with a smaller `max_tasks` replaces the attached one while
+  tasks are starting, the tasks that already had a slot still go to it, so
+  for a moment it can hold more open tasks than its `max_tasks`. An agent that says `max_tasks` of 2
   or more runs those tasks side by side: each task is answered, cancelled
   and stopped by its own ID, and an answer or a cancel for one task never
   touches another.

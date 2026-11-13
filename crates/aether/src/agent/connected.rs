@@ -104,8 +104,12 @@ enum NodeMessage<'a> {
 enum AgentMessage {
     Ready {
         protocol: u64,
+        /// Any JSON value, so that a `ready` with a `max_tasks` that is not
+        /// a whole number still attaches the agent, which then takes one
+        /// task at a time. As a `u64` such a line would not parse, and the
+        /// node would skip it and wait for a `ready` that never comes.
         #[serde(default)]
-        max_tasks: Option<u64>,
+        max_tasks: Option<serde_json::Value>,
     },
     Progress {
         id: String,
@@ -202,6 +206,8 @@ impl Shared {
         let mut reader = BufReader::new(stream);
         let max_tasks = match read_message(&mut reader) {
             Some(AgentMessage::Ready { protocol: PROTOCOL, max_tasks }) => max_tasks
+                .as_ref()
+                .and_then(serde_json::Value::as_u64)
                 .and_then(|tasks| usize::try_from(tasks).ok())
                 .map_or(DEFAULT_MAX_TASKS, |tasks| tasks.max(1)),
             _ => return,
@@ -655,7 +661,8 @@ mod tests {
         let ready = json!({"type": "ready", "protocol": PROTOCOL, "max_tasks": 3});
         assert!(matches!(
             serde_json::from_value::<AgentMessage>(ready),
-            Ok(AgentMessage::Ready { protocol: PROTOCOL, max_tasks: Some(3) })
+            Ok(AgentMessage::Ready { protocol: PROTOCOL, max_tasks: Some(tasks) })
+                if tasks == json!(3)
         ));
     }
 
@@ -670,6 +677,11 @@ mod tests {
             (json!({"type": "ready", "protocol": 1}), 1),
             (json!({"type": "ready", "protocol": 1, "max_tasks": 3}), 3),
             (json!({"type": "ready", "protocol": 1, "max_tasks": 0}), 1),
+            // Not a whole number: the agent still attaches, with one task.
+            (json!({"type": "ready", "protocol": 1, "max_tasks": 2.5}), 1),
+            (json!({"type": "ready", "protocol": 1, "max_tasks": -1}), 1),
+            (json!({"type": "ready", "protocol": 1, "max_tasks": "2"}), 1),
+            (json!({"type": "ready", "protocol": 1, "max_tasks": null}), 1),
         ] {
             let _peer = Peer::attach(&agent, &path, &ready);
             assert_eq!(agent.capacity(), capacity, "{ready}");
