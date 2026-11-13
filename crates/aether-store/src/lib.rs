@@ -157,6 +157,16 @@ impl NodeStore {
         Self::open(dir.join(NODE_DATABASE))
     }
 
+    /// Whether the database has exactly the migrations that this binary
+    /// knows: one cheap `PRAGMA user_version`. A store that stays open checks
+    /// this before a use, because another binary can migrate the file after
+    /// the open. When it is `false` (or the read fails), open the file again:
+    /// [`NodeStore::open`] migrates an older schema and refuses a newer one.
+    #[must_use]
+    pub fn schema_is_current(&self) -> bool {
+        migrate::schema_is_latest(&self.connection, NODE_MIGRATIONS).unwrap_or(false)
+    }
+
     pub fn put_scope(&self, id: &str, kind: ScopeKind) -> Result<(), StoreError> {
         put_scope(&self.connection, id, kind)
     }

@@ -21,6 +21,7 @@ use aether_store::{
 
 use crate::{
     direct::{InvitationBundle, RequestIds},
+    settings::KeptStore,
     transport::{
         A2aAuthorization, A2aTaskStatus, Frame, FrameKind, Link, TransportError,
     },
@@ -37,7 +38,14 @@ pub const OFFLINE_PROBE: Duration = Duration::from_mins(30);
 /// The longest pause between rounds while rounds fail.
 const ERROR_PAUSE_CAP: Duration = Duration::from_secs(30);
 
+/// The pause before the next attempt after the rate limit of the agent shed
+/// the requests of an attempt. It is short and does not grow: the limit
+/// refills within a second, and the task is not stuck, as one behind a full
+/// queue is.
+const RATE_LIMITED_PAUSE: Duration = Duration::from_secs(2);
+
 const UNREACHABLE: &str = "the agent cannot be reached; it may be offline";
+const RATE_LIMITED: &str = "the agent is busy with other requests from this node";
 const ACCESS_ENDED: &str = "the access to this agent ended";
 const EXPIRED: &str = "the agent did not answer before the deadline";
 const PURGE_KEY: &str = "outbox.last_purge";
@@ -162,6 +170,10 @@ pub enum Delay {
     Working,
     /// The queue of the agent is full.
     Busy,
+    /// The per-peer rate limit of the agent shed the requests of this node,
+    /// also after `follow` sent them again for a while. The agent has the
+    /// task, or room for it: the limit refills within a second.
+    RateLimited,
     /// The agent cannot be reached.
     Unreachable,
 }
@@ -171,6 +183,7 @@ pub enum Delay {
 pub fn next_delay(delay: Delay, attempts: u64) -> Duration {
     let (first, cap) = match delay {
         Delay::Working => return Duration::from_secs(5),
+        Delay::RateLimited => return RATE_LIMITED_PAUSE,
         Delay::Busy => (Duration::from_secs(5), Duration::from_mins(5)),
         Delay::Unreachable => (Duration::from_secs(30), OFFLINE_PROBE),
     };
@@ -220,6 +233,12 @@ pub fn outcome(task_id: &str, result: Result<Vec<Frame>, TransportError>) -> Out
         return Outcome::waiting(UNREACHABLE, Delay::Unreachable);
     };
     let last_event_sequence = crate::transport::response_last_event_sequence(&frames);
+    // The rate limit sends the same message as a full queue, with
+    // `retryAfterMs` in its `data`. It admitted nothing, so the task is
+    // neither refused nor stuck behind a queue: ask again soon.
+    if crate::transport::is_rate_limited(&frames) {
+        return Outcome::waiting(RATE_LIMITED, Delay::RateLimited);
+    }
     if frames.last().is_some_and(|frame| frame.kind == FrameKind::Error) {
         let message = frames
             .last()
@@ -303,16 +322,13 @@ pub async fn attempt(
     task: &SentTask,
     window: Duration,
 ) -> Result<SentState, OutboxError> {
-    let data_dir = data_dir.to_path_buf();
+    let store = open_shared(data_dir);
     let endpoint_id = task.endpoint_id.clone();
-    let (store, bundle) = off_runtime(move || {
-        let store =
-            NodeStore::in_dir(&data_dir).map_err(|_| OutboxError::Unavailable)?;
-        let bundle = crate::direct::contact_by_endpoint(&store, &endpoint_id).ok();
-        Ok((store, bundle))
+    let bundle = with_store(&store, move |store| {
+        Ok(crate::direct::contact_by_endpoint(store, &endpoint_id).ok())
     })
     .await?;
-    attempt_in(&Arc::new(Mutex::new(store)), courier, task, bundle, window).await
+    attempt_in(&store, courier, task, bundle, window).await
 }
 
 /// [`attempt`] with an open store and the bundle of the task's contact.
@@ -380,6 +396,8 @@ async fn follow(
     let mut after = task.last_event_sequence;
     let mut link = Link::default();
     let mut replayed = false;
+    let mut shed_since: Option<std::time::Instant> = None;
+    let mut shed_retries: u32 = 0;
     loop {
         let frame = crate::direct::resend_frame(
             authorization.clone(),
@@ -395,6 +413,27 @@ async fn follow(
         if !replayed && is_replay(&result) {
             replayed = true;
             continue;
+        }
+        // The per-peer rate limit of the agent shed the frame before the
+        // agent saw it, also in the middle of a poll. Send it again a little
+        // later with a new frame, as `request_with_polling_on` does, but
+        // never past the attempt window. A full queue is not retried: it is
+        // the `Busy` delay of `outcome`.
+        if result.as_ref().is_ok_and(|frames| crate::transport::is_rate_limited(frames))
+        {
+            let since = *shed_since.get_or_insert_with(std::time::Instant::now);
+            if let Some(wait) = crate::transport::overload_retry_wait(
+                shed_retries,
+                since.elapsed(),
+                window.saturating_sub(started.elapsed()),
+            ) {
+                tokio::time::sleep(wait).await;
+                shed_retries = shed_retries.saturating_add(1);
+                continue;
+            }
+        } else {
+            shed_since = None;
+            shed_retries = 0;
         }
         // An ended status is not enough to stop: the host cut the page
         // before the last event when it says that more events remain.
@@ -440,8 +479,10 @@ fn is_replay(result: &Result<Vec<Frame>, TransportError>) -> bool {
     })
 }
 
-/// The node store of one round, shared by its attempts.
-type SharedStore = Arc<Mutex<NodeStore>>;
+/// The node store of a round and its attempts. It stays open between rounds
+/// and opens again when the database file is replaced or migrated by another
+/// binary (see [`KeptStore`]), so `enqueue` and the loop use the same file.
+type SharedStore = Arc<Mutex<KeptStore>>;
 
 async fn off_runtime<R: Send + 'static>(
     work: impl FnOnce() -> Result<R, OutboxError> + Send + 'static,
@@ -449,13 +490,18 @@ async fn off_runtime<R: Send + 'static>(
     tokio::task::spawn_blocking(work).await.map_err(|_| OutboxError::Unavailable)?
 }
 
+/// Runs `work` on the current store, off the runtime. The work runs once:
+/// a store that fails to open is [`OutboxError::Unavailable`].
 async fn with_store<R: Send + 'static>(
     store: &SharedStore,
     work: impl FnOnce(&mut NodeStore) -> Result<R, OutboxError> + Send + 'static,
 ) -> Result<R, OutboxError> {
     let store = Arc::clone(store);
-    off_runtime(move || work(&mut store.lock().unwrap_or_else(PoisonError::into_inner)))
-        .await
+    off_runtime(move || {
+        let mut kept = store.lock().unwrap_or_else(PoisonError::into_inner);
+        work(kept.current().map_err(|_| OutboxError::Unavailable)?)
+    })
+    .await
 }
 
 /// What one round of the outbox did.
@@ -478,19 +524,13 @@ pub async fn run_once(
     presence: Option<&BTreeMap<String, bool>>,
     now: i64,
 ) -> Result<RoundReport, OutboxError> {
-    let store = open_shared(data_dir).await?;
+    let store = open_shared(data_dir);
     run_round(&store, courier, presence, now).await
 }
 
-/// Opens the node store of `data_dir`, for rounds to share.
-async fn open_shared(data_dir: &Path) -> Result<SharedStore, OutboxError> {
-    let data_dir = data_dir.to_path_buf();
-    off_runtime(move || {
-        NodeStore::in_dir(&data_dir)
-            .map(|store| Arc::new(Mutex::new(store)))
-            .map_err(|_| OutboxError::Unavailable)
-    })
-    .await
+/// The node store of `data_dir`, for rounds to share. It opens on first use.
+fn open_shared(data_dir: &Path) -> SharedStore {
+    Arc::new(Mutex::new(KeptStore::new(data_dir.to_path_buf(), false)))
 }
 
 /// One round on an open `store`; [`run`] keeps one store for all its rounds.
@@ -606,22 +646,13 @@ fn error_pause(failures: u32) -> Duration {
     POLL_INTERVAL.saturating_mul(factor).min(ERROR_PAUSE_CAP)
 }
 
-/// One round of [`run`] on the open `store`, which it opens first when
-/// there is none.
+/// One round of [`run`] on the `store` that all its rounds share.
 async fn next_round(
-    store: &mut Option<SharedStore>,
-    data_dir: &Path,
+    store: &SharedStore,
     courier: &Arc<dyn Courier>,
     presence: Option<&BTreeMap<String, bool>>,
 ) -> Result<RoundReport, OutboxError> {
-    let open = if let Some(open) = store {
-        Arc::clone(open)
-    } else {
-        let open = open_shared(data_dir).await?;
-        *store = Some(Arc::clone(&open));
-        open
-    };
-    run_round(&open, Arc::clone(courier), presence, now()).await
+    run_round(store, Arc::clone(courier), presence, now()).await
 }
 
 /// Runs the outbox until the task is aborted.
@@ -641,9 +672,10 @@ pub async fn run(
     let mut presence: Option<BTreeMap<String, bool>> = None;
     let mut presence_read: Option<std::time::Instant> = None;
     let mut active = true;
-    // The store stays open between rounds. A failed round drops it, so the
-    // next round opens the file again.
-    let mut store: Option<SharedStore> = None;
+    // The store stays open between rounds. It opens the file again when the
+    // path names another file or another binary migrated it, and a failed
+    // round makes it open again too.
+    let store = open_shared(&data_dir);
     let mut failures: u32 = 0;
     loop {
         if active
@@ -665,15 +697,14 @@ pub async fn run(
             };
             presence_read = Some(std::time::Instant::now());
         }
-        let round =
-            next_round(&mut store, &data_dir, &courier, presence.as_ref()).await;
+        let round = next_round(&store, &courier, presence.as_ref()).await;
         if let Ok(report) = round {
             active = report.active;
             failures = 0;
         } else {
             active = true;
             failures = failures.saturating_add(1);
-            store = None;
+            store.lock().unwrap_or_else(PoisonError::into_inner).close();
         }
         let pause = if failures > 0 {
             error_pause(failures)
@@ -793,6 +824,20 @@ mod tests {
         }])
     }
 
+    /// The "node overloaded" answer of the host's per-peer rate limit.
+    #[expect(clippy::unnecessary_wraps, reason = "a scripted answer is a Result")]
+    fn rate_limited() -> Result<Vec<Frame>, TransportError> {
+        let request = Frame {
+            version: 0,
+            kind: FrameKind::Request,
+            exchange_id: "e".to_owned(),
+            scope_id: "direct".to_owned(),
+            task_id: None,
+            payload: serde_json::json!({}),
+        };
+        Ok(crate::transport::rate_limited_response(&[request]))
+    }
+
     /// A caller data directory with the contact `tudor`.
     fn caller() -> (tempfile::TempDir, tempfile::TempDir) {
         let host = tempfile::tempdir().expect("directory must create");
@@ -811,6 +856,14 @@ mod tests {
         let task = "00000000-0000-4000-8000-000000000001";
         let busy = outcome(task, error("node overloaded"));
         assert_eq!((busy.state, busy.delay), (SentState::Waiting, Some(Delay::Busy)));
+        // The rate limit has the same message, and its own reason and delay.
+        let limited = outcome(task, rate_limited());
+        assert_eq!(
+            (limited.state, limited.delay),
+            (SentState::Waiting, Some(Delay::RateLimited))
+        );
+        assert_eq!(limited.reason.as_deref(), Some(super::RATE_LIMITED));
+        assert_eq!(busy.reason.as_deref(), Some("the queue of the agent is full"));
         for message in [
             "permission denied",
             "task result has expired",
@@ -856,6 +909,10 @@ mod tests {
         assert_eq!(next_delay(Delay::Unreachable, 2), Duration::from_secs(120));
         assert_eq!(next_delay(Delay::Unreachable, 99), super::OFFLINE_PROBE);
         assert_eq!(next_delay(Delay::Working, 99), Duration::from_secs(5));
+        // A rate-limited task waits briefly and the wait does not grow.
+        assert_eq!(next_delay(Delay::RateLimited, 0), super::RATE_LIMITED_PAUSE);
+        assert_eq!(next_delay(Delay::RateLimited, 99), super::RATE_LIMITED_PAUSE);
+        assert!(super::RATE_LIMITED_PAUSE < next_delay(Delay::Busy, 0));
     }
 
     #[test]
@@ -1044,9 +1101,12 @@ mod tests {
         let first =
             run_once(caller.path(), courier.clone(), None, now()).await.expect("round");
         assert_eq!(first.attempted, [(task.task_id.clone(), SentState::Waiting)]);
+        // A full queue is not sent again within the attempt.
+        assert_eq!(courier.requests().len(), 1);
         let store = NodeStore::in_dir(caller.path()).expect("store");
         let waiting = store.sent_task(&task.task_id).expect("read").expect("exists");
         assert!(waiting.next_attempt_at >= now().saturating_add(4));
+        assert_eq!(waiting.reason.as_deref(), Some("the queue of the agent is full"));
         let early =
             run_once(caller.path(), courier.clone(), None, now()).await.expect("round");
         assert!(early.attempted.is_empty());
@@ -1056,6 +1116,145 @@ mod tests {
                 .expect("round");
         assert_eq!(later.attempted, [(task.task_id, SentState::Answered)]);
         assert!(!later.active);
+    }
+
+    #[tokio::test]
+    async fn a_poll_that_the_rate_limit_shed_is_sent_again_in_the_attempt() {
+        let (_host, caller) = caller();
+        let task = enqueue(caller.path(), "tudor", "work", now()).expect("enqueue");
+        let courier = Scripted::with(vec![
+            result(A2aTaskStatus::Working, ""),
+            rate_limited(),
+            rate_limited(),
+            result(A2aTaskStatus::Completed, "done"),
+        ]);
+        let state =
+            attempt(caller.path(), courier.as_ref(), &task, Duration::from_secs(10))
+                .await
+                .expect("attempt");
+        assert_eq!(state, SentState::Answered);
+        let payloads: Vec<A2aRequest> = courier
+            .requests()
+            .iter()
+            .map(|frame| {
+                serde_json::from_value(frame.payload.clone()).expect("payload")
+            })
+            .collect();
+        assert_eq!(payloads.len(), 4);
+        assert!(
+            payloads
+                .iter()
+                .all(|payload| payload.idempotency_key == task.idempotency_key)
+        );
+        let nonces: std::collections::BTreeSet<&str> =
+            payloads.iter().map(|payload| payload.request_nonce.as_str()).collect();
+        assert_eq!(nonces.len(), 4, "every send is a new frame");
+    }
+
+    #[tokio::test]
+    async fn an_agent_that_keeps_shedding_makes_the_task_wait_briefly_with_its_own_reason()
+     {
+        let (_host, caller) = caller();
+        let task = enqueue(caller.path(), "tudor", "work", now()).expect("enqueue");
+        let courier = Scripted::with((0..40).map(|_| rate_limited()).collect());
+        let started = std::time::Instant::now();
+        let state =
+            attempt(caller.path(), courier.as_ref(), &task, Duration::from_secs(20))
+                .await
+                .expect("attempt");
+        let elapsed = started.elapsed();
+        assert_eq!(state, SentState::Waiting);
+        // The sends stop at the end of the overload window, not the attempt's.
+        assert!(elapsed >= crate::transport::OVERLOAD_RETRY_WINDOW, "{elapsed:?}");
+        assert!(
+            elapsed
+                < crate::transport::OVERLOAD_RETRY_WINDOW + Duration::from_millis(600),
+            "{elapsed:?}"
+        );
+        assert!(courier.requests().len() > 2);
+        let kept = NodeStore::in_dir(caller.path())
+            .expect("store")
+            .sent_task(&task.task_id)
+            .expect("read")
+            .expect("the task exists");
+        assert_eq!(kept.reason.as_deref(), Some(super::RATE_LIMITED));
+        let pause = kept.next_attempt_at.saturating_sub(now());
+        assert!(
+            (0..=super::seconds(super::RATE_LIMITED_PAUSE)).contains(&pause),
+            "{pause} s"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_rate_limit_retry_stops_at_the_attempt_window() {
+        let (_host, caller) = caller();
+        let task = enqueue(caller.path(), "tudor", "work", now()).expect("enqueue");
+        let courier = Scripted::with((0..40).map(|_| rate_limited()).collect());
+        let started = std::time::Instant::now();
+        let state = attempt(caller.path(), courier.as_ref(), &task, Duration::ZERO)
+            .await
+            .expect("attempt");
+        assert_eq!(state, SentState::Waiting);
+        assert_eq!(courier.requests().len(), 1);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    /// Changes `user_version` of the database in `directory` by `change`.
+    fn bump_schema_version(directory: &std::path::Path, change: i64) {
+        let connection =
+            rusqlite::Connection::open(directory.join(aether_store::NODE_DATABASE))
+                .expect("database must open");
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version must read");
+        connection
+            .pragma_update(None, "user_version", version.saturating_add(change))
+            .expect("version must write");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rounds_that_share_a_store_follow_a_database_file_that_replaced_the_old_one()
+     {
+        let (host, caller) = caller();
+        let store = super::open_shared(caller.path());
+        let courier = Scripted::with(vec![result(A2aTaskStatus::Completed, "done")]);
+        let idle = super::run_round(&store, courier.clone(), None, now())
+            .await
+            .expect("round");
+        assert!(idle.attempted.is_empty());
+        // An operator restores a backup over the database while the node runs.
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(
+                caller.path().join(format!("{}{suffix}", aether_store::NODE_DATABASE)),
+            );
+        }
+        let endpoint = crate::direct::endpoint_id(caller.path()).expect("endpoint");
+        crate::direct::import_bundle(
+            caller.path(),
+            &crate::direct::test_bundle(host.path(), &endpoint, false),
+        )
+        .expect("the contact must import");
+        let task = enqueue(caller.path(), "tudor", "work", now()).expect("enqueue");
+        let round =
+            super::run_round(&store, courier, None, now()).await.expect("round");
+        assert_eq!(round.attempted, [(task.task_id, SentState::Answered)]);
+    }
+
+    #[tokio::test]
+    async fn rounds_that_share_a_store_fail_closed_for_a_newer_schema() {
+        let (_host, caller) = caller();
+        let store = super::open_shared(caller.path());
+        let courier = Scripted::with(Vec::new());
+        super::run_round(&store, courier.clone(), None, now()).await.expect("round");
+        // Another binary migrated the file while the loop kept its store.
+        bump_schema_version(caller.path(), 1);
+        assert_eq!(
+            super::run_round(&store, courier.clone(), None, now()).await.err(),
+            Some(OutboxError::Unavailable)
+        );
+        bump_schema_version(caller.path(), -1);
+        super::run_round(&store, courier, None, now()).await.expect("round");
     }
 
     #[tokio::test]

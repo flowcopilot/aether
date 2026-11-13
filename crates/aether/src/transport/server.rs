@@ -22,7 +22,7 @@ use super::wire::{
     validate_order, validate_payloads,
 };
 
-type PeerLimiter = DefaultKeyedRateLimiter<String>;
+pub(crate) type PeerLimiter = DefaultKeyedRateLimiter<String>;
 type HandlerService = BoxCloneSyncService<(String, Vec<Frame>), Vec<Frame>, BoxError>;
 
 pub async fn bind_node(
@@ -95,12 +95,28 @@ where
         + Sync
         + 'static,
 {
+    router_with_limiter(endpoint, handler, peer_limiter())
+}
+
+/// [`router`] with the per-peer limiter that the caller gives, so that a test
+/// can use a small quota. The node uses [`peer_limiter`].
+pub(crate) fn router_with_limiter<F>(
+    endpoint: iroh::Endpoint,
+    handler: F,
+    limiter: PeerLimiter,
+) -> iroh::protocol::Router
+where
+    F: Fn(&str, Vec<Frame>) -> Result<Vec<Frame>, TransportError>
+        + Send
+        + Sync
+        + 'static,
+{
     iroh::protocol::Router::builder(endpoint)
         .accept(
             ALPN,
             AetherProtocol {
                 handler: handler_service(handler),
-                limiter: Arc::new(peer_limiter()),
+                limiter: Arc::new(limiter),
                 permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
                 cancellation: CancellationToken::new(),
                 tasks: TaskTracker::new(),
@@ -281,6 +297,12 @@ pub(crate) fn peer_limiter() -> PeerLimiter {
     // The constant is not zero; the fallback only keeps the conversion total.
     let requests = std::num::NonZeroU32::new(PEER_REQUESTS_PER_SECOND)
         .unwrap_or(std::num::NonZeroU32::MIN);
+    peer_limiter_for(requests)
+}
+
+/// A per-peer limiter that allows `requests` a second, with a burst of as
+/// many.
+pub(crate) fn peer_limiter_for(requests: std::num::NonZeroU32) -> PeerLimiter {
     RateLimiter::keyed(Quota::per_second(requests))
 }
 

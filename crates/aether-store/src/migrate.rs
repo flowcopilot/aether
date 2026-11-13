@@ -57,7 +57,7 @@ fn migrated() -> MutexGuard<'static, HashSet<PathBuf>> {
 }
 
 /// Whether the database at `connection` has every one of `migrations`.
-fn schema_is_latest(
+pub fn schema_is_latest(
     connection: &Connection,
     migrations: &[&str],
 ) -> Result<bool, StoreError> {
