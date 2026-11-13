@@ -17,6 +17,8 @@ defmodule AetherHub.Application do
         {Registry, keys: :duplicate, name: AetherHub.Waiters},
         AetherHub.RateLimit,
         AetherHub.Presence,
+        AetherHub.AccountCache,
+        AetherHub.DirectoryCache,
         AetherHub.Sweeper
       ] ++ server()
 

@@ -463,6 +463,10 @@ no account, and it counts against the directory limit of the client address.
 - `people` is the count of personal agents. The directory shows no
   presence of a person, and no name of a person except an owner.
 
+The hub builds the directory once in 15 seconds and serves that view to
+every reader in between, as `cache-control: public, max-age=15` says. A new
+listing, an owner or a change of presence can take up to 15 seconds to show.
+
 ## Owner links
 
 An owner link joins a service agent to the personal agent of its owner. The
