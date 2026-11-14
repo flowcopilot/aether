@@ -78,6 +78,7 @@ pub const MAX_ACCESS_REQUEST_DRAFTS: i64 = 5;
 
 impl NodeStore {
     /// Keeps `approval`, in place of a record with the same invite id.
+    /// A missing group returns [`StoreError::MissingAccessGroup`].
     pub fn put_hub_approval(&self, approval: &HubApproval) -> Result<(), StoreError> {
         self.connection.execute_cached(
             "INSERT OR REPLACE INTO hub_approvals(invite_id,side,kind,peer_name,peer_endpoint,days,access_group,bundle,created_at,expires_at,listing,listing_signature,listing_expires_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
@@ -96,7 +97,15 @@ impl NodeStore {
                 approval.listing.as_ref().map(|listing| &listing.signature),
                 approval.listing.as_ref().map(|listing| listing.expires_at),
             ],
-        )?;
+        ).map_err(|error| {
+            if matches!(&error, rusqlite::Error::SqliteFailure(code, _)
+                if code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY)
+            {
+                StoreError::MissingAccessGroup(approval.access_group.clone())
+            } else {
+                StoreError::from(error)
+            }
+        })?;
         Ok(())
     }
 
@@ -348,6 +357,47 @@ mod tests {
             created_at,
             expires_at: created_at.saturating_add(24 * 60 * 60),
         }
+    }
+
+    #[test]
+    fn hub_approval_requires_a_group_and_failed_replacement_keeps_the_old_record() {
+        let (_directory, store) = crate::test_support::temp_node_store();
+        let kept = approval("invite", 900);
+        store.put_hub_approval(&kept).expect("valid approval must store");
+        let invalid =
+            HubApproval { access_group: "missing".to_owned(), ..kept.clone() };
+        let error =
+            store.put_hub_approval(&invalid).expect_err("missing group must fail");
+        assert_eq!(error.to_string(), "access group 'missing' was not found");
+        assert_eq!(store.hub_approval("invite").expect("read"), Some(kept));
+        assert!(store.connection.execute(
+            "UPDATE hub_approvals SET access_group='missing' WHERE invite_id='invite'", [],
+        ).is_err());
+    }
+
+    #[test]
+    fn deleting_a_group_cancels_its_approvals_and_keeps_other_groups() {
+        let (_directory, store) = crate::test_support::temp_node_store();
+        store.create_access_group("custom").expect("group must store");
+        for side in [ApprovalSide::Sender, ApprovalSide::Receiver] {
+            let pending = HubApproval {
+                side,
+                access_group: "custom".to_owned(),
+                ..approval(side.as_str(), 900)
+            };
+            store.put_hub_approval(&pending).expect("approval must store");
+        }
+        let kept = approval("other", 900);
+        store.put_hub_approval(&kept).expect("approval must store");
+        store.delete_access_group("custom").expect("delete must cancel approvals");
+        for id in ["sender", "receiver"] {
+            assert_eq!(store.hub_approval(id).expect("read"), None);
+            assert_eq!(
+                store.pin_hub_approval(&approval(id, 900), "endpoint", "bundle"),
+                Err(StoreError::NotFound)
+            );
+        }
+        assert_eq!(store.hub_approval("other").expect("read"), Some(kept));
     }
 
     #[test]

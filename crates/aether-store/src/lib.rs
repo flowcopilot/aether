@@ -68,6 +68,7 @@ pub const NODE_MIGRATIONS: &[&str] = &[
     include_str!("../migrations/node/016_signed_record_kinds.sql"),
     include_str!("../migrations/node/017_drop_unused_grants.sql"),
     include_str!("../migrations/node/018_task_caller_ids.sql"),
+    include_str!("../migrations/node/019_hub_approval_access_group.sql"),
 ];
 
 pub const NODE_DATABASE: &str = "node.sqlite";
@@ -82,6 +83,8 @@ pub enum StoreError {
     DuplicateConflict,
     #[error("caller is not authorized")]
     Unauthorized,
+    #[error("access group '{0}' was not found")]
+    MissingAccessGroup(String),
     #[error("stored item was not found")]
     NotFound,
     #[error(transparent)]
