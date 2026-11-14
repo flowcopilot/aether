@@ -2,6 +2,15 @@
 All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
 
 - - -
+## [v0.1.1](https://github.com/flowcopilot/aether/compare/ef5b7f312ef1e07aa958ae851ffb4abddfdc9bb9..v0.1.1) - 2026-11-14
+#### Bug Fixes
+- (**mcp**) match server version to package version - ([0f8bc30](https://github.com/flowcopilot/aether/commit/0f8bc30a0d9a03e06a4f2986cbeb5b366d0a5242)) - TudorAndrei
+- (**store**) enforce hub approval access groups - ([ef5b7f3](https://github.com/flowcopilot/aether/commit/ef5b7f312ef1e07aa958ae851ffb4abddfdc9bb9)) - TudorAndrei
+#### Continuous Integration
+- (**release**) remove macOS Intel target - ([baad0d7](https://github.com/flowcopilot/aether/commit/baad0d780d14c6a832e7d43501f058dadb34b803)) - TudorAndrei
+
+- - -
+
 ## [v0.1.0](https://github.com/flowcopilot/aether/compare/6723963bae81d43027ab6ffbe575024c8aef1a1b..v0.1.0) - 2026-11-14
 #### Features
 - (**agent-socket**) let an agent say how many tasks it takes at once - ([cf1ad60](https://github.com/flowcopilot/aether/commit/cf1ad6003ada5f57c602cf91061525bfb2972b3b)) - TudorAndrei
