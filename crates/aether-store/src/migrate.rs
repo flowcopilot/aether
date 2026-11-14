@@ -240,6 +240,46 @@ mod tests {
     }
 
     #[test]
+    fn hub_approval_migration_keeps_valid_rows_and_discards_missing_groups() {
+        let database = path("hub-approval-foreign-key");
+        let mut connection = Connection::open(&database).expect("database must open");
+        migrate(&mut connection, &NODE_MIGRATIONS[..18]).expect("old schema");
+        connection.execute_batch(
+            "DELETE FROM access_groups WHERE name='friends';
+             INSERT INTO hub_approvals(invite_id,side,kind,peer_name,peer_endpoint,days,access_group,bundle,created_at,expires_at,listing,listing_signature,listing_expires_at)
+             VALUES('valid','receiver','request','ana','endpoint',7,'requests','bundle',100,900,'listing','signature',800),
+                   ('orphan','sender','invite','bob',NULL,7,'friends',NULL,100,900,NULL,NULL,NULL);",
+        ).expect("legacy approvals must store");
+        drop(connection);
+        let store = NodeStore::open(&database).expect("migration must apply");
+        let expected = HubApproval {
+            invite_id: "valid".to_owned(),
+            side: ApprovalSide::Receiver,
+            kind: ApprovalKind::Request,
+            peer_name: "ana".to_owned(),
+            peer_endpoint: Some("endpoint".to_owned()),
+            days: 7,
+            access_group: "requests".to_owned(),
+            bundle: Some("bundle".to_owned()),
+            created_at: 100,
+            expires_at: 900,
+            listing: Some(KeptListing {
+                text: "listing".to_owned(),
+                signature: "signature".to_owned(),
+                expires_at: 800,
+            }),
+        };
+        assert_eq!(store.hub_approval("valid").expect("read"), Some(expected.clone()));
+        assert_eq!(store.hub_approval("orphan").expect("read"), None);
+        assert_eq!(backup_count(&database), 1);
+        drop(store);
+        let store = NodeStore::open(&database).expect("reopen");
+        assert_eq!(store.hub_approval("valid").expect("read"), Some(expected));
+        store.delete_access_group("requests").expect("cascade after upgrade");
+        assert_eq!(store.hub_approval("valid").expect("read"), None);
+    }
+
+    #[test]
     fn a_later_open_in_the_process_still_checks_the_schema_version() {
         let database = path("later-open");
         drop(NodeStore::open(&database).expect("first open must migrate"));

@@ -61,6 +61,8 @@ impl NodeStore {
         Ok(())
     }
 
+    /// Deletes the group, its members, and its hub approvals. A later hub
+    /// reply cannot use a deleted approval to sign a grant.
     pub fn delete_access_group(&self, name: &str) -> Result<(), StoreError> {
         if self
             .connection
