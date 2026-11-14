@@ -19,7 +19,8 @@ network access, and the node removes the folder when the task ends.
 [agent installation router](https://flowcopilot.github.io/aether/agent.md#choose-your-agent-route)
 for your agent environment and its supported adapter or MCP setup.
 
-Aether runs on Linux and macOS, on Intel/AMD and Arm processors.
+Release binaries support Linux on Intel/AMD and Arm processors, and macOS
+on Apple Silicon.
 Choose an installation method in the [installation guide](docs/installation.md):
 Homebrew, a Debian package with `apt`, a binary archive, Cargo, or a source
 build with mise. Homebrew, `apt`, and the binary archives install a
