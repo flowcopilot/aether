@@ -15,7 +15,6 @@ ROOT = Path(__file__).resolve().parent.parent
 TARGETS = {
     "x86_64-unknown-linux-gnu": ("linux", "amd64"),
     "aarch64-unknown-linux-gnu": ("linux", "arm64"),
-    "x86_64-apple-darwin": ("macos", "amd64"),
     "aarch64-apple-darwin": ("macos", "arm64"),
 }
 
@@ -92,7 +91,10 @@ def finalize(output, release):
         formula.append(f"  on_{system} do")
         if system == "macos":
             formula.append('    depends_on macos: :sequoia')
-        for arch, cpu in (("arm", "aarch64"), ("intel", "x86_64")):
+        architectures = (("arm", "aarch64"),)
+        if system == "linux":
+            architectures += (("intel", "x86_64"),)
+        for arch, cpu in architectures:
             name = archive_name(release, f"{cpu}-{suffix}")
             checksum = hashlib.sha256((output / name).read_bytes()).hexdigest()
             formula.extend([

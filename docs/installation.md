@@ -11,7 +11,7 @@ The release workflow builds these packages:
 - Linux, x86-64 and Arm64: a binary archive and a Debian package. The builds
   use Ubuntu 24.04. Use Ubuntu 24.04 or a compatible system with glibc 2.39
   or later. Alpine Linux needs a source build with its own build tools.
-- macOS 15 or later, Intel and Apple Silicon: a binary archive.
+- macOS 15 or later, Apple Silicon: a binary archive.
 
 Windows is not supported. The node and its agent adapters use Unix sockets.
 
@@ -72,6 +72,10 @@ case "$(uname -m)" in
   x86_64) cpu=x86_64 ;;
   *) echo 'Unsupported processor' >&2; exit 1 ;;
 esac
+if [ "$platform" = apple-darwin ] && [ "$cpu" = x86_64 ]; then
+  echo 'macOS binary archives require Apple Silicon' >&2
+  exit 1
+fi
 gh release download --repo flowcopilot/aether --pattern "aether-*-${cpu}-${platform}.tar.gz" --pattern SHA256SUMS
 ```
 
