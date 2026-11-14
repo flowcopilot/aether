@@ -1,0 +1,206 @@
+# Changelog
+All notable changes to this project will be documented in this file. See [conventional commits](https://www.conventionalcommits.org/) for commit guidelines.
+
+- - -
+## [v0.1.0](https://github.com/flowcopilot/aether/compare/6723963bae81d43027ab6ffbe575024c8aef1a1b..v0.1.0) - 2026-11-14
+#### Features
+- (**agent-socket**) let an agent say how many tasks it takes at once - ([cf1ad60](https://github.com/flowcopilot/aether/commit/cf1ad6003ada5f57c602cf91061525bfb2972b3b)) - TudorAndrei
+- (**distribution**) add native release packages and Homebrew updates - ([3eb6ff7](https://github.com/flowcopilot/aether/commit/3eb6ff72ea3655db924b7fb33be9d7d3eb7386d5)) - TudorAndrei
+- (**grokbot**) add self-installing executor bridge - ([9e74587](https://github.com/flowcopilot/aether/commit/9e74587ede4d9a9988c92daf332418463a366279)) - TudorAndrei
+- (**hub**) put the directory's unavailable error and cache time in the contract - ([59ffe72](https://github.com/flowcopilot/aether/commit/59ffe720b4c8655fe0e5a344fcf27b2814e4d52a)) - TudorAndrei
+- (**node**) run more than one task at a time, up to a limit that the owner sets - ([dad9c41](https://github.com/flowcopilot/aether/commit/dad9c41b25e17eaf0908f71528b4ac134a480300)) - TudorAndrei
+- (**protocol**) add the hub contract and golden signing vectors - ([838c500](https://github.com/flowcopilot/aether/commit/838c500e5608262ab18c5d81a81c99719c14eb61)) - TudorAndrei
+- publish Aether as an open-source project - ([6723963](https://github.com/flowcopilot/aether/commit/6723963bae81d43027ab6ffbe575024c8aef1a1b)) - TudorAndrei
+#### Bug Fixes
+- (**admin**) bind the administration socket privately - ([0ea5f35](https://github.com/flowcopilot/aether/commit/0ea5f354bd9c11a916bb5269bb95c8ee68f62274)) - TudorAndrei
+- (**admin**) keep a confirmation token when its confirm fails - ([a225c6e](https://github.com/flowcopilot/aether/commit/a225c6e3e1f2cec723c4754d174dd70d8e161ce7)) - TudorAndrei
+- (**admin**) require the session to change the public listing - ([c0e7b08](https://github.com/flowcopilot/aether/commit/c0e7b082cf02c1441932dcb5bbc7c875f5817465)) - TudorAndrei
+- (**admin**) reload the waiting hub screen, not always / - ([4d821d7](https://github.com/flowcopilot/aether/commit/4d821d7cd62d1a51c9943893763ef6b91fe09f97)) - TudorAndrei
+- (**admin**) show sent-task and activity read failures instead of empty lists - ([d4c82bf](https://github.com/flowcopilot/aether/commit/d4c82bf23ca748d4dde895fbe2d8e39109d8f2f5)) - TudorAndrei
+- (**admin**) show an error when the audit or policy read fails - ([e77e10a](https://github.com/flowcopilot/aether/commit/e77e10a91c0ce9e8f2fe67a9393e8038ae175fdf)) - TudorAndrei
+- (**admin**) unify apply path, invites, and page context - ([1674bb9](https://github.com/flowcopilot/aether/commit/1674bb90399304ddfc839cc9b66473d697c4aad4)) - TudorAndrei
+- (**agent**) honour a Codex cancel that comes before the turn starts - ([1e2b0bc](https://github.com/flowcopilot/aether/commit/1e2b0bc3fac6692d976b5aa69c9de6359102a263)) - TudorAndrei
+- (**agent**) bound the connected agent's early cancels - ([0c85e97](https://github.com/flowcopilot/aether/commit/0c85e97e23024ec43a83d8ed5eb671d8873c5128)) - TudorAndrei
+- (**agent**) decline Codex approval requests that come before a response - ([07e192c](https://github.com/flowcopilot/aether/commit/07e192c544c1009a104b4332433562679c799d65)) - TudorAndrei
+- (**agent**) charge a Codex turn's setup time to its deadline - ([f5afd5e](https://github.com/flowcopilot/aether/commit/f5afd5e9b8df5a2c6f9bf016ec198f082b7445b3)) - TudorAndrei
+- (**agent**) unify codex env, connected replace/cancel, and accept loop - ([b760c51](https://github.com/flowcopilot/aether/commit/b760c51a6acad3c23825c5735a3f9ba505163ead)) - TudorAndrei
+- (**agent**) replay the agent-socket protocol transcript in connected.rs - ([de0255f](https://github.com/flowcopilot/aether/commit/de0255f818bc9c240ee403d7217ba137725c1c7b)) - TudorAndrei
+- (**cli**) drop unused imports and the lock held across an if let - ([5936f97](https://github.com/flowcopilot/aether/commit/5936f9707829a66c5bec70c05b86d2494944307c)) - TudorAndrei
+- (**distribution**) use a deploy key for Homebrew tap updates - ([c214b71](https://github.com/flowcopilot/aether/commit/c214b71ca765638745dee6f61717e31f251fe6fe)) - TudorAndrei
+- (**grokbot**) rebuild an installed Aether binary that is too old - ([218114b](https://github.com/flowcopilot/aether/commit/218114bb66f0c4924e01e6e70fd3629b05ac5fa7)) - TudorAndrei
+- (**grokbot**) take over a runtime lock that never recorded its owner - ([3f7fc13](https://github.com/flowcopilot/aether/commit/3f7fc132e1b4e940d93f0e6f2b2a31998262c52f)) - TudorAndrei
+- (**grokbot**) leave no partial claim marker when its write fails - ([e9c977f](https://github.com/flowcopilot/aether/commit/e9c977f91d7eb838c95c285850345263fc9d79f3)) - TudorAndrei
+- (**grokbot**) share one node between connector processes - ([3258bcd](https://github.com/flowcopilot/aether/commit/3258bcda71a3d9e576756ec02591062931313407)) - TudorAndrei
+- (**hermes**) give each adapter connect its own stop event - ([dde9822](https://github.com/flowcopilot/aether/commit/dde98223e10773120259279b72b3b6002ddbdf8a)) - TudorAndrei
+- (**hermes**) end the node session cleanly when a message handler fails - ([10fe6d5](https://github.com/flowcopilot/aether/commit/10fe6d5fcde32cb8a36568e8628c292ce6a2a606)) - TudorAndrei
+- (**hermes-plugin**) replay the agent-socket transcript and list caller tools from the server - ([bb8b937](https://github.com/flowcopilot/aether/commit/bb8b937766967a31352714b3df6820180937c7d5)) - TudorAndrei
+- (**hub**) back off after a failed directory build, 503 when the cache is down - ([befbba8](https://github.com/flowcopilot/aether/commit/befbba838f979a146939540753ffdea1a7f0a86c)) - TudorAndrei
+- (**hub**) expire cached accounts and never store a copy a write overtook - ([3cf5192](https://github.com/flowcopilot/aether/commit/3cf5192191be63bdd7c261e47696d814ac4ef14a)) - TudorAndrei
+- (**hub**) drop the accounts(kind) index that slowed people search - ([acacf29](https://github.com/flowcopilot/aether/commit/acacf2949f040fea460a9d30c5588d2194522b13)) - TudorAndrei
+- (**hub**) undo the group membership of a grant that cannot be pinned - ([2c14395](https://github.com/flowcopilot/aether/commit/2c14395730443cd5d5c1490b3034e19b6571d7a9)) - TudorAndrei
+- (**hub**) say so when this computer cannot remove a block - ([c3fec52](https://github.com/flowcopilot/aether/commit/c3fec52881e1591282d86633e753ed8bb7711fd5)) - TudorAndrei
+- (**hub**) take a listing off the hub when this node cannot keep it - ([f2581c0](https://github.com/flowcopilot/aether/commit/f2581c0bcffbeea18a2e2810947ecc5b13c2819a)) - TudorAndrei
+- (**hub**) keep the request approval when the hub answer is lost - ([636e8cf](https://github.com/flowcopilot/aether/commit/636e8cfe253baa160b642396383f7ad8bfca02d8)) - TudorAndrei
+- (**hub**) give no last-seen time past the presence keep window - ([3f156b5](https://github.com/flowcopilot/aether/commit/3f156b539f81222f6ec43d70f6f478ccbaa08254)) - TudorAndrei
+- (**hub**) count only live owner links toward the owner-link limits - ([081c1c5](https://github.com/flowcopilot/aether/commit/081c1c5f3d22805743b8727844c66a4c235cd6fb)) - TudorAndrei
+- (**hub**) keep feature tests apart from sweeps and the wall clock - ([395c982](https://github.com/flowcopilot/aether/commit/395c982d33ef68eec371c14f3912e6747b8e864e)) - TudorAndrei
+- (**hub**) join drafts by listing endpoint and honor serve hub URL - ([e6adf7e](https://github.com/flowcopilot/aether/commit/e6adf7e8b97c20e70beac4c444c05e128d6472f1)) - TudorAndrei
+- (**invites**) undo the grant and new membership when the invite cannot be encoded - ([a1190e6](https://github.com/flowcopilot/aether/commit/a1190e64a3eb21b74c927632f4a7a98a528ec3d3)) - TudorAndrei
+- (**managed**) keep the cached roster when the roster sync fails - ([a43de1d](https://github.com/flowcopilot/aether/commit/a43de1dafd71b8e20f37a6463791a05f6e3dd888)) - TudorAndrei
+- (**mcp**) report unreadable relay and hub settings in settings.get - ([ef15a7f](https://github.com/flowcopilot/aether/commit/ef15a7feb8853df4dbea7d22389972bf31dcd541)) - TudorAndrei
+- (**mcp**) give aether.change its typed schema again - ([195127f](https://github.com/flowcopilot/aether/commit/195127ffde69b2f4bc4ba08b63402ef0c61b4480)) - TudorAndrei
+- (**node**) close the gaps that the review of parallel tasks found - ([cb68105](https://github.com/flowcopilot/aether/commit/cb681050fd5ee9171a96038c28614526d83a8f99)) - TudorAndrei
+- (**node**) retry rate-limited outbox sends and reopen kept stores - ([34e3e5c](https://github.com/flowcopilot/aether/commit/34e3e5c94e6b82854575df7ee02c1757d4d40db1)) - TudorAndrei
+- (**node**) retry an exchange that the per-peer rate limit shed - ([b11e196](https://github.com/flowcopilot/aether/commit/b11e1960c8a254f1948372caead5192951002afc)) - TudorAndrei
+- (**node**) do not log a broadcast with no receivers as a failure - ([bd329e8](https://github.com/flowcopilot/aether/commit/bd329e8470294bc5b523b731d3949eb9fc07a2ff)) - TudorAndrei
+- (**node**) shut down gracefully on SIGTERM as well as Ctrl-C - ([451bc66](https://github.com/flowcopilot/aether/commit/451bc66c9611c10cdc3bfd1333fab7fdfd08c264)) - TudorAndrei
+- (**node**) serialise directory renewals with capability changes - ([1554464](https://github.com/flowcopilot/aether/commit/155446428ccbfdbc3157a8093daa7e45414c804e)) - TudorAndrei
+- (**node**) requeue a task when shutdown lands just before it starts - ([e216416](https://github.com/flowcopilot/aether/commit/e2164167d3a7ccd689354079525319a645b701ae)) - TudorAndrei
+- (**node**) settle each execution exactly once - ([fa63d5d](https://github.com/flowcopilot/aether/commit/fa63d5dad212be849e5717c5d9b0257d382bc066)) - TudorAndrei
+- (**node**) recreate a deleted default task folder at startup - ([fc965d7](https://github.com/flowcopilot/aether/commit/fc965d7ab43713aba6a09bf1eecbe615b6b84da9)) - TudorAndrei
+- (**node**) give every task event the A2A status of the state it leaves - ([2bc523c](https://github.com/flowcopilot/aether/commit/2bc523c9dd6748a25c8e8722575dfd25ccfb8f43)) - TudorAndrei
+- (**openclaw-plugin**) stop cancelled and orphaned turns and replay the protocol transcript - ([d0dd7d9](https://github.com/flowcopilot/aether/commit/d0dd7d982ad15fd2638e18178a088a1f1ef8054a)) - TudorAndrei
+- (**pact**) forget a message whose send was dropped mid-turn - ([208abe1](https://github.com/flowcopilot/aether/commit/208abe17cdd42f8c9ce420bf5c97c42bb40697ba)) - TudorAndrei
+- (**pact**) spend a refresh token only for the caller its grant binds - ([7f1c650](https://github.com/flowcopilot/aether/commit/7f1c6509f627baaaf646b85fd152d565874b023b)) - TudorAndrei
+- (**pact**) guard every device transition by the state it leaves - ([34873eb](https://github.com/flowcopilot/aether/commit/34873ebf06bdc551bd9ab9389ba72486e2c828fa)) - TudorAndrei
+- (**pact**) answer server_error when the node cannot read its policy - ([7f9e490](https://github.com/flowcopilot/aether/commit/7f9e49063e4feae3e559905e89aa324535a493b5)) - TudorAndrei
+- (**proof**) log lease recovery and content cleanup failures - ([752c11e](https://github.com/flowcopilot/aether/commit/752c11ec0bfeb5c815fe4090e27c62c384637874)) - TudorAndrei
+- (**proof**) centralize scheduler settle and fail leased invalid workspaces - ([165cda2](https://github.com/flowcopilot/aether/commit/165cda248b9a01e8e207b61c23fda7f4eaa81b8f)) - TudorAndrei
+- (**scheduler**) drop a kept cancel when a run ends without a turn - ([7c86776](https://github.com/flowcopilot/aether/commit/7c8677689b1beb659d97c75d9f75d04417e9a8fd)) - TudorAndrei
+- (**store**) let cancellation win over a dispatch rejection - ([ab3fc75](https://github.com/flowcopilot/aether/commit/ab3fc75893e65e2991190cdd6d09d23c92685a1b)) - TudorAndrei
+- close the races and gaps that the TLA+ models found - ([77f9c52](https://github.com/flowcopilot/aether/commit/77f9c52fa04b40504986fc17ca0dc62d90ec5159)) - TudorAndrei
+- update SQLite, MCP, Node.js, and minimatch (#12) - ([56b4068](https://github.com/flowcopilot/aether/commit/56b4068f39bcf1f8ae7112f895cf6f87da54740c)) - gabimoncha
+#### Performance Improvements
+- (**hub**) cache the directory, batch owner lookups, cache signed-request accounts - ([fe6367c](https://github.com/flowcopilot/aether/commit/fe6367c8869a33f7379b436635b83f35603db2f7)) - TudorAndrei
+- (**hub**) read from a read-only pool and sweep expired invites in chunks - ([a3a6eab](https://github.com/flowcopilot/aether/commit/a3a6eab7d5c3caacd1a0451006f17c5d98c82b7b)) - TudorAndrei
+- (**node**) reuse store connections and remember verified signatures - ([1541a39](https://github.com/flowcopilot/aether/commit/1541a399dc042c9f3fddaea6c8c3d1ab26c6c48d)) - TudorAndrei
+- (**node**) cache prepared SQL statements in the store - ([69e578d](https://github.com/flowcopilot/aether/commit/69e578dd05a8592e2e44438385727e2a02a5a011)) - TudorAndrei
+- (**node**) use ring as the process-wide rustls provider - ([759da03](https://github.com/flowcopilot/aether/commit/759da03790b3f374069676ade43be43ff9499a67)) - TudorAndrei
+- (**node**) poll a task again soon after submit and back off - ([faf9e31](https://github.com/flowcopilot/aether/commit/faf9e31789da52a6d7d389ed33047f19d44e36ef)) - TudorAndrei
+#### Documentation
+- (**direct**) say which contact readers include expired contacts - ([a3e2045](https://github.com/flowcopilot/aether/commit/a3e2045dd294a262fd52316e05464f9a5053b6aa)) - TudorAndrei
+- (**hub**) take protocol values from protocol/hub instead of repeating them - ([8d303d1](https://github.com/flowcopilot/aether/commit/8d303d1cb87763c2b7d38097e24336a26e1f271b)) - TudorAndrei
+- (**installation**) explain platform packages and Cargo installation - ([25c19e8](https://github.com/flowcopilot/aether/commit/25c19e8eae83ed4b57428fd73e6ed80e47b47be3)) - TudorAndrei
+- (**specs**) name invites.ex as the honest hub of the invite spec - ([cbd90e5](https://github.com/flowcopilot/aether/commit/cbd90e5c755aaa30d37dfdfa4bcf421ee570608d)) - TudorAndrei
+- document retryAfterMs in the wire profile - ([4b5f2c8](https://github.com/flowcopilot/aether/commit/4b5f2c80f334c238ef29b4b3cffd029a6dcd14fa)) - TudorAndrei
+- record the Astro documentation design system - ([bdea040](https://github.com/flowcopilot/aether/commit/bdea040a7cefb70dde8446c1e3dcf64b8c5dcf0d)) - TudorAndrei
+- rebuild site with Astro and route agent installation - ([0693fcb](https://github.com/flowcopilot/aether/commit/0693fcbfdfcf98821bdef4b6de2d443f8ad7ab1a)) - TudorAndrei
+- add onboarding paths for humans and agents - ([f1ae081](https://github.com/flowcopilot/aether/commit/f1ae08104829f01332660f29b8e0bbd8e7335e85)) - TudorAndrei
+- build the documentation site with mdBook - ([f88a91e](https://github.com/flowcopilot/aether/commit/f88a91ed62d1ff099214946c59980ee23c7d09e3)) - TudorAndrei
+- use absolute links for files outside docs/ - ([8b2de85](https://github.com/flowcopilot/aether/commit/8b2de853f4554fe9a8c8bfa897945c00220fa0b5)) - TudorAndrei
+- use the public HTTPS clone URL - ([6e2ac81](https://github.com/flowcopilot/aether/commit/6e2ac81cd05fee089c76673ca0f9b50ac77469a3)) - TudorAndrei
+#### Continuous Integration
+- (**docs**) deploy the documentation site to GitHub Pages - ([eb837d8](https://github.com/flowcopilot/aether/commit/eb837d8ffeb2e5bfad49076101cb964a285416c9)) - TudorAndrei
+#### Refactoring
+- (**admin**) post_button for the one-button forms - ([4abe850](https://github.com/flowcopilot/aether/commit/4abe850443b83b1e1cd867d8ce21862b02eff904)) - TudorAndrei
+- (**admin**) compute what an invite row offers in one function - ([9e9542c](https://github.com/flowcopilot/aether/commit/9e9542c2ea3c6b75d023ee33145c943523e43210)) - TudorAndrei
+- (**admin**) shared error line, section heading, count badge, URL row - ([25dcb41](https://github.com/flowcopilot/aether/commit/25dcb41de4c0bea5e42f8b4f55eb78cf57908b3a)) - TudorAndrei
+- (**admin**) days_select and days_label for the access days - ([a574e96](https://github.com/flowcopilot/aether/commit/a574e965cde0e0afe4ed17aa60c41d12d5e915cb)) - TudorAndrei
+- (**admin**) lock the administration per request and check sizes once - ([9564e94](https://github.com/flowcopilot/aether/commit/9564e9403dace4505d32814c15ae4eebf4257f66)) - TudorAndrei
+- (**admin**) one Tone and state_badge for task and sent states - ([1857599](https://github.com/flowcopilot/aether/commit/185759917a8f0abc231f43039c008b81d31904e6)) - TudorAndrei
+- (**admin**) typed actions for the group and listing forms - ([d1da998](https://github.com/flowcopilot/aether/commit/d1da9987084f6963a3b84ba2b8a6ccfbd1266061)) - TudorAndrei
+- (**admin**) helpers for the session, page, hub and lock of a handler - ([d88e3e8](https://github.com/flowcopilot/aether/commit/d88e3e86eee19e7e52dcb70d21d5e060343e3a96)) - TudorAndrei
+- (**admin**) count what waits once and keep hub_form_screen in hub.rs - ([4ed99be](https://github.com/flowcopilot/aether/commit/4ed99be7c1e7edb3d0c33069a0b6cb9951a28852)) - TudorAndrei
+- (**admin**) one Notice enum for the host and caller screens - ([12167df](https://github.com/flowcopilot/aether/commit/12167dfaaaa559015c33623421ddf3df59f9322d)) - TudorAndrei
+- (**admin**) one UiMode instead of the host_ui and caller flags - ([fe8296a](https://github.com/flowcopilot/aether/commit/fe8296ad3348f73dfd262aced3b56f9f7d7e928c)) - TudorAndrei
+- (**admin**) move invite signing and hub workers out of admin UI - ([e1d6aa0](https://github.com/flowcopilot/aether/commit/e1d6aa0235279fdcc861e581fcb4a85e74d38935)) - TudorAndrei
+- (**admin**) unify grant risk, hub store, policy writer, and hub load errors - ([50e6a4a](https://github.com/flowcopilot/aether/commit/50e6a4a5d828c30df1d2fd0c8b3c94848504b1c5)) - TudorAndrei
+- (**admin**) one confirmation rule for MCP changes and invites - ([79b7751](https://github.com/flowcopilot/aether/commit/79b7751e6d08d4ab8c03dc1af26474733789f123)) - TudorAndrei
+- (**agent**) read a Codex turn's answer once and share the JSON writer - ([6697d37](https://github.com/flowcopilot/aether/commit/6697d37ffc0e2b7f3d76e81909890758288d3873)) - TudorAndrei
+- (**agent**) type the Codex sandbox and validate its limits once - ([74f070c](https://github.com/flowcopilot/aether/commit/74f070c35db3119c7555a857e39f3d9af7d0233c)) - TudorAndrei
+- (**agent**) remove the unused agent workspace hook - ([49cef4e](https://github.com/flowcopilot/aether/commit/49cef4e58b39dbd2a9fe236a4c09cef3abae196e)) - TudorAndrei
+- (**agent**) make start_turn_with_events the required Agent method - ([e6c759a](https://github.com/flowcopilot/aether/commit/e6c759a213f879ca5c0839bfce851e5986176ec6)) - TudorAndrei
+- (**cli**) move node subcommand runners out of main - ([87907af](https://github.com/flowcopilot/aether/commit/87907af1b624df7ec7fc64dac0395bafd7cfb0b0)) - TudorAndrei
+- (**core**) add typed QueueLimitId for queue caps - ([6c6be63](https://github.com/flowcopilot/aether/commit/6c6be63b655f0f962bf70b4e6012ad9d330098cc)) - TudorAndrei
+- (**core**) keep one clock, one grant check and shared limits in core - ([bbf9bb7](https://github.com/flowcopilot/aether/commit/bbf9bb73812a50fc285f0e85e38ad1e6dc981148)) - TudorAndrei
+- (**direct**) build request frames without a JSON round trip - ([2f04cb2](https://github.com/flowcopilot/aether/commit/2f04cb2df5d1d4e4bcbd44ef9794c80e3c434045)) - TudorAndrei
+- (**direct**) read contacts from one open store - ([e21f7cf](https://github.com/flowcopilot/aether/commit/e21f7cfaa357e7b9df8381350fedc0571b95e3c6)) - TudorAndrei
+- (**discovery**) centralize wire-to-store signed records - ([80e1c4e](https://github.com/flowcopilot/aether/commit/80e1c4ee1fc74656fe12c462278dc49178857fe5)) - TudorAndrei
+- (**discovery**) share one signed-bytes module and keep wire forms by the domain - ([eedd770](https://github.com/flowcopilot/aether/commit/eedd770df2ea3ac4bd31ee83dcb25f9bb573d9a9)) - TudorAndrei
+- (**examples**) drop sign_authorization, which the CLI and admin page replace - ([9a77006](https://github.com/flowcopilot/aether/commit/9a770060fc21db63bbf7bdb87a24b1cb0ccb7a19)) - TudorAndrei
+- (**execution**) N4 boundaries for proof, A2A, limits, and PACT grants - ([d75ad90](https://github.com/flowcopilot/aether/commit/d75ad90523b9ce0882bd8d1d7536e65eca75b661)) - TudorAndrei
+- (**execution**) build TurnContext once per turn with path rules - ([3eca18a](https://github.com/flowcopilot/aether/commit/3eca18af3f3cbe2672e458a214761fb91c18359b)) - TudorAndrei
+- (**grokbot**) split settings and wake out of main, share the request limit - ([45e5e50](https://github.com/flowcopilot/aether/commit/45e5e50c661e0511906ea244db77af48f806ea41)) - TudorAndrei
+- (**grokbot**) derive executor forwarding from one operation table - ([a7bac1a](https://github.com/flowcopilot/aether/commit/a7bac1a5926af835d6f7b8f0ae179b5fc1d31af4)) - TudorAndrei
+- (**grokbot**) drop connection checks the stop fence already covers - ([fb970ec](https://github.com/flowcopilot/aether/commit/fb970eccd05be3ff6d10db0678b4d83ce185a759)) - TudorAndrei
+- (**hermes**) resolve the platform data directory in one place - ([b4a6e81](https://github.com/flowcopilot/aether/commit/b4a6e81cd0b328a5cb5b4328559e752a4ba43e17)) - TudorAndrei
+- (**hub**) remove the HubStore wrapper - ([387e4e0](https://github.com/flowcopilot/aether/commit/387e4e0ec5f9fa19a8fbae72d52fd1031bca3acf)) - TudorAndrei
+- (**hub**) drop a stored relay copy, an unreachable arm and an alias - ([5a8843d](https://github.com/flowcopilot/aether/commit/5a8843dee62d3927832f5c04a766b7a5b792c4e0)) - TudorAndrei
+- (**hub**) read the hub name and agent kind through two helpers - ([ceeea2e](https://github.com/flowcopilot/aether/commit/ceeea2e0d0023fb2296d3f1fbd8c39f01e10a5e0)) - TudorAndrei
+- (**hub**) build a new hub approval with one constructor - ([eaec7a2](https://github.com/flowcopilot/aether/commit/eaec7a2525633f02c742db7f831042edc077334c)) - TudorAndrei
+- (**hub**) parse a listing into one type and define its limits once - ([a91c71e](https://github.com/flowcopilot/aether/commit/a91c71efc64e4a1b695ba0b7f729b37b753f4b9b)) - TudorAndrei
+- (**hub**) return HubError and ListingError from the protocol checks - ([f96f194](https://github.com/flowcopilot/aether/commit/f96f19491fe81cccb2a51964e250118ebfad5fda)) - TudorAndrei
+- (**hub**) share the JSON, no-answer and not-found request plumbing - ([e9b652f](https://github.com/flowcopilot/aether/commit/e9b652fe5a9bcdf8d2d6bfbfd9fb8ace52395f03)) - TudorAndrei
+- (**hub**) follow the hub access directly and carry the signer in HostStep::Sign - ([0e6a8e8](https://github.com/flowcopilot/aether/commit/0e6a8e833d86e086c2cb75784a6c5a18597ef941)) - TudorAndrei
+- (**hub**) share the test helpers for rate-limit windows, invite lists and searches - ([8d40145](https://github.com/flowcopilot/aether/commit/8d4014532ca7fcac8d721b4189619794333d7c1d)) - TudorAndrei
+- (**hub**) fold valid_endpoint?, hide Blocks.blocked?, add Notify.waiting? - ([e8f2e5d](https://github.com/flowcopilot/aether/commit/e8f2e5dc23d0c1d82b5255407898e8897cde39c9)) - TudorAndrei
+- (**hub**) compute the wanted account values once in Accounts.put - ([1a033fd](https://github.com/flowcopilot/aether/commit/1a033fda8ae8f7c004639e59425fba343e87d32c)) - TudorAndrei
+- (**hub**) look up an account by full name and type in Names - ([98c2d4d](https://github.com/flowcopilot/aether/commit/98c2d4d4b5f538bc29a7f0b5cebf2a981869d76a)) - TudorAndrei
+- (**hub**) one search helper and a shorter counted/2 in the router - ([d8c6817](https://github.com/flowcopilot/aether/commit/d8c6817947a8335f5f1fa2b78f2c3aebdc920d08)) - TudorAndrei
+- (**hub**) write the invite moves as one transition table - ([af4890c](https://github.com/flowcopilot/aether/commit/af4890ca0b3829daa3216333eb923bc6c39f838f)) - TudorAndrei
+- (**hub**) bump versions and wake long polls in one Versions.commit - ([4d8f1f8](https://github.com/flowcopilot/aether/commit/4d8f1f8a1c7a3e84211d2f3983d81142d36716c3)) - TudorAndrei
+- (**hub**) drop the delete_contact client route that nothing calls - ([634c05e](https://github.com/flowcopilot/aether/commit/634c05e87a50abb6e094834e58b55f415d6b154f)) - TudorAndrei
+- (**hub**) replay listing vectors and full Rust contract table - ([6ceb03d](https://github.com/flowcopilot/aether/commit/6ceb03dcafc934f0b82af8c6161d21649e80045f)) - TudorAndrei
+- (**hub**) one Rust protocol owner and hub wire types - ([3601dc7](https://github.com/flowcopilot/aether/commit/3601dc73958db73250ed6a1564659cd567ca9ff5)) - TudorAndrei
+- (**hub**) name the contract enums in Protocol and use them in every module - ([5ce8e89](https://github.com/flowcopilot/aether/commit/5ce8e89ad566b9b84a6ec9c92774aa6a31ff98e2)) - TudorAndrei
+- (**hub**) take offer days and access limits from the protocol table only - ([fea2484](https://github.com/flowcopilot/aether/commit/fea24841b6e748f831f1f1c5543d3bd4c24063c8)) - TudorAndrei
+- (**hub**) protocol table, FullName, and NodeHub owner - ([bb61d5c](https://github.com/flowcopilot/aether/commit/bb61d5c8ef57af3fd37881453f869066804b58cc)) - TudorAndrei
+- (**hub**) split the hub by feature on one contract and one clock - ([ba2515b](https://github.com/flowcopilot/aether/commit/ba2515be1a09a355ff472c60656c051b4672e315)) - TudorAndrei
+- (**identity**) keep identity free of transport and own the grant codec - ([cbaf07b](https://github.com/flowcopilot/aether/commit/cbaf07b4f4c9d7426adbde6adbf3ca5cd9cce6cc)) - TudorAndrei
+- (**mcp**) share the tool result and find-wait shapes - ([c9de2a8](https://github.com/flowcopilot/aether/commit/c9de2a8cdb4e881c970a3c2397798bda90a01b2a)) - TudorAndrei
+- (**mcp**) send admin requests through one ask helper - ([e62b733](https://github.com/flowcopilot/aether/commit/e62b73342c43785a6801e030ed35a02b10fa3217)) - TudorAndrei
+- (**mcp**) read presence through caller_hub - ([683e0bd](https://github.com/flowcopilot/aether/commit/683e0bd80145ac0461f36a77e0f70b9b2c426cb2)) - TudorAndrei
+- (**mcp**) require the node data directory - ([edb9806](https://github.com/flowcopilot/aether/commit/edb9806cae5f87022376f3439e97b5a7ba7cd5e2)) - TudorAndrei
+- (**mcp**) give the admin, hub and caller tools one router each - ([6ea8c8f](https://github.com/flowcopilot/aether/commit/6ea8c8f3a9f53522fbfbc976ad78d869c0762eaf)) - TudorAndrei
+- (**mcp**) split tools into mod, args, support, and tools modules - ([aed5f3c](https://github.com/flowcopilot/aether/commit/aed5f3c478b34a1a1482d485e13e719712041ccd)) - TudorAndrei
+- (**node**) pass NodeService options to its constructor - ([33e9508](https://github.com/flowcopilot/aether/commit/33e9508dc1e444b6cd9fa4f3fe9c1b10394b7eca)) - TudorAndrei
+- (**node**) read hub name and agent kind through the settings helpers - ([a6a95e9](https://github.com/flowcopilot/aether/commit/a6a95e9cb743f74ba82e369f5dde6df926ba20db)) - TudorAndrei
+- (**node**) read the queue limits through one helper - ([b6f93b1](https://github.com/flowcopilot/aether/commit/b6f93b123f64cd28def6fe5d5cd02c7ca74f73a6)) - TudorAndrei
+- (**node**) keep the PublicationRecord in DirectoryPublication - ([40133bb](https://github.com/flowcopilot/aether/commit/40133bb88fc83dda834f1cbf0109663035bcfa76)) - TudorAndrei
+- (**node**) open the direct store once for a request - ([0b4ee21](https://github.com/flowcopilot/aether/commit/0b4ee21d08a12944c5ce8e06d0af8612fd935470)) - TudorAndrei
+- (**node**) parse node commands into the library types - ([c6299ae](https://github.com/flowcopilot/aether/commit/c6299ae1158c19d6c2dfb4d8a35c1973b8a4ff28)) - TudorAndrei
+- (**node**) print CLI results through one print_json helper - ([f88f474](https://github.com/flowcopilot/aether/commit/f88f474aba29773f7aab0f779c634adf25e05b58)) - TudorAndrei
+- (**node**) replace unit errors with directory_client::Failed - ([1a9a108](https://github.com/flowcopilot/aether/commit/1a9a10839144a80f6799f72dd902e86c778917cf)) - TudorAndrei
+- (**node**) inline roster_sync into the two sync loops - ([89a9f06](https://github.com/flowcopilot/aether/commit/89a9f0685b97b094ebcfcbbf1ef146ddc92c82db)) - TudorAndrei
+- (**node**) drop the per-event cursor check in roster sync - ([d1ce6f4](https://github.com/flowcopilot/aether/commit/d1ce6f44520524184280adcc6c534761e6ca4357)) - TudorAndrei
+- (**node**) share worker shutdown and group the publication flags - ([d7b5a10](https://github.com/flowcopilot/aether/commit/d7b5a10a8f447ea8ec772d9be72ce9aa930936e9)) - TudorAndrei
+- (**node**) release the execution slot through one guard - ([84ee2be](https://github.com/flowcopilot/aether/commit/84ee2be1033e269ded980b2fb234e9d50085c353)) - TudorAndrei
+- (**node**) merge the pinned HTTPS module into pinned_json - ([1d5b1ef](https://github.com/flowcopilot/aether/commit/1d5b1ef6e8b0229961ac61b600509f08d9957866)) - TudorAndrei
+- (**node**) remove the ProofHandle forwarding layer - ([5811a1f](https://github.com/flowcopilot/aether/commit/5811a1fb65fd91c48c09e97a16f2e2b80fb0e66d)) - TudorAndrei
+- (**node**) let the pinned JSON client report HttpError - ([88ccf41](https://github.com/flowcopilot/aether/commit/88ccf414d94a6ac523e48ee6e4b03390d9142f9f)) - TudorAndrei
+- (**node**) run hub workers and invite signing on the node's hub owner - ([c6a8188](https://github.com/flowcopilot/aether/commit/c6a81885a4357198ccb1f208b4076cdd4d222435)) - TudorAndrei
+- (**node**) share pinned JSON client for directory and managed - ([c4fc060](https://github.com/flowcopilot/aether/commit/c4fc06061b83d82d58e5268beaf27267485fd140)) - TudorAndrei
+- (**node**) unify data-dir resolution and CLI layout - ([dfeb224](https://github.com/flowcopilot/aether/commit/dfeb2245dc255262a5425022770408c70690fcce)) - TudorAndrei
+- (**node**) wire QueueLimitId and consolidated codex environment - ([7e18049](https://github.com/flowcopilot/aether/commit/7e18049a07f28daf14264ec383af2e80ee020014)) - TudorAndrei
+- (**node**) move node serve into node_runtime::run - ([514ce26](https://github.com/flowcopilot/aether/commit/514ce2607973780f71b764cb631839c7bfc65101)) - TudorAndrei
+- (**node**) start background workers outside the admin UI - ([4530dc3](https://github.com/flowcopilot/aether/commit/4530dc377d9fb3dfcf2e7789f82d184b7deb0ad2)) - TudorAndrei
+- (**node**) split node_config into policy, node_builder and feature settings - ([a64a713](https://github.com/flowcopilot/aether/commit/a64a713647f07919cb6e888839c265f8196e76ec)) - TudorAndrei
+- (**node**) let DataDir own every file of a data directory - ([bd242b4](https://github.com/flowcopilot/aether/commit/bd242b471dc66fbc9f8328a510a6fb483f335e09)) - TudorAndrei
+- (**openclaw**) drop unused account field, local flag and exports - ([e621506](https://github.com/flowcopilot/aether/commit/e621506c8f549ef257e557ecf1968951b90a2d55)) - TudorAndrei
+- (**openclaw-plugin**) take the caller tools from the caller-only server - ([f9da335](https://github.com/flowcopilot/aether/commit/f9da335544d30a2c4141dfc8eecc7d6b3a6560e2)) - TudorAndrei
+- (**pact**) check message:send with ? and one error path - ([5a2f338](https://github.com/flowcopilot/aether/commit/5a2f338df6e7c80e3890c1c8991151e353a37c63)) - TudorAndrei
+- (**pact**) keep only the error cases callers tell apart - ([b9c3637](https://github.com/flowcopilot/aether/commit/b9c363771984dc3004a66bdcb22e6b82054b24e3)) - TudorAndrei
+- (**pact**) rely on Validation for the PA token's iss and aud - ([cb925ee](https://github.com/flowcopilot/aether/commit/cb925eede0e901f17ae3f2c6f5d668fccf0ca02f)) - TudorAndrei
+- (**pact**) read and write device status through sql_named - ([8292e5c](https://github.com/flowcopilot/aether/commit/8292e5c3491102a82145f8de9d4d3903ebcec34c)) - TudorAndrei
+- (**pact**) build the gateway test fixture in one place - ([d5232a6](https://github.com/flowcopilot/aether/commit/d5232a63f8262eaa8feba9950aec523b3e2fa7e8)) - TudorAndrei
+- (**pact**) one grant module and one shared PactStore - ([0fdf52e](https://github.com/flowcopilot/aether/commit/0fdf52e1176af4f404b349c1d1c9ad7d62ec90a9)) - TudorAndrei
+- (**pact**) drop ConsentLink::new, which only called Default - ([f69d676](https://github.com/flowcopilot/aether/commit/f69d676797bbf7545bc098edc902631b1ac92960)) - TudorAndrei
+- (**pact**) name OAuth codes and grant types through the core named! table - ([06a40a9](https://github.com/flowcopilot/aether/commit/06a40a9c84b1e45bab0dfc672f61f0ae7bdfebf8)) - TudorAndrei
+- (**policy**) own the PACT section of the policy file - ([38a8f44](https://github.com/flowcopilot/aether/commit/38a8f4479fbcf406ce72af1ef88463d38ad0d16f)) - TudorAndrei
+- (**proof**) narrow node handle and sharpen transport errors - ([e8ecb59](https://github.com/flowcopilot/aether/commit/e8ecb5969229649fbba67f1a28c5f4ef82cc77b8)) - TudorAndrei
+- (**q2**) decouple wire from outbox and tighten hub/pact edges - ([437c569](https://github.com/flowcopilot/aether/commit/437c5693ecc1d77f0e8357c290382f6a6ffbbd0e)) - TudorAndrei
+- (**scripts**) share the e2e steps in scripts/lib.sh - ([5045acc](https://github.com/flowcopilot/aether/commit/5045accca9559aa5db5b242da0a5de0e66fbdf25)) - TudorAndrei
+- (**store**) guard state changes on the state that was checked - ([67e654b](https://github.com/flowcopilot/aether/commit/67e654b0d8043c21535770943a2092c1a9ef2eff)) - TudorAndrei
+- (**store**) share the terminal-state tail and the cancel body - ([a993e1e](https://github.com/flowcopilot/aether/commit/a993e1e45aba095d1c325b6dc9ddc2bc1b6a57ce)) - TudorAndrei
+- (**store**) type the store vocabulary and own every key format - ([50be4df](https://github.com/flowcopilot/aether/commit/50be4dfa429fdebb5a029b76e12d3a3940e6b193)) - TudorAndrei
+- (**store**) split the node store into one module per feature - ([128e3b3](https://github.com/flowcopilot/aether/commit/128e3b33b536da7d0df0a601e4b2b40dedbbeb58)) - TudorAndrei
+- (**transport**) read and write the active relay like the saved one - ([94ee828](https://github.com/flowcopilot/aether/commit/94ee828ae5ab4e98702d8824d04ecfe8913ab4e5)) - TudorAndrei
+- (**transport**) name the phases of a served connection - ([5b3593e](https://github.com/flowcopilot/aether/commit/5b3593ee6926c0bb698134875db5965eb0ae5142)) - TudorAndrei
+- (**transport**) hold a link's connection state in one enum - ([9c9f313](https://github.com/flowcopilot/aether/commit/9c9f313a6db2a1948c7b40db44886396872c7803)) - TudorAndrei
+- (**transport**) build reply frames with Frame::reply_to - ([8989ec7](https://github.com/flowcopilot/aether/commit/8989ec749dddf390c3fbeebd1530f52a08c2e369)) - TudorAndrei
+- (**transport**) name the event metadata keys and drop wrapper payloads - ([47b0e40](https://github.com/flowcopilot/aether/commit/47b0e4055a74f7d9fa7fb31ec43c1c78db8a1ca9)) - TudorAndrei
+- remove dead code - ([d2a8265](https://github.com/flowcopilot/aether/commit/d2a8265d06f5b9cd3d08025181a18c0632fccd82)) - TudorAndrei
+
+- - -
+
+Changelog generated by [cocogitto](https://github.com/cocogitto/cocogitto).
