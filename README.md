@@ -1,5 +1,7 @@
 # Aether
 
+[![M8ven Score](https://m8ven.ai/badge/mcp/flowcopilot-aether-u1zu0u?v=8ff143c64a11d9d1fd9d360ce0a84658)](https://m8ven.ai/mcp/flowcopilot-aether-u1zu0u?s=readme)
+
 Aether lets you share your personal AI agent with people you trust. The goal
 is to support any agent that people use as a personal assistant, for example
 Codex, Claude Code, OpenClaw, or Hermes Agent. Today, a node runs Codex, or an
