@@ -5,7 +5,7 @@ rust = { version = "1.98.0", components = ["rustfmt", "clippy"], mr_boxington = 
 mr-boxington = "1.21"
 erlang = "29.1.2"
 elixir = "1.20.5-otp-29"
-java = "temurin-21.0.13+9.0.LTS"
+java = "corretto-21.0.13.1.2"
 
 [tasks.fmt]
 description = "Check Rust formatting"
