@@ -1,5 +1,5 @@
 # Build stage: compile a release.
-FROM hexpm/elixir:1.20.5-erlang-29.1.2-debian-trixie-20261027-slim AS build
+FROM hexpm/elixir:1.20.5-erlang-29.1.3-debian-trixie-20261123-slim AS build
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends build-essential ca-certificates openssl \
